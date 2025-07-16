@@ -13,7 +13,7 @@ import io
 import sys
 import re
 
-from case39_pypower import get_case39_pypower
+from src.case39_pypower import get_case39_pypower
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
 
 # TODO: 数据读取部分请根据你的数据格式自行实现

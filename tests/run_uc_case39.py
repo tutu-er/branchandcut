@@ -1,5 +1,6 @@
 import sys
 from pathlib import Path
+
 root_dir = Path(__file__).resolve().parent.parent
 sys.path.append(str(root_dir))
 
@@ -8,6 +9,7 @@ from src.case39_uc_data import get_case39_uc
 from src.case39_pypower import get_case39_pypower
 from src.uc_gurobipy import UnitCommitmentModel
 from src.uc_cvxpy import UnitCommitmentModelCVXPY
+from src.uc_cplex import UnitCommitmentModelCplex
 import matplotlib.pyplot as plt
 import seaborn as sns
 import pandas as pd
@@ -27,6 +29,7 @@ ppc = get_case39_pypower()
 # 创建模型对象
 uc = UnitCommitmentModel(ppc, Pd, T_delta)
 # uc = UnitCommitmentModelCVXPY(ppc, Pd, T_delta)
+# uc = UnitCommitmentModelCplex(ppc, Pd, T_delta)
 # 求解
 pg_sol, x_sol, total_cost = uc.solve()
 
