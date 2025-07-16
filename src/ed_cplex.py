@@ -1,0 +1,136 @@
+import numpy as np
+import cplex
+from cplex.exceptions import CplexError
+from pypower.makePTDF import makePTDF
+from pypower.ext2int import ext2int
+from pypower.idx_gen import GEN_BUS, PMIN, PMAX, QMIN, QMAX, VG, MBASE, GEN_STATUS
+from pypower.idx_bus import BUS_I, BUS_TYPE, PD, QD, GS, BS, BUS_AREA, VM, VA, BASE_KV, ZONE, VMAX, VMIN
+from pypower.idx_brch import F_BUS, T_BUS, BR_R, BR_X, BR_B, RATE_A, RATE_B, RATE_C, TAP, SHIFT, BR_STATUS, ANGMIN, ANGMAX
+
+class EconomicDispatchCplex:
+    def __init__(self, ppc, Pd, T_delta, x):
+        self.ppc = ppc
+        ppc = ext2int(ppc)
+        self.baseMVA = ppc['baseMVA']
+        self.bus = ppc['bus']
+        self.gen = ppc['gen']
+        self.branch = ppc['branch']
+        self.gencost = ppc['gencost']
+        self.Pd = Pd
+        self.T_delta = T_delta
+        self.T = Pd.shape[1]
+        self.ng = self.gen.shape[0]
+        self.nb = self.branch.shape[0]
+        self.x = x  # 二值变量由外部给定，shape=(ng, T)
+        self.model = cplex.Cplex()
+        self.model.objective.set_sense(self.model.objective.sense.minimize)
+        self._build_model()
+
+    def _build_model(self):
+        ng, T = self.ng, self.T
+        # 变量名
+        pg_names = [f"pg_{g}_{t}" for g in range(ng) for t in range(T)]
+        cpower_names = [f"cpower_{g}_{t}" for g in range(ng) for t in range(T)]
+        # 连续变量
+        self.model.variables.add(names=pg_names, lb=[0]*ng*T)
+        self.model.variables.add(names=cpower_names, lb=[0]*ng*T)
+        # 有功平衡
+        for t in range(T):
+            ind = [f"pg_{g}_{t}" for g in range(ng)]
+            val = [1.0]*ng
+            self.model.linear_constraints.add(
+                lin_expr=[cplex.SparsePair(ind, val)],
+                senses=["E"],
+                rhs=[float(np.sum(self.Pd[:, t]))],
+                names=[f"power_balance_{t}"])
+            for g in range(ng):
+                # pmin
+                self.model.linear_constraints.add(
+                    lin_expr=[cplex.SparsePair([f"pg_{g}_{t}"], [1.0])],
+                    senses=["G"], rhs=[self.gen[g, PMIN] * self.x[g, t]])
+                # pmax
+                self.model.linear_constraints.add(
+                    lin_expr=[cplex.SparsePair([f"pg_{g}_{t}"], [1.0])],
+                    senses=["L"], rhs=[self.gen[g, PMAX] * self.x[g, t]])
+        # 爬坡约束
+        Ru = 0.4 * self.gen[:, PMAX] / self.T_delta
+        Rd = 0.4 * self.gen[:, PMAX] / self.T_delta
+        Ru_co = 0.3 * self.gen[:, PMAX]
+        Rd_co = 0.3 * self.gen[:, PMAX]
+        for t in range(1, T):
+            for g in range(ng):
+                # up
+                self.model.linear_constraints.add(
+                    lin_expr=[cplex.SparsePair([
+                        f"pg_{g}_{t}", f"pg_{g}_{t-1}"
+                    ], [1, -1])],
+                    senses=["L"], rhs=[Ru[g] * self.x[g, t-1] + Ru_co[g] * (1 - self.x[g, t-1])])
+                # down
+                self.model.linear_constraints.add(
+                    lin_expr=[cplex.SparsePair([
+                        f"pg_{g}_{t-1}", f"pg_{g}_{t}"
+                    ], [1, -1])],
+                    senses=["L"], rhs=[Rd[g] * self.x[g, t] + Rd_co[g] * (1 - self.x[g, t])])
+        # 发电成本
+        for t in range(T):
+            for g in range(ng):
+                self.model.linear_constraints.add(
+                    lin_expr=[cplex.SparsePair([
+                        f"cpower_{g}_{t}", f"pg_{g}_{t}", f"const_x_{g}_{t}"
+                    ], [1, -self.gencost[g, -2]/self.T_delta, -self.gencost[g, -1]/self.T_delta])],
+                    senses=["G"], rhs=[-self.gencost[g, -1]/self.T_delta * self.x[g, t]])
+        # 潮流约束
+        try:
+            nb = self.Pd.shape[0]
+            G = np.zeros((nb, self.ng))
+            for g in range(self.ng):
+                bus_idx = int(self.gen[g, GEN_BUS])
+                G[bus_idx, g] = 1
+            PTDF = makePTDF(self.baseMVA, self.bus, self.branch)
+            branch_limit = self.branch[:, RATE_A]
+            for t in range(self.T):
+                for l in range(self.branch.shape[0]):
+                    expr = []
+                    coeff = []
+                    for g in range(self.ng):
+                        expr.append(f"pg_{g}_{t}")
+                        coeff.append(PTDF[l, :] @ G[:, g])
+                    expr += [f"const_load_{i}_{t}" for i in range(nb)]
+                    coeff += list(-PTDF[l, :])
+                    self.model.linear_constraints.add(
+                        lin_expr=[cplex.SparsePair(expr, coeff)],
+                        senses=["L"], rhs=[branch_limit[l]])
+                    self.model.linear_constraints.add(
+                        lin_expr=[cplex.SparsePair(expr, [-c for c in coeff])],
+                        senses=["L"], rhs=[branch_limit[l]])
+        except ImportError:
+            print('未安装pypower，DCPF潮流约束未添加。')
+        # 目标函数
+        obj = [0]*(self.model.variables.get_num())
+        for t in range(self.T):
+            for g in range(self.ng):
+                idx = self.model.variables.get_indices(f"cpower_{g}_{t}")
+                obj[idx] += 1
+        self.model.objective.set_linear(list(enumerate(obj)))
+
+    def solve(self):
+        try:
+            self.model.parameters.mip.display.set(2)
+            self.model.solve()
+        except CplexError as e:
+            print(e)
+            return None, None, None
+        if self.model.solution.get_status() == 101:
+            pg_sol = np.zeros((self.ng, self.T))
+            for g in range(self.ng):
+                for t in range(self.T):
+                    pg_sol[g, t] = self.model.solution.get_values(f"pg_{g}_{t}")
+            print(f"总运行成本: {self.model.solution.get_objective_value()}")
+            return pg_sol, self.model.solution.get_objective_value()
+        else:
+            print("未找到最优解")
+            return None, None
+
+# 示例调用：
+# ed = EconomicDispatchCplex(gen, branch, gencost, Pd, T_delta, x)
+# pg_sol, total_cost = ed.solve()

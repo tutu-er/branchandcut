@@ -1,6 +1,7 @@
 import numpy as np
 import gurobipy as gp
 from gurobipy import GRB
+import pandas as pd
 from pypower.makePTDF import makePTDF
 from pypower.ext2int import ext2int
 from pypower.idx_gen import GEN_BUS, PMIN, PMAX, QMIN, QMAX, VG, MBASE, GEN_STATUS
@@ -11,6 +12,8 @@ from pypower.idx_brch import F_BUS, T_BUS, BR_R, BR_X, BR_B, RATE_A, RATE_B, RAT
 import io
 import sys
 import re
+
+from case39_pypower import get_case39_pypower
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
 
 # TODO: 数据读取部分请根据你的数据格式自行实现
@@ -138,6 +141,87 @@ class UnitCommitmentModel:
             print("未找到最优解")
             return None, None, None
 
+    def solve_with_manual_cuts(self, add_cut_func=None):
+        """
+        求解模型，并在回调中手动添加割平面。
+        add_cut_func: 用户自定义的割平面添加函数，签名为 add_cut_func(model, where)
+        """
+        self.cut_count_log = []
+
+        def cut_callback(model, where):
+            if where == GRB.Callback.MIP:
+                # 记录割平面数
+                try:
+                    cutcnt = model.cbGet(GRB.Callback.MIP_CUTCNT)
+                    self.cut_count_log.append(cutcnt)
+                except Exception:
+                    pass
+                # 手动添加割平面
+            elif where == GRB.Callback.MIPNODE:
+                if add_cut_func is not None:
+                    add_cut_func(model, where)
+
+        self.model.Params.OutputFlag = 1
+        self.model.optimize(cut_callback)
+
+        # 求解结束后输出割平面统计
+        if hasattr(self.model, 'CutCount'):
+            print(f"Gurobi求解过程中总割平面数: {self.model.CutCount}")
+        if self.cut_count_log:
+            print(f"Callback记录的割平面数变化: {self.cut_count_log}")
+
+        if self.model.status == GRB.OPTIMAL:
+            pg_sol = np.array([[self.pg[g, t].X for t in range(self.T)] for g in range(self.ng)])
+            x_sol = np.array([[self.x[g, t].X for t in range(self.T)] for g in range(self.ng)])
+            print(f"总运行成本: {self.model.objVal}")
+            return pg_sol, x_sol, self.model.objVal
+        else:
+            print("未找到最优解")
+            return None, None, None
+
 # 示例调用：
 # uc = UnitCommitmentModel(gen, branch, gencost, Pd, T_delta)
 # pg_sol, x_sol, total_cost = uc.solve()
+if __name__ == "__main__":
+    load_df = pd.read_csv('src/load.csv', header=None)
+    Pd = load_df.values  # shape: (nb, T)
+    T = Pd.shape[1]
+    T_delta = 4  # 如有需要可根据数据调整
+
+    ppc = get_case39_pypower()
+
+    # 创建模型对象
+    uc = UnitCommitmentModel(ppc, Pd, T_delta)
+    pg_sol, x_sol, total_cost = uc.solve_with_manual_cuts()
+
+    if pg_sol is not None:
+        pass
+        # print("机组出力方案：", pg_sol)
+        # print("机组启停方案：", x_sol)
+        # print("总成本：", total_cost)
+
+        # ====== 结果绘图 ======
+        # # 机组出力折线图
+        # plt.figure(figsize=(12, 6))
+        # for g in range(pg_sol.shape[0]):
+        #     if np.sum(x_sol[g, :]) > 0:
+        #         plt.plot(range(1, pg_sol.shape[1]+1), pg_sol[g, :], label=f'机组{g+1}')
+        # plt.xlabel('时段')
+        # plt.ylabel('出力 (MW)')
+        # plt.title('机组出力折线图')
+        # plt.legend()
+        # plt.tight_layout()
+        # plt.show()
+
+        # # 启停状态热力图
+        # plt.figure(figsize=(12, 4))
+        # sns.heatmap(x_sol, cmap='Blues', cbar=False)
+        # plt.xlabel('时段')
+        # plt.ylabel('机组编号')
+        # plt.title('机组启停状态热力图 (蓝色=运行, 白色=停机)')
+        # plt.tight_layout()
+        # plt.show()
+    else:
+        print("未找到可行解")
+
+
