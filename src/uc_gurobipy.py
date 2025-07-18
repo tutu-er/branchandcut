@@ -7,11 +7,13 @@ from pypower.ext2int import ext2int
 from pypower.idx_gen import GEN_BUS, PMIN, PMAX, QMIN, QMAX, VG, MBASE, GEN_STATUS
 from pypower.idx_bus import BUS_I, BUS_TYPE, PD, QD, GS, BS, BUS_AREA, VM, VA, BASE_KV, ZONE, VMAX, VMIN
 from pypower.idx_brch import F_BUS, T_BUS, BR_R, BR_X, BR_B, RATE_A, RATE_B, RATE_C, TAP, SHIFT, BR_STATUS, ANGMIN, ANGMAX
-
-
+from pathlib import Path
 import io
 import sys
 import re
+
+root_dir = Path(__file__).resolve().parent.parent
+sys.path.append(str(root_dir))
 
 from src.case39_pypower import get_case39_pypower
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')

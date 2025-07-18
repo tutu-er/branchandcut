@@ -1,4 +1,5 @@
 import cplex
+import PySCIPOpt as pyscipopt
 # 初始化模型
 prob = cplex.Cplex()
 prob.objective.set_sense(prob.objective.sense.maximize)
