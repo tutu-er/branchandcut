@@ -7,6 +7,14 @@ import pypower.case14
 import pypower.case9
 import pypower.idx_bus
 
+from pathlib import Path
+import io
+import sys
+import re
+
+root_dir = Path(__file__).resolve().parent.parent
+sys.path.append(str(root_dir))
+
 from src.case39_pypower import get_case39_pypower
 from src.ed_cvxpy import EconomicDispatchCVXPY
 from src.uc_cvxpy import UnitCommitmentModelCVXPY
@@ -68,9 +76,7 @@ class ActiveSetLearner:
         M_max = max_samples
         while True:
             # 计算窗口大小
-            WM = int(c * max(np.log(M), np.log(self.M_base)))
-            WM = max(W_min, WM)
-            WM = min(WM, M_max - M)  # 防止超出最大样本数
+            WM = 130
             iter_count += 1
             print(f"迭代{iter_count}: 当前窗口WM={WM}, 当前M={M}")
             # 采样

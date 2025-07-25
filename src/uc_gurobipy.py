@@ -2,6 +2,7 @@ import numpy as np
 import gurobipy as gp
 from gurobipy import GRB
 import pandas as pd
+import pypower
 from pypower.makePTDF import makePTDF
 from pypower.ext2int import ext2int
 from pypower.idx_gen import GEN_BUS, PMIN, PMAX, QMIN, QMAX, VG, MBASE, GEN_STATUS
@@ -79,7 +80,7 @@ class UnitCommitmentModel:
         shut_cost = self.gencost[:, 2]
         for t in range(1, self.T):
             for g in range(self.ng):
-                self.model.addConstr(self.coc[g, t-1] >= -start_cost[g] * (self.x[g, t] - self.x[g, t-1]))
+                self.model.addConstr(self.coc[g, t-1] >= start_cost[g] * (self.x[g, t] - self.x[g, t-1]))
                 self.model.addConstr(self.coc[g, t-1] >= shut_cost[g] * (self.x[g, t-1] - self.x[g, t]))
                 self.model.addConstr(self.coc[g, t-1] >= 0)
         # 发电成本
@@ -164,6 +165,7 @@ class UnitCommitmentModel:
                     add_cut_func(model, where)
 
         self.model.Params.OutputFlag = 1
+        self.model.Params.MIPGap = 1e-10
         self.model.optimize(cut_callback)
 
         # 求解结束后输出割平面统计
