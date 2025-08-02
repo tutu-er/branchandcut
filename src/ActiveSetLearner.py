@@ -213,6 +213,8 @@ if __name__ == "__main__":
     Pd = ppc['bus'][:, pypower.idx_bus.PD]  # 假设Pd为bus数据中的Pd列
     Pd = Pd[:, None] * Pd_base[None, :] / np.max(Pd_base)  # 归一化负荷
     
+    ppc['branch'][:, pypower.idx_brch.RATE_A] = ppc['branch'][:, pypower.idx_brch.RATE_A] * 0.45
+    
     learner = ActiveSetLearner(alpha=0.50, delta=0.05, epsilon=0.20, ppc=ppc, T_delta=1, Pd=Pd)
     active_sets = learner.run(max_samples=200)
     
