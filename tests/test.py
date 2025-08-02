@@ -34,7 +34,7 @@ from scipy.stats import beta
 alpha = 0.01
 p_threshold = 0.05
 
-for n in range(200, 10000):
+for n in range(10, 10000):
     k = max(int(0.01 * n),1)  # 最多1%的成功样本
     upper_bound = beta.ppf(1 - alpha, k + 1, n - k)
     if upper_bound < p_threshold:
