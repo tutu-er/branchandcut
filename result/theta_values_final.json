@@ -1,0 +1,16 @@
+{
+  "theta_values": {
+    "theta_branch_4_unit_0_0": -10.0,
+    "theta_branch_4_unit_0_1": -10.0,
+    "theta_branch_4_unit_0_2": -10.0,
+    "theta_branch_4_unit_1_0": -10.0,
+    "theta_branch_4_unit_1_1": -10.0,
+    "theta_branch_4_unit_1_2": 1.1060759174171242,
+    "theta_branch_4_unit_2_0": 10.0,
+    "theta_branch_4_unit_2_1": 9.997550391151293,
+    "theta_branch_4_unit_2_2": 0.9132340117450024,
+    "theta_branch_4_rhs_0": 9.828384396732702,
+    "theta_branch_4_rhs_1": 10.0,
+    "theta_branch_4_rhs_2": 0.913226271392201
+  }
+}

@@ -21,6 +21,9 @@ from src.case39_pypower import get_case39_pypower
 from src.ed_cvxpy import EconomicDispatchCVXPY
 from src.uc_cvxpy import UnitCommitmentModelCVXPY
 
+from src.uc_gurobipy import UnitCommitmentModel
+from src.ed_gurobipy import EconomicDispatchGurobi
+
 class ActiveSetLearner:
     def __init__(self, alpha=0.05, delta=0.01, epsilon=0.04, ppc=None, T_delta=4, Pd=None):
         self.alpha = alpha
@@ -45,15 +48,18 @@ class ActiveSetLearner:
                 break
         self.W = n
     
-    def _generate_random_Pd(self):
+    def _generate_random_Pd(self, rng=42):
+        np.random.seed(rng)  # 设置随机种子
         perturb = np.random.uniform(0.95, 1.05, self.Pd.shape)
         Pd_perturbed = self.Pd * perturb
         return Pd_perturbed
 
     def _solve_optimization(self, Pd):
         """求解优化问题并返回活动集"""
+        # uc = UnitCommitmentModel(self.ppc, Pd, self.T_delta)
         uc = UnitCommitmentModelCVXPY(self.ppc, Pd, self.T_delta)
         pg_sol, x_sol, total_cost = uc.solve()
+        # ed = EconomicDispatchGurobi(self.ppc, Pd, self.T_delta, x_sol)
         ed = EconomicDispatchCVXPY(self.ppc, Pd, self.T_delta, x_sol)
         pg_sol, total_cost = ed.solve()
         # 将x_sol转为(序号,值)的list
@@ -171,7 +177,7 @@ class ActiveSetLearner:
             for idx in range(WM):
                 if M >= M_max:
                     break
-                Pd = self._generate_random_Pd()
+                Pd = self._generate_random_Pd(rng=idx)
                 active_set = self._solve_optimization(Pd)
                 samples.append((Pd, active_set))
                 # 进度条显示
@@ -213,7 +219,7 @@ if __name__ == "__main__":
     Pd = ppc['bus'][:, pypower.idx_bus.PD]  # 假设Pd为bus数据中的Pd列
     Pd = Pd[:, None] * Pd_base[None, :] / np.max(Pd_base)  # 归一化负荷
     
-    ppc['branch'][:, pypower.idx_brch.RATE_A] = ppc['branch'][:, pypower.idx_brch.RATE_A] * 0.45
+    ppc['branch'][:, pypower.idx_brch.RATE_A] = ppc['branch'][:, pypower.idx_brch.RATE_A]
     
     learner = ActiveSetLearner(alpha=0.50, delta=0.05, epsilon=0.20, ppc=ppc, T_delta=1, Pd=Pd)
     active_sets = learner.run(max_samples=200)

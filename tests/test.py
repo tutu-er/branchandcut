@@ -29,14 +29,25 @@
 # # 查看最优解
 # print("最优解：",prob.solution.get_values())
 
-from scipy.stats import beta
+# from scipy.stats import beta
 
-alpha = 0.01
-p_threshold = 0.05
+# alpha = 0.01
+# p_threshold = 0.05
 
-for n in range(10, 10000):
-    k = max(int(0.01 * n),1)  # 最多1%的成功样本
-    upper_bound = beta.ppf(1 - alpha, k + 1, n - k)
-    if upper_bound < p_threshold:
-        print(f"Required sample size: {n}, k = {k}, Upper Bound = {upper_bound:.4f}")
-        break
+# for n in range(10, 10000):
+#     k = max(int(0.01 * n),1)  # 最多1%的成功样本
+#     upper_bound = beta.ppf(1 - alpha, k + 1, n - k)
+#     if upper_bound < p_threshold:
+#         print(f"Required sample size: {n}, k = {k}, Upper Bound = {upper_bound:.4f}")
+#         break
+
+totle = 1e4
+amount = 250
+
+perc = 1
+for i in range(1, amount + 1):
+    perc *= (totle - i) / totle
+    
+print(1 - perc)
+
+

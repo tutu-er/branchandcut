@@ -1,0 +1,81 @@
+{
+  "sample_id": 12,
+  "timestamp": "20250805_182021",
+  "original_cost": 17960.89359558343,
+  "theta_variable_mode": {
+    "A_shape": [
+      521,
+      285
+    ],
+    "A_dtype": "object",
+    "has_theta_expressions": true
+  },
+  "theta_numeric_mode": {
+    "A_shape": [
+      521,
+      285
+    ],
+    "A_dtype": "float64",
+    "theta_values_used": {
+      "theta_branch_2_rhs_0": 0.1,
+      "theta_branch_2_rhs_1": 0.01,
+      "theta_branch_2_rhs_2": 0.001,
+      "theta_branch_2_unit_0_0": 0.05,
+      "theta_branch_2_unit_0_1": 0.01,
+      "theta_branch_2_unit_0_2": 0.001,
+      "theta_branch_2_unit_1_0": 0.05,
+      "theta_branch_2_unit_1_1": 0.01,
+      "theta_branch_2_unit_1_2": 0.001,
+      "theta_branch_2_unit_2_0": 0.05,
+      "theta_branch_2_unit_2_1": 0.01,
+      "theta_branch_2_unit_2_2": 0.001,
+      "theta_branch_4_rhs_0": 0.1,
+      "theta_branch_4_rhs_1": 0.01,
+      "theta_branch_4_rhs_2": 0.001,
+      "theta_branch_4_unit_0_0": 0.05,
+      "theta_branch_4_unit_0_1": 0.01,
+      "theta_branch_4_unit_0_2": 0.001,
+      "theta_branch_4_unit_1_0": 0.05,
+      "theta_branch_4_unit_1_1": 0.01,
+      "theta_branch_4_unit_1_2": 0.001,
+      "theta_branch_4_unit_2_0": 0.05,
+      "theta_branch_4_unit_2_1": 0.01,
+      "theta_branch_4_unit_2_2": 0.001,
+      "theta_branch_6_rhs_0": 0.1,
+      "theta_branch_6_rhs_1": 0.01,
+      "theta_branch_6_rhs_2": 0.001,
+      "theta_branch_6_unit_0_0": 0.05,
+      "theta_branch_6_unit_0_1": 0.01,
+      "theta_branch_6_unit_0_2": 0.001,
+      "theta_branch_6_unit_1_0": 0.05,
+      "theta_branch_6_unit_1_1": 0.01,
+      "theta_branch_6_unit_1_2": 0.001,
+      "theta_branch_6_unit_2_0": 0.05,
+      "theta_branch_6_unit_2_1": 0.01,
+      "theta_branch_6_unit_2_2": 0.001
+    }
+  },
+  "unit_constraints": {
+    "num_units": 3,
+    "A_g_shapes": [
+      [
+        336,
+        285
+      ],
+      [
+        336,
+        285
+      ],
+      [
+        336,
+        285
+      ]
+    ]
+  },
+  "objective": {
+    "c_vector_shape": [
+      285
+    ],
+    "nonzero_coefficients": 141
+  }
+}

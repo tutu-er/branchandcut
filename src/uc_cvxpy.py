@@ -63,7 +63,7 @@ class UnitCommitmentModelCVXPY:
         shut_cost = self.gencost[:, 2]
         for t in range(1, T):
             for g in range(ng):
-                self.constraints.append(self.coc[g, t-1] >= -start_cost[g] * (self.x[g, t] - self.x[g, t-1]))
+                self.constraints.append(self.coc[g, t-1] >= start_cost[g] * (self.x[g, t] - self.x[g, t-1]))
                 self.constraints.append(self.coc[g, t-1] >= shut_cost[g] * (self.x[g, t-1] - self.x[g, t]))
                 self.constraints.append(self.coc[g, t-1] >= 0)
         # 发电成本
@@ -91,7 +91,11 @@ class UnitCommitmentModelCVXPY:
         self.prob = cp.Problem(cp.Minimize(obj), self.constraints)
 
     def solve(self):
-        result = self.prob.solve(solver=cp.GUROBI, verbose=False)
+        result = self.prob.solve(
+            solver=cp.GUROBI,
+            verbose=False,
+            MIPGap=1e-10
+        )
         if self.prob.status == cp.OPTIMAL or self.prob.status == cp.OPTIMAL_INACCURATE:
             pg_sol = self.pg.value
             x_sol = self.x.value
