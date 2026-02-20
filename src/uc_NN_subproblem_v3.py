@@ -441,26 +441,26 @@ class DualVariablePredictorTrainer:
 
 class SubproblemSurrogateNet(nn.Module):
     """
-    单机组子问题的代理约束网络 - 时间耦合版本
+    单机组子问题的代理约束网络 - V3三时段耦合版本
     
     输入: Pd数据 + 对偶变量λ (pd_dim + T)
-    输出: 时间耦合约束参数 (alphas, betas, gammas)
-          约束形式: alpha_t * x_t + beta_t * x_{t+1} <= gamma_t  (对于 t = 0..T-2)
+    输出: 三时段耦合约束参数 (alphas, betas, gammas, deltas)
+          约束形式: alpha_t * x_t + beta_t * x_{t+1} + gamma_t * x_{t+2} <= delta_t
           
-    这种形式可以学习相邻时段的关系：
-    - 模拟最小运行/停机时间的软约束
-    - 限制开关机频率
-    - 在整数性差的时段附近加强约束
+    改进点：
+    - 三时段约束捕捉更长时间窗口
+    - 敏感时段动态选择（只对整数性差的时段生成约束）
+    - 最大约束数量max_constraints（而非固定T-1）
     """
     
-    def __init__(self, input_dim: int, T: int, hidden_dims: List[int] = None):
+    def __init__(self, input_dim: int, T: int, max_constraints: int = 20, hidden_dims: List[int] = None):
         super(SubproblemSurrogateNet, self).__init__()
         
         self.T = T
-        self.num_coupling_constraints = T - 1  # T-1个时序耦合约束
+        self.max_constraints = max_constraints  # 最大约束数量
         
         if hidden_dims is None:
-            hidden_dims = [128, 256, 128]
+            hidden_dims = [256, 512, 256]  # V3: 更大网络容量
         
         # 统一的特征提取网络
         feature_layers = []
@@ -468,20 +468,18 @@ class SubproblemSurrogateNet(nn.Module):
         for hidden_dim in hidden_dims:
             feature_layers.append(nn.Linear(prev_dim, hidden_dim))
             feature_layers.append(nn.ReLU())
-            feature_layers.append(nn.Dropout(0.1))
+            feature_layers.append(nn.Dropout(0.15))  # 增加dropout
             prev_dim = hidden_dim
         self.feature_extractor = nn.Sequential(*feature_layers)
         
-        # alpha网络：预测当前时段系数 (T-1个)
-        self.alpha_net = nn.Linear(prev_dim, self.num_coupling_constraints)
+        # 四个参数网络: alpha(t), beta(t+1), gamma(t+2), delta(RHS)
+        self.alpha_net = nn.Linear(prev_dim, self.max_constraints)
+        self.beta_net = nn.Linear(prev_dim, self.max_constraints)
+        self.gamma_net = nn.Linear(prev_dim, self.max_constraints)
         
-        # beta网络：预测下一时段系数 (T-1个)
-        self.beta_net = nn.Linear(prev_dim, self.num_coupling_constraints)
-        
-        # gamma网络：预测右端项 (T-1个)
-        # 使用Softplus确保非负，加上偏置使初始值接近1
-        self.gamma_net = nn.Sequential(
-            nn.Linear(prev_dim, self.num_coupling_constraints),
+        # delta网络：右端项，使用Softplus确保非负
+        self.delta_net = nn.Sequential(
+            nn.Linear(prev_dim, self.max_constraints),
             nn.Softplus()
         )
         
@@ -494,9 +492,9 @@ class SubproblemSurrogateNet(nn.Module):
                 if module.bias is not None:
                     nn.init.zeros_(module.bias)
         
-        # gamma网络的偏置初始化为正值，使初始gamma接近1
-        if hasattr(self.gamma_net[0], 'bias') and self.gamma_net[0].bias is not None:
-            nn.init.constant_(self.gamma_net[0].bias, 1.0)
+        # delta网络的偏置初始化为正值
+        if hasattr(self.delta_net[0], 'bias') and self.delta_net[0].bias is not None:
+            nn.init.constant_(self.delta_net[0].bias, 1.0)
     
     def forward(self, x):
         """
@@ -506,15 +504,59 @@ class SubproblemSurrogateNet(nn.Module):
             x: 输入特征 (batch_size, input_dim)
         
         Returns:
-            alphas: 当前时段系数 (batch_size, T-1)
-            betas: 下一时段系数 (batch_size, T-1)
-            gammas: 右端项 (batch_size, T-1)
+            alphas: t时段系数 (batch_size, max_constraints)
+            betas: t+1时段系数 (batch_size, max_constraints)
+            gammas: t+2时段系数 (batch_size, max_constraints)
+            deltas: 右端项 (batch_size, max_constraints)
         """
         features = self.feature_extractor(x)
         alphas = self.alpha_net(features)
         betas = self.beta_net(features)
         gammas = self.gamma_net(features)
-        return alphas, betas, gammas
+        deltas = self.delta_net(features)
+        return alphas, betas, gammas, deltas
+
+
+def identify_sensitive_timesteps(x_vals, threshold_low=0.1, threshold_high=0.9, max_constraints=20):
+    """
+    识别整数性差的敏感时段（用于三时段约束）
+    
+    Args:
+        x_vals: (T,) 时段变量值
+        threshold_low: 下阈值，低于此值认为接近0
+        threshold_high: 上阈值，高于此值认为接近1
+        max_constraints: 最大约束数量
+    
+    Returns:
+        sensitive_timesteps: 需要生成约束的时段索引列表（长度≤max_constraints）
+    """
+    T = len(x_vals)
+    sensitive = []
+    
+    # 三时段约束需要t, t+1, t+2都存在
+    for t in range(T - 2):
+        # 检查三时段窗口是否有整数性问题
+        window = x_vals[t:t+3]
+        # 如果窗口内任意变量在(0.1, 0.9)区间，标记为敏感
+        if any(threshold_low < x < threshold_high for x in window):
+            sensitive.append(t)
+    
+    # 限制约束数量
+    if len(sensitive) > max_constraints:
+        # 按整数性从差到好排序，保留最差的max_constraints个
+        violations = []
+        for t in sensitive:
+            window = x_vals[t:t+3]
+            # 整数性：sum(x*(1-x))，越大越差
+            viol = sum(x * (1-x) for x in window)
+            violations.append((t, viol))
+        
+        # 按违反程度排序
+        violations.sort(key=lambda item: item[1], reverse=True)
+        sensitive = [t for t, _ in violations[:max_constraints]]
+        sensitive.sort()  # 按时间顺序排列
+    
+    return sensitive
 
 
 class SubproblemSurrogateTrainer:
@@ -535,9 +577,10 @@ class SubproblemSurrogateTrainer:
     """
     
     def __init__(self, ppc, active_set_data, T_delta, unit_id: int, 
-                 lambda_predictor: DualVariablePredictorTrainer = None, device=None):
+                 lambda_predictor: DualVariablePredictorTrainer = None, 
+                 max_constraints: int = 20, device=None):
         """
-        初始化单机组子问题代理约束训练器
+        初始化单机组子问题代理约束训练器 - V3三时段版本
         
         Args:
             ppc: PyPower案例数据
@@ -545,6 +588,7 @@ class SubproblemSurrogateTrainer:
             T_delta: 时间间隔
             unit_id: 机组索引
             lambda_predictor: 已训练的对偶变量预测器（可选）
+            max_constraints: 最大约束数量（敏感时段）
             device: 计算设备
         """
         self.ppc = ppc
@@ -557,6 +601,7 @@ class SubproblemSurrogateTrainer:
         self.n_samples = len(active_set_data)
         self.T_delta = T_delta
         self.unit_id = unit_id
+        self.max_constraints = max_constraints  # V3新增
         
         if isinstance(active_set_data, list):
             self.T = active_set_data[0]['pd_data'].shape[1]
@@ -600,20 +645,26 @@ class SubproblemSurrogateTrainer:
         self.coc = np.zeros((self.n_samples, self.T-1))
         self.cpower = np.zeros((self.n_samples, self.T))
         
-        # 时序耦合约束：T-1个约束，每个约束一个对偶变量
-        self.num_coupling_constraints = self.T - 1
+        # V3: 三时段耦合约束，每个样本可能有不同数量的约束（≤max_constraints）
+        # 初始化为max_constraints大小
+        self.num_coupling_constraints = self.max_constraints
         self.mu = np.ones((self.n_samples, self.num_coupling_constraints)) * self.mu_lower_bound
+        
+        # V3: 存储每个样本的敏感时段索引
+        self.sensitive_timesteps = [[] for _ in range(self.n_samples)]
         
         # 获取对偶变量λ
         self.lambda_vals = self._get_lambda_values()
         
-        # 初始化时序耦合代理约束参数
-        # alphas: (n_samples, T-1) - 当前时段系数
-        # betas: (n_samples, T-1) - 下一时段系数
-        # gammas: (n_samples, T-1) - 右端项
+        # V3: 初始化三时段耦合代理约束参数
+        # alphas: (n_samples, max_constraints) - t时段系数
+        # betas: (n_samples, max_constraints) - t+1时段系数
+        # gammas: (n_samples, max_constraints) - t+2时段系数
+        # deltas: (n_samples, max_constraints) - 右端项
         self.alpha_values = np.zeros((self.n_samples, self.num_coupling_constraints))
         self.beta_values = np.zeros((self.n_samples, self.num_coupling_constraints))
-        self.gamma_values = np.ones((self.n_samples, self.num_coupling_constraints))
+        self.gamma_values = np.zeros((self.n_samples, self.num_coupling_constraints))
+        self.delta_values = np.ones((self.n_samples, self.num_coupling_constraints))
         
         # 初始化神经网络
         if TORCH_AVAILABLE:
@@ -712,19 +763,21 @@ class SubproblemSurrogateTrainer:
         return np.array(lambda_vals)
     
     def _init_neural_network(self):
-        """初始化代理约束神经网络"""
+        """初始化代理约束神经网络 - V3版本"""
         # 使用实际pd_data的维度而不是总节点数
         input_dim = self.n_load * self.T + self.T  # Pd + λ
         
         self.surrogate_net = SubproblemSurrogateNet(
             input_dim=input_dim,
             T=self.T,
-            hidden_dims=[128, 256, 128]
+            max_constraints=self.max_constraints,  # V3新增
+            hidden_dims=[256, 512, 256]  # V3: 更大网络
         ).to(self.device)
         
-        self.optimizer = optim.Adam(self.surrogate_net.parameters(), lr=1e-4)
+        self.optimizer = optim.Adam(self.surrogate_net.parameters(), lr=5e-5)  # V3: 降低学习率
         
         print(f"  - 代理约束网络输入维度: {input_dim}", flush=True)
+        print(f"  - 最大约束数量: {self.max_constraints}", flush=True)
     
     def _initialize_solve(self):
         """初始化求解，获取初始的pg, x, coc, cpower"""
