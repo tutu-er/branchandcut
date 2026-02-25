@@ -269,86 +269,67 @@ class DualVariablePredictorTrainer:
         print(f"  - 输入维度: {self.input_dim}, 输出维度: {self.output_dim}", flush=True)
     
     def _solve_for_true_dual_variables(self) -> np.ndarray:
-        """求解UC问题获取功率平衡约束的对偶变量真值"""
+        """获取功率平衡约束的对偶变量真值λ
+        
+        优化策略：
+        1. 如果JSON有lambda → 直接读取（0次求解）
+        2. 如果JSON没有lambda → 从active_set提取x，求解ED（LP）获取（不需要MILP）
+        """
         lambda_true = []
+        needs_solve = []
         
+        # 检查JSON中是否已有lambda
         for sample_id in range(self.n_samples):
-            Pd = self.active_set_data[sample_id]['pd_data']
-            model = gp.Model('uc_for_dual')
-            model.Params.OutputFlag = 0
-            
-            # 变量
-            pg = model.addVars(self.ng, self.T, lb=0, name='pg')
-            x = model.addVars(self.ng, self.T, vtype=GRB.BINARY, name='x')
-            coc = model.addVars(self.ng, self.T-1, lb=0, name='coc')
-            cpower = model.addVars(self.ng, self.T, lb=0, name='cpower')
-            
-            # 功率平衡约束
-            for t in range(self.T):
-                model.addConstr(
-                    gp.quicksum(pg[g, t] for g in range(self.ng)) == np.sum(Pd[:, t]),
-                    name=f'power_balance_{t}'
-                )
-            
-            # 发电上下限约束
-            for g in range(self.ng):
-                for t in range(self.T):
-                    model.addConstr(pg[g, t] >= self.gen[g, PMIN] * x[g, t], name=f'pg_lower_{g}_{t}')
-                    model.addConstr(pg[g, t] <= self.gen[g, PMAX] * x[g, t], name=f'pg_upper_{g}_{t}')
-            
-            # 爬坡约束
-            Ru = 0.4 * self.gen[:, PMAX] / self.T_delta
-            Rd = 0.4 * self.gen[:, PMAX] / self.T_delta
-            for g in range(self.ng):
-                for t in range(1, self.T):
-                    model.addConstr(pg[g, t] - pg[g, t-1] <= Ru[g] * x[g, t-1] + self.gen[g, PMAX] * (1 - x[g, t-1]))
-                    model.addConstr(pg[g, t-1] - pg[g, t] <= Rd[g] * x[g, t] + self.gen[g, PMAX] * (1 - x[g, t]))
-            
-            # 最小开关机时间约束
-            Ton = min(4, self.T)
-            Toff = min(4, self.T)
-            for g in range(self.ng):
-                for tau in range(1, Ton+1):
-                    for t1 in range(self.T - tau):
-                        model.addConstr(x[g, t1+1] - x[g, t1] <= x[g, t1+tau])
-                for tau in range(1, Toff+1):
-                    for t1 in range(self.T - tau):
-                        model.addConstr(-x[g, t1+1] + x[g, t1] <= 1 - x[g, t1+tau])
-            
-            # 启停成本
-            start_cost = self.gencost[:, 1]
-            shut_cost = self.gencost[:, 2]
-            for t in range(1, self.T):
-                for g in range(self.ng):
-                    model.addConstr(coc[g, t-1] >= start_cost[g] * (x[g, t] - x[g, t-1]))
-                    model.addConstr(coc[g, t-1] >= shut_cost[g] * (x[g, t-1] - x[g, t]))
-            
-            # 发电成本
-            for t in range(self.T):
-                for g in range(self.ng):
-                    model.addConstr(cpower[g, t] >= self.gencost[g, -2]/self.T_delta * pg[g, t] + 
-                                  self.gencost[g, -1]/self.T_delta * x[g, t])
-            
-            # 目标函数
-            obj = (gp.quicksum(cpower[g, t] for g in range(self.ng) for t in range(self.T)) +
-                   gp.quicksum(coc[g, t] for g in range(self.ng) for t in range(self.T-1)))
-            model.setObjective(obj, GRB.MINIMIZE)
-            model.optimize()
-            
-            if model.status == GRB.OPTIMAL:
-                lambda_sample = np.zeros(self.T)
-                for t in range(self.T):
-                    constr = model.getConstrByName(f'power_balance_{t}')
-                    if constr is not None:
-                        try:
-                            lambda_sample[t] = constr.Pi
-                        except:
-                            lambda_sample[t] = 0.0
-                lambda_true.append(lambda_sample)
+            if 'lambda' in self.active_set_data[sample_id] and \
+               self.active_set_data[sample_id]['lambda'] is not None:
+                lambda_true.append(np.array(self.active_set_data[sample_id]['lambda']))
             else:
-                lambda_true.append(np.zeros(self.T))
+                needs_solve.append(sample_id)
         
-        return np.array(lambda_true)
+        # 如果所有样本都有lambda，直接返回
+        if not needs_solve:
+            print(f"✓ 从数据中读取了 {len(lambda_true)} 个样本的 lambda 真值", flush=True)
+            return np.array(lambda_true)
+        
+        # 否则通过求解LP获取缺失的lambda
+        print(f"⚠ {len(needs_solve)} 个样本缺少 lambda，从 active_set 提取 x 并求解 LP...", flush=True)
+        
+        # 构建完整的lambda_true数组（保持顺序）
+        lambda_dict = {i: lambda_true[i] for i in range(len(lambda_true))}
+        
+        for sample_id in needs_solve:
+            Pd = self.active_set_data[sample_id]['pd_data']
+            active_set = self.active_set_data[sample_id]['active_set']
+            
+            # 从active_set中恢复x矩阵
+            x_sol = np.zeros((self.ng, self.T))
+            for item in active_set:
+                # x元素格式: [[g, t], value]
+                if isinstance(item, list) and len(item) == 2 and isinstance(item[0], list):
+                    g, t = item[0]
+                    value = item[1]
+                    x_sol[g, t] = value
+            
+            # 用x求解ED（LP），获取对偶变量
+            from src.ed_cvxpy import EconomicDispatchCVXPY
+            ed = EconomicDispatchCVXPY(self.ppc, Pd, self.T_delta, x_sol)
+            pg_sol, total_cost = ed.solve()
+            
+            # 提取功率平衡约束的对偶变量λ（前T个约束）
+            lambda_sample = np.zeros(self.T)
+            for t in range(self.T):
+                dual_val = ed.constraints[t].dual_value
+                if dual_val is None:
+                    lambda_sample[t] = 0.0
+                else:
+                    lambda_sample[t] = float(dual_val)
+            
+            lambda_dict[sample_id] = lambda_sample
+        
+        print(f"✓ 成功获取所有 {self.n_samples} 个样本的 lambda（{len(lambda_true)} 个从JSON读取，{len(needs_solve)} 个求解LP获得）", flush=True)
+        
+        # 按sample_id顺序返回
+        return np.array([lambda_dict[i] for i in range(self.n_samples)])
     
     def _extract_features(self, sample_id: int) -> np.ndarray:
         """提取Pd数据作为特征"""
@@ -690,77 +671,59 @@ class SubproblemSurrogateTrainer:
             return self._solve_for_lambda()
     
     def _solve_for_lambda(self) -> np.ndarray:
-        """求解原问题获取λ"""
+        """获取对偶变量λ（优先从数据读取，否则从active_set提取x求解LP）"""
         lambda_vals = []
-        for sample_id in range(self.n_samples):
-            Pd = self.active_set_data[sample_id]['pd_data']
-            model = gp.Model('uc_for_lambda')
-            model.Params.OutputFlag = 0
-            
-            pg = model.addVars(self.ng, self.T, lb=0, name='pg')
-            x = model.addVars(self.ng, self.T, vtype=GRB.BINARY, name='x')
-            coc = model.addVars(self.ng, self.T-1, lb=0, name='coc')
-            cpower = model.addVars(self.ng, self.T, lb=0, name='cpower')
-            
-            # 功率平衡约束
-            for t in range(self.T):
-                model.addConstr(gp.quicksum(pg[g, t] for g in range(self.ng)) == np.sum(Pd[:, t]),
-                              name=f'power_balance_{t}')
-            
-            # 其他约束（简化）
-            for g in range(self.ng):
-                for t in range(self.T):
-                    model.addConstr(pg[g, t] >= self.gen[g, PMIN] * x[g, t])
-                    model.addConstr(pg[g, t] <= self.gen[g, PMAX] * x[g, t])
-            
-            Ru = 0.4 * self.gen[:, PMAX] / self.T_delta
-            Rd = 0.4 * self.gen[:, PMAX] / self.T_delta
-            for g in range(self.ng):
-                for t in range(1, self.T):
-                    model.addConstr(pg[g, t] - pg[g, t-1] <= Ru[g] * x[g, t-1] + self.gen[g, PMAX] * (1 - x[g, t-1]))
-                    model.addConstr(pg[g, t-1] - pg[g, t] <= Rd[g] * x[g, t] + self.gen[g, PMAX] * (1 - x[g, t]))
-            
-            Ton = min(4, self.T)
-            Toff = min(4, self.T)
-            for g in range(self.ng):
-                for tau in range(1, Ton+1):
-                    for t1 in range(self.T - tau):
-                        model.addConstr(x[g, t1+1] - x[g, t1] <= x[g, t1+tau])
-                for tau in range(1, Toff+1):
-                    for t1 in range(self.T - tau):
-                        model.addConstr(-x[g, t1+1] + x[g, t1] <= 1 - x[g, t1+tau])
-            
-            start_cost = self.gencost[:, 1]
-            shut_cost = self.gencost[:, 2]
-            for t in range(1, self.T):
-                for g in range(self.ng):
-                    model.addConstr(coc[g, t-1] >= start_cost[g] * (x[g, t] - x[g, t-1]))
-                    model.addConstr(coc[g, t-1] >= shut_cost[g] * (x[g, t-1] - x[g, t]))
-            
-            for t in range(self.T):
-                for g in range(self.ng):
-                    model.addConstr(cpower[g, t] >= self.gencost[g, -2]/self.T_delta * pg[g, t] + 
-                                  self.gencost[g, -1]/self.T_delta * x[g, t])
-            
-            obj = (gp.quicksum(cpower[g, t] for g in range(self.ng) for t in range(self.T)) +
-                   gp.quicksum(coc[g, t] for g in range(self.ng) for t in range(self.T-1)))
-            model.setObjective(obj, GRB.MINIMIZE)
-            model.optimize()
-            
-            if model.status == GRB.OPTIMAL:
-                lambda_sample = np.zeros(self.T)
-                for t in range(self.T):
-                    constr = model.getConstrByName(f'power_balance_{t}')
-                    if constr is not None:
-                        try:
-                            lambda_sample[t] = constr.Pi
-                        except:
-                            pass
-                lambda_vals.append(lambda_sample)
-            else:
-                lambda_vals.append(np.zeros(self.T))
+        needs_solve = []
         
-        return np.array(lambda_vals)
+        # 检查JSON中是否已有lambda
+        for sample_id in range(self.n_samples):
+            if 'lambda' in self.active_set_data[sample_id] and \
+               self.active_set_data[sample_id]['lambda'] is not None:
+                lambda_vals.append(np.array(self.active_set_data[sample_id]['lambda']))
+            else:
+                needs_solve.append(sample_id)
+        
+        # 如果所有样本都有lambda，直接返回
+        if not needs_solve:
+            return np.array(lambda_vals)
+        
+        # 否则通过求解LP获取缺失的lambda
+        print(f"⚠ {len(needs_solve)} 个样本缺少 lambda，从 active_set 提取 x 并求解 LP...", flush=True)
+        
+        # 构建完整的lambda_vals数组（保持顺序）
+        lambda_dict = {i: lambda_vals[i] for i in range(len(lambda_vals))}
+        
+        for sample_id in needs_solve:
+            Pd = self.active_set_data[sample_id]['pd_data']
+            active_set = self.active_set_data[sample_id]['active_set']
+            
+            # 从active_set中恢复x矩阵
+            x_sol = np.zeros((self.ng, self.T))
+            for item in active_set:
+                # x元素格式: [[g, t], value]
+                if isinstance(item, list) and len(item) == 2 and isinstance(item[0], list):
+                    g, t = item[0]
+                    value = item[1]
+                    x_sol[g, t] = value
+            
+            # 用x求解ED（LP），获取对偶变量
+            from src.ed_cvxpy import EconomicDispatchCVXPY
+            ed = EconomicDispatchCVXPY(self.ppc, Pd, self.T_delta, x_sol)
+            pg_sol, total_cost = ed.solve()
+            
+            # 提取功率平衡约束的对偶变量λ（前T个约束）
+            lambda_sample = np.zeros(self.T)
+            for t in range(self.T):
+                dual_val = ed.constraints[t].dual_value
+                if dual_val is None:
+                    lambda_sample[t] = 0.0
+                else:
+                    lambda_sample[t] = float(dual_val)
+            
+            lambda_dict[sample_id] = lambda_sample
+        
+        # 按sample_id顺序返回
+        return np.array([lambda_dict[i] for i in range(self.n_samples)])
     
     def _init_neural_network(self):
         """初始化代理约束神经网络 - V3版本"""
@@ -780,53 +743,58 @@ class SubproblemSurrogateTrainer:
         print(f"  - 最大约束数量: {self.max_constraints}", flush=True)
     
     def _initialize_solve(self):
-        """初始化求解，获取初始的pg, x, coc, cpower"""
+        """初始化求解，从active_set提取x，用LP获取初始的pg, coc, cpower
+        
+        优化：不需要求解MILP，直接从active_set中恢复x，然后求解LP
+        """
         g = self.unit_id
         
         for sample_id in range(self.n_samples):
             lambda_val = self.lambda_vals[sample_id]
+            active_set = self.active_set_data[sample_id]['active_set']
             
-            model = gp.Model('init_subproblem')
+            # 从active_set中恢复x矩阵（取第g个机组的x）
+            x_init = np.zeros(self.T)
+            for item in active_set:
+                # x元素格式: [[g_idx, t], value]
+                if isinstance(item, list) and len(item) == 2 and isinstance(item[0], list):
+                    g_idx, t = item[0]
+                    value = item[1]
+                    if g_idx == g:  # 只提取当前机组的x
+                        x_init[t] = value
+            
+            # 用提取的x求解LP，获取pg, coc, cpower
+            model = gp.Model('init_subproblem_LP')
             model.Params.OutputFlag = 0
             
             pg = model.addVars(self.T, lb=0, name='pg')
-            x = model.addVars(self.T, vtype=GRB.BINARY, name='x')
+            x_fixed = x_init  # 固定x为从active_set提取的值
             coc = model.addVars(self.T-1, lb=0, name='coc')
             cpower = model.addVars(self.T, lb=0, name='cpower')
             
-            # 发电上下限约束
+            # 发电上下限约束（x已固定）
             for t in range(self.T):
-                model.addConstr(pg[t] >= self.gen[g, PMIN] * x[t], name=f'pg_lower_{t}')
-                model.addConstr(pg[t] <= self.gen[g, PMAX] * x[t], name=f'pg_upper_{t}')
+                model.addConstr(pg[t] >= self.gen[g, PMIN] * x_fixed[t], name=f'pg_lower_{t}')
+                model.addConstr(pg[t] <= self.gen[g, PMAX] * x_fixed[t], name=f'pg_upper_{t}')
             
             # 爬坡约束
             Ru = 0.4 * self.gen[g, PMAX] / self.T_delta
             Rd = 0.4 * self.gen[g, PMAX] / self.T_delta
             for t in range(1, self.T):
-                model.addConstr(pg[t] - pg[t-1] <= Ru * x[t-1] + self.gen[g, PMAX] * (1 - x[t-1]), name=f'ramp_up_{t}')
-                model.addConstr(pg[t-1] - pg[t] <= Rd * x[t] + self.gen[g, PMAX] * (1 - x[t]), name=f'ramp_down_{t}')
-            
-            # 最小开关机时间约束
-            Ton = min(4, self.T)
-            Toff = min(4, self.T)
-            for tau in range(1, Ton+1):
-                for t1 in range(self.T - tau):
-                    model.addConstr(x[t1+1] - x[t1] <= x[t1+tau], name=f'min_on_{tau}_{t1}')
-            for tau in range(1, Toff+1):
-                for t1 in range(self.T - tau):
-                    model.addConstr(-x[t1+1] + x[t1] <= 1 - x[t1+tau], name=f'min_off_{tau}_{t1}')
+                model.addConstr(pg[t] - pg[t-1] <= Ru * x_fixed[t-1] + self.gen[g, PMAX] * (1 - x_fixed[t-1]), name=f'ramp_up_{t}')
+                model.addConstr(pg[t-1] - pg[t] <= Rd * x_fixed[t] + self.gen[g, PMAX] * (1 - x_fixed[t]), name=f'ramp_down_{t}')
             
             # 启停成本
             start_cost = self.gencost[g, 1]
             shut_cost = self.gencost[g, 2]
             for t in range(1, self.T):
-                model.addConstr(coc[t-1] >= start_cost * (x[t] - x[t-1]), name=f'start_cost_{t}')
-                model.addConstr(coc[t-1] >= shut_cost * (x[t-1] - x[t]), name=f'shut_cost_{t}')
+                model.addConstr(coc[t-1] >= start_cost * (x_fixed[t] - x_fixed[t-1]), name=f'start_cost_{t}')
+                model.addConstr(coc[t-1] >= shut_cost * (x_fixed[t-1] - x_fixed[t]), name=f'shut_cost_{t}')
             
             # 发电成本
             for t in range(self.T):
                 model.addConstr(cpower[t] >= self.gencost[g, -2]/self.T_delta * pg[t] + 
-                              self.gencost[g, -1]/self.T_delta * x[t], name=f'cpower_{t}')
+                              self.gencost[g, -1]/self.T_delta * x_fixed[t], name=f'cpower_{t}')
             
             # 目标函数: cost - λᵀ × pg
             obj = gp.quicksum(cpower[t] for t in range(self.T))
@@ -838,7 +806,7 @@ class SubproblemSurrogateTrainer:
             
             if model.status == GRB.OPTIMAL:
                 self.pg[sample_id] = np.array([pg[t].X for t in range(self.T)])
-                self.x[sample_id] = np.array([x[t].X for t in range(self.T)])
+                self.x[sample_id] = x_fixed.copy()  # 使用提取的x
                 self.coc[sample_id] = np.array([coc[t].X for t in range(self.T-1)])
                 self.cpower[sample_id] = np.array([cpower[t].X for t in range(self.T)])
     

@@ -55,15 +55,34 @@ class ActiveSetLearner:
         return Pd_perturbed
 
     def _solve_optimization(self, Pd):
-        """求解优化问题并返回活动集"""
+        """求解优化问题并返回活动集和对偶变量λ
+        
+        注意：求解MILP获取活动集（包含x），然后用x求解LP获取λ
+        """
+        # Step 1: 求解 UC (MILP) 获取机组状态 x
         # uc = UnitCommitmentModel(self.ppc, Pd, self.T_delta)
         uc = UnitCommitmentModelCVXPY(self.ppc, Pd, self.T_delta)
         pg_sol, x_sol, total_cost = uc.solve()
+        
+        # Step 2: 用 x 求解 ED (LP) 获取对偶变量 λ
         # ed = EconomicDispatchGurobi(self.ppc, Pd, self.T_delta, x_sol)
         ed = EconomicDispatchCVXPY(self.ppc, Pd, self.T_delta, x_sol)
         pg_sol, total_cost = ed.solve()
-        # 将x_sol转为(序号,值)的list
-        x_sol_list = [((i, j), int(x_sol[i, j])) for i in range(x_sol.shape[0]) for j in range(x_sol.shape[1])]
+        
+        # Step 3: 提取功率平衡约束的对偶变量 λ（前T个约束）
+        T = Pd.shape[1]
+        lambda_vals = []
+        for t in range(T):
+            # 功率平衡约束是 ed.constraints 的前 T 个约束
+            dual_val = ed.constraints[t].dual_value
+            if dual_val is None:
+                lambda_vals.append(0.0)
+            else:
+                lambda_vals.append(float(dual_val))
+        
+        # Step 4: 构建活动集（包含 x 和活跃约束索引）
+        # 将x_sol转为[[g,t],value]的list（保持JSON格式一致）
+        x_sol_list = [[[i, j], int(x_sol[i, j])] for i in range(x_sol.shape[0]) for j in range(x_sol.shape[1])]
         # 确定活动约束（仅考虑不等式约束）
         active = []
         active.extend(x_sol_list)
@@ -73,7 +92,14 @@ class ActiveSetLearner:
             for j in range(ed.constraints[i].size):
                 if abs(dual_val[j]) > 1e-6:
                     active.append(i)
-        return frozenset(active)  # 用不可变类型存储活动集
+        
+        # 转换为可哈希的frozenset（用于集合操作）
+        def make_hashable(item):
+            if isinstance(item, list):
+                return tuple(tuple(x) if isinstance(x, list) else x for x in item)
+            return item
+        
+        return frozenset(make_hashable(item) for item in active), lambda_vals
 
     def save_active_sets_json(self, filename=None):
         """保存活动集为JSON格式，紧凑格式减少换行"""
@@ -100,13 +126,14 @@ class ActiveSetLearner:
                 'std_size': float(np.std(sizes))
             }
         
-        # 直接保存所有样本的Pd数据和对应活动集（一一对应）
+        # 直接保存所有样本的Pd数据、活动集和对偶变量（一一对应）
         all_samples = []
-        for i, (pd_data, active_set) in enumerate(self.samples):
+        for i, (pd_data, active_set, lambda_vals) in enumerate(self.samples):
             all_samples.append({
                 'sample_id': i,
                 'pd_data': pd_data.tolist(),
-                'active_set': list(active_set)
+                'active_set': list(active_set),
+                'lambda': lambda_vals  # 新增：保存对偶变量λ
             })
         
         data = {
@@ -178,8 +205,8 @@ class ActiveSetLearner:
                 if M >= M_max:
                     break
                 Pd = self._generate_random_Pd(rng=idx)
-                active_set = self._solve_optimization(Pd)
-                samples.append((Pd, active_set))
+                active_set, lambda_vals = self._solve_optimization(Pd)
+                samples.append((Pd, active_set, lambda_vals))
                 # 进度条显示
                 bar_len = 30
                 percent = (idx + 1) / WM
@@ -190,7 +217,7 @@ class ActiveSetLearner:
             # 计算发现率
             window_samples = samples[-WM:]
             new_active_sets = set()
-            for _, active_set in window_samples:
+            for _, active_set, _ in window_samples:
                 if active_set not in O:
                     new_active_sets.add(active_set)
             O.update(new_active_sets)
@@ -237,7 +264,7 @@ if __name__ == "__main__":
 
     # 验证新样本
     Pd = learner._generate_random_Pd()
-    test_active_set = learner._solve_optimization(Pd)
+    test_active_set, test_lambda = learner._solve_optimization(Pd)
     
     # 使用集合预测（简单示例）
     if test_active_set in learner.observed_active_sets:
