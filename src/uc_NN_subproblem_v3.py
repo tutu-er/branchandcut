@@ -1562,37 +1562,26 @@ def evaluate_trained_models(dual_predictor: DualVariablePredictorTrainer,
             gammas = trainer.gamma_values[sample_id]
             n_constr = trainer.num_coupling_constraints
             
+            x_true = active_set_data[sample_id].get('unit_commitment_matrix', None)
+            
             # 无代理约束
             x_without = solve_subproblem_LP_simple(trainer, sample_id, lambda_val, None, None)
-            gap_without = np.sum(x_without * (1 - x_without))
+            gap_without = np.sum(np.abs(x_without - x_true))
             total_gap_without += gap_without
             
             # 有代理约束 (V3: 传入alphas, betas)
             x_with = solve_subproblem_LP_simple(trainer, sample_id, lambda_val, alphas, betas)
-            gap_with = np.sum(x_with * (1 - x_with))
+            gap_with = np.sum(np.abs(x_with - x_true))
             total_gap_with += gap_with
-            
-            # 真实解可行性 (V3: 时序耦合约束)
-            unit_commitment = active_set_data[sample_id].get('unit_commitment_matrix', None)
-            if unit_commitment is not None and g < unit_commitment.shape[0]:
-                x_target = unit_commitment[g]
-                feasible = all(
-                    alphas[t] * x_target[t] + betas[t] * x_target[t+1] <= gammas[t] + 1e-6
-                    for t in range(n_constr)
-                )
-                if feasible:
-                    feasible_count += 1
         
         avg_gap_without = total_gap_without / n_eval
         avg_gap_with = total_gap_with / n_eval
         gap_reduction = (avg_gap_without - avg_gap_with) / max(avg_gap_without, 1e-6) * 100
-        feasibility_rate = feasible_count / n_eval * 100
         
         print(f"\n  机组 {g}:", flush=True)
-        print(f"    整数性间隙 (无代理): {avg_gap_without:.4f}", flush=True)
-        print(f"    整数性间隙 (有代理): {avg_gap_with:.4f}", flush=True)
+        print(f"    最优性间隙 (无代理): {avg_gap_without:.4f}", flush=True)
+        print(f"    最优性间隙 (有代理): {avg_gap_with:.4f}", flush=True)
         print(f"    间隙减少: {gap_reduction:.2f}%", flush=True)
-        print(f"    真实解可行率: {feasibility_rate:.1f}%", flush=True)
 
 
 def _build_coupled_LP(gen, gencost, ng, T, T_delta, total_demand, trained_unit_ids, trainers, sample_id, with_surrogate):
