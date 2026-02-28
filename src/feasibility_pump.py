@@ -43,33 +43,36 @@ def _add_surrogate_constraints(
     x_vars: dict,
     alphas: np.ndarray,
     betas: np.ndarray,
-    rhs: np.ndarray,
+    gammas: np.ndarray,
+    deltas: np.ndarray,
     T: int,
     prefix: str = ''
 ) -> None:
     """
     向 Gurobi 模型添加 V3 三时段代理约束。
 
-    约束形式：alphas[k] * x[t_k] + betas[k] * x[t_k+1] <= rhs[k]
-    时段映射：t_k = k % (T-1)（对 max_constraints > T-1 的情形循环分配）
+    约束形式：alphas[k]*x[t_k] + betas[k]*x[t_k+1] + gammas[k]*x[t_k+2] <= deltas[k]
+    时段映射：t_k = k % (T-2)（循环分配，确保 t_k+2 不越界）
 
     Args:
         model: Gurobi 模型
         x_vars: {t: Gurobi Var} 时段到变量的映射
-        alphas: (max_constraints,) 当前时段系数
-        betas: (max_constraints,) 下一时段系数
-        rhs: (max_constraints,) 右端项
+        alphas: (max_constraints,) 第一时段系数
+        betas: (max_constraints,) 第二时段系数
+        gammas: (max_constraints,) 第三时段系数
+        deltas: (max_constraints,) 右端项
         T: 时段总数
         prefix: 约束命名前缀（用于区分不同机组）
     """
-    T_pairs = max(1, T - 1)
+    T_triples = max(1, T - 2)
     for k in range(len(alphas)):
-        t_k = k % T_pairs
+        t_k  = k % T_triples
         t_k1 = min(t_k + 1, T - 1)
-        a, b, r = float(alphas[k]), float(betas[k]), float(rhs[k])
-        if abs(a) > 1e-10 or abs(b) > 1e-10:
+        t_k2 = min(t_k + 2, T - 1)
+        a, b, c, r = float(alphas[k]), float(betas[k]), float(gammas[k]), float(deltas[k])
+        if abs(a) > 1e-10 or abs(b) > 1e-10 or abs(c) > 1e-10:
             model.addConstr(
-                a * x_vars[t_k] + b * x_vars[t_k1] <= r,
+                a * x_vars[t_k] + b * x_vars[t_k1] + c * x_vars[t_k2] <= r,
                 name=f'{prefix}surr_{k}'
             )
 
@@ -81,15 +84,16 @@ def _solve_unit_LP_with_surrogate(
     lambda_val: np.ndarray,
     alphas: np.ndarray,
     betas: np.ndarray,
-    rhs: np.ndarray
+    gammas: np.ndarray,
+    deltas: np.ndarray
 ) -> np.ndarray:
     """
-    求解单机组子问题 LP（使用 V3 多代理约束）。
+    求解单机组子问题 LP（使用 V3 三时段代理约束）。
 
     Args:
         trainer: 该机组的 SubproblemSurrogateTrainer
         lambda_val: (T,) 功率平衡对偶变量
-        alphas, betas, rhs: 代理约束参数，各 shape (max_constraints,)
+        alphas, betas, gammas, deltas: V3 代理约束参数，各 shape (max_constraints,)
 
     Returns:
         x_LP: (T,) LP 松弛解；若不可行返回零向量
@@ -135,9 +139,9 @@ def _solve_unit_LP_with_surrogate(
                        + trainer.gencost[g, -1] / trainer.T_delta * x[t]
         )
 
-    # V3 代理约束
+    # V3 三时段代理约束
     x_dict = {t: x[t] for t in range(T)}
-    _add_surrogate_constraints(model, x_dict, alphas, betas, rhs, T)
+    _add_surrogate_constraints(model, x_dict, alphas, betas, gammas, deltas, T)
 
     # 目标：最小化成本 - 拉格朗日对偶项
     obj = gp.quicksum(cpower[t] for t in range(T))
@@ -187,20 +191,21 @@ def collect_integer_solutions(
 
     for g in unit_ids:
         trainer = trainers[g]
-        alphas, betas, rhs = trainer.get_surrogate_params(pd_data, lambda_val)
+        alphas, betas, gammas, deltas = trainer.get_surrogate_params(pd_data, lambda_val)
 
         # 原始子问题 LP
-        x_LP_k = _solve_unit_LP_with_surrogate(trainer, lambda_val, alphas, betas, rhs)
+        x_LP_k = _solve_unit_LP_with_surrogate(trainer, lambda_val, alphas, betas, gammas, deltas)
         x_init_k[g] = round_to_integer(x_LP_k)
 
         # 扰动代理参数，生成多组解
         for m in range(n_perturbations):
             noise_a = 1.0 + perturb_std * rng.standard_normal(len(alphas))
             noise_b = 1.0 + perturb_std * rng.standard_normal(len(betas))
-            noise_r = 1.0 + perturb_std * rng.standard_normal(len(rhs))
+            noise_c = 1.0 + perturb_std * rng.standard_normal(len(gammas))
+            noise_r = 1.0 + perturb_std * rng.standard_normal(len(deltas))
             x_LP_m = _solve_unit_LP_with_surrogate(
                 trainer, lambda_val,
-                alphas * noise_a, betas * noise_b, rhs * noise_r
+                alphas * noise_a, betas * noise_b, gammas * noise_c, deltas * noise_r
             )
             x_init_k_m[g, m] = round_to_integer(x_LP_m)
 
@@ -329,11 +334,11 @@ def solve_global_LP_relaxation(
                                + gencost[g, -1] / T_delta * x[g, t]
             )
 
-        # 代理约束（仅对已训练机组）
+        # V3 三时段代理约束（仅对已训练机组）
         if g in trainers:
-            alphas, betas, rhs = trainers[g].get_surrogate_params(pd_data, lambda_val)
+            alphas, betas, gammas, deltas = trainers[g].get_surrogate_params(pd_data, lambda_val)
             x_g = {t: x[g, t] for t in range(T)}
-            _add_surrogate_constraints(model, x_g, alphas, betas, rhs, T, prefix=f'g{g}_')
+            _add_surrogate_constraints(model, x_g, alphas, betas, gammas, deltas, T, prefix=f'g{g}_')
 
     # 目标：最小化总发电成本
     obj = gp.quicksum(cpower[g, t] for g in range(ng) for t in range(T))
