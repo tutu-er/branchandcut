@@ -847,15 +847,18 @@ class SubproblemSurrogateTrainer:
         cpower = model.addVars(self.T, lb=0, name='cpower')
         
         x_true = self.active_set_data[sample_id].get('x_true', None)
+        if x_true is None:
+            # 回退到由 _initialize_solve 从 active_set 提取的初始整数解
+            x_true = self.x[sample_id]
         x_binary_dev = model.addVars(self.T, lb=0, name='x_binary_dev')
-        
+
         # 时序耦合约束违反量（每个时序约束一个）
         surrogate_viols = model.addVars(self.num_coupling_constraints, lb=0, name='surrogate_viol')
         surrogate_abs_vals = model.addVars(self.num_coupling_constraints, lb=0, name='surrogate_abs')
-        
+
         for t in range(self.T):
-            model.addConstr(x_binary_dev[t] >= x[t] - x_true[t], name=f'x_binary_dev_{t}')
-            model.addConstr(x_binary_dev[t] >= x_true[t] - x[t], name=f'x_binary_dev_{t}')
+            model.addConstr(x_binary_dev[t] >= x[t] - x_true[t], name=f'x_binary_dev_pos_{t}')
+            model.addConstr(x_binary_dev[t] >= x_true[t] - x[t], name=f'x_binary_dev_neg_{t}')
         
         # 发电上下限约束
         for t in range(self.T):
@@ -1190,10 +1193,10 @@ class SubproblemSurrogateTrainer:
                 'lambda_ramp_down':  np.array([lam_ramp_down[t].X  for t in range(self.T - 1)]),
                 'lambda_min_on':     np.array([[lam_min_on[tau - 1, t1].X
                                                 for t1 in range(self.T - tau)]
-                                               for tau in range(1, Ton + 1)]),
+                                               for tau in range(1, Ton + 1)], dtype=object),
                 'lambda_min_off':    np.array([[lam_min_off[tau - 1, t1].X
                                                 for t1 in range(self.T - tau)]
-                                               for tau in range(1, Toff + 1)]),
+                                               for tau in range(1, Toff + 1)], dtype=object),
                 'lambda_start_cost': np.array([lam_start_cost[t].X for t in range(self.T - 1)]),
                 'lambda_shut_cost':  np.array([lam_shut_cost[t].X  for t in range(self.T - 1)]),
                 'lambda_coc_nonneg': np.array([lam_coc_nonneg[t].X for t in range(self.T - 1)]),
@@ -1653,7 +1656,7 @@ class SubproblemSurrogateTrainer:
     def load(self, filepath: str):
         """加载V3模型"""
         if TORCH_AVAILABLE:
-            state = torch.load(filepath, map_location=self.device)
+            state = torch.load(filepath, map_location=self.device, weights_only=False)
             self.surrogate_net.load_state_dict(state['surrogate_net_state_dict'])
             self.optimizer.load_state_dict(state['optimizer_state_dict'])
             self.alpha_values = state['alpha_values']
