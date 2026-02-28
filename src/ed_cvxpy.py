@@ -20,7 +20,7 @@ class EconomicDispatchCVXPY:
         self.T = Pd.shape[1]
         self.ng = self.gen.shape[0]
         self.nb = self.branch.shape[0]
-        self.x = x  # 二值变量由外部给定，shape=(ng, T)
+        self.x_true = x  # 二值变量由外部给定，shape=(ng, T)
         self.constraints = None
         self.prob = None
         self._build_model()
@@ -28,6 +28,7 @@ class EconomicDispatchCVXPY:
     def _build_model(self):
         ng, T = self.ng, self.T
         self.pg = cp.Variable((ng, T))
+        self.x = cp.Variable((ng, T))
         self.cpower = cp.Variable((ng, T))
         self.constraints = []
         for t in range(T):
@@ -61,6 +62,11 @@ class EconomicDispatchCVXPY:
                     self.constraints.append(flow[l] >= -branch_limit[l])
         except ImportError:
             print('未安装pypower，DCPF潮流约束未添加。')
+        
+        for t in range(T):
+            for g in range(ng):
+                self.constraints.append(self.x[g, t] == self.x_true[g, t])
+                
         obj = cp.sum(self.cpower)
         self.prob = cp.Problem(cp.Minimize(obj), self.constraints)
 

@@ -58,3 +58,12 @@ coverage.xml
 
 # VS Code
 .vscode/
+
+# Cursor IDE
+.cursor/
+
+# Claude Code
+.claude/
+
+# Experiment results and outputs
+result/

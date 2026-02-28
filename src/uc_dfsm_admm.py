@@ -25,7 +25,7 @@ root_dir = Path(__file__).resolve().parent.parent
 sys.path.append(str(root_dir))
 
 from src.case39_pypower import get_case39_pypower
-sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', line_buffering=True)
+sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
 
 def load_active_set_from_json(json_filepath: str, sample_id: Optional[int] = None) -> Dict:
     """
@@ -345,18 +345,7 @@ class Iter_BCD:
     迭代BCD类，用于处理参数化约束和模型更新。
     """
     
-    def __init__(self, ppc, active_set_data, T_delta, union_analysis=None, use_theta=True, use_zeta=True):
-        """
-        初始化迭代BCD类
-        
-        Args:
-            ppc: 电力系统数据
-            active_set_data: 活动集数据
-            T_delta: 时间间隔
-            union_analysis: 并集分析结果（可选）
-            use_theta: 是否在迭代时使用theta系列约束及变量（默认True）
-            use_zeta: 是否在迭代时使用zeta系列约束及变量（默认True）
-        """
+    def __init__(self, ppc, active_set_data, T_delta, union_analysis=None):
         self.ppc = ppc
         ppc = ext2int(ppc)
         self.baseMVA = ppc['baseMVA']
@@ -367,19 +356,11 @@ class Iter_BCD:
         self.n_samples = len(active_set_data)
         self.T_delta = T_delta
         
-        # 选择参数
-        self.use_theta = use_theta
-        self.use_zeta = use_zeta
-        
         self.rho_primal = 1e-3
-        self.rho_dual = 1e-3
+        self.rho_dual = 1e-5
         self.rho_opt = 1e-5
         
-        self.gamma = 1e-1
-        
-        # 右端项u的缩放参数
-        self.theta_u_scale = 300.0  # theta系列u的缩放因子
-        self.zeta_u_scale = np.mean(np.sum(active_set_data[0]['pd_data'], axis=0))   # zeta系列u的缩放因子
+        self.gamma = 1e-2
         
         # 处理单个样本或多个样本的情况
         if isinstance(active_set_data, list):
@@ -402,27 +383,14 @@ class Iter_BCD:
         # 如果没有提供union_analysis，则基于x_init创建
         if union_analysis is None:
             self._current_union_analysis = self._create_union_analysis_from_x_init(self.x, self.lambda_)
-        else:
-            self._current_union_analysis = union_analysis
-        
-        # 根据选择参数决定是否创建theta变量
-        if self.use_theta:
-            if self._current_union_analysis:
-                self.add_theta_variables_for_branches(self._current_union_analysis)
-            self.theta_values, self.mu = self.initialize_theta_values(self._current_union_analysis)
-        else:
-            self.theta_values = {}
-            self.mu = np.zeros((self.n_samples, self.nl, self.T), dtype=float)
+            # 创建theta变量
+            self.add_theta_variables_for_branches(self._current_union_analysis)
+        elif union_analysis:
+            self.add_theta_variables_for_branches(union_analysis)
 
-        # 根据选择参数决定是否创建zeta变量
-        if self.use_zeta:
-            if self._current_union_analysis:
-                self.add_zeta_variables_for_units(self._current_union_analysis)
-            self.zeta_values, self.ita_lower, self.ita_upper = self.initialize_zeta_values(self._current_union_analysis)
-        else:
-            self.zeta_values = {}
-            self.ita_lower = np.zeros((self.n_samples, 1, self.T), dtype=float)
-            self.ita_upper = np.zeros((self.n_samples, 1, self.T), dtype=float)
+        self.theta_values, self.mu = self.initialize_theta_values(self._current_union_analysis)
+
+        self.zeta_values, self.ita_lower, self.ita_upper = self.initialize_zeta_values(self._current_union_analysis)
 
         # result = self.iter_with_pg_block(sample_id=0, theta_values=self.theta_values, union_analysis=self._current_union_analysis)
         
@@ -881,11 +849,11 @@ class Iter_BCD:
                     for g in range(self.ng)
                 ])
             
-            # print("✓ 成功将对偶变量转换为数组格式")
+            print("✓ 成功将对偶变量转换为数组格式")
             return lambda_sol_implicit
             
         except Exception as e:
-            # print(f"❌ 对偶变量数组转换失败: {e}")
+            print(f"❌ 对偶变量数组转换失败: {e}")
             import traceback
             traceback.print_exc()
             return {}
@@ -1089,31 +1057,30 @@ class Iter_BCD:
         Returns:
             List: 平衡节点功率约束列表
         """
-        # 记录出现平衡节点非整数变量的时段和机组
         fractional_time_slots = set()
-        balance_unit_ids = set()
+        balance_fractional_units = []
         for frac_var in fractional_variables:
-            # 平衡节点类型为3
-            if self.bus[self.gen[frac_var['unit_id'], GEN_BUS].astype(int), BUS_TYPE] == 3:
+            if self.bus[self.gen[frac_var['unit_id'], GEN_BUS].astype(int), BUS_TYPE] == 3:  # 平衡节点类型为3
                 fractional_time_slots.add(frac_var['time_slot'])
-                balance_unit_ids.add(frac_var['unit_id'])
+                balance_fractional_units.append(frac_var)
 
-        print(f"平衡节点非整数变量涉时时段: {sorted(fractional_time_slots)}")
+        print(f"平衡节点非整数变量涉及时段: {sorted(fractional_time_slots)}")
         
         union_constraints = []
-
-        # 只要fractional variables中出现了平衡节点，
-        # 就对这些平衡节点对应的机组在**全时段**添加zeta系列约束
-        if fractional_time_slots is not None:
-            for unit_id in sorted(balance_unit_ids):
-                for t in range(self.T):
-                    union_constraints.append({
-                        'time_slot': t,
-                        'unit_id': unit_id,
-                        'constraint_type': 'balance_node_power',
-                        'constraint_name': f"balance_node_power_{unit_id}_{t}"
-                    })
-
+        
+        # TODO: 实现平衡节点功率约束的计算逻辑
+        
+        for var in balance_fractional_units:
+            
+            print(f"平衡节点非整数变量: 机组 {var['unit_id']} 时段 {var['time_slot']}")
+            
+            union_constraints.append({
+                'time_slot': var['time_slot'],
+                'unit_id': var['unit_id'],
+                'constraint_type': 'balance_node_power',
+                'constraint_name': f"balance_node_power_{var['unit_id']}_{var['time_slot']}"
+            })            
+       
         return union_constraints
 
     def initialize_theta_values(self, union_analysis=None):
@@ -1134,7 +1101,7 @@ class Iter_BCD:
             return {}
         
         union_constraints = union_analysis['union_constraints']
-        
+
         # 初始化结果字典
         initialization_values = {
             'theta_values': {},
@@ -1153,19 +1120,19 @@ class Iter_BCD:
                 unit_id = coeff_info['unit_id']
                 for order in range(3):
                     var_name = f'theta_branch_{branch_id}_unit_{unit_id}_time_{time_slot}_{order}'
-                    initialization_values['theta_values'][var_name] = 1
+                    initialization_values['theta_values'][var_name] = 0
             
             # 为右端项创建theta变量的零值
             for order in range(3):
                 var_name = f'theta_branch_{branch_id}_time_{time_slot}_rhs_{order}'
-                initialization_values['theta_values'][var_name] = 1
+                initialization_values['theta_values'][var_name] = 0
         
         #初始化mu
         mu_init = np.zeros((self.n_samples, self.branch.shape[0], self.T), dtype=float)
         for sample in range(self.n_samples):
             for b in range(mu_init.shape[1]):
                 for t in range(mu_init.shape[2]):
-                    mu_init[sample,b,t] = 1e-3
+                    mu_init[sample,b,t] = 0
 
         return initialization_values['theta_values'], mu_init
 
@@ -1200,34 +1167,34 @@ class Iter_BCD:
             # 为每个机组创建3个zeta变量的零值 (zeta_0, zeta_1, zeta_2)
             for order in range(3):
                 var_name = f'zeta_lower_unit_{constraint["unit_id"]}_time_{constraint["time_slot"]}_{order}'
-                initialization_values['zeta_values'][var_name] = 1
+                initialization_values['zeta_values'][var_name] = 0
 
             # 为右端项创建zeta变量的零值
             for order in range(3):
                 var_name = f'zeta_lower_unit_{constraint["unit_id"]}_time_{constraint["time_slot"]}_rhs_{order}'
-                initialization_values['zeta_values'][var_name] = 1
+                initialization_values['zeta_values'][var_name] = 0
 
             for order in range(3):
                 var_name = f'zeta_upper_unit_{constraint["unit_id"]}_time_{constraint["time_slot"]}_{order}'
-                initialization_values['zeta_values'][var_name] = 1
+                initialization_values['zeta_values'][var_name] = 0
 
             # 为右端项创建zeta变量的零值
             for order in range(3):
                 var_name = f'zeta_upper_unit_{constraint["unit_id"]}_time_{constraint["time_slot"]}_rhs_{order}'
-                initialization_values['zeta_values'][var_name] = 1
+                initialization_values['zeta_values'][var_name] = 0
                 
         #初始化zeta
         ita_lower_init = np.zeros((self.n_samples, 1, self.T), dtype=float)
         for sample in range(self.n_samples):
             for i in range(ita_lower_init.shape[1]):
                 for t in range(ita_lower_init.shape[2]):
-                    ita_lower_init[sample,i,t] = 1e-3
+                    ita_lower_init[sample,i,t] = 0
 
         ita_upper_init = np.zeros((self.n_samples, 1, self.T), dtype=float)
         for sample in range(self.n_samples):
             for i in range(ita_upper_init.shape[1]):
                 for t in range(ita_upper_init.shape[2]):
-                    ita_upper_init[sample,i,t] = 1e-3
+                    ita_upper_init[sample,i,t] = 0
 
         return initialization_values['zeta_values'], ita_lower_init, ita_upper_init
 
@@ -1348,7 +1315,7 @@ class Iter_BCD:
                 
         print(f"✓ 创建了 {len(self.zeta_vars)} 个zeta变量")
 
-    def _add_parametric_dcpf_constraints_with_theta(self, model, pg, sample_id, theta_values=None, union_analysis=None, PTDF=None, branch_limit=None):
+    def _add_parametric_dcpf_constraints_with_theta(self, model, pg, sample_id, theta_values=None, union_analysis=None):
         """
         添加包含theta参数的DCPF约束
         
@@ -1357,8 +1324,6 @@ class Iter_BCD:
             pg: 功率变量
             theta_values: theta参数值字典，如果为None则使用默认值0
             union_analysis: 并集约束分析结果
-            PTDF: 预计算的PTDF矩阵（如果为None则重新计算，但不推荐）
-            branch_limit: 预计算的线路容量限制（如果为None则从self.branch获取）
         """
         if union_analysis is None:
             union_analysis = self._current_union_analysis
@@ -1373,31 +1338,32 @@ class Iter_BCD:
             print("未提供theta值，使用默认值0")
             theta_values = {}
         
-        # 如果没有传入预计算的矩阵，则计算（不推荐，性能较差）
-        if PTDF is None:
-            PTDF = makePTDF(self.baseMVA, self.bus, self.branch)
-        if branch_limit is None:
-            branch_limit = self.branch[:, RATE_A]
-        
         try:
+            # 构建机组-节点映射矩阵
+            nb = self.bus.shape[0]
+            G = np.zeros((nb, self.ng))
+            for g in range(self.ng):
+                bus_idx = int(self.gen[g, GEN_BUS])
+                G[bus_idx, g] = 1
+            
+            # 计算PTDF矩阵
+            PTDF = makePTDF(self.baseMVA, self.bus, self.branch)
+            branch_limit = self.branch[:, RATE_A]
             
             constraint_count = 0
             
             for constraint_info in union_constraints:
                 branch_id = constraint_info['branch_id']
                 time_slot = constraint_info['time_slot']
-                constraint_type = constraint_info.get('constraint_type', 'dcpf_upper')
+                constraint_type = constraint_info.get('constraint_type', 'upper')
                 nonzero_coefficients = constraint_info['nonzero_pg_coefficients']
                 
-                if constraint_type == 'dcpf_upper' or constraint_type == 'upper':
+                if constraint_type == 'upper':
                     u = branch_limit[branch_id] + PTDF[branch_id, :] @ self.active_set_data[sample_id]['pd_data'][:, time_slot]
-                elif constraint_type == 'dcpf_lower' or constraint_type == 'lower':
+                elif constraint_type == 'lower':
                     u = branch_limit[branch_id] - PTDF[branch_id, :] @ self.active_set_data[sample_id]['pd_data'][:, time_slot]
                 else:
                     u = branch_limit[branch_id] + PTDF[branch_id, :] @ self.active_set_data[sample_id]['pd_data'][:, time_slot]
-
-                # 对u进行缩放（在计算左端项和右端项之前）
-                u_scaled = u / self.theta_u_scale if self.theta_u_scale != 0 else u
 
                 # 构建左端项表达式
                 lhs_expr = 0
@@ -1415,13 +1381,13 @@ class Iter_BCD:
                     theta_1 = theta_values.get(theta_1_name, 0.0)
                     theta_2 = theta_values.get(theta_2_name, 0.0)
                     
-                    # 计算参数化系数: original_coeff + theta_0 + theta_1*u_scaled + theta_2*u_scaled^2
-                    parametric_coeff = original_coeff + theta_0 + theta_1 * u_scaled + theta_2 * u_scaled * u_scaled
+                    # 计算参数化系数: original_coeff + theta_0 + theta_1*u + theta_2*u^2
+                    parametric_coeff = original_coeff + theta_0 + theta_1 * u + theta_2 * u * u
                     
                     # 添加到左端项
                     lhs_expr += parametric_coeff * pg[unit_id, time_slot]
                 
-                # 构建右端项: u_scaled + theta_rhs_0 + theta_rhs_1*u_scaled + theta_rhs_2*u_scaled^2（按时段参数化）
+                # 构建右端项: u + theta_rhs_0 + theta_rhs_1*u + theta_rhs_2*u^2（按时段参数化）
                 theta_rhs_0_name = f'theta_branch_{branch_id}_time_{time_slot}_rhs_0'
                 theta_rhs_1_name = f'theta_branch_{branch_id}_time_{time_slot}_rhs_1'
                 theta_rhs_2_name = f'theta_branch_{branch_id}_time_{time_slot}_rhs_2'
@@ -1430,13 +1396,13 @@ class Iter_BCD:
                 theta_rhs_1 = theta_values.get(theta_rhs_1_name, 0.0)
                 theta_rhs_2 = theta_values.get(theta_rhs_2_name, 0.0)
                 
-                parametric_rhs = u_scaled + theta_rhs_0 + theta_rhs_1 * u_scaled + theta_rhs_2 * u_scaled * u_scaled
+                parametric_rhs = u + theta_rhs_0 + theta_rhs_1 * u + theta_rhs_2 * u * u
                 
                 # 添加约束
-                if constraint_type == 'dcpf_upper' or constraint_type == 'upper' or constraint_type == 'le':
+                if constraint_type == 'upper' or constraint_type == 'le':
                     model.addConstr(lhs_expr <= parametric_rhs, 
                                   name=f'parametric_dcpf_upper_branch_{branch_id}_t_{time_slot}')
-                elif constraint_type == 'dcpf_lower' or constraint_type == 'lower' or constraint_type == 'ge':
+                elif constraint_type == 'lower' or constraint_type == 'ge':
                     model.addConstr(lhs_expr >= parametric_rhs, 
                                   name=f'parametric_dcpf_lower_branch_{branch_id}_t_{time_slot}')
                 else:
@@ -1486,8 +1452,37 @@ class Iter_BCD:
 
                 u = np.sum(self.active_set_data[sample_id]['pd_data'][:, time_slot])
 
-                # 对u进行缩放（在计算左端项和右端项之前）
-                u_scaled = u / self.zeta_u_scale if self.zeta_u_scale != 0 else u
+                # 构建左端项表达式
+                lhs_expr = 0
+                zeta_0_name = f'zeta_lower_unit_{unit_id}_time_{time_slot}_0'
+                zeta_1_name = f'zeta_lower_unit_{unit_id}_time_{time_slot}_1'
+                zeta_2_name = f'zeta_lower_unit_{unit_id}_time_{time_slot}_2'
+
+                zeta_0 = zeta_values.get(zeta_0_name, 0.0)
+                zeta_1 = zeta_values.get(zeta_1_name, 0.0)
+                zeta_2 = zeta_values.get(zeta_2_name, 0.0)
+
+                # 计算参数化系数: original_coeff + zeta_0 + zeta_1*u + zeta_2*u^2
+                parametric_coeff = original_coeff + zeta_0 + zeta_1 * u + zeta_2 * u * u
+
+                # 添加到左端项
+                lhs_expr += parametric_coeff * pg[unit_id, time_slot]
+
+                # 构建右端项: u + zeta_rhs_0 + zeta_rhs_1*u + zeta_rhs_2*u^2
+                zeta_rhs_0_name = f'zeta_lower_unit_{unit_id}_time_{time_slot}_rhs_0'
+                zeta_rhs_1_name = f'zeta_lower_unit_{unit_id}_time_{time_slot}_rhs_1'
+                zeta_rhs_2_name = f'zeta_lower_unit_{unit_id}_time_{time_slot}_rhs_2'
+
+                zeta_rhs_0 = zeta_values.get(zeta_rhs_0_name, 0.0)
+                zeta_rhs_1 = zeta_values.get(zeta_rhs_1_name, 0.0)
+                zeta_rhs_2 = zeta_values.get(zeta_rhs_2_name, 0.0)
+
+                parametric_rhs = zeta_rhs_0 + zeta_rhs_1 * u + zeta_rhs_2 * u * u
+
+                model.addConstr(lhs_expr >= parametric_rhs, 
+                                name=f'parametric_balance_power_lower_unit_{unit_id}_t_{time_slot}')
+                
+                constraint_count += 1
 
                 # 构建左端项表达式
                 lhs_expr = 0
@@ -1499,13 +1494,13 @@ class Iter_BCD:
                 zeta_1 = zeta_values.get(zeta_1_name, 0.0)
                 zeta_2 = zeta_values.get(zeta_2_name, 0.0)
 
-                # 计算参数化系数: original_coeff + zeta_0 + zeta_1*u_scaled + zeta_2*u_scaled^2
-                parametric_coeff = original_coeff + zeta_0 + zeta_1 * u_scaled + zeta_2 * u_scaled * u_scaled
+                # 计算参数化系数: original_coeff + zeta_0 + zeta_1*u + zeta_2*u^2
+                parametric_coeff = original_coeff + zeta_0 + zeta_1 * u + zeta_2 * u * u
 
                 # 添加到左端项
                 lhs_expr += parametric_coeff * pg[unit_id, time_slot]
 
-                # 构建右端项: zeta_rhs_0 + zeta_rhs_1*u_scaled + zeta_rhs_2*u_scaled^2
+                # 构建右端项: u + zeta_rhs_0 + zeta_rhs_1*u + zeta_rhs_2*u^2
                 zeta_rhs_0_name = f'zeta_lower_unit_{unit_id}_time_{time_slot}_rhs_0'
                 zeta_rhs_1_name = f'zeta_lower_unit_{unit_id}_time_{time_slot}_rhs_1'
                 zeta_rhs_2_name = f'zeta_lower_unit_{unit_id}_time_{time_slot}_rhs_2'
@@ -1514,39 +1509,7 @@ class Iter_BCD:
                 zeta_rhs_1 = zeta_values.get(zeta_rhs_1_name, 0.0)
                 zeta_rhs_2 = zeta_values.get(zeta_rhs_2_name, 0.0)
 
-                parametric_rhs = zeta_rhs_0 + zeta_rhs_1 * u_scaled + zeta_rhs_2 * u_scaled * u_scaled
-
-                model.addConstr(lhs_expr >= parametric_rhs, 
-                                name=f'parametric_balance_power_lower_unit_{unit_id}_t_{time_slot}')
-                
-                constraint_count += 1
-
-                # 构建左端项表达式（upper约束）
-                lhs_expr = 0
-                zeta_0_name = f'zeta_upper_unit_{unit_id}_time_{time_slot}_0'
-                zeta_1_name = f'zeta_upper_unit_{unit_id}_time_{time_slot}_1'
-                zeta_2_name = f'zeta_upper_unit_{unit_id}_time_{time_slot}_2'
-
-                zeta_0 = zeta_values.get(zeta_0_name, 0.0)
-                zeta_1 = zeta_values.get(zeta_1_name, 0.0)
-                zeta_2 = zeta_values.get(zeta_2_name, 0.0)
-
-                # 计算参数化系数: original_coeff + zeta_0 + zeta_1*u_scaled + zeta_2*u_scaled^2
-                parametric_coeff = original_coeff + zeta_0 + zeta_1 * u_scaled + zeta_2 * u_scaled * u_scaled
-
-                # 添加到左端项
-                lhs_expr += parametric_coeff * pg[unit_id, time_slot]
-
-                # 构建右端项: zeta_rhs_0 + zeta_rhs_1*u_scaled + zeta_rhs_2*u_scaled^2
-                zeta_rhs_0_name = f'zeta_upper_unit_{unit_id}_time_{time_slot}_rhs_0'
-                zeta_rhs_1_name = f'zeta_upper_unit_{unit_id}_time_{time_slot}_rhs_1'
-                zeta_rhs_2_name = f'zeta_upper_unit_{unit_id}_time_{time_slot}_rhs_2'
-
-                zeta_rhs_0 = zeta_values.get(zeta_rhs_0_name, 0.0)
-                zeta_rhs_1 = zeta_values.get(zeta_rhs_1_name, 0.0)
-                zeta_rhs_2 = zeta_values.get(zeta_rhs_2_name, 0.0)
-
-                parametric_rhs = zeta_rhs_0 + zeta_rhs_1 * u_scaled + zeta_rhs_2 * u_scaled * u_scaled
+                parametric_rhs = zeta_rhs_0 + zeta_rhs_1 * u + zeta_rhs_2 * u * u
 
                 model.addConstr(lhs_expr <= parametric_rhs, 
                                 name=f'parametric_balance_power_upper_unit_{unit_id}_t_{time_slot}')
@@ -1562,7 +1525,7 @@ class Iter_BCD:
 
 ### theta ###
 
-    def _add_parametric_penalties_pg_block(self, model, x, sample_id,  theta_values=None, union_analysis=None, PTDF=None, branch_limit=None):
+    def _add_parametric_penalties_pg_block(self, model, x, sample_id,  theta_values=None, union_analysis=None):
         """
         添加包含theta参数的DCPF罚项
 
@@ -1571,8 +1534,6 @@ class Iter_BCD:
             pg: 功率变量
             theta_values: theta参数值字典，如果为None则使用默认值0
             union_analysis: 并集约束分析结果
-            PTDF: 预计算的PTDF矩阵（如果为None则重新计算，但不推荐）
-            branch_limit: 预计算的线路容量限制（如果为None则从self.branch获取）
         """
         if union_analysis is None:
             union_analysis = self._current_union_analysis
@@ -1587,13 +1548,17 @@ class Iter_BCD:
             print("未提供theta值，使用默认值0")
             theta_values = {}
         
-        # 如果没有传入预计算的矩阵，则计算（不推荐，性能较差）
-        if PTDF is None:
-            PTDF = makePTDF(self.baseMVA, self.bus, self.branch)
-        if branch_limit is None:
-            branch_limit = self.branch[:, RATE_A]
-        
         try:
+            # 构建机组-节点映射矩阵
+            nb = self.bus.shape[0]
+            G = np.zeros((nb, self.ng))
+            for g in range(self.ng):
+                bus_idx = int(self.gen[g, GEN_BUS])
+                G[bus_idx, g] = 1
+            
+            # 计算PTDF矩阵
+            PTDF = makePTDF(self.baseMVA, self.bus, self.branch)
+            branch_limit = self.branch[:, RATE_A]
             
             constraint_count = 0
             obj_primal = gp.LinExpr()
@@ -1602,19 +1567,16 @@ class Iter_BCD:
             for constraint_info in union_constraints:
                 branch_id = constraint_info['branch_id']
                 time_slot = constraint_info['time_slot']
-                constraint_type = constraint_info.get('constraint_type', 'dcpf_upper')
+                constraint_type = constraint_info.get('constraint_type', 'upper')
                 nonzero_coefficients = constraint_info['nonzero_pg_coefficients']
                 constraint_name = constraint_info['constraint_name']
 
-                if constraint_type == 'dcpf_upper' or constraint_type == 'upper':
+                if constraint_type == 'upper':
                     u = branch_limit[branch_id] + PTDF[branch_id, :] @ self.active_set_data[sample_id]['pd_data'][:, time_slot]
-                elif constraint_type == 'dcpf_lower' or constraint_type == 'lower':
+                elif constraint_type == 'lower':
                     u = branch_limit[branch_id] - PTDF[branch_id, :] @ self.active_set_data[sample_id]['pd_data'][:, time_slot]
                 else:
                     u = branch_limit[branch_id] + PTDF[branch_id, :] @ self.active_set_data[sample_id]['pd_data'][:, time_slot]
-
-                # 对u进行缩放（在计算左端项和右端项之前）
-                u_scaled = u / self.theta_u_scale if self.theta_u_scale != 0 else u
 
                 # 构建左端项表达式
                 lhs_expr = 0
@@ -1632,13 +1594,13 @@ class Iter_BCD:
                     theta_1 = theta_values.get(theta_1_name, 0.0)
                     theta_2 = theta_values.get(theta_2_name, 0.0)
                     
-                    # 计算参数化系数: original_coeff + theta_0 + theta_1*u_scaled + theta_2*u_scaled^2
-                    parametric_coeff = original_coeff + theta_0 + theta_1 * u_scaled + theta_2 * u_scaled * u_scaled
+                    # 计算参数化系数: original_coeff + theta_0 + theta_1*u + theta_2*u^2
+                    parametric_coeff = original_coeff + theta_0 + theta_1 * u + theta_2 * u * u
                     
                     # 添加到左端项
                     lhs_expr += parametric_coeff * x[unit_id, time_slot]
                 
-                # 构建右端项: theta_rhs_0 + theta_rhs_1*u_scaled + theta_rhs_2*u_scaled^2（按时段参数化）
+                # 构建右端项: u + theta_rhs_0 + theta_rhs_1*u + theta_rhs_2*u^2（按时段参数化）
                 theta_rhs_0_name = f'theta_branch_{branch_id}_time_{time_slot}_rhs_0'
                 theta_rhs_1_name = f'theta_branch_{branch_id}_time_{time_slot}_rhs_1'
                 theta_rhs_2_name = f'theta_branch_{branch_id}_time_{time_slot}_rhs_2'
@@ -1647,7 +1609,7 @@ class Iter_BCD:
                 theta_rhs_1 = theta_values.get(theta_rhs_1_name, 0.0)
                 theta_rhs_2 = theta_values.get(theta_rhs_2_name, 0.0)
                 
-                parametric_rhs = theta_rhs_0 + theta_rhs_1 * u_scaled + theta_rhs_2 * u_scaled * u_scaled
+                parametric_rhs = theta_rhs_0 + theta_rhs_1 * u + theta_rhs_2 * u * u
 
                 parametric_rhs_viol = model.addVars(1, 1, lb=0, name=f'parametric_rhs_viol_{branch_id}_{time_slot}')
                 parametric_rhs_abs = model.addVars(1, 1, lb=0, name=f'parametric_rhs_abs_{branch_id}_{time_slot}')
@@ -1668,20 +1630,9 @@ class Iter_BCD:
             import traceback
             traceback.print_exc()
 
-    def _add_parametric_constraints_dual_block(self, model, g_id, t_id, mu, sample_id, theta_values=None, union_analysis=None, PTDF=None, branch_limit=None): 
+    def _add_parametric_constraints_dual_block(self, model, g_id, t_id, mu, sample_id, theta_values=None, union_analysis=None): 
         """
-        计算参数化约束的对偶表达式
 
-        Args:
-            model: Gurobi模型
-            g_id: 机组ID
-            t_id: 时段ID
-            mu: 对偶变量
-            sample_id: 样本ID
-            theta_values: theta参数值字典
-            union_analysis: 并集约束分析结果
-            PTDF: 预计算的PTDF矩阵（如果为None则重新计算，但不推荐）
-            branch_limit: 预计算的线路容量限制（如果为None则从self.branch获取）
         """
         if union_analysis is None:
             union_analysis = self._current_union_analysis
@@ -1695,13 +1646,17 @@ class Iter_BCD:
         if theta_values is None:
             theta_values = {}
         
-        # 如果没有传入预计算的矩阵，则计算（不推荐，性能较差）
-        if PTDF is None:
-            PTDF = makePTDF(self.baseMVA, self.bus, self.branch)
-        if branch_limit is None:
-            branch_limit = self.branch[:, RATE_A]
-        
         try:
+            # 构建机组-节点映射矩阵
+            nb = self.bus.shape[0]
+            G = np.zeros((nb, self.ng))
+            for g in range(self.ng):
+                bus_idx = int(self.gen[g, GEN_BUS])
+                G[bus_idx, g] = 1
+            
+            # 计算PTDF矩阵
+            PTDF = makePTDF(self.baseMVA, self.bus, self.branch)
+            branch_limit = self.branch[:, RATE_A]
             
             constraint_count = 0
             
@@ -1712,21 +1667,18 @@ class Iter_BCD:
                 time_slot = constraint_info['time_slot']
                 if time_slot != t_id:
                     continue
-                constraint_type = constraint_info.get('constraint_type', 'dcpf_upper')
+                constraint_type = constraint_info.get('constraint_type', 'upper')
                 nonzero_coefficients = constraint_info['nonzero_pg_coefficients']
                 constraint_name = constraint_info['constraint_name']
                 
                 model.addConstr(mu[branch_id, time_slot] >= 1e-3, name=f'parametric_mu_least_{branch_id}_{time_slot}')
 
-                if constraint_type == 'dcpf_upper' or constraint_type == 'upper':
+                if constraint_type == 'upper':
                     u = branch_limit[branch_id] + PTDF[branch_id, :] @ self.active_set_data[sample_id]['pd_data'][:, time_slot]
-                elif constraint_type == 'dcpf_lower' or constraint_type == 'lower':
+                elif constraint_type == 'lower':
                     u = branch_limit[branch_id] - PTDF[branch_id, :] @ self.active_set_data[sample_id]['pd_data'][:, time_slot]
                 else:
                     u = branch_limit[branch_id] + PTDF[branch_id, :] @ self.active_set_data[sample_id]['pd_data'][:, time_slot]
-
-                # 对u进行缩放
-                u_scaled = u / self.theta_u_scale if self.theta_u_scale != 0 else u
 
                 for coeff_info in nonzero_coefficients:
                 
@@ -1744,8 +1696,8 @@ class Iter_BCD:
                     theta_1 = theta_values.get(theta_1_name, 0.0)
                     theta_2 = theta_values.get(theta_2_name, 0.0)
                     
-                    # 计算参数化系数: original_coeff + theta_0 + theta_1*u_scaled + theta_2*u_scaled^2
-                    parametric_coeff = original_coeff + theta_0 + theta_1 * u_scaled + theta_2 * u_scaled * u_scaled
+                    # 计算参数化系数: original_coeff + theta_0 + theta_1*u + theta_2*u^2
+                    parametric_coeff = original_coeff + theta_0 + theta_1 * u + theta_2 * u * u
                     
                     dual_expr += parametric_coeff * mu[branch_id, time_slot]
 
@@ -1757,7 +1709,7 @@ class Iter_BCD:
             import traceback
             traceback.print_exc()      
 
-    def _add_parametric_obj_dual_block(self, model, x, mu, sample_id, theta_values=None, union_analysis=None, PTDF=None, branch_limit=None):
+    def _add_parametric_obj_dual_block(self, model, x, mu, sample_id, theta_values=None, union_analysis=None):
         """
         添加包含theta参数的DCPF罚项
 
@@ -1766,8 +1718,6 @@ class Iter_BCD:
             pg: 功率变量
             theta_values: theta参数值字典，如果为None则使用默认值0
             union_analysis: 并集约束分析结果
-            PTDF: 预计算的PTDF矩阵（如果为None则重新计算，但不推荐）
-            branch_limit: 预计算的线路容量限制（如果为None则从self.branch获取）
         """
         if union_analysis is None:
             union_analysis = self._current_union_analysis
@@ -1782,13 +1732,17 @@ class Iter_BCD:
             print("未提供theta值，使用默认值0")
             theta_values = {}
         
-        # 如果没有传入预计算的矩阵，则计算（不推荐，性能较差）
-        if PTDF is None:
-            PTDF = makePTDF(self.baseMVA, self.bus, self.branch)
-        if branch_limit is None:
-            branch_limit = self.branch[:, RATE_A]
-        
         try:
+            # 构建机组-节点映射矩阵
+            nb = self.bus.shape[0]
+            G = np.zeros((nb, self.ng))
+            for g in range(self.ng):
+                bus_idx = int(self.gen[g, GEN_BUS])
+                G[bus_idx, g] = 1
+            
+            # 计算PTDF矩阵
+            PTDF = makePTDF(self.baseMVA, self.bus, self.branch)
+            branch_limit = self.branch[:, RATE_A]
             
             obj_opt = gp.LinExpr()
             constraint_count = 0
@@ -1796,21 +1750,18 @@ class Iter_BCD:
             for constraint_info in union_constraints:
                 branch_id = constraint_info['branch_id']
                 time_slot = constraint_info['time_slot']
-                constraint_type = constraint_info.get('constraint_type', 'dcpf_upper')
+                constraint_type = constraint_info.get('constraint_type', 'upper')
                 nonzero_coefficients = constraint_info['nonzero_pg_coefficients']
                 constraint_name = constraint_info['constraint_name']                
                 
                 model.addConstr(mu[branch_id, time_slot] >= 1e-6, name=f'parametric_mu_least_{branch_id}_{time_slot}')
                 
-                if constraint_type == 'dcpf_upper' or constraint_type == 'upper':
+                if constraint_type == 'upper':
                     u = branch_limit[branch_id] + PTDF[branch_id, :] @ self.active_set_data[sample_id]['pd_data'][:, time_slot]
-                elif constraint_type == 'dcpf_lower' or constraint_type == 'lower':
+                elif constraint_type == 'lower':
                     u = branch_limit[branch_id] - PTDF[branch_id, :] @ self.active_set_data[sample_id]['pd_data'][:, time_slot]
                 else:
                     u = branch_limit[branch_id] + PTDF[branch_id, :] @ self.active_set_data[sample_id]['pd_data'][:, time_slot]
-                
-                # 对u进行缩放（在计算左端项和右端项之前）
-                u_scaled = u / self.theta_u_scale if self.theta_u_scale != 0 else u
                 
                 # 构建左端项表达式
                 lhs_expr = 0
@@ -1819,39 +1770,35 @@ class Iter_BCD:
                     unit_id = coeff_info['unit_id']
                     original_coeff = 0
                     
-                    # 获取theta变量值（按时段参数化）
-                    theta_0_name = f'theta_branch_{branch_id}_unit_{unit_id}_time_{time_slot}_0'
-                    theta_1_name = f'theta_branch_{branch_id}_unit_{unit_id}_time_{time_slot}_1'
-                    theta_2_name = f'theta_branch_{branch_id}_unit_{unit_id}_time_{time_slot}_2'
+                    # 获取theta变量值
+                    theta_0_name = f'theta_branch_{branch_id}_unit_{unit_id}_0'
+                    theta_1_name = f'theta_branch_{branch_id}_unit_{unit_id}_1'
+                    theta_2_name = f'theta_branch_{branch_id}_unit_{unit_id}_2'
                     
                     theta_0 = theta_values.get(theta_0_name, 0.0)
                     theta_1 = theta_values.get(theta_1_name, 0.0)
                     theta_2 = theta_values.get(theta_2_name, 0.0)
                     
-                    # 计算参数化系数: original_coeff + theta_0 + theta_1*u_scaled + theta_2*u_scaled^2
-                    parametric_coeff = original_coeff + theta_0 + theta_1 * u_scaled + theta_2 * u_scaled * u_scaled
+                    # 计算参数化系数: original_coeff + theta_0 + theta_1*u + theta_2*u^2
+                    parametric_coeff = original_coeff + theta_0 + theta_1 * u + theta_2 * u * u
                     
                     # 添加到左端项
                     lhs_expr += parametric_coeff * x[unit_id, time_slot]
                 
-                # 构建右端项: theta_rhs_0 + theta_rhs_1*u_scaled + theta_rhs_2*u_scaled^2（按时段参数化）
-                theta_rhs_0_name = f'theta_branch_{branch_id}_time_{time_slot}_rhs_0'
-                theta_rhs_1_name = f'theta_branch_{branch_id}_time_{time_slot}_rhs_1'
-                theta_rhs_2_name = f'theta_branch_{branch_id}_time_{time_slot}_rhs_2'
+                # 构建右端项: u + theta_rhs_0 + theta_rhs_1*u + theta_rhs_2*u^2
+                theta_rhs_0_name = f'theta_branch_{branch_id}_rhs_0'
+                theta_rhs_1_name = f'theta_branch_{branch_id}_rhs_1'
+                theta_rhs_2_name = f'theta_branch_{branch_id}_rhs_2'
                 
                 theta_rhs_0 = theta_values.get(theta_rhs_0_name, 0.0)
                 theta_rhs_1 = theta_values.get(theta_rhs_1_name, 0.0)
                 theta_rhs_2 = theta_values.get(theta_rhs_2_name, 0.0)
                 
-                parametric_rhs = theta_rhs_0 + theta_rhs_1 * u_scaled + theta_rhs_2 * u_scaled * u_scaled
+                parametric_rhs = theta_rhs_0 + theta_rhs_1 * u + theta_rhs_2 * u * u
 
                 parametric_rhs_abs = abs(lhs_expr - parametric_rhs)
 
-                # 过滤数值精度问题：如果绝对值小于阈值，则忽略该项，避免极小系数导致数值不稳定
-                # 阈值设置为 1e-10，这是浮点数精度的一般水平
-                if parametric_rhs_abs > 1e-10:
-                    obj_opt += parametric_rhs_abs * mu[branch_id, time_slot]
-                # 如果值非常小（< 1e-10），可能是数值误差，直接忽略，避免产生极小系数
+                obj_opt += parametric_rhs_abs * mu[branch_id, time_slot]
 
             model.update()
 
@@ -1861,7 +1808,7 @@ class Iter_BCD:
             import traceback
             traceback.print_exc()
 
-    def _add_variational_primal_theta_block(self, model, x, sample_id, theta, union_analysis=None, PTDF=None, branch_limit=None):
+    def _add_variational_primal_theta_block(self, model, x, sample_id, theta, union_analysis=None):
         """
         添加包含theta参数的DCPF罚项
 
@@ -1870,8 +1817,6 @@ class Iter_BCD:
             pg: 功率变量
             theta_values: theta参数值字典，如果为None则使用默认值0
             union_analysis: 并集约束分析结果
-            PTDF: 预计算的PTDF矩阵（如果为None则重新计算，但不推荐）
-            branch_limit: 预计算的线路容量限制（如果为None则从self.branch获取）
         """
         if union_analysis is None:
             union_analysis = self._current_union_analysis
@@ -1882,13 +1827,17 @@ class Iter_BCD:
         
         union_constraints = union_analysis['union_constraints']
         
-        # 如果没有传入预计算的矩阵，则计算（不推荐，性能较差）
-        if PTDF is None:
-            PTDF = makePTDF(self.baseMVA, self.bus, self.branch)
-        if branch_limit is None:
-            branch_limit = self.branch[:, RATE_A]
-        
         try:
+            # 构建机组-节点映射矩阵
+            nb = self.bus.shape[0]
+            G = np.zeros((nb, self.ng))
+            for g in range(self.ng):
+                bus_idx = int(self.gen[g, GEN_BUS])
+                G[bus_idx, g] = 1
+            
+            # 计算PTDF矩阵
+            PTDF = makePTDF(self.baseMVA, self.bus, self.branch)
+            branch_limit = self.branch[:, RATE_A]
             
             constraint_count = 0
             obj_primal = gp.LinExpr()
@@ -1897,19 +1846,16 @@ class Iter_BCD:
             for constraint_info in union_constraints:
                 branch_id = constraint_info['branch_id']
                 time_slot = constraint_info['time_slot']
-                constraint_type = constraint_info.get('constraint_type', 'dcpf_upper')
+                constraint_type = constraint_info.get('constraint_type', 'upper')
                 nonzero_coefficients = constraint_info['nonzero_pg_coefficients']
                 constraint_name = constraint_info['constraint_name']
 
-                if constraint_type == 'dcpf_upper' or constraint_type == 'upper':
+                if constraint_type == 'dcpf_upper':
                     u = branch_limit[branch_id] + PTDF[branch_id, :] @ self.active_set_data[sample_id]['pd_data'][:, time_slot]
-                elif constraint_type == 'dcpf_lower' or constraint_type == 'lower':
+                elif constraint_type == 'dcpf_lower':
                     u = branch_limit[branch_id] - PTDF[branch_id, :] @ self.active_set_data[sample_id]['pd_data'][:, time_slot]
                 else:
                     u = branch_limit[branch_id] + PTDF[branch_id, :] @ self.active_set_data[sample_id]['pd_data'][:, time_slot]
-
-                # 对u进行缩放（在计算左端项和右端项之前）
-                u_scaled = u / self.theta_u_scale if self.theta_u_scale != 0 else u
 
                 # 构建左端项表达式
                 lhs_expr = 0
@@ -1918,31 +1864,31 @@ class Iter_BCD:
                     unit_id = coeff_info['unit_id']
                     original_coeff = 0
                     
-                    # 获取theta变量值（按时段参数化）
-                    theta_0_name = f'theta_branch_{branch_id}_unit_{unit_id}_time_{time_slot}_0'
-                    theta_1_name = f'theta_branch_{branch_id}_unit_{unit_id}_time_{time_slot}_1'
-                    theta_2_name = f'theta_branch_{branch_id}_unit_{unit_id}_time_{time_slot}_2'
+                    # 获取theta变量值
+                    theta_0_name = f'theta_branch_{branch_id}_unit_{unit_id}_0'
+                    theta_1_name = f'theta_branch_{branch_id}_unit_{unit_id}_1'
+                    theta_2_name = f'theta_branch_{branch_id}_unit_{unit_id}_2'
 
                     theta_0 = theta[theta_0_name]
                     theta_1 = theta[theta_1_name]
                     theta_2 = theta[theta_2_name]
 
-                    # 计算参数化系数: original_coeff + theta_0 + theta_1*u_scaled + theta_2*u_scaled^2
-                    parametric_coeff = original_coeff + theta_0 + theta_1 * u_scaled + theta_2 * u_scaled * u_scaled
+                    # 计算参数化系数: original_coeff + theta_0 + theta_1*u + theta_2*u^2
+                    parametric_coeff = original_coeff + theta_0 + theta_1 * u + theta_2 * u * u
                     
                     # 添加到左端项
                     lhs_expr += parametric_coeff * x[unit_id, time_slot]
                 
-                # 构建右端项: theta_rhs_0 + theta_rhs_1*u_scaled + theta_rhs_2*u_scaled^2（按时段参数化）
-                theta_rhs_0_name = f'theta_branch_{branch_id}_time_{time_slot}_rhs_0'
-                theta_rhs_1_name = f'theta_branch_{branch_id}_time_{time_slot}_rhs_1'
-                theta_rhs_2_name = f'theta_branch_{branch_id}_time_{time_slot}_rhs_2'
+                # 构建右端项: u + theta_rhs_0 + theta_rhs_1*u + theta_rhs_2*u^2
+                theta_rhs_0_name = f'theta_branch_{branch_id}_rhs_0'
+                theta_rhs_1_name = f'theta_branch_{branch_id}_rhs_1'
+                theta_rhs_2_name = f'theta_branch_{branch_id}_rhs_2'
                 
                 theta_rhs_0 = theta[theta_rhs_0_name]
                 theta_rhs_1 = theta[theta_rhs_1_name]
                 theta_rhs_2 = theta[theta_rhs_2_name]
 
-                parametric_rhs = theta_rhs_0 + theta_rhs_1 * u_scaled + theta_rhs_2 * u_scaled * u_scaled
+                parametric_rhs = theta_rhs_0 + theta_rhs_1 * u + theta_rhs_2 * u * u
 
                 parametric_rhs_viol = model.addVar(lb=0, name=f'sample_{sample_id}_parametric_rhs_viol_{branch_id}_{time_slot}')
                 parametric_rhs_abs = model.addVar(lb=0, name=f'sample_{sample_id}_parametric_rhs_abs_{branch_id}_{time_slot}')
@@ -1964,20 +1910,9 @@ class Iter_BCD:
             import traceback
             traceback.print_exc()
 
-    def _add_variational_dual_theta_block(self, model, g_id, t_id, mu, sample_id, theta, union_analysis=None, PTDF=None, branch_limit=None): 
+    def _add_variational_dual_theta_block(self, model, g_id, t_id, mu, sample_id, theta, union_analysis=None): 
         """
-        计算变分对偶theta块
 
-        Args:
-            model: Gurobi模型
-            g_id: 机组ID
-            t_id: 时段ID
-            mu: 对偶变量
-            sample_id: 样本ID
-            theta: theta变量字典
-            union_analysis: 并集约束分析结果
-            PTDF: 预计算的PTDF矩阵（如果为None则重新计算，但不推荐）
-            branch_limit: 预计算的线路容量限制（如果为None则从self.branch获取）
         """
         if union_analysis is None:
             union_analysis = self._current_union_analysis
@@ -1988,13 +1923,17 @@ class Iter_BCD:
         
         union_constraints = union_analysis['union_constraints']
         
-        # 如果没有传入预计算的矩阵，则计算（不推荐，性能较差）
-        if PTDF is None:
-            PTDF = makePTDF(self.baseMVA, self.bus, self.branch)
-        if branch_limit is None:
-            branch_limit = self.branch[:, RATE_A]
-        
         try:
+            # 构建机组-节点映射矩阵
+            nb = self.bus.shape[0]
+            G = np.zeros((nb, self.ng))
+            for g in range(self.ng):
+                bus_idx = int(self.gen[g, GEN_BUS])
+                G[bus_idx, g] = 1
+            
+            # 计算PTDF矩阵
+            PTDF = makePTDF(self.baseMVA, self.bus, self.branch)
+            branch_limit = self.branch[:, RATE_A]
             
             constraint_count = 0
             
@@ -2005,19 +1944,16 @@ class Iter_BCD:
                 time_slot = constraint_info['time_slot']
                 if time_slot != t_id:
                     continue
-                constraint_type = constraint_info.get('constraint_type', 'dcpf_upper')
+                constraint_type = constraint_info.get('constraint_type', 'upper')
                 nonzero_coefficients = constraint_info['nonzero_pg_coefficients']
                 constraint_name = constraint_info['constraint_name']
 
-                if constraint_type == 'dcpf_upper' or constraint_type == 'upper':
+                if constraint_type == 'upper':
                     u = branch_limit[branch_id] + PTDF[branch_id, :] @ self.active_set_data[sample_id]['pd_data'][:, time_slot]
-                elif constraint_type == 'dcpf_lower' or constraint_type == 'lower':
+                elif constraint_type == 'lower':
                     u = branch_limit[branch_id] - PTDF[branch_id, :] @ self.active_set_data[sample_id]['pd_data'][:, time_slot]
                 else:
                     u = branch_limit[branch_id] + PTDF[branch_id, :] @ self.active_set_data[sample_id]['pd_data'][:, time_slot]
-
-                # 对u进行缩放
-                u_scaled = u / self.theta_u_scale if self.theta_u_scale != 0 else u
 
                 for coeff_info in nonzero_coefficients:
                 
@@ -2026,29 +1962,29 @@ class Iter_BCD:
                         continue
                     original_coeff = 0
                     
-                    # 获取theta变量值（按时段参数化）
-                    theta_0_name = f'theta_branch_{branch_id}_unit_{unit_id}_time_{time_slot}_0'
-                    theta_1_name = f'theta_branch_{branch_id}_unit_{unit_id}_time_{time_slot}_1'
-                    theta_2_name = f'theta_branch_{branch_id}_unit_{unit_id}_time_{time_slot}_2'
+                    # 获取theta变量值
+                    theta_0_name = f'theta_branch_{branch_id}_unit_{unit_id}_0'
+                    theta_1_name = f'theta_branch_{branch_id}_unit_{unit_id}_1'
+                    theta_2_name = f'theta_branch_{branch_id}_unit_{unit_id}_2'
                     
                     theta_0 = theta[theta_0_name]
                     theta_1 = theta[theta_1_name]
                     theta_2 = theta[theta_2_name]
 
-                    # 计算参数化系数: original_coeff + theta_0 + theta_1*u_scaled + theta_2*u_scaled^2
-                    parametric_coeff = original_coeff + theta_0 + theta_1 * u_scaled + theta_2 * u_scaled * u_scaled
+                    # 计算参数化系数: original_coeff + theta_0 + theta_1*u + theta_2*u^2
+                    parametric_coeff = original_coeff + theta_0 + theta_1 * u + theta_2 * u * u
 
                     dual_expr += parametric_coeff * mu[branch_id, time_slot]
 
             model.update()
-            
+
             return model, dual_expr
         except Exception as e:
             print(f"❌ 添加参数化约束时出错: {e}")
             import traceback
             traceback.print_exc()    
 
-    def _add_parametric_penalties_pg_block_const(self, x, sample_id, theta_values=None, union_analysis=None, PTDF=None, branch_limit=None):
+    def _add_parametric_penalties_pg_block_const(self, x, sample_id, theta_values=None, union_analysis=None):
         """
         添加包含theta参数的DCPF罚项
 
@@ -2057,184 +1993,6 @@ class Iter_BCD:
             pg: 功率变量
             theta_values: theta参数值字典，如果为None则使用默认值0
             union_analysis: 并集约束分析结果
-            PTDF: 预计算的PTDF矩阵（如果为None则重新计算，但不推荐）
-            branch_limit: 预计算的线路容量限制（如果为None则从self.branch获取）
-        """
-        if union_analysis is None:
-            union_analysis = self._current_union_analysis
-        
-        if not union_analysis or 'union_constraints' not in union_analysis:
-            return 0, 0
-        
-        union_constraints = union_analysis['union_constraints']
-        
-        if theta_values is None:
-            theta_values = {}
-        
-        # 如果没有传入预计算的矩阵，则计算（不推荐，性能较差）
-        if PTDF is None:
-            PTDF = makePTDF(self.baseMVA, self.bus, self.branch)
-        if branch_limit is None:
-            branch_limit = self.branch[:, RATE_A]
-            
-        try:
-            constraint_count = 0
-            obj_primal = 0
-            obj_opt = 0
-            
-            for constraint_info in union_constraints:
-                branch_id = constraint_info['branch_id']
-                time_slot = constraint_info['time_slot']
-                constraint_type = constraint_info.get('constraint_type', 'dcpf_upper')
-                nonzero_coefficients = constraint_info['nonzero_pg_coefficients']
-                constraint_name = constraint_info['constraint_name']
-
-                if constraint_type == 'dcpf_upper' or constraint_type == 'upper':
-                    u = branch_limit[branch_id] + PTDF[branch_id, :] @ self.active_set_data[sample_id]['pd_data'][:, time_slot]
-                elif constraint_type == 'dcpf_lower' or constraint_type == 'lower':
-                    u = branch_limit[branch_id] - PTDF[branch_id, :] @ self.active_set_data[sample_id]['pd_data'][:, time_slot]
-                else:
-                    u = branch_limit[branch_id] + PTDF[branch_id, :] @ self.active_set_data[sample_id]['pd_data'][:, time_slot]
-
-                # 对u进行缩放（在计算左端项和右端项之前）
-                u_scaled = u / self.theta_u_scale if self.theta_u_scale != 0 else u
-
-                # 构建左端项表达式
-                lhs_expr = 0
-                
-                for coeff_info in nonzero_coefficients:
-                    unit_id = coeff_info['unit_id']
-                    original_coeff = 0
-                    
-                    # 获取theta变量值（按时段参数化）
-                    theta_0_name = f'theta_branch_{branch_id}_unit_{unit_id}_time_{time_slot}_0'
-                    theta_1_name = f'theta_branch_{branch_id}_unit_{unit_id}_time_{time_slot}_1'
-                    theta_2_name = f'theta_branch_{branch_id}_unit_{unit_id}_time_{time_slot}_2'
-                    
-                    theta_0 = theta_values.get(theta_0_name, 0.0)
-                    theta_1 = theta_values.get(theta_1_name, 0.0)
-                    theta_2 = theta_values.get(theta_2_name, 0.0)
-                    
-                    # 计算参数化系数: original_coeff + theta_0 + theta_1*u_scaled + theta_2*u_scaled^2
-                    parametric_coeff = original_coeff + theta_0 + theta_1 * u_scaled + theta_2 * u_scaled * u_scaled
-                    
-                    # 添加到左端项
-                    lhs_expr += parametric_coeff * x[unit_id, time_slot]
-                
-                # 构建右端项: theta_rhs_0 + theta_rhs_1*u_scaled + theta_rhs_2*u_scaled^2（按时段参数化）
-                theta_rhs_0_name = f'theta_branch_{branch_id}_time_{time_slot}_rhs_0'
-                theta_rhs_1_name = f'theta_branch_{branch_id}_time_{time_slot}_rhs_1'
-                theta_rhs_2_name = f'theta_branch_{branch_id}_time_{time_slot}_rhs_2'
-                
-                theta_rhs_0 = theta_values.get(theta_rhs_0_name, 0.0)
-                theta_rhs_1 = theta_values.get(theta_rhs_1_name, 0.0)
-                theta_rhs_2 = theta_values.get(theta_rhs_2_name, 0.0)
-                
-                parametric_rhs = theta_rhs_0 + theta_rhs_1 * u_scaled + theta_rhs_2 * u_scaled * u_scaled
-
-                obj_primal += max(0, lhs_expr - parametric_rhs)
-
-                obj_opt += abs(lhs_expr - parametric_rhs) * self.mu[sample_id, branch_id, time_slot]
-
-            return obj_primal, obj_opt
-        except Exception as e:
-            print(f"❌ 添加参数化约束时出错: {e}")
-            import traceback
-            traceback.print_exc()
-            return 0, 0
-
-    def _add_parametric_constraints_dual_block_const(self, g_id, t_id, mu, sample_id, theta_values=None, union_analysis=None, PTDF=None, branch_limit=None): 
-        """
-        计算参数化约束的对偶表达式
-
-        Args:
-            g_id: 机组ID
-            t_id: 时段ID
-            mu: 对偶变量
-            sample_id: 样本ID
-            theta_values: theta参数值字典
-            union_analysis: 并集约束分析结果
-            PTDF: 预计算的PTDF矩阵（如果为None则重新计算，但不推荐）
-            branch_limit: 预计算的线路容量限制（如果为None则从self.branch获取）
-        """
-        if union_analysis is None:
-            union_analysis = self._current_union_analysis
-        
-        if not union_analysis or 'union_constraints' not in union_analysis:
-            return 0.0
-        
-        union_constraints = union_analysis['union_constraints']
-        
-        if theta_values is None:
-            theta_values = {}
-        
-        # 如果没有传入预计算的矩阵，则计算（不推荐，性能较差）
-        if PTDF is None:
-            PTDF = makePTDF(self.baseMVA, self.bus, self.branch)
-        if branch_limit is None:
-            branch_limit = self.branch[:, RATE_A]
-            
-        try:
-            dual_expr = 0.0
-            
-            for constraint_info in union_constraints:
-                branch_id = constraint_info['branch_id']
-                time_slot = constraint_info['time_slot']
-                if time_slot != t_id:
-                    continue
-                constraint_type = constraint_info.get('constraint_type', 'dcpf_upper')
-                nonzero_coefficients = constraint_info['nonzero_pg_coefficients']
-                constraint_name = constraint_info['constraint_name']
-
-                if constraint_type == 'dcpf_upper' or constraint_type == 'upper':
-                    u = branch_limit[branch_id] + PTDF[branch_id, :] @ self.active_set_data[sample_id]['pd_data'][:, time_slot]
-                elif constraint_type == 'dcpf_lower' or constraint_type == 'lower':
-                    u = branch_limit[branch_id] - PTDF[branch_id, :] @ self.active_set_data[sample_id]['pd_data'][:, time_slot]
-                else:
-                    u = branch_limit[branch_id] + PTDF[branch_id, :] @ self.active_set_data[sample_id]['pd_data'][:, time_slot]
-
-                # 对u进行缩放
-                u_scaled = u / self.theta_u_scale if self.theta_u_scale != 0 else u
-
-                for coeff_info in nonzero_coefficients:
-                
-                    unit_id = coeff_info['unit_id']
-                    if unit_id != g_id:
-                        continue
-                    original_coeff = 0
-                    
-                    # 获取theta变量值（按时段参数化）
-                    theta_0_name = f'theta_branch_{branch_id}_unit_{unit_id}_time_{time_slot}_0'
-                    theta_1_name = f'theta_branch_{branch_id}_unit_{unit_id}_time_{time_slot}_1'
-                    theta_2_name = f'theta_branch_{branch_id}_unit_{unit_id}_time_{time_slot}_2'
-                    
-                    theta_0 = theta_values.get(theta_0_name, 0.0)
-                    theta_1 = theta_values.get(theta_1_name, 0.0)
-                    theta_2 = theta_values.get(theta_2_name, 0.0)
-                    
-                    # 计算参数化系数: original_coeff + theta_0 + theta_1*u_scaled + theta_2*u_scaled^2
-                    parametric_coeff = original_coeff + theta_0 + theta_1 * u_scaled + theta_2 * u_scaled * u_scaled
-                    
-                    dual_expr += parametric_coeff * mu[branch_id, time_slot]
-
-            return dual_expr
-        except Exception as e:
-            print(f"❌ 添加参数化约束时出错: {e}")
-            import traceback
-            traceback.print_exc()   
-            return 0.0   
-
-    def _add_parametric_penalties_pg_block_solid(self, model, x, sample_id,  theta_values=None, union_analysis=None, PTDF=None, branch_limit=None):
-        """
-        添加包含theta参数的DCPF罚项
-
-        Args:
-            model: Gurobi模型
-            pg: 功率变量
-            theta_values: theta参数值字典，如果为None则使用默认值0
-            union_analysis: 并集约束分析结果
-            PTDF: 预计算的PTDF矩阵（如果为None则重新计算，但不推荐）
-            branch_limit: 预计算的线路容量限制（如果为None则从self.branch获取）
         """
         if union_analysis is None:
             union_analysis = self._current_union_analysis
@@ -2249,30 +2007,35 @@ class Iter_BCD:
             print("未提供theta值，使用默认值0")
             theta_values = {}
         
-        # 如果没有传入预计算的矩阵，则计算（不推荐，性能较差）
-        if PTDF is None:
-            PTDF = makePTDF(self.baseMVA, self.bus, self.branch)
-        if branch_limit is None:
-            branch_limit = self.branch[:, RATE_A]
-        
         try:
+            # 构建机组-节点映射矩阵
+            nb = self.bus.shape[0]
+            G = np.zeros((nb, self.ng))
+            for g in range(self.ng):
+                bus_idx = int(self.gen[g, GEN_BUS])
+                G[bus_idx, g] = 1
+            
+            # 计算PTDF矩阵
+            PTDF = makePTDF(self.baseMVA, self.bus, self.branch)
+            branch_limit = self.branch[:, RATE_A]
+            
+            constraint_count = 0
+            obj_primal = 0
+            obj_opt = 0
             
             for constraint_info in union_constraints:
                 branch_id = constraint_info['branch_id']
                 time_slot = constraint_info['time_slot']
-                constraint_type = constraint_info.get('constraint_type', 'dcpf_upper')
+                constraint_type = constraint_info.get('constraint_type', 'upper')
                 nonzero_coefficients = constraint_info['nonzero_pg_coefficients']
                 constraint_name = constraint_info['constraint_name']
 
-                if constraint_type == 'dcpf_upper' or constraint_type == 'upper':
+                if constraint_type == 'upper':
                     u = branch_limit[branch_id] + PTDF[branch_id, :] @ self.active_set_data[sample_id]['pd_data'][:, time_slot]
-                elif constraint_type == 'dcpf_lower' or constraint_type == 'lower':
+                elif constraint_type == 'lower':
                     u = branch_limit[branch_id] - PTDF[branch_id, :] @ self.active_set_data[sample_id]['pd_data'][:, time_slot]
                 else:
                     u = branch_limit[branch_id] + PTDF[branch_id, :] @ self.active_set_data[sample_id]['pd_data'][:, time_slot]
-
-                # 对u进行缩放（在计算左端项和右端项之前）
-                u_scaled = u / self.theta_u_scale if self.theta_u_scale != 0 else u
 
                 # 构建左端项表达式
                 lhs_expr = 0
@@ -2281,31 +2044,196 @@ class Iter_BCD:
                     unit_id = coeff_info['unit_id']
                     original_coeff = 0
                     
-                    # 获取theta变量值（按时段参数化）
-                    theta_0_name = f'theta_branch_{branch_id}_unit_{unit_id}_time_{time_slot}_0'
-                    theta_1_name = f'theta_branch_{branch_id}_unit_{unit_id}_time_{time_slot}_1'
-                    theta_2_name = f'theta_branch_{branch_id}_unit_{unit_id}_time_{time_slot}_2'
+                    # 获取theta变量值
+                    theta_0_name = f'theta_branch_{branch_id}_unit_{unit_id}_0'
+                    theta_1_name = f'theta_branch_{branch_id}_unit_{unit_id}_1'
+                    theta_2_name = f'theta_branch_{branch_id}_unit_{unit_id}_2'
                     
                     theta_0 = theta_values.get(theta_0_name, 0.0)
                     theta_1 = theta_values.get(theta_1_name, 0.0)
                     theta_2 = theta_values.get(theta_2_name, 0.0)
                     
-                    # 计算参数化系数: original_coeff + theta_0 + theta_1*u_scaled + theta_2*u_scaled^2
-                    parametric_coeff = original_coeff + theta_0 + theta_1 * u_scaled + theta_2 * u_scaled * u_scaled
+                    # 计算参数化系数: original_coeff + theta_0 + theta_1*u + theta_2*u^2
+                    parametric_coeff = original_coeff + theta_0 + theta_1 * u + theta_2 * u * u
                     
                     # 添加到左端项
                     lhs_expr += parametric_coeff * x[unit_id, time_slot]
                 
-                # 构建右端项: theta_rhs_0 + theta_rhs_1*u_scaled + theta_rhs_2*u_scaled^2（按时段参数化）
-                theta_rhs_0_name = f'theta_branch_{branch_id}_time_{time_slot}_rhs_0'
-                theta_rhs_1_name = f'theta_branch_{branch_id}_time_{time_slot}_rhs_1'
-                theta_rhs_2_name = f'theta_branch_{branch_id}_time_{time_slot}_rhs_2'
+                # 构建右端项: u + theta_rhs_0 + theta_rhs_1*u + theta_rhs_2*u^2
+                theta_rhs_0_name = f'theta_branch_{branch_id}_rhs_0'
+                theta_rhs_1_name = f'theta_branch_{branch_id}_rhs_1'
+                theta_rhs_2_name = f'theta_branch_{branch_id}_rhs_2'
                 
                 theta_rhs_0 = theta_values.get(theta_rhs_0_name, 0.0)
                 theta_rhs_1 = theta_values.get(theta_rhs_1_name, 0.0)
                 theta_rhs_2 = theta_values.get(theta_rhs_2_name, 0.0)
                 
-                parametric_rhs = theta_rhs_0 + theta_rhs_1 * u_scaled + theta_rhs_2 * u_scaled * u_scaled
+                parametric_rhs = theta_rhs_0 + theta_rhs_1 * u + theta_rhs_2 * u * u
+
+                obj_primal += max(0, lhs_expr - parametric_rhs)
+
+                obj_opt += abs(lhs_expr - parametric_rhs) * self.mu[sample_id, branch_id, time_slot]
+
+            return obj_primal, obj_opt
+        except Exception as e:
+            print(f"❌ 添加参数化约束时出错: {e}")
+            import traceback
+            traceback.print_exc()
+
+    def _add_parametric_constraints_dual_block_const(self, g_id, t_id, mu, sample_id, theta_values=None, union_analysis=None): 
+        """
+
+        """
+        if union_analysis is None:
+            union_analysis = self._current_union_analysis
+        
+        if not union_analysis or 'union_constraints' not in union_analysis:
+            print("⚠ 未提供union_analysis，跳过参数化约束")
+            return
+        
+        union_constraints = union_analysis['union_constraints']
+        
+        if theta_values is None:
+            theta_values = {}
+        
+        try:
+            # 构建机组-节点映射矩阵
+            nb = self.bus.shape[0]
+            G = np.zeros((nb, self.ng))
+            for g in range(self.ng):
+                bus_idx = int(self.gen[g, GEN_BUS])
+                G[bus_idx, g] = 1
+            
+            # 计算PTDF矩阵
+            PTDF = makePTDF(self.baseMVA, self.bus, self.branch)
+            branch_limit = self.branch[:, RATE_A]
+            
+            dual_expr = 0
+            
+            for constraint_info in union_constraints:
+                branch_id = constraint_info['branch_id']
+                time_slot = constraint_info['time_slot']
+                if time_slot != t_id:
+                    continue
+                constraint_type = constraint_info.get('constraint_type', 'upper')
+                nonzero_coefficients = constraint_info['nonzero_pg_coefficients']
+                constraint_name = constraint_info['constraint_name']
+
+                if constraint_type == 'upper':
+                    u = branch_limit[branch_id] + PTDF[branch_id, :] @ self.active_set_data[sample_id]['pd_data'][:, time_slot]
+                elif constraint_type == 'lower':
+                    u = branch_limit[branch_id] - PTDF[branch_id, :] @ self.active_set_data[sample_id]['pd_data'][:, time_slot]
+                else:
+                    u = branch_limit[branch_id] + PTDF[branch_id, :] @ self.active_set_data[sample_id]['pd_data'][:, time_slot]
+
+                for coeff_info in nonzero_coefficients:
+                
+                    unit_id = coeff_info['unit_id']
+                    if unit_id != g_id:
+                        continue
+                    original_coeff = 0
+                    
+                    # 获取theta变量值
+                    theta_0_name = f'theta_branch_{branch_id}_unit_{unit_id}_0'
+                    theta_1_name = f'theta_branch_{branch_id}_unit_{unit_id}_1'
+                    theta_2_name = f'theta_branch_{branch_id}_unit_{unit_id}_2'
+                    
+                    theta_0 = theta_values.get(theta_0_name, 0.0)
+                    theta_1 = theta_values.get(theta_1_name, 0.0)
+                    theta_2 = theta_values.get(theta_2_name, 0.0)
+                    
+                    # 计算参数化系数: original_coeff + theta_0 + theta_1*u + theta_2*u^2
+                    parametric_coeff = original_coeff + theta_0 + theta_1 * u + theta_2 * u * u
+                    
+                    dual_expr += parametric_coeff * mu[branch_id, time_slot]
+
+            return dual_expr
+        except Exception as e:
+            print(f"❌ 添加参数化约束时出错: {e}")
+            import traceback
+            traceback.print_exc()   
+
+    def _add_parametric_penalties_pg_block_solid(self, model, x, sample_id,  theta_values=None, union_analysis=None):
+        """
+        添加包含theta参数的DCPF罚项
+
+        Args:
+            model: Gurobi模型
+            pg: 功率变量
+            theta_values: theta参数值字典，如果为None则使用默认值0
+            union_analysis: 并集约束分析结果
+        """
+        if union_analysis is None:
+            union_analysis = self._current_union_analysis
+        
+        if not union_analysis or 'union_constraints' not in union_analysis:
+            print("⚠ 未提供union_analysis，跳过参数化约束")
+            return
+        
+        union_constraints = union_analysis['union_constraints']
+        
+        if theta_values is None:
+            print("未提供theta值，使用默认值0")
+            theta_values = {}
+        
+        try:
+            # 构建机组-节点映射矩阵
+            nb = self.bus.shape[0]
+            G = np.zeros((nb, self.ng))
+            for g in range(self.ng):
+                bus_idx = int(self.gen[g, GEN_BUS])
+                G[bus_idx, g] = 1
+            
+            # 计算PTDF矩阵
+            PTDF = makePTDF(self.baseMVA, self.bus, self.branch)
+            branch_limit = self.branch[:, RATE_A]
+            
+            for constraint_info in union_constraints:
+                branch_id = constraint_info['branch_id']
+                time_slot = constraint_info['time_slot']
+                constraint_type = constraint_info.get('constraint_type', 'upper')
+                nonzero_coefficients = constraint_info['nonzero_pg_coefficients']
+                constraint_name = constraint_info['constraint_name']
+
+                if constraint_type == 'upper':
+                    u = branch_limit[branch_id] + PTDF[branch_id, :] @ self.active_set_data[sample_id]['pd_data'][:, time_slot]
+                elif constraint_type == 'lower':
+                    u = branch_limit[branch_id] - PTDF[branch_id, :] @ self.active_set_data[sample_id]['pd_data'][:, time_slot]
+                else:
+                    u = branch_limit[branch_id] + PTDF[branch_id, :] @ self.active_set_data[sample_id]['pd_data'][:, time_slot]
+
+                # 构建左端项表达式
+                lhs_expr = 0
+                
+                for coeff_info in nonzero_coefficients:
+                    unit_id = coeff_info['unit_id']
+                    original_coeff = 0
+                    
+                    # 获取theta变量值
+                    theta_0_name = f'theta_branch_{branch_id}_unit_{unit_id}_0'
+                    theta_1_name = f'theta_branch_{branch_id}_unit_{unit_id}_1'
+                    theta_2_name = f'theta_branch_{branch_id}_unit_{unit_id}_2'
+                    
+                    theta_0 = theta_values.get(theta_0_name, 0.0)
+                    theta_1 = theta_values.get(theta_1_name, 0.0)
+                    theta_2 = theta_values.get(theta_2_name, 0.0)
+                    
+                    # 计算参数化系数: original_coeff + theta_0 + theta_1*u + theta_2*u^2
+                    parametric_coeff = original_coeff + theta_0 + theta_1 * u + theta_2 * u * u
+                    
+                    # 添加到左端项
+                    lhs_expr += parametric_coeff * x[unit_id, time_slot]
+                
+                # 构建右端项: u + theta_rhs_0 + theta_rhs_1*u + theta_rhs_2*u^2
+                theta_rhs_0_name = f'theta_branch_{branch_id}_rhs_0'
+                theta_rhs_1_name = f'theta_branch_{branch_id}_rhs_1'
+                theta_rhs_2_name = f'theta_branch_{branch_id}_rhs_2'
+                
+                theta_rhs_0 = theta_values.get(theta_rhs_0_name, 0.0)
+                theta_rhs_1 = theta_values.get(theta_rhs_1_name, 0.0)
+                theta_rhs_2 = theta_values.get(theta_rhs_2_name, 0.0)
+                
+                parametric_rhs = theta_rhs_0 + theta_rhs_1 * u + theta_rhs_2 * u * u
 
                 model.addConstr(lhs_expr <= parametric_rhs, name=f'parametric_solid_{branch_id}_{time_slot}')
 
@@ -2353,9 +2281,6 @@ class Iter_BCD:
 
                 u = np.sum(self.active_set_data[sample_id]['pd_data'][:, time_slot])
 
-                # 对u进行缩放（在计算左端项和右端项之前）
-                u_scaled = u / self.zeta_u_scale if self.zeta_u_scale != 0 else u
-
                 # 构建左端项表达式
                 lhs_expr = 0
                 zeta_0_name = f'zeta_lower_unit_{unit_id}_time_{time_slot}_0'
@@ -2366,13 +2291,13 @@ class Iter_BCD:
                 zeta_1 = zeta_values.get(zeta_1_name, 0.0)
                 zeta_2 = zeta_values.get(zeta_2_name, 0.0)
 
-                # 计算参数化系数: original_coeff + zeta_0 + zeta_1*u_scaled + zeta_2*u_scaled^2
-                parametric_coeff = original_coeff + zeta_0 + zeta_1 * u_scaled + zeta_2 * u_scaled * u_scaled
+                # 计算参数化系数: original_coeff + zeta_0 + zeta_1*u + zeta_2*u^2
+                parametric_coeff = original_coeff + zeta_0 + zeta_1 * u + zeta_2 * u * u
 
                 # 添加到左端项
                 lhs_expr += parametric_coeff * x[unit_id, time_slot]
 
-                # 构建右端项: u_scaled + zeta_rhs_0 + zeta_rhs_1*u_scaled + zeta_rhs_2*u_scaled^2
+                # 构建右端项: u + zeta_rhs_0 + zeta_rhs_1*u + zeta_rhs_2*u^2
                 zeta_rhs_0_name = f'zeta_lower_unit_{unit_id}_time_{time_slot}_rhs_0'
                 zeta_rhs_1_name = f'zeta_lower_unit_{unit_id}_time_{time_slot}_rhs_1'
                 zeta_rhs_2_name = f'zeta_lower_unit_{unit_id}_time_{time_slot}_rhs_2'
@@ -2381,8 +2306,7 @@ class Iter_BCD:
                 zeta_rhs_1 = zeta_values.get(zeta_rhs_1_name, 0.0)
                 zeta_rhs_2 = zeta_values.get(zeta_rhs_2_name, 0.0)
 
-                # 使用已定义的u_scaled计算右端项
-                parametric_rhs = zeta_rhs_0 + zeta_rhs_1 * u_scaled + zeta_rhs_2 * u_scaled * u_scaled
+                parametric_rhs = zeta_rhs_0 + zeta_rhs_1 * u + zeta_rhs_2 * u * u
 
                 parametric_rhs_viol = model.addVar(lb=0, name=f'parametric_balance_power_lower_rhs_viol_{unit_id}_{time_slot}')
                 parametric_rhs_abs = model.addVar(lb=0, name=f'parametric_balance_power_lower_rhs_abs_{unit_id}_{time_slot}')
@@ -2405,13 +2329,13 @@ class Iter_BCD:
                 zeta_1 = zeta_values.get(zeta_1_name, 0.0)
                 zeta_2 = zeta_values.get(zeta_2_name, 0.0)
 
-                # 计算参数化系数: original_coeff + zeta_0 + zeta_1*u_scaled + zeta_2*u_scaled^2
-                parametric_coeff = original_coeff + zeta_0 + zeta_1 * u_scaled + zeta_2 * u_scaled * u_scaled
+                # 计算参数化系数: original_coeff + zeta_0 + zeta_1*u + zeta_2*u^2
+                parametric_coeff = original_coeff + zeta_0 + zeta_1 * u + zeta_2 * u * u
 
                 # 添加到左端项
                 lhs_expr += parametric_coeff * x[unit_id, time_slot]
 
-                # 构建右端项: u_scaled + zeta_rhs_0 + zeta_rhs_1*u_scaled + zeta_rhs_2*u_scaled^2
+                # 构建右端项: u + zeta_rhs_0 + zeta_rhs_1*u + zeta_rhs_2*u^2
                 zeta_rhs_0_name = f'zeta_upper_unit_{unit_id}_time_{time_slot}_rhs_0'
                 zeta_rhs_1_name = f'zeta_upper_unit_{unit_id}_time_{time_slot}_rhs_1'
                 zeta_rhs_2_name = f'zeta_upper_unit_{unit_id}_time_{time_slot}_rhs_2'
@@ -2420,8 +2344,7 @@ class Iter_BCD:
                 zeta_rhs_1 = zeta_values.get(zeta_rhs_1_name, 0.0)
                 zeta_rhs_2 = zeta_values.get(zeta_rhs_2_name, 0.0)
 
-                # 使用已定义的u_scaled计算右端项
-                parametric_rhs = zeta_rhs_0 + zeta_rhs_1 * u_scaled + zeta_rhs_2 * u_scaled * u_scaled
+                parametric_rhs = zeta_rhs_0 + zeta_rhs_1 * u + zeta_rhs_2 * u * u
 
                 parametric_rhs_viol = model.addVar(lb=0, name=f'parametric_balance_power_upper_rhs_viol_{unit_id}_{time_slot}')
                 parametric_rhs_abs = model.addVar(lb=0, name=f'parametric_balance_power_upper_rhs_abs_{unit_id}_{time_slot}')
@@ -2470,14 +2393,11 @@ class Iter_BCD:
 
                 u = np.sum(self.active_set_data[sample_id]['pd_data'][:, time_slot])
 
-                # 对u进行缩放
-                u_scaled = u / self.zeta_u_scale if self.zeta_u_scale != 0 else u
-
                 model.addConstr(ita_lower[0, time_slot] + ita_upper[0, time_slot] >= 1e-3, name=f'parametric_ita_least_{time_slot}')
                 
                 original_coeff = 0
 
-                # 构建参数化系数: zeta_0 + zeta_1*u_scaled + zeta_2*u_scaled^2
+                # 构建右端项: u + zeta_0 + zeta_1*u + zeta_2*u^2
                 zeta_0_name = f'zeta_lower_unit_{unit_id}_time_{time_slot}_0'
                 zeta_1_name = f'zeta_lower_unit_{unit_id}_time_{time_slot}_1'
                 zeta_2_name = f'zeta_lower_unit_{unit_id}_time_{time_slot}_2'
@@ -2486,11 +2406,11 @@ class Iter_BCD:
                 zeta_1 = zeta_values.get(zeta_1_name, 0.0)
                 zeta_2 = zeta_values.get(zeta_2_name, 0.0)
 
-                parametric_coeff = original_coeff + zeta_0 + zeta_1 * u_scaled + zeta_2 * u_scaled * u_scaled
+                parametric_coeff = original_coeff + zeta_0 + zeta_1 * u + zeta_2 * u * u
 
                 dual_expr += - parametric_coeff * ita_lower[0, time_slot]
 
-                # 构建参数化系数: zeta_0 + zeta_1*u_scaled + zeta_2*u_scaled^2
+                # 构建右端项: u + zeta_0 + zeta_1*u + zeta_2*u^2
                 zeta_0_name = f'zeta_upper_unit_{unit_id}_time_{time_slot}_0'
                 zeta_1_name = f'zeta_upper_unit_{unit_id}_time_{time_slot}_1'
                 zeta_2_name = f'zeta_upper_unit_{unit_id}_time_{time_slot}_2'
@@ -2499,7 +2419,7 @@ class Iter_BCD:
                 zeta_1 = zeta_values.get(zeta_1_name, 0.0)
                 zeta_2 = zeta_values.get(zeta_2_name, 0.0)
                 
-                parametric_coeff = original_coeff + zeta_0 + zeta_1 * u_scaled + zeta_2 * u_scaled * u_scaled
+                parametric_coeff = original_coeff + zeta_0 + zeta_1 * u + zeta_2 * u * u
                     
                 dual_expr += parametric_coeff * ita_upper[0, time_slot]
             
@@ -2542,9 +2462,6 @@ class Iter_BCD:
 
                 u = np.sum(self.active_set_data[sample_id]['pd_data'][:, time_slot])
 
-                # 对u进行缩放（在计算左端项和右端项之前）
-                u_scaled = u / self.zeta_u_scale if self.zeta_u_scale != 0 else u
-
                 # 构建左端项表达式
                 lhs_expr = 0
                 zeta_0_name = f'zeta_lower_unit_{unit_id}_time_{time_slot}_0'
@@ -2555,13 +2472,13 @@ class Iter_BCD:
                 zeta_1 = zeta_values.get(zeta_1_name, 0.0)
                 zeta_2 = zeta_values.get(zeta_2_name, 0.0)
 
-                # 计算参数化系数: original_coeff + zeta_0 + zeta_1*u_scaled + zeta_2*u_scaled^2
-                parametric_coeff = original_coeff + zeta_0 + zeta_1 * u_scaled + zeta_2 * u_scaled * u_scaled
+                # 计算参数化系数: original_coeff + zeta_0 + zeta_1*u + zeta_2*u^2
+                parametric_coeff = original_coeff + zeta_0 + zeta_1 * u + zeta_2 * u * u
 
                 # 添加到左端项
                 lhs_expr += parametric_coeff * x[unit_id, time_slot]
 
-                # 构建右端项: u_scaled + zeta_rhs_0 + zeta_rhs_1*u_scaled + zeta_rhs_2*u_scaled^2
+                # 构建右端项: u + zeta_rhs_0 + zeta_rhs_1*u + zeta_rhs_2*u^2
                 zeta_rhs_0_name = f'zeta_lower_unit_{unit_id}_time_{time_slot}_rhs_0'
                 zeta_rhs_1_name = f'zeta_lower_unit_{unit_id}_time_{time_slot}_rhs_1'
                 zeta_rhs_2_name = f'zeta_lower_unit_{unit_id}_time_{time_slot}_rhs_2'
@@ -2570,14 +2487,11 @@ class Iter_BCD:
                 zeta_rhs_1 = zeta_values.get(zeta_rhs_1_name, 0.0)
                 zeta_rhs_2 = zeta_values.get(zeta_rhs_2_name, 0.0)
 
-                # 使用已定义的u_scaled计算右端项
-                parametric_rhs = zeta_rhs_0 + zeta_rhs_1 * u_scaled + zeta_rhs_2 * u_scaled * u_scaled
+                parametric_rhs = zeta_rhs_0 + zeta_rhs_1 * u + zeta_rhs_2 * u * u
 
                 parametric_rhs_abs = abs(lhs_expr - parametric_rhs)
 
-                # 过滤数值精度问题：如果绝对值小于阈值，则忽略该项，避免极小系数导致数值不稳定
-                if parametric_rhs_abs > 1e-10:
-                    obj_opt += parametric_rhs_abs * ita_lower[0, time_slot]
+                obj_opt += parametric_rhs_abs * ita_lower[0, time_slot]
 
                 # 构建左端项表达式
                 lhs_expr = 0
@@ -2589,13 +2503,13 @@ class Iter_BCD:
                 zeta_1 = zeta_values.get(zeta_1_name, 0.0)
                 zeta_2 = zeta_values.get(zeta_2_name, 0.0)
 
-                # 计算参数化系数: original_coeff + zeta_0 + zeta_1*u_scaled + zeta_2*u_scaled^2
-                parametric_coeff = original_coeff + zeta_0 + zeta_1 * u_scaled + zeta_2 * u_scaled * u_scaled
+                # 计算参数化系数: original_coeff + zeta_0 + zeta_1*u + zeta_2*u^2
+                parametric_coeff = original_coeff + zeta_0 + zeta_1 * u + zeta_2 * u * u
 
                 # 添加到左端项
                 lhs_expr += parametric_coeff * x[unit_id, time_slot]
 
-                # 构建右端项: u_scaled + zeta_rhs_0 + zeta_rhs_1*u_scaled + zeta_rhs_2*u_scaled^2
+                # 构建右端项: u + zeta_rhs_0 + zeta_rhs_1*u + zeta_rhs_2*u^2
                 zeta_rhs_0_name = f'zeta_upper_unit_{unit_id}_time_{time_slot}_rhs_0'
                 zeta_rhs_1_name = f'zeta_upper_unit_{unit_id}_time_{time_slot}_rhs_1'
                 zeta_rhs_2_name = f'zeta_upper_unit_{unit_id}_time_{time_slot}_rhs_2'
@@ -2604,15 +2518,11 @@ class Iter_BCD:
                 zeta_rhs_1 = zeta_values.get(zeta_rhs_1_name, 0.0)
                 zeta_rhs_2 = zeta_values.get(zeta_rhs_2_name, 0.0)
 
-                # 对u进行缩放
-                u_scaled = u / self.zeta_u_scale if self.zeta_u_scale != 0 else u
-                parametric_rhs = zeta_rhs_0 + zeta_rhs_1 * u_scaled + zeta_rhs_2 * u_scaled * u_scaled
+                parametric_rhs = zeta_rhs_0 + zeta_rhs_1 * u + zeta_rhs_2 * u * u
 
                 parametric_rhs_abs = abs(lhs_expr - parametric_rhs)
 
-                # 过滤数值精度问题：如果绝对值小于阈值，则忽略该项，避免极小系数导致数值不稳定
-                if parametric_rhs_abs > 1e-10:
-                    obj_opt += parametric_rhs_abs * ita_upper[0, time_slot]
+                obj_opt += parametric_rhs_abs * ita_upper[0, time_slot]
 
             model.update()
 
@@ -2652,9 +2562,6 @@ class Iter_BCD:
 
                 u = np.sum(self.active_set_data[sample_id]['pd_data'][:, time_slot])
 
-                # 对u进行缩放（在计算左端项和右端项之前）
-                u_scaled = u / self.zeta_u_scale if self.zeta_u_scale != 0 else u
-
                 # 构建左端项表达式
                 lhs_expr = 0
                 zeta_0_name = f'zeta_lower_unit_{unit_id}_time_{time_slot}_0'
@@ -2665,13 +2572,13 @@ class Iter_BCD:
                 zeta_1 = zeta[zeta_1_name]
                 zeta_2 = zeta[zeta_2_name]
 
-                # 计算参数化系数: original_coeff + zeta_0 + zeta_1*u_scaled + zeta_2*u_scaled^2
-                parametric_coeff = original_coeff + zeta_0 + zeta_1 * u_scaled + zeta_2 * u_scaled * u_scaled
+                # 计算参数化系数: original_coeff + zeta_0 + zeta_1*u + zeta_2*u^2
+                parametric_coeff = original_coeff + zeta_0 + zeta_1 * u + zeta_2 * u * u
 
                 # 添加到左端项
                 lhs_expr += parametric_coeff * x[unit_id, time_slot]
 
-                # 构建右端项: u_scaled + zeta_rhs_0 + zeta_rhs_1*u_scaled + zeta_rhs_2*u_scaled^2
+                # 构建右端项: u + zeta_rhs_0 + zeta_rhs_1*u + zeta_rhs_2*u^2
                 zeta_rhs_0_name = f'zeta_lower_unit_{unit_id}_time_{time_slot}_rhs_0'
                 zeta_rhs_1_name = f'zeta_lower_unit_{unit_id}_time_{time_slot}_rhs_1'
                 zeta_rhs_2_name = f'zeta_lower_unit_{unit_id}_time_{time_slot}_rhs_2'
@@ -2680,9 +2587,7 @@ class Iter_BCD:
                 zeta_rhs_1 = zeta[zeta_rhs_1_name]
                 zeta_rhs_2 = zeta[zeta_rhs_2_name]
 
-                # 对u进行缩放
-                u_scaled = u / self.zeta_u_scale if self.zeta_u_scale != 0 else u
-                parametric_rhs = zeta_rhs_0 + zeta_rhs_1 * u_scaled + zeta_rhs_2 * u_scaled * u_scaled
+                parametric_rhs = zeta_rhs_0 + zeta_rhs_1 * u + zeta_rhs_2 * u * u
 
                 parametric_rhs_viol = model.addVar(lb=0, name=f'parametric_balance_power_lower_rhs_viol_{unit_id}_{time_slot}_sample_{sample_id}')
                 parametric_rhs_abs = model.addVar(lb=0, name=f'parametric_balance_power_lower_rhs_abs_{unit_id}_{time_slot}_sample_{sample_id}')
@@ -2705,13 +2610,13 @@ class Iter_BCD:
                 zeta_1 = zeta[zeta_1_name]
                 zeta_2 = zeta[zeta_2_name]
 
-                # 计算参数化系数: original_coeff + zeta_0 + zeta_1*u_scaled + zeta_2*u_scaled^2
-                parametric_coeff = original_coeff + zeta_0 + zeta_1 * u_scaled + zeta_2 * u_scaled * u_scaled
+                # 计算参数化系数: original_coeff + zeta_0 + zeta_1*u + zeta_2*u^2
+                parametric_coeff = original_coeff + zeta_0 + zeta_1 * u + zeta_2 * u * u
 
                 # 添加到左端项
                 lhs_expr += parametric_coeff * x[unit_id, time_slot]
 
-                # 构建右端项: u_scaled + zeta_rhs_0 + zeta_rhs_1*u_scaled + zeta_rhs_2*u_scaled^2
+                # 构建右端项: u + zeta_rhs_0 + zeta_rhs_1*u + zeta_rhs_2*u^2
                 zeta_rhs_0_name = f'zeta_upper_unit_{unit_id}_time_{time_slot}_rhs_0'
                 zeta_rhs_1_name = f'zeta_upper_unit_{unit_id}_time_{time_slot}_rhs_1'
                 zeta_rhs_2_name = f'zeta_upper_unit_{unit_id}_time_{time_slot}_rhs_2'
@@ -2720,9 +2625,7 @@ class Iter_BCD:
                 zeta_rhs_1 = zeta[zeta_rhs_1_name]
                 zeta_rhs_2 = zeta[zeta_rhs_2_name]
 
-                # 对u进行缩放
-                u_scaled = u / self.zeta_u_scale if self.zeta_u_scale != 0 else u
-                parametric_rhs = zeta_rhs_0 + zeta_rhs_1 * u_scaled + zeta_rhs_2 * u_scaled * u_scaled
+                parametric_rhs = zeta_rhs_0 + zeta_rhs_1 * u + zeta_rhs_2 * u * u
 
                 parametric_rhs_viol = model.addVar(lb=0, name=f'parametric_balance_power_upper_rhs_viol_{unit_id}_{time_slot}_sample_{sample_id}')
                 parametric_rhs_abs = model.addVar(lb=0, name=f'parametric_balance_power_upper_rhs_abs_{unit_id}_{time_slot}_sample_{sample_id}')
@@ -2769,10 +2672,7 @@ class Iter_BCD:
 
                 u = np.sum(self.active_set_data[sample_id]['pd_data'][:, time_slot])
 
-                # 对u进行缩放
-                u_scaled = u / self.zeta_u_scale if self.zeta_u_scale != 0 else u
-
-                # 构建参数化系数: zeta_0 + zeta_1*u_scaled + zeta_2*u_scaled^2
+                # 构建右端项: u + zeta_rhs_0 + zeta_rhs_1*u + zeta_rhs_2*u^2
                 zeta_0_name = f'zeta_lower_unit_{unit_id}_time_{time_slot}_0'
                 zeta_1_name = f'zeta_lower_unit_{unit_id}_time_{time_slot}_1'
                 zeta_2_name = f'zeta_lower_unit_{unit_id}_time_{time_slot}_2'
@@ -2780,11 +2680,11 @@ class Iter_BCD:
                 zeta_0 = zeta[zeta_0_name]
                 zeta_1 = zeta[zeta_1_name]
                 zeta_2 = zeta[zeta_2_name]
-                parametric_coeff = zeta_0 + zeta_1 * u_scaled + zeta_2 * u_scaled * u_scaled
+                parametric_coeff = zeta_0 + zeta_1 * u + zeta_2 * u * u
 
                 dual_expr += - parametric_coeff * ita_lower[0, time_slot]
 
-                # 构建参数化系数: zeta_0 + zeta_1*u_scaled + zeta_2*u_scaled^2
+                # 构建右端项: u + zeta_rhs_0 + zeta_rhs_1*u + zeta_rhs_2*u^2
                 zeta_0_name = f'zeta_upper_unit_{unit_id}_time_{time_slot}_0'
                 zeta_1_name = f'zeta_upper_unit_{unit_id}_time_{time_slot}_1'
                 zeta_2_name = f'zeta_upper_unit_{unit_id}_time_{time_slot}_2'
@@ -2792,7 +2692,7 @@ class Iter_BCD:
                 zeta_0 = zeta[zeta_0_name]
                 zeta_1 = zeta[zeta_1_name]
                 zeta_2 = zeta[zeta_2_name]
-                parametric_coeff = zeta_0 + zeta_1 * u_scaled + zeta_2 * u_scaled * u_scaled
+                parametric_coeff = zeta_0 + zeta_1 * u + zeta_2 * u * u
                     
                 dual_expr += parametric_coeff * ita_upper[0, time_slot]
 
@@ -2838,9 +2738,6 @@ class Iter_BCD:
 
                 u = np.sum(self.active_set_data[sample_id]['pd_data'][:, time_slot])
 
-                # 对u进行缩放（在计算左端项和右端项之前）
-                u_scaled = u / self.zeta_u_scale if self.zeta_u_scale != 0 else u
-
                 # 构建左端项表达式
                 lhs_expr = 0
                 zeta_0_name = f'zeta_lower_unit_{unit_id}_time_{time_slot}_0'
@@ -2851,13 +2748,13 @@ class Iter_BCD:
                 zeta_1 = zeta_values.get(zeta_1_name, 0.0)
                 zeta_2 = zeta_values.get(zeta_2_name, 0.0)
 
-                # 计算参数化系数: original_coeff + zeta_0 + zeta_1*u_scaled + zeta_2*u_scaled^2
-                parametric_coeff = original_coeff + zeta_0 + zeta_1 * u_scaled + zeta_2 * u_scaled * u_scaled
+                # 计算参数化系数: original_coeff + zeta_0 + zeta_1*u + zeta_2*u^2
+                parametric_coeff = original_coeff + zeta_0 + zeta_1 * u + zeta_2 * u * u
 
                 # 添加到左端项
                 lhs_expr += parametric_coeff * x[unit_id, time_slot]
 
-                # 构建右端项: u_scaled + zeta_rhs_0 + zeta_rhs_1*u_scaled + zeta_rhs_2*u_scaled^2
+                # 构建右端项: u + zeta_rhs_0 + zeta_rhs_1*u + zeta_rhs_2*u^2
                 zeta_rhs_0_name = f'zeta_lower_unit_{unit_id}_time_{time_slot}_rhs_0'
                 zeta_rhs_1_name = f'zeta_lower_unit_{unit_id}_time_{time_slot}_rhs_1'
                 zeta_rhs_2_name = f'zeta_lower_unit_{unit_id}_time_{time_slot}_rhs_2'
@@ -2866,9 +2763,7 @@ class Iter_BCD:
                 zeta_rhs_1 = zeta_values.get(zeta_rhs_1_name, 0.0)
                 zeta_rhs_2 = zeta_values.get(zeta_rhs_2_name, 0.0)
 
-                # 对u进行缩放
-                u_scaled = u / self.zeta_u_scale if self.zeta_u_scale != 0 else u
-                parametric_rhs = zeta_rhs_0 + zeta_rhs_1 * u_scaled + zeta_rhs_2 * u_scaled * u_scaled
+                parametric_rhs = zeta_rhs_0 + zeta_rhs_1 * u + zeta_rhs_2 * u * u
 
                 obj_primal += max(0, - lhs_expr + parametric_rhs)
 
@@ -2884,13 +2779,13 @@ class Iter_BCD:
                 zeta_1 = zeta_values.get(zeta_1_name, 0.0)
                 zeta_2 = zeta_values.get(zeta_2_name, 0.0)
 
-                # 计算参数化系数: original_coeff + zeta_0 + zeta_1*u_scaled + zeta_2*u_scaled^2
-                parametric_coeff = original_coeff + zeta_0 + zeta_1 * u_scaled + zeta_2 * u_scaled * u_scaled
+                # 计算参数化系数: original_coeff + zeta_0 + zeta_1*u + zeta_2*u^2
+                parametric_coeff = original_coeff + zeta_0 + zeta_1 * u + zeta_2 * u * u
 
                 # 添加到左端项
                 lhs_expr += parametric_coeff * x[unit_id, time_slot]
 
-                # 构建右端项: u_scaled + zeta_rhs_0 + zeta_rhs_1*u_scaled + zeta_rhs_2*u_scaled^2
+                # 构建右端项: u + zeta_rhs_0 + zeta_rhs_1*u + zeta_rhs_2*u^2
                 zeta_rhs_0_name = f'zeta_upper_unit_{unit_id}_time_{time_slot}_rhs_0'
                 zeta_rhs_1_name = f'zeta_upper_unit_{unit_id}_time_{time_slot}_rhs_1'
                 zeta_rhs_2_name = f'zeta_upper_unit_{unit_id}_time_{time_slot}_rhs_2'
@@ -2899,9 +2794,7 @@ class Iter_BCD:
                 zeta_rhs_1 = zeta_values.get(zeta_rhs_1_name, 0.0)
                 zeta_rhs_2 = zeta_values.get(zeta_rhs_2_name, 0.0)
 
-                # 对u进行缩放
-                u_scaled = u / self.zeta_u_scale if self.zeta_u_scale != 0 else u
-                parametric_rhs = zeta_rhs_0 + zeta_rhs_1 * u_scaled + zeta_rhs_2 * u_scaled * u_scaled
+                parametric_rhs = zeta_rhs_0 + zeta_rhs_1 * u + zeta_rhs_2 * u * u
 
                 obj_primal += max(0, lhs_expr - parametric_rhs)
 
@@ -2943,9 +2836,6 @@ class Iter_BCD:
                 
                 u = np.sum(self.active_set_data[sample_id]['pd_data'][:, time_slot])
 
-                # 对u进行缩放
-                u_scaled = u / self.zeta_u_scale if self.zeta_u_scale != 0 else u
-
                 zeta_0_name = f'zeta_lower_unit_{unit_id}_time_{time_slot}_0'
                 zeta_1_name = f'zeta_lower_unit_{unit_id}_time_{time_slot}_1'
                 zeta_2_name = f'zeta_lower_unit_{unit_id}_time_{time_slot}_2'
@@ -2954,7 +2844,7 @@ class Iter_BCD:
                 zeta_1 = zeta_values.get(zeta_1_name, 0.0)
                 zeta_2 = zeta_values.get(zeta_2_name, 0.0)
                 
-                parametric_coeff = original_coeff + zeta_0 + zeta_1 * u_scaled + zeta_2 * u_scaled * u_scaled
+                parametric_coeff = original_coeff + zeta_0 + zeta_1 * u + zeta_2 * u * u
 
                 dual_expr += - parametric_coeff * ita_lower[0, time_slot]
 
@@ -2966,7 +2856,7 @@ class Iter_BCD:
                 zeta_1 = zeta_values.get(zeta_1_name, 0.0)
                 zeta_2 = zeta_values.get(zeta_2_name, 0.0)
                 
-                parametric_coeff = original_coeff + zeta_0 + zeta_1 * u_scaled + zeta_2 * u_scaled * u_scaled
+                parametric_coeff = original_coeff + zeta_0 + zeta_1 * u + zeta_2 * u * u
                     
                 dual_expr += parametric_coeff * ita_upper[0, time_slot]
 
@@ -3007,9 +2897,6 @@ class Iter_BCD:
 
                 u = np.sum(self.active_set_data[sample_id]['pd_data'][:, time_slot])
 
-                # 对u进行缩放（在计算左端项和右端项之前）
-                u_scaled = u / self.zeta_u_scale if self.zeta_u_scale != 0 else u
-
                 # 构建左端项表达式
                 lhs_expr = 0
                 zeta_0_name = f'zeta_lower_unit_{unit_id}_time_{time_slot}_0'
@@ -3020,13 +2907,13 @@ class Iter_BCD:
                 zeta_1 = zeta_values.get(zeta_1_name, 0.0)
                 zeta_2 = zeta_values.get(zeta_2_name, 0.0)
 
-                # 计算参数化系数: original_coeff + zeta_0 + zeta_1*u_scaled + zeta_2*u_scaled^2
-                parametric_coeff = original_coeff + zeta_0 + zeta_1 * u_scaled + zeta_2 * u_scaled * u_scaled
+                # 计算参数化系数: original_coeff + zeta_0 + zeta_1*u + zeta_2*u^2
+                parametric_coeff = original_coeff + zeta_0 + zeta_1 * u + zeta_2 * u * u
 
                 # 添加到左端项
                 lhs_expr += parametric_coeff * x[unit_id, time_slot]
 
-                # 构建右端项: u_scaled + zeta_rhs_0 + zeta_rhs_1*u_scaled + zeta_rhs_2*u_scaled^2
+                # 构建右端项: u + zeta_rhs_0 + zeta_rhs_1*u + zeta_rhs_2*u^2
                 zeta_rhs_0_name = f'zeta_lower_unit_{unit_id}_time_{time_slot}_rhs_0'
                 zeta_rhs_1_name = f'zeta_lower_unit_{unit_id}_time_{time_slot}_rhs_1'
                 zeta_rhs_2_name = f'zeta_lower_unit_{unit_id}_time_{time_slot}_rhs_2'
@@ -3035,9 +2922,7 @@ class Iter_BCD:
                 zeta_rhs_1 = zeta_values.get(zeta_rhs_1_name, 0.0)
                 zeta_rhs_2 = zeta_values.get(zeta_rhs_2_name, 0.0)
 
-                # 对u进行缩放
-                u_scaled = u / self.zeta_u_scale if self.zeta_u_scale != 0 else u
-                parametric_rhs = zeta_rhs_0 + zeta_rhs_1 * u_scaled + zeta_rhs_2 * u_scaled * u_scaled
+                parametric_rhs = zeta_rhs_0 + zeta_rhs_1 * u + zeta_rhs_2 * u * u
 
                 model.addConstr(lhs_expr >= parametric_rhs, name=f'parametric_balance_power_lower_solid_{unit_id}_{time_slot}')
                 
@@ -3051,13 +2936,13 @@ class Iter_BCD:
                 zeta_1 = zeta_values.get(zeta_1_name, 0.0)
                 zeta_2 = zeta_values.get(zeta_2_name, 0.0)
 
-                # 计算参数化系数: original_coeff + zeta_0 + zeta_1*u_scaled + zeta_2*u_scaled^2
-                parametric_coeff = original_coeff + zeta_0 + zeta_1 * u_scaled + zeta_2 * u_scaled * u_scaled
+                # 计算参数化系数: original_coeff + zeta_0 + zeta_1*u + zeta_2*u^2
+                parametric_coeff = original_coeff + zeta_0 + zeta_1 * u + zeta_2 * u * u
 
                 # 添加到左端项
                 lhs_expr += parametric_coeff * x[unit_id, time_slot]
 
-                # 构建右端项: u_scaled + zeta_rhs_0 + zeta_rhs_1*u_scaled + zeta_rhs_2*u_scaled^2
+                # 构建右端项: u + zeta_rhs_0 + zeta_rhs_1*u + zeta_rhs_2*u^2
                 zeta_rhs_0_name = f'zeta_upper_unit_{unit_id}_time_{time_slot}_rhs_0'
                 zeta_rhs_1_name = f'zeta_upper_unit_{unit_id}_time_{time_slot}_rhs_1'
                 zeta_rhs_2_name = f'zeta_upper_unit_{unit_id}_time_{time_slot}_rhs_2'
@@ -3066,9 +2951,7 @@ class Iter_BCD:
                 zeta_rhs_1 = zeta_values.get(zeta_rhs_1_name, 0.0)
                 zeta_rhs_2 = zeta_values.get(zeta_rhs_2_name, 0.0)
 
-                # 对u进行缩放
-                u_scaled = u / self.zeta_u_scale if self.zeta_u_scale != 0 else u
-                parametric_rhs = zeta_rhs_0 + zeta_rhs_1 * u_scaled + zeta_rhs_2 * u_scaled * u_scaled
+                parametric_rhs = zeta_rhs_0 + zeta_rhs_1 * u + zeta_rhs_2 * u * u
 
                 model.addConstr(lhs_expr <= parametric_rhs, name=f'parametric_balance_power_upper_solid_{unit_id}_{time_slot}')
 
@@ -3316,15 +3199,15 @@ class Iter_BCD:
                 model.addConstr(x_binary_dev[g, t] >= -x_dev_expr, name=f'x_dev_neg_{g}_{t}')
                 obj_binary += x_binary_dev[g, t]
 
-        # 添加参数化约束的罚项（根据选择参数决定）
-        if self.use_theta and union_analysis is not None and theta_values is not None:
+        # 添加参数化约束的罚项
+        if union_analysis is not None and theta_values is not None:
             model, parametric_obj_primal, parametric_obj_opt = self._add_parametric_penalties_pg_block(
                 model, x, sample_id, theta_values, union_analysis
             )
             obj_primal += parametric_obj_primal
             obj_opt += parametric_obj_opt
         
-        if self.use_zeta and union_analysis is not None and zeta_values is not None:
+        if union_analysis is not None and zeta_values is not None:
             model, parametric_obj_primal, parametric_obj_opt = self._add_parametric_balance_power_penalties_pg_block(
                 model, x, sample_id, zeta_values, union_analysis
             )
@@ -3339,7 +3222,7 @@ class Iter_BCD:
         model.setObjective(total_objective, GRB.MINIMIZE)
 
         model.Params.OutputFlag = 0
-        model.Params.MIPGap = 1e-6
+        model.Params.MIPGap = 1e-10
         model.optimize()
         
         if model.status == GRB.OPTIMAL:
@@ -3348,10 +3231,10 @@ class Iter_BCD:
             cpower_sol = np.array([[cpower[g, t].X for t in range(self.T)] for g in range(self.ng)])
             coc_sol = np.array([[coc[g, t].X for t in range(self.T-1)] for g in range(self.ng)])
 
-            if sample_id <= 2:
+            if sample_id <= 1:
                 print(f"pg_block, sample_id: {sample_id}, obj_primal: {obj_primal.getValue()}, obj_opt: {obj_opt.getValue()}, obj_binary: {obj_binary.getValue()}")
                 
-                # print(f"obj_primal_zeta: {obj_primal_zeta.getValue() if 'obj_primal_zeta' in locals() else 'N/A'}, obj_opt_zeta: {obj_opt_zeta.getValue() if 'obj_opt_zeta' in locals() else 'N/A'}")
+                print(f"obj_primal_zeta: {obj_primal_zeta.getValue() if 'obj_primal_zeta' in locals() else 'N/A'}, obj_opt_zeta: {obj_opt_zeta.getValue() if 'obj_opt_zeta' in locals() else 'N/A'}")
           
             return pg_sol, x_sol, cpower_sol, coc_sol
         else:
@@ -3399,26 +3282,6 @@ class Iter_BCD:
         ita_lower = model.addVars(1, self.T, lb=0, name='ita_lower')
         ita_upper = model.addVars(1, self.T, lb=0, name='ita_upper')
 
-        mu_max = model.addVar(lb=0, name='mu_max')
-        ita_lower_max = model.addVar(lb=0, name='ita_lower_max')
-        ita_upper_max = model.addVar(lb=0, name='ita_upper_max')
-        
-        deadband = 100
-        
-        for l in range(self.nl):
-            for t in range(self.T):
-                model.addConstr(mu_max >= mu[l, t] - deadband, name=f'mu_max_constr_{l}_{t}')
-                model.addConstr(mu_max >= -mu[l, t] - deadband, name=f'mu_max_constr_neg_{l}_{t}')
-        for t in range(self.T):
-            model.addConstr(ita_lower_max >= ita_lower[0, t] - deadband, name=f'ita_lower_max_constr_{t}')
-            model.addConstr(ita_lower_max >= -ita_lower[0, t] - deadband, name=f'ita_lower_max_constr_neg_{t}')
-            model.addConstr(ita_upper_max >= ita_upper[0, t] - deadband, name=f'ita_upper_max_constr_{t}')
-            model.addConstr(ita_upper_max >= -ita_upper[0, t] - deadband, name=f'ita_upper_max_constr_neg_{t}')
-            
-        penalty_factor = 0  # 惩罚因子
-        penal_mu = penalty_factor * mu_max
-        penal_ita_lower = penalty_factor * ita_lower_max
-        penal_ita_upper = penalty_factor * ita_upper_max
 
         nb = Pd.shape[0]
         G = np.zeros((nb, self.ng))
@@ -3519,15 +3382,13 @@ class Iter_BCD:
                     dual_expr -= start_cost[g] * lambda_start_cost[g, t]
                     dual_expr += shut_cost[g] * lambda_shut_cost[g, t]
 
-                # 根据选择参数决定是否添加theta约束
-                if self.use_theta:
-                    model, dual_expr_para = self._add_parametric_constraints_dual_block(model, g, t, mu, sample_id, theta_values, union_analysis, PTDF=PTDF, branch_limit=branch_limit)
-                    dual_expr += dual_expr_para
+                model, dual_expr_para = self._add_parametric_constraints_dual_block(model, g, t, mu, sample_id, theta_values, union_analysis)
 
-                # 根据选择参数决定是否添加zeta约束
-                if self.use_zeta:
-                    model, dual_expr_para = self._add_parametric_balance_power_constraints_dual_block(model, g, t, ita_lower, ita_upper, sample_id, zeta_values, union_analysis)
-                    dual_expr += dual_expr_para
+                dual_expr += dual_expr_para
+
+                model, dual_expr_para = self._add_parametric_balance_power_constraints_dual_block(model, g, t, ita_lower, ita_upper, sample_id, zeta_values, union_analysis)
+
+                dual_expr += dual_expr_para
                                 
                 dual_expr_x_abs = model.addVar(lb=0, name=f'dual_expr_abs_x_{g}_{t}')
                 model.addConstr(dual_expr_x_abs >= dual_expr, name=f'dual_expr_abs_x_pos_{g}_{t}')
@@ -3570,101 +3431,64 @@ class Iter_BCD:
             lambda_power_balance_abs = model.addVar(lb=0, name=f'lambda_power_balance_{t}')
             model.addConstr(lambda_power_balance_abs >=  lambda_power_balance[t], name=f'lambda_power_balance_pos_{t}')
             model.addConstr(lambda_power_balance_abs >= -lambda_power_balance[t], name=f'lambda_power_balance_neg_{t}')
-            power_balance_viol = abs(sum(self.pg[sample_id, g, t] for g in range(self.ng)) - np.sum(Pd[:, t]))
-            if power_balance_viol > 1e-10:  # 数值精度过滤
-                obj_opt += power_balance_viol * lambda_power_balance_abs
+            obj_opt += abs(sum(self.pg[sample_id, g, t] for g in range(self.ng)) - np.sum(Pd[:, t])) * lambda_power_balance_abs
 
             for g in range(self.ng):
-                pg_lower_viol = abs(self.pg[sample_id, g, t] - self.gen[g, PMIN] * self.x[sample_id, g, t])
-                if pg_lower_viol > 1e-10:
-                    obj_opt += pg_lower_viol * lambda_pg_lower[g, t]
-                pg_upper_viol = abs(self.gen[g, PMAX] * self.x[sample_id, g, t] - self.pg[sample_id, g, t])
-                if pg_upper_viol > 1e-10:
-                    obj_opt += pg_upper_viol * lambda_pg_upper[g, t]
+                obj_opt += abs(self.pg[sample_id, g, t] - self.gen[g, PMIN] * self.x[sample_id, g, t]) * lambda_pg_lower[g, t]
+                obj_opt += abs(self.gen[g, PMAX] * self.x[sample_id, g, t] - self.pg[sample_id, g, t]) * lambda_pg_upper[g, t]
 
         # 爬坡约束
         for t in range(1, self.T):
             for g in range(self.ng):
-                ramp_up_viol = abs(self.pg[sample_id, g, t] - self.pg[sample_id, g, t-1] - (Ru[g] * self.x[sample_id, g, t-1] + Ru_co[g] * (1 - self.x[sample_id, g, t-1])))
-                if ramp_up_viol > 1e-10:
-                    obj_opt += ramp_up_viol * lambda_ramp_up[g, t-1]
-                ramp_down_viol = abs(self.pg[sample_id, g, t-1] - self.pg[sample_id, g, t] - (Rd[g] * self.x[sample_id, g, t] + Rd_co[g] * (1 - self.x[sample_id, g, t])))
-                if ramp_down_viol > 1e-10:
-                    obj_opt += ramp_down_viol * lambda_ramp_down[g, t-1]
+                obj_opt += abs(self.pg[sample_id, g, t] - self.pg[sample_id, g, t-1] - (Ru[g] * self.x[sample_id, g, t-1] + Ru_co[g] * (1 - self.x[sample_id, g, t-1]))) * lambda_ramp_up[g, t-1]
+                obj_opt += abs(self.pg[sample_id, g, t-1] - self.pg[sample_id, g, t] - (Rd[g] * self.x[sample_id, g, t] + Rd_co[g] * (1 - self.x[sample_id, g, t]))) * lambda_ramp_down[g, t-1]
         # 最小开机时间和最小关机时间约束
         # 最小开机时间约束（与matlab一致）
         for g in range(self.ng):
             for t in range(1, Ton+1):
                 for t1 in range(self.T - t):
-                    min_on_viol = abs(self.x[sample_id, g, t1+1] - self.x[sample_id, g, t1] - self.x[sample_id, g, t1+t])
-                    if min_on_viol > 1e-10:
-                        obj_opt += min_on_viol * lambda_min_on[g, t-1, t1]
+                    obj_opt += abs(self.x[sample_id, g, t1+1] - self.x[sample_id, g, t1] - self.x[sample_id, g, t1+t]) * lambda_min_on[g, t-1, t1]
         # 最小关机时间约束（与matlab一致）
         for g in range(self.ng):
             for t in range(1, Toff+1):
                 for t1 in range(self.T - t):
-                    min_off_viol = abs(-self.x[sample_id, g, t1+1] + self.x[sample_id, g, t1] - 1 + self.x[sample_id, g, t1+t])
-                    if min_off_viol > 1e-10:
-                        obj_opt += min_off_viol * lambda_min_off[g, t-1, t1]
+                    obj_opt += abs(-self.x[sample_id, g, t1+1] + self.x[sample_id, g, t1] - 1 + self.x[sample_id, g, t1+t]) * lambda_min_off[g, t-1, t1]
         # 启停成本
         for t in range(1, self.T):
             for g in range(self.ng):
-                coc_viol = abs(self.coc[sample_id, g, t-1])
-                if coc_viol > 1e-10:
-                    obj_opt += coc_viol * lambda_coc_nonneg[g, t-1]
-                start_cost_viol = abs(self.coc[sample_id, g, t-1] - start_cost[g] * (self.x[sample_id, g, t] - self.x[sample_id, g, t-1]))
-                if start_cost_viol > 1e-10:
-                    obj_opt += start_cost_viol * lambda_start_cost[g, t-1]
-                shut_cost_viol = abs(self.coc[sample_id, g, t-1] - shut_cost[g] * (self.x[sample_id, g, t-1] - self.x[sample_id, g, t]))
-                if shut_cost_viol > 1e-10:
-                    obj_opt += shut_cost_viol * lambda_shut_cost[g, t-1]
+                obj_opt += abs(self.coc[sample_id, g, t-1]) * lambda_coc_nonneg[g, t-1]
+                obj_opt += abs(self.coc[sample_id, g, t-1] - start_cost[g] * (self.x[sample_id, g, t] - self.x[sample_id, g, t-1])) * lambda_start_cost[g, t-1]
+                obj_opt += abs(self.coc[sample_id, g, t-1] - shut_cost[g] * (self.x[sample_id, g, t-1] - self.x[sample_id, g, t])) * lambda_shut_cost[g, t-1]
         # 发电成本
         for t in range(self.T):
             for g in range(self.ng):
-                cpower_viol = abs(self.cpower[sample_id, g, t] - (self.gencost[g, -2]/self.T_delta * self.pg[sample_id, g, t] + self.gencost[g, -1]/self.T_delta * self.x[sample_id, g, t]))
-                if cpower_viol > 1e-10:
-                    obj_opt += cpower_viol
+                obj_opt += abs(self.cpower[sample_id, g, t] - (self.gencost[g, -2]/self.T_delta * self.pg[sample_id, g, t] + self.gencost[g, -1]/self.T_delta * self.x[sample_id, g, t]))
         # 潮流约束
         # G: 机组-节点映射矩阵，需用户根据数据准备
         # 这里假设 G 为 (nb, ng) 的0-1矩阵，gen[:,0]为机组母线编号（1-based）
         for t in range(self.T):
             flow = PTDF @ (G @ np.array([self.pg[sample_id, g, t] for g in range(self.ng)]) - Pd[:, t])
             for l in range(self.branch.shape[0]):
-                dcpf_upper_viol = abs(flow[l] - branch_limit[l])
-                dcpf_lower_viol = abs(flow[l] + branch_limit[l])
-                if dcpf_upper_viol > 1e-10:
-                    obj_opt += dcpf_upper_viol * lambda_dcpf_upper[l, t]
-                if dcpf_lower_viol > 1e-10:
-                    obj_opt += dcpf_lower_viol * lambda_dcpf_lower[l, t]
+                obj_opt += abs(flow[l] - branch_limit[l]) * lambda_dcpf_upper[l, t] + abs(flow[l] + branch_limit[l]) * lambda_dcpf_lower[l, t]
         
         for t in range(self.T):
             for g in range(self.ng):
-                x_lower_viol = abs(self.x[sample_id, g, t])
-                if x_lower_viol > 1e-10:
-                    obj_opt += x_lower_viol * lambda_x_lower[g, t]
-                x_upper_viol = abs(self.x[sample_id, g, t] - 1)
-                if x_upper_viol > 1e-10:
-                    obj_opt += x_upper_viol * lambda_x_upper[g, t]    
+                obj_opt += abs(self.x[sample_id, g, t]) * lambda_x_lower[g, t]
+                obj_opt += abs(self.x[sample_id, g, t] - 1) * lambda_x_upper[g, t]    
 
-        # 根据选择参数决定是否添加theta目标项
-        if self.use_theta:
-            model, obj_opt_para = self._add_parametric_obj_dual_block(model, self.x[sample_id, :, :], mu, sample_id, theta_values, union_analysis, PTDF=PTDF, branch_limit=branch_limit)
-            obj_opt += obj_opt_para
+        model, obj_opt_para = self._add_parametric_obj_dual_block(model, self.x[sample_id, :, :], mu, sample_id, theta_values, union_analysis)
+        obj_opt += obj_opt_para
         
-        # 根据选择参数决定是否添加zeta目标项
-        if self.use_zeta:
-            model, obj_opt_para = self._add_parametric_balance_power_obj_dual_block(model, self.x[sample_id, :, :], ita_lower, ita_upper, sample_id, zeta_values, union_analysis)
-            obj_opt += obj_opt_para
+        model, obj_opt_para = self._add_parametric_balance_power_obj_dual_block(model, self.x[sample_id, :, :], ita_lower, ita_upper, sample_id, zeta_values, union_analysis)
+        obj_opt += obj_opt_para
    
         # 设置目标函数
-        total_objective = self.rho_dual * obj_dual + self.rho_opt * obj_opt + penal_mu + penal_ita_lower + penal_ita_upper
+        total_objective = self.rho_dual * obj_dual + self.rho_opt * obj_opt
         model.setObjective(total_objective, GRB.MINIMIZE)
 
         model.Params.OutputFlag = 0
-        model.Params.MIPGap = 1e-6  # 稍微放宽容差，避免数值精度问题
+        model.Params.MIPGap = 1e-10
         model.Params.Presolve = 0
-        model.Params.NumericFocus = 2  # 提高数值稳定性，关注数值精度问题
-        model.Params.ScaleFlag = 2  # 启用自动缩放，改善数值条件
         model.optimize()
         
         if model.status == GRB.OPTIMAL:
@@ -3707,7 +3531,7 @@ class Iter_BCD:
             ita_lower_sol = np.array([ita_lower[0, t].X for t in range(self.T)])
             ita_upper_sol = np.array([ita_upper[0, t].X for t in range(self.T)])
             
-            if sample_id <= 2:            
+            if sample_id <= 1:            
                 print(f"dual_block, sample_id: {sample_id}, obj_dual: {obj_dual.getValue()}, obj_opt: {obj_opt.getValue()}")
             
             return lambda_sol, mu_sol, ita_lower_sol, ita_upper_sol
@@ -3720,34 +3544,21 @@ class Iter_BCD:
         model = gp.Model("iter_with_theta_block")
         model_theta_vars = {}
         model_theta_vars_abs = {}
+        for theta_var in self.theta_values:
+            var = model.addVar(lb=-1e1, ub=1e1, name=theta_var)
+            model_theta_vars[theta_var] = var
+            model_theta_vars_abs[theta_var] = model.addVar(lb=0, name=f'{theta_var}_abs')
+            model.addConstr(model_theta_vars_abs[theta_var] >= var, name=f'{theta_var}_abs_pos')
+            model.addConstr(model_theta_vars_abs[theta_var] >= -var, name=f'{theta_var}_abs_neg')
+
         model_zeta_vars = {}
         model_zeta_vars_abs = {}
-        
-        max_theta = model.addVar(lb=0, name='max_theta')
-        max_zeta = model.addVar(lb=0, name='max_zeta')
-        
-        bound = 1e5
-        
-        # 根据选择参数决定是否创建theta变量
-        if self.use_theta:
-            for theta_var in self.theta_values:
-                var = model.addVar(lb=-bound, ub=bound, name=theta_var)
-                model_theta_vars[theta_var] = var
-                model_theta_vars_abs[theta_var] = model.addVar(lb=0, name=f'{theta_var}_abs')
-                model.addConstr(model_theta_vars_abs[theta_var] >= var, name=f'{theta_var}_abs_pos')
-                model.addConstr(model_theta_vars_abs[theta_var] >= -var, name=f'{theta_var}_abs_neg')
-                model.addConstr(max_theta >= model_theta_vars_abs[theta_var], name=f'max_theta_constr_{theta_var}')
-
-        # 根据选择参数决定是否创建zeta变量
-        if self.use_zeta:
-            for zeta_var in self.zeta_values:
-                var = model.addVar(lb=-bound, ub=bound, name=zeta_var)
-                model_zeta_vars[zeta_var] = var
-                model_zeta_vars_abs[zeta_var] = model.addVar(lb=0, name=f'{zeta_var}_abs')
-                model.addConstr(model_zeta_vars_abs[zeta_var] >= var, name=f'{zeta_var}_abs_pos')
-                model.addConstr(model_zeta_vars_abs[zeta_var] >= -var, name=f'{zeta_var}_abs_neg')
-                model.addConstr(max_zeta >= model_zeta_vars_abs[zeta_var], name=f'max_zeta_constr_{zeta_var}')
-        
+        for zeta_var in self.zeta_values:
+            var = model.addVar(lb=-1e1, ub=1e1, name=zeta_var)
+            model_zeta_vars[zeta_var] = var
+            model_zeta_vars_abs[zeta_var] = model.addVar(lb=0, name=f'{zeta_var}_abs')
+            model.addConstr(model_zeta_vars_abs[zeta_var] >= var, name=f'{zeta_var}_abs_pos')
+            model.addConstr(model_zeta_vars_abs[zeta_var] >= -var, name=f'{zeta_var}_abs_neg')
 
         Ton = min(4, self.T)
         Toff = min(4, self.T)
@@ -3775,26 +3586,22 @@ class Iter_BCD:
         model.update()
         
         for sample_id in range(self.n_samples):
-            # 根据选择参数决定是否添加theta目标项
-            if self.use_theta:
-                model, obj_primal_para, obj_opt_para = self._add_variational_primal_theta_block(model, self.x[sample_id, :, :], sample_id, model_theta_vars, union_analysis)
-                obj_primal += obj_primal_para
-                obj_opt += obj_opt_para
-                model.update()
+            model, obj_primal_para, obj_opt_para = self._add_variational_primal_theta_block(model, self.x[sample_id, :, :], sample_id, model_theta_vars, union_analysis)
+            obj_primal += obj_primal_para
+            obj_opt += obj_opt_para
+            
+            model.update()
 
-            # 根据选择参数决定是否添加zeta目标项
-            if self.use_zeta:
-                model, obj_primal_para, obj_opt_para = self._add_variational_balance_power_primal_zeta_block(model, self.x[sample_id, :, :], sample_id, model_zeta_vars, union_analysis)
-                obj_primal += obj_primal_para
-                obj_opt += obj_opt_para
-                model.update()
+            model, obj_primal_para, obj_opt_para = self._add_variational_balance_power_primal_zeta_block(model, self.x[sample_id, :, :], sample_id, model_zeta_vars, union_analysis)
+            obj_primal += obj_primal_para
+            obj_opt += obj_opt_para
+
+            model.update()
         
         obj_dual = 0
         
-        penalty_factor_theta = 1e-6  # 惩罚因子
-        penalty_factor_zeta = 1e-6  # 惩罚因子
-        penal_theta = penalty_factor_theta * max_theta if self.use_theta else 0
-        penal_zeta = penalty_factor_zeta * max_zeta if self.use_zeta else 0
+        penalty_factor = 1e-4  # 惩罚因子
+        penal_theta = penalty_factor * gp.quicksum(model_theta_vars_abs[theta_var] for theta_var in self.theta_values)
 
                 # x变量的对偶约束
         for sample_id in range(self.n_samples):
@@ -3844,15 +3651,11 @@ class Iter_BCD:
                         dual_expr -= start_cost[g] * self.lambda_[sample_id]['lambda_start_cost'][g, t]
                         dual_expr += shut_cost[g] * self.lambda_[sample_id]['lambda_shut_cost'][g, t]
 
-                    # 根据选择参数决定是否添加theta对偶约束
-                    if self.use_theta:
-                        model, dual_expr_para = self._add_variational_dual_theta_block(model, g, t, self.mu[sample_id, :, :], sample_id, model_theta_vars, union_analysis)
-                        dual_expr += dual_expr_para
+                    model, dual_expr_para = self._add_variational_dual_theta_block(model, g, t, self.mu[sample_id, :, :], sample_id, model_theta_vars, union_analysis)
+                    dual_expr += dual_expr_para
 
-                    # 根据选择参数决定是否添加zeta对偶约束
-                    if self.use_zeta:
-                        model, dual_expr_para = self._add_variational_balance_power_dual_zeta_block(model, g, t, self.ita_lower[sample_id, :, :], self.ita_upper[sample_id, :, :], sample_id, model_zeta_vars, union_analysis)
-                        dual_expr += dual_expr_para
+                    model, dual_expr_para = self._add_variational_balance_power_dual_zeta_block(model, g, t, self.ita_lower[sample_id, :, :], self.ita_upper[sample_id, :, :], sample_id, model_zeta_vars, union_analysis)
+                    dual_expr += dual_expr_para
                     
                     dual_expr_abs = model.addVar(lb=0, name=f'dual_expr_abs_x_{g}_{t}_sample_{sample_id}')
                     model.addConstr(dual_expr_abs >= dual_expr, name=f'dual_expr_abs_x_pos_{g}_{t}_sample_{sample_id}')
@@ -3861,35 +3664,11 @@ class Iter_BCD:
                     obj_dual += dual_expr_abs
                 
         # 设置目标函数
-        total_objective = self.rho_primal * obj_primal + self.rho_dual * obj_dual + self.rho_opt * obj_opt + penal_theta + penal_zeta
+        total_objective = self.rho_primal * obj_primal + self.rho_dual * obj_dual + self.rho_opt * obj_opt
         model.setObjective(total_objective, GRB.MINIMIZE)
 
         model.Params.OutputFlag = 0
-        
-        # 数值稳定性相关参数
-        model.Params.NumericFocus = 3  # 最大数值稳定性：重点关注数值精度问题
-        model.Params.ScaleFlag = 3 # 启用自动缩放：改善数值条件数
-        
-        # 收敛容差设置（根据bound的大小调整）
-        # 当bound较大时，变量范围更大，需要相对宽松的容差（相对于变量范围）
-        # 但绝对容差应该保持一致，确保求解质量
-        model.Params.OptimalityTol = 1e-6  # 最优性容差：保持一致的绝对容差
-        model.Params.FeasibilityTol = 1e-6  # 可行性容差：保持一致的绝对容差
-        
-        # 内点法相关参数（如果使用障碍法）
-        model.Params.BarConvTol = 1e-12  # 内点法收敛容差
-        model.Params.BarQCPConvTol = 1e-12  # QCP内点法收敛容差
-        
-        # 对偶约简：启用以提高效率
-        model.Params.DualReductions = 1
-        
-        # 预求解：启用以改善数值条件
-        model.Params.Presolve = 2  # 激进预求解：更彻底的预求解
-        
-        
-        model.Params.Method = 1 # 对偶单纯形法
-        # model.Params.Method = 2 # 内点法
-        
+        model.Params.MIPGap = 1e-10
         model.optimize()
         
         if model.status == GRB.OPTIMAL:
@@ -3902,7 +3681,7 @@ class Iter_BCD:
             for zeta_var in model_zeta_vars:
                 zeta_value_sol[zeta_var] = model_zeta_vars[zeta_var].X
 
-            print(f"theta_block, status: {model.status}, obj_primal_part: {obj_primal.getValue()}, obj_dual_part: {obj_dual.getValue()}, obj_opt_part: {obj_opt.getValue()}, total_objective: {total_objective.getValue()}")
+            print(f"theta_block, status: {model.status}, obj_primal_part: {obj_primal.getValue()}, obj_dual_part: {obj_dual.getValue()}, obj_opt_part: {obj_opt.getValue()}")
             
             return theta_value_sol, zeta_value_sol
         else:
@@ -3913,32 +3692,6 @@ class Iter_BCD:
         obj_primal = 0
         obj_opt = 0
         obj_dual = 0
-        
-        # 预计算不依赖于sample_id的常量，避免在循环内重复计算
-        Ton = min(4, self.T)
-        Toff = min(4, self.T)
-        
-        # 爬坡约束参数
-        Ru = 0.4 * self.gen[:, PMAX] / self.T_delta
-        Rd = 0.4 * self.gen[:, PMAX] / self.T_delta
-        Ru_co = 0.3 * self.gen[:, PMAX]
-        Rd_co = 0.3 * self.gen[:, PMAX]
-        
-        # 启停成本
-        start_cost = self.gencost[:, 1]
-        shut_cost = self.gencost[:, 2]
-        
-        # 潮流约束相关矩阵（只计算一次）
-        nb = self.bus.shape[0]
-        G = np.zeros((nb, self.ng))
-        for g in range(self.ng):
-            bus_idx = int(self.gen[g, GEN_BUS])
-            G[bus_idx, g] = 1
-        # 计算PTDF（只计算一次，这是最昂贵的操作）
-        PTDF = makePTDF(self.baseMVA, self.bus, self.branch)
-        branch_limit = self.branch[:, RATE_A]  # 线路容量
-        # 预计算 PTDF @ G，避免在循环内重复计算
-        PTDF_G = PTDF @ G  # shape: (nbranch, ng)
                 
         for sample_id in range(self.n_samples):
             Pd = self.active_set_data[sample_id]['pd_data']
@@ -3947,12 +3700,14 @@ class Iter_BCD:
             coc = self.coc[sample_id, :, :]
             cpower = self.cpower[sample_id, :, :]
 
+            Ton = min(4, self.T)
+            Toff = min(4, self.T)
+
             # 构建约束和目标函数项
      
             # 功率平衡约束
             for t in range(self.T):
-                # 使用NumPy向量化操作，避免列表推导式
-                power_balance_expr = np.sum(pg[:, t]) - np.sum(Pd[:, t])
+                power_balance_expr = sum([pg[g, t] for g in range(self.ng)]) - np.sum(Pd[:, t])
                 
                 obj_primal += abs(power_balance_expr)
                 
@@ -3978,6 +3733,11 @@ class Iter_BCD:
                     obj_opt += (1 - x[g, t]) * abs(self.lambda_[sample_id]['lambda_x_upper'][g, t])
 
             # 爬坡约束（类似处理）
+            Ru = 0.4 * self.gen[:, PMAX] / self.T_delta
+            Rd = 0.4 * self.gen[:, PMAX] / self.T_delta
+            Ru_co = 0.3 * self.gen[:, PMAX]
+            Rd_co = 0.3 * self.gen[:, PMAX]
+
             for t in range(1, self.T):
                 for g in range(self.ng):
                     # 上爬坡约束违反
@@ -4011,6 +3771,8 @@ class Iter_BCD:
                         obj_opt += abs(min_off_expr) * abs(self.lambda_[sample_id]['lambda_min_off'][g, t-1, t1])
 
             # 启停成本
+            start_cost = self.gencost[:, 1]
+            shut_cost = self.gencost[:, 2]
             for t in range(1, self.T):
                 for g in range(self.ng):
                     start_cost_expr = start_cost[g] * (x[g, t] - x[g, t-1]) - coc[g, t-1]
@@ -4033,9 +3795,18 @@ class Iter_BCD:
                     obj_opt += abs(cpower_expr) * abs(self.lambda_[sample_id]['lambda_cpower'][g, t])
 
             # 潮流约束
+            # G: 机组-节点映射矩阵，需用户根据数据准备
+            # 这里假设 G 为 (nb, ng) 的0-1矩阵，gen[:,0]为机组母线编号（1-based）
+            nb = self.bus.shape[0]
+            G = np.zeros((nb, self.ng))
+            for g in range(self.ng):
+                bus_idx = int(self.gen[g, GEN_BUS])
+                G[bus_idx, g] = 1
+            # 计算PTDF
+            PTDF = makePTDF(self.baseMVA, self.bus, self.branch)
+            branch_limit = self.branch[:, RATE_A]  # 线路容量
             for t in range(self.T):
-                # 使用预计算的PTDF_G和向量化操作
-                flow = PTDF_G @ pg[:, t] - PTDF @ Pd[:, t]
+                flow = PTDF @ (G @ np.array([pg[g, t] for g in range(self.ng)]) - Pd[:, t])
                 for l in range(self.branch.shape[0]):
                     dcpf_upper_expr = flow[l] - branch_limit[l]
                     dcpf_lower_expr = -flow[l] - branch_limit[l]
@@ -4044,21 +3815,17 @@ class Iter_BCD:
                     obj_opt += abs(dcpf_upper_expr) * abs(self.lambda_[sample_id]['lambda_dcpf_upper'][l, t])
                     obj_opt += abs(dcpf_lower_expr) * abs(self.lambda_[sample_id]['lambda_dcpf_lower'][l, t])
 
-            # 根据选择参数决定是否添加theta罚项
-            if self.use_theta:
-                parametric_obj_primal, parametric_obj_opt = self._add_parametric_penalties_pg_block_const(
-                    x, sample_id, self.theta_values, union_analysis, PTDF=PTDF, branch_limit=branch_limit
-                )
-                obj_primal += parametric_obj_primal
-                obj_opt += parametric_obj_opt
+            parametric_obj_primal, parametric_obj_opt = self._add_parametric_penalties_pg_block_const(
+                x, sample_id, self.theta_values, union_analysis
+            )
+            obj_primal += parametric_obj_primal
+            obj_opt += parametric_obj_opt
 
-            # 根据选择参数决定是否添加zeta罚项
-            if self.use_zeta:
-                parametric_obj_primal, parametric_obj_opt = self._add_parametric_balance_power_penalties_pg_block_const(
-                    x, sample_id, self.zeta_values, union_analysis
-                )
-                obj_primal += parametric_obj_primal
-                obj_opt += parametric_obj_opt
+            parametric_obj_primal, parametric_obj_opt = self._add_parametric_balance_power_penalties_pg_block_const(
+                x, sample_id, self.zeta_values, union_analysis
+            )
+            obj_primal += parametric_obj_primal
+            obj_opt += parametric_obj_opt
                     
             # pg变量的对偶约束
             for g in range(self.ng):
@@ -4081,8 +3848,8 @@ class Iter_BCD:
                         dual_expr -= self.lambda_[sample_id]['lambda_ramp_up'][g, t]
                         dual_expr += self.lambda_[sample_id]['lambda_ramp_down'][g, t]
 
-                    # DCPF约束贡献 - 使用预计算的PTDF_G
-                    ptdfg_col = PTDF_G[:, g]  # 直接获取列，无需矩阵乘法
+                    # DCPF约束贡献
+                    ptdfg_col = (PTDF @ G[:, g]).T
                     for l in range(self.branch.shape[0]):
                         pg_coeff = ptdfg_col[l]
                         dual_expr += pg_coeff * (self.lambda_[sample_id]['lambda_dcpf_upper'][l, t] - self.lambda_[sample_id]['lambda_dcpf_lower'][l, t])
@@ -4137,15 +3904,11 @@ class Iter_BCD:
                         dual_expr -= start_cost[g] * self.lambda_[sample_id]['lambda_start_cost'][g, t]
                         dual_expr += shut_cost[g] * self.lambda_[sample_id]['lambda_shut_cost'][g, t]
 
-                    # 根据选择参数决定是否添加theta对偶约束
-                    if self.use_theta:
-                        dual_expr_para = self._add_parametric_constraints_dual_block_const(g, t, self.mu[sample_id, :, :], sample_id, self.theta_values, union_analysis, PTDF=PTDF, branch_limit=branch_limit)
-                        dual_expr += dual_expr_para
+                    dual_expr_para = self._add_parametric_constraints_dual_block_const(g, t, self.mu[sample_id, :, :], sample_id, self.theta_values, union_analysis)
+                    dual_expr += dual_expr_para
 
-                    # 根据选择参数决定是否添加zeta对偶约束
-                    if self.use_zeta:
-                        dual_expr_para = self._add_parametric_balance_power_constraints_dual_block_const(g, t, self.ita_lower[sample_id, :, :], self.ita_upper[sample_id, :, :], sample_id, self.zeta_values, union_analysis)
-                        dual_expr += dual_expr_para
+                    dual_expr_para = self._add_parametric_balance_power_constraints_dual_block_const(g, t, self.ita_lower[sample_id, :, :], self.ita_upper[sample_id, :, :], sample_id, self.zeta_values, union_analysis)
+                    dual_expr += dual_expr_para
 
                     # 对偶约束：梯度 = 0
                     obj_dual += abs(dual_expr)
@@ -4178,20 +3941,15 @@ class Iter_BCD:
         for i in range(max_iter):
             print(f"🔄 迭代 {i+1}/{max_iter} 开始")
             # 迭代PG块
-            EPS = 1e-10  # 数值精度阈值
             for sample_id in range(self.n_samples):
                 pg_sol, x_sol, cpower_sol, coc_sol = self.iter_with_pg_block(sample_id=sample_id, theta_values=self.theta_values, zeta_values=self.zeta_values, union_analysis=union_analysis)
                 if pg_sol is None:
                     print("❌ PG块迭代失败，终止迭代")
                     break
-                # 简单数值过滤：绝对值过小的值设为0
-                pg_sol = np.where(np.abs(pg_sol) < EPS, 0, pg_sol)
-                x_sol = np.where(np.abs(x_sol) < EPS, 0, x_sol)
-                x_sol = np.where(np.abs(x_sol - 1) < EPS, 1, x_sol)
                 self.pg[sample_id, :, :] = pg_sol
                 self.x[sample_id, :, :] = x_sol
-                self.cpower[sample_id, :, :] = np.where(np.abs(cpower_sol) < EPS, 0, cpower_sol)
-                self.coc[sample_id, :, :] = np.where(np.abs(coc_sol) < EPS, 0, coc_sol)
+                self.cpower[sample_id, :, :] = cpower_sol
+                self.coc[sample_id, :, :] = coc_sol
 
             # 迭代对偶块
             for sample_id in range(self.n_samples):
@@ -4200,10 +3958,9 @@ class Iter_BCD:
                     print("❌ 对偶块迭代失败，终止迭代")
                     break
                 self.lambda_[sample_id] = lambda_sol
-                # 简单数值过滤：绝对值过小的对偶变量设为0
-                self.mu[sample_id, :, :] = np.where(np.abs(mu_sol) < EPS, 0, mu_sol)
-                self.ita_lower[sample_id, :, :] = np.where(np.abs(ita_lower_sol) < EPS, 0, ita_lower_sol)
-                self.ita_upper[sample_id, :, :] = np.where(np.abs(ita_upper_sol) < EPS, 0, ita_upper_sol)
+                self.mu[sample_id, :, :] = mu_sol
+                self.ita_lower[sample_id, :, :] = ita_lower_sol
+                self.ita_upper[sample_id, :, :] = ita_upper_sol
 
             # 迭代theta块
             theta_value_sol, zeta_value_sol = self.iter_with_theta_block(union_analysis=union_analysis)
@@ -4220,18 +3977,11 @@ class Iter_BCD:
             # 递增\rho
             obj_primal, obj_dual, obj_opt = self.cal_viol(union_analysis=union_analysis)
             
-            # 简单数值过滤：绝对值过小的值设为0
-            EPS = 1e-12
-            obj_primal = obj_primal if abs(obj_primal) >= EPS else 0.0
-            obj_dual = obj_dual if abs(obj_dual) >= EPS else 0.0
-            obj_opt = obj_opt if abs(obj_opt) >= EPS else 0.0
-            
             print(f'obj_primal:{obj_primal}, obj_dual:{obj_dual}, obj_opt:{obj_opt}')
             self.rho_primal += self.gamma * obj_primal
             self.rho_dual += self.gamma * obj_dual
             self.rho_opt += self.gamma * obj_opt
             print(f"当前惩罚参数: ρ_primal={self.rho_primal}, ρ_dual={self.rho_dual}, ρ_opt={self.rho_opt}")
-            print("--------------------------------")
 
             time.sleep(1)
             pass
@@ -4345,23 +4095,13 @@ class Iter_BCD:
                 model, x, sample_id, theta_values, union_analysis
             )
 
-        # if union_analysis is not None and zeta_values is not None:
-        #     model = self._add_parametric_balance_power_penalties_pg_block_solid(
-        #         model, x, sample_id, zeta_values, union_analysis
-        #     )
-                    
         if union_analysis is not None and zeta_values is not None:
-            model, obj_primal, _ = self._add_parametric_balance_power_penalties_pg_block(
+            model = self._add_parametric_balance_power_penalties_pg_block_solid(
                 model, x, sample_id, zeta_values, union_analysis
             )
-        
-        if obj_primal is not None:
-            obj_model = obj + 60 * obj_primal
-        else:
-            obj_model = obj
 
-        # 设置目标函数并优化
-        model.setObjective(obj_model, GRB.MINIMIZE)
+        # 设置目标函数
+        model.setObjective(obj, GRB.MINIMIZE)
 
         model.Params.OutputFlag = 0
         model.Params.MIPGap = 1e-10
@@ -4374,7 +4114,7 @@ class Iter_BCD:
             coc_sol = np.array([[coc[g, t].X for t in range(self.T-1)] for g in range(self.ng)])
 
             if sample_id <= 1:
-                print(f"pg_block, sample_id: {sample_id}, obj: {obj.getValue()}")
+                print(f"pg_block, sample_id: {sample_id}, obj: {model.ObjVal}")
 
             return pg_sol, x_sol, cpower_sol, coc_sol
         else:
@@ -4708,19 +4448,13 @@ class Iter_BCD:
             sol_LP_refined = self.solve_LP_with_theta_constraints(sample_id, self.theta_values, self.zeta_values, self._current_union_analysis)
             x_LP_refined = sol_LP_refined[1]
             
-            differ_LP_sample = np.sum(np.abs(x_LP - self.active_set_data[sample_id]['unit_commitment_matrix']))
-            differ_LP_refined_sample = np.sum(np.abs(x_LP_refined - self.active_set_data[sample_id]['unit_commitment_matrix']))
+            differ_LP += np.sum(np.abs(x_LP - self.active_set_data[sample_id]['unit_commitment_matrix']))
+            differ_LP_refined += np.sum(np.abs(x_LP_refined - self.active_set_data[sample_id]['unit_commitment_matrix']))
 
-            differ_LP_heu_sample = np.sum(np.abs(np.round(x_LP).astype(int) - self.active_set_data[sample_id]['unit_commitment_matrix']))
-            differ_LP_heu_refined_sample = np.sum(np.abs(np.round(x_LP_refined).astype(int) - self.active_set_data[sample_id]['unit_commitment_matrix']))
+            differ_LP_heu += np.sum(np.abs(np.round(x_LP).astype(int) - self.active_set_data[sample_id]['unit_commitment_matrix']))
+            differ_LP_heu_refined += np.sum(np.abs(np.round(x_LP_refined).astype(int) - self.active_set_data[sample_id]['unit_commitment_matrix']))
             
-            differ_spec_heu_sample = np.sum(np.abs(self.heuristic_sol_x_spec(sample_id, x_LP, x_LP_refined) - self.active_set_data[sample_id]['unit_commitment_matrix']))
-            
-            differ_LP += differ_LP_sample
-            differ_LP_refined += differ_LP_refined_sample
-            differ_LP_heu += differ_LP_heu_sample
-            differ_LP_heu_refined += differ_LP_heu_refined_sample
-            differ_spec_heu += differ_spec_heu_sample
+            differ_spec_heu += np.sum(np.abs(self.heuristic_sol_x_spec(sample_id, x_LP, x_LP_refined) - self.active_set_data[sample_id]['unit_commitment_matrix']))
             
         print(f"最优间隙（不含theta约束）: {differ_LP}")
         print(f"最优间隙（含theta约束）: {differ_LP_refined}")      
@@ -4781,7 +4515,7 @@ class Iter_BCD:
             
         
 if __name__ == "__main__":
-    json_file = "result/active_sets_20251221_161355.json" 
+    json_file = "result/active_sets_20251128_115314.json"
     
     active_set_data = load_active_set_from_json(json_file)
     
@@ -4792,9 +4526,9 @@ if __name__ == "__main__":
     T_delta = 1
     # 创建模型对象
 
-    iter_bcd = Iter_BCD(ppc, active_set_data=active_set_data, T_delta=T_delta, use_theta=False, use_zeta=True)
-    # iter_bcd.iter(max_iter=20)  # 运行迭代
-    iter_bcd.load_theta_values('result/theta_values_final_20251202_205941.json')
+    iter_bcd = Iter_BCD(ppc, active_set_data=active_set_data, T_delta=T_delta)
+    iter_bcd.iter(max_iter=20)  # 运行迭代
+    # iter_bcd.load_theta_values('result/theta_values_final_20251129_013032.json')
     iter_bcd.analyse_surrogate_model_totle()
     
-    ## TODO : 目前参数下可能会迭代dual块爆炸，看运气
+    ## TODO : 把theta(branch)约束也改成每个时段一个
