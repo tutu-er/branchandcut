@@ -25,7 +25,7 @@ from src.uc_gurobipy import UnitCommitmentModel
 from src.ed_gurobipy import EconomicDispatchGurobi
 
 class ActiveSetLearner:
-    def __init__(self, alpha=0.05, delta=0.01, epsilon=0.04, ppc=None, T_delta=4, Pd=None):
+    def __init__(self, alpha=0.05, delta=0.01, epsilon=0.04, ppc=None, T_delta=4, Pd=None, case_name=None):
         self.alpha = alpha
         self.delta = delta
         self.epsilon = epsilon
@@ -35,6 +35,7 @@ class ActiveSetLearner:
         self.ppc = ppc
         self.T_delta = T_delta
         self.Pd = Pd
+        self.case_name = case_name
         self._cal_W()  # 计算初始窗口大小
 
     def _cal_W(self):
@@ -104,17 +105,20 @@ class ActiveSetLearner:
     def save_active_sets_json(self, filename=None):
         """保存活动集为JSON格式，紧凑格式减少换行"""
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        
+
         if filename is None:
-            filename = f"active_sets_{timestamp}.json"
-        
+            case_tag = self.case_name if self.case_name else 'unknown'
+            T = self.Pd.shape[1] if self.Pd is not None else 0
+            n = len(self.samples)
+            filename = f"active_sets_{case_tag}_T{T}_n{n}_{timestamp}.json"
+
         # 创建result目录（如果不存在）
         result_dir = Path('result')
         result_dir.mkdir(exist_ok=True)
-        
+
         # 将frozenset转换为list便于JSON序列化
         active_sets_list = [list(active_set) for active_set in self.observed_active_sets]
-        
+
         # 计算活动集大小分布统计
         sizes = [len(active_set) for active_set in self.observed_active_sets]
         size_stats = {}
@@ -125,7 +129,7 @@ class ActiveSetLearner:
                 'avg_size': float(np.mean(sizes)),
                 'std_size': float(np.std(sizes))
             }
-        
+
         # 直接保存所有样本的Pd数据、活动集和对偶变量（一一对应）
         all_samples = []
         for i, (pd_data, active_set, lambda_vals) in enumerate(self.samples):
@@ -135,11 +139,13 @@ class ActiveSetLearner:
                 'active_set': list(active_set),
                 'lambda': lambda_vals  # 新增：保存对偶变量λ
             })
-        
+
         data = {
             'metadata': {
+                'case_name': self.case_name,
                 'total_active_sets': len(self.observed_active_sets),
                 'total_samples': len(self.samples),
+                'T': self.Pd.shape[1] if self.Pd is not None else None,
                 'timestamp': timestamp,
                 'size_statistics': size_stats
             },
@@ -167,7 +173,10 @@ class ActiveSetLearner:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         
         if filename is None:
-            filename = f"active_sets_mapping_{timestamp}.json"
+            case_tag = self.case_name if self.case_name else 'unknown'
+            T = self.Pd.shape[1] if self.Pd is not None else 0
+            n = len(self.samples)
+            filename = f"active_sets_mapping_{case_tag}_T{T}_n{n}_{timestamp}.json"
         
         # 创建result目录（如果不存在）
         result_dir = Path('result')
@@ -248,7 +257,7 @@ if __name__ == "__main__":
     
     ppc['branch'][:, pypower.idx_brch.RATE_A] = ppc['branch'][:, pypower.idx_brch.RATE_A]
     
-    learner = ActiveSetLearner(alpha=0.50, delta=0.05, epsilon=0.20, ppc=ppc, T_delta=1, Pd=Pd)
+    learner = ActiveSetLearner(alpha=0.50, delta=0.05, epsilon=0.20, ppc=ppc, T_delta=1, Pd=Pd, case_name='case9')
     active_sets = learner.run(max_samples=200)
     
     print(f"发现的活动集数量: {len(active_sets)}")
