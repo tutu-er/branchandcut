@@ -702,7 +702,7 @@ class SubproblemSurrogateTrainer:
         self.rho_primal = 1e-2
         self.rho_dual = 1e-2
         self.rho_opt = 1e-2
-        self.gamma = 1e-1
+        self.gamma = 1e-3
         self.mu_lower_bound = 0.1
         self.iter_number = 0
         
@@ -868,6 +868,7 @@ class SubproblemSurrogateTrainer:
 
             # 恢复x：优先用 active_set，否则用 unit_commitment_matrix
             x_init = np.zeros(self.T)
+            _x_source = 'none'
             if 'active_set' in self.active_set_data[sample_id]:
                 active_set = self.active_set_data[sample_id]['active_set']
                 for item in active_set:
@@ -876,10 +877,19 @@ class SubproblemSurrogateTrainer:
                         value = item[1]
                         if g_idx == g:
                             x_init[t] = value
+                _x_source = 'active_set'
             elif 'unit_commitment_matrix' in self.active_set_data[sample_id]:
                 uc = self.active_set_data[sample_id]['unit_commitment_matrix']
-                if g < uc.shape[0]:
+                if isinstance(uc, np.ndarray) and uc.ndim == 2 and g < uc.shape[0]:
                     x_init = uc[g].astype(float)
+                    _x_source = 'unit_commitment_matrix'
+
+            if np.all(x_init == 0) and _x_source != 'none':
+                print(f"  ⚠ 样本 {sample_id} 机组 {g}: x_init 全零（来源={_x_source}），"
+                      f"该机组在所有时段均关机或数据缺失", flush=True)
+            elif _x_source == 'none':
+                print(f"  ⚠ 样本 {sample_id} 机组 {g}: 数据中既无 active_set 也无 "
+                      f"unit_commitment_matrix，x_init 使用全零默认值", flush=True)
 
             # 求解单机组LP（x固定），目标: cost - λᵀpg
             model = gp.Model('init_subproblem_LP')
@@ -925,6 +935,9 @@ class SubproblemSurrogateTrainer:
             if model.status == GRB.OPTIMAL:
                 self.pg[sample_id]     = np.array([pg[t].X     for t in range(self.T)])
                 self.x[sample_id]      = x_init.copy()
+                # 将 JSON 整数解存入 sample，作为 iter_with_primal_block 的持久锚点
+                # （不随 BCD 迭代更新，确保 x_true 始终指向原始 MILP 最优解）
+                self.active_set_data[sample_id]['x_true'] = x_init.copy()
                 self.coc[sample_id]    = np.array([coc[t].X    for t in range(self.T-1)])
                 self.cpower[sample_id] = np.array([cpower[t].X for t in range(self.T)])
 
@@ -2865,9 +2878,9 @@ def main():
         # 配置参数
         case_name = 'case30'  # 可选: 'case14', 'case30', 'case39'
         n_samples = 20
-        T = 8
+        T = 24
         T_delta = 1.0
-        unit_ids = None  # None表示所有机组，或指定如 [0, 1, 2]
+        unit_ids = [0]  # None表示所有机组，或指定如 [0, 1, 2]
         save_dir = result_dir  # 使用绝对路径
         
         # 训练参数

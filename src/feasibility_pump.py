@@ -17,7 +17,7 @@ from typing import Dict, List, Optional, Tuple
 from pypower.ext2int import ext2int
 from pypower.idx_gen import GEN_BUS, PMIN, PMAX
 
-from src.uc_NN_subproblem_v3 import SubproblemSurrogateTrainer
+from uc_NN_subproblem_v3 import SubproblemSurrogateTrainer
 
 
 # ========================== Step 1：整数恢复启发式 ==========================

@@ -153,7 +153,7 @@ class ActiveSetReader:
 def load_active_set_from_json(json_filepath: str, sample_id: Optional[int] = None):
     """从JSON文件加载活动集数据"""
     reader = ActiveSetReader(json_filepath)
-    
+
     if sample_id is not None:
         active_constraints, active_variables, pd_data = reader.extract_active_constraints_and_variables(sample_id)
         unit_commitment = reader.get_unit_commitment_matrix(sample_id)
@@ -166,6 +166,30 @@ def load_active_set_from_json(json_filepath: str, sample_id: Optional[int] = Non
         }
     else:
         return reader.load_all_samples()
+
+
+def _extract_lambda_power_balance(lambda_field, T: int) -> np.ndarray:
+    """从样本的 lambda 字段中提取功率平衡对偶变量 (T,) 数组。
+    支持三种格式：
+      - list/ndarray: 直接使用
+      - dict with 'lambda_power_balance' key: 提取该字段
+      - dict without that key: 取第一个 list 值
+    """
+    if isinstance(lambda_field, dict):
+        if 'lambda_power_balance' in lambda_field:
+            arr = np.array(lambda_field['lambda_power_balance'], dtype=float)
+        else:
+            for v in lambda_field.values():
+                if isinstance(v, list):
+                    arr = np.array(v, dtype=float)
+                    break
+            else:
+                return np.zeros(T)
+    else:
+        arr = np.array(lambda_field, dtype=float)
+    if arr.ndim != 1 or len(arr) != T:
+        return np.zeros(T)
+    return arr
 
 
 # ========================== 第一部分：对偶变量预测网络 ==========================
@@ -269,86 +293,78 @@ class DualVariablePredictorTrainer:
         print(f"  - 输入维度: {self.input_dim}, 输出维度: {self.output_dim}", flush=True)
     
     def _solve_for_true_dual_variables(self) -> np.ndarray:
-        """求解UC问题获取功率平衡约束的对偶变量真值"""
+        """获取功率平衡约束的对偶变量真值λ
+
+        优化策略：
+        1. 如果JSON有lambda → 直接读取（0次求解）
+        2. 如果JSON没有lambda → 从active_set提取x，求解ED（LP）获取（不需要MILP）
+        """
         lambda_true = []
-        
+        needs_solve = []
+
+        # 检查JSON中是否已有lambda
         for sample_id in range(self.n_samples):
-            Pd = self.active_set_data[sample_id]['pd_data']
-            model = gp.Model('uc_for_dual')
-            model.Params.OutputFlag = 0
-            
-            # 变量
-            pg = model.addVars(self.ng, self.T, lb=0, name='pg')
-            x = model.addVars(self.ng, self.T, vtype=GRB.BINARY, name='x')
-            coc = model.addVars(self.ng, self.T-1, lb=0, name='coc')
-            cpower = model.addVars(self.ng, self.T, lb=0, name='cpower')
-            
-            # 功率平衡约束
-            for t in range(self.T):
-                model.addConstr(
-                    gp.quicksum(pg[g, t] for g in range(self.ng)) == np.sum(Pd[:, t]),
-                    name=f'power_balance_{t}'
-                )
-            
-            # 发电上下限约束
-            for g in range(self.ng):
-                for t in range(self.T):
-                    model.addConstr(pg[g, t] >= self.gen[g, PMIN] * x[g, t], name=f'pg_lower_{g}_{t}')
-                    model.addConstr(pg[g, t] <= self.gen[g, PMAX] * x[g, t], name=f'pg_upper_{g}_{t}')
-            
-            # 爬坡约束
-            Ru = 0.4 * self.gen[:, PMAX] / self.T_delta
-            Rd = 0.4 * self.gen[:, PMAX] / self.T_delta
-            for g in range(self.ng):
-                for t in range(1, self.T):
-                    model.addConstr(pg[g, t] - pg[g, t-1] <= Ru[g] * x[g, t-1] + self.gen[g, PMAX] * (1 - x[g, t-1]))
-                    model.addConstr(pg[g, t-1] - pg[g, t] <= Rd[g] * x[g, t] + self.gen[g, PMAX] * (1 - x[g, t]))
-            
-            # 最小开关机时间约束
-            Ton = min(4, self.T)
-            Toff = min(4, self.T)
-            for g in range(self.ng):
-                for tau in range(1, Ton+1):
-                    for t1 in range(self.T - tau):
-                        model.addConstr(x[g, t1+1] - x[g, t1] <= x[g, t1+tau])
-                for tau in range(1, Toff+1):
-                    for t1 in range(self.T - tau):
-                        model.addConstr(-x[g, t1+1] + x[g, t1] <= 1 - x[g, t1+tau])
-            
-            # 启停成本
-            start_cost = self.gencost[:, 1]
-            shut_cost = self.gencost[:, 2]
-            for t in range(1, self.T):
-                for g in range(self.ng):
-                    model.addConstr(coc[g, t-1] >= start_cost[g] * (x[g, t] - x[g, t-1]))
-                    model.addConstr(coc[g, t-1] >= shut_cost[g] * (x[g, t-1] - x[g, t]))
-            
-            # 发电成本
-            for t in range(self.T):
-                for g in range(self.ng):
-                    model.addConstr(cpower[g, t] >= self.gencost[g, -2]/self.T_delta * pg[g, t] + 
-                                  self.gencost[g, -1]/self.T_delta * x[g, t])
-            
-            # 目标函数
-            obj = (gp.quicksum(cpower[g, t] for g in range(self.ng) for t in range(self.T)) +
-                   gp.quicksum(coc[g, t] for g in range(self.ng) for t in range(self.T-1)))
-            model.setObjective(obj, GRB.MINIMIZE)
-            model.optimize()
-            
-            if model.status == GRB.OPTIMAL:
-                lambda_sample = np.zeros(self.T)
-                for t in range(self.T):
-                    constr = model.getConstrByName(f'power_balance_{t}')
-                    if constr is not None:
-                        try:
-                            lambda_sample[t] = constr.Pi
-                        except:
-                            lambda_sample[t] = 0.0
-                lambda_true.append(lambda_sample)
+            if 'lambda' in self.active_set_data[sample_id] and \
+               self.active_set_data[sample_id]['lambda'] is not None:
+                lam = _extract_lambda_power_balance(
+                    self.active_set_data[sample_id]['lambda'], self.T)
+                lambda_true.append(lam)
             else:
-                lambda_true.append(np.zeros(self.T))
-        
-        return np.array(lambda_true)
+                needs_solve.append(sample_id)
+
+        # 如果所有样本都有lambda，直接返回
+        if not needs_solve:
+            print(f"✓ 从数据中读取了 {len(lambda_true)} 个样本的 lambda 真值", flush=True)
+            return np.array(lambda_true)
+
+        # 否则通过求解LP获取缺失的lambda
+        print(f"⚠ {len(needs_solve)} 个样本缺少 lambda，从 active_set 提取 x 并求解 LP...", flush=True)
+
+        # 构建完整的lambda_true字典（按sample_id索引）
+        lambda_dict = {}
+        already_loaded = [i for i in range(self.n_samples) if i not in needs_solve]
+        for idx, sample_id in enumerate(already_loaded):
+            lambda_dict[sample_id] = lambda_true[idx]
+
+        for sample_id in needs_solve:
+            Pd = self.active_set_data[sample_id]['pd_data']
+
+            # 恢复x矩阵：优先用 active_set，否则用 unit_commitment_matrix
+            x_sol = np.zeros((self.ng, self.T))
+            if 'active_set' in self.active_set_data[sample_id]:
+                active_set = self.active_set_data[sample_id]['active_set']
+                for item in active_set:
+                    if isinstance(item, list) and len(item) == 2 and isinstance(item[0], list):
+                        g, t = item[0]
+                        value = item[1]
+                        x_sol[g, t] = value
+            elif 'unit_commitment_matrix' in self.active_set_data[sample_id]:
+                uc = self.active_set_data[sample_id]['unit_commitment_matrix']
+                x_sol[:uc.shape[0], :] = uc
+
+            # 用x求解ED（LP），获取对偶变量
+            from ed_cvxpy import EconomicDispatchCVXPY
+            ed = EconomicDispatchCVXPY(self.ppc, Pd, self.T_delta, x_sol)
+            pg_sol, total_cost = ed.solve()
+
+            # 提取功率平衡约束的对偶变量λ（前T个约束）
+            lambda_sample = np.zeros(self.T)
+            for t in range(self.T):
+                dual_val = ed.constraints[t].dual_value
+                if dual_val is None:
+                    lambda_sample[t] = 0.0
+                else:
+                    lambda_sample[t] = float(dual_val)
+
+            lambda_dict[sample_id] = lambda_sample
+
+        n_loaded = len(already_loaded)
+        n_solved = len(needs_solve)
+        print(f"✓ 成功获取所有 {self.n_samples} 个样本的 lambda"
+              f"（{n_loaded} 个从JSON读取，{n_solved} 个求解LP获得）", flush=True)
+
+        # 按sample_id顺序返回
+        return np.array([lambda_dict[i] for i in range(self.n_samples)])
     
     def _extract_features(self, sample_id: int) -> np.ndarray:
         """提取Pd数据作为特征"""

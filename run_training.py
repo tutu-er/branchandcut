@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-V3 三时段耦合约束训练脚本
-- 支持从 JSON 数据文件加载，或自动生成测试数据
-- 使用 uc_NN_subproblem_v3 中的训练函数
+训练脚本（多模式）
+- surrogate:        V3 三时段代理约束训练（uc_NN_subproblem_v3）
+- bcd:              BCD 主代理训练（uc_NN_BCD，Agent_NN_BCD）
+- feasibility_pump: 代理训练后运行可行性泵测试（feasibility_pump）
+
+修改顶部的 MODE 变量切换执行模式。
 """
 
 import sys
@@ -46,19 +49,27 @@ def check_and_install_dependencies():
 if not check_and_install_dependencies():
     sys.exit(1)
 
+# ──────────────────────── 模式配置 ────────────────────────
+#
+#   'surrogate'        - V3 三时段代理约束训练
+#   'bcd'              - BCD 主代理训练（Agent_NN_BCD）
+#   'feasibility_pump' - 代理训练 + 可行性泵整数解恢复测试
+#
+MODE = 'surrogate'
+
 # ──────────────────────── 导入 ────────────────────────
 
 import numpy as np
 
-# 添加源码路径
-sys.path.insert(0, str(Path(__file__).parent / 'src'))
+# 添加 src/ 到模块搜索路径
+_ROOT = Path(__file__).parent
+sys.path.insert(0, str(_ROOT / 'src'))
 
 try:
     import pypower.case14
     import pypower.case30
     import pypower.case39
     from uc_NN_subproblem_v3 import (
-        generate_test_data,
         train_dual_predictor_from_data,
         train_subproblem_surrogate_from_data,
         train_complete_model,
@@ -68,6 +79,22 @@ except ImportError as e:
     print(f"模块导入失败: {e}")
     print("请确保在项目根目录运行此脚本，且 src/ 目录存在")
     sys.exit(1)
+
+# BCD 模式额外导入
+if MODE == 'bcd':
+    try:
+        from uc_NN_BCD import load_active_set_from_json, Agent_NN_BCD
+    except ImportError as e:
+        print(f"BCD 模块导入失败: {e}")
+        sys.exit(1)
+
+# 可行性泵模式额外导入
+if MODE == 'feasibility_pump':
+    try:
+        from feasibility_pump import recover_integer_solution
+    except ImportError as e:
+        print(f"feasibility_pump 模块导入失败: {e}")
+        sys.exit(1)
 
 # ──────────────────────── 工具函数 ────────────────────────
 
@@ -88,29 +115,152 @@ def load_json_data(data_file: Path) -> list:
 
     log(f"  原始样本数: {len(all_samples)}")
 
-    # 规范化每个样本
     for sample in all_samples:
-        # pd_data: list → numpy array
         if isinstance(sample.get('pd_data'), list):
             sample['pd_data'] = np.array(sample['pd_data'], dtype=float)
-        # lambda: dict → 确保 v3 可以解析（保持原样，v3 内部用 _extract_lambda_power_balance 处理）
-        # active_set 保持原样（v3 _initialize_solve 可处理整数索引列表，不提取 x 就用全零）
 
     return all_samples
 
 
 def pick_data_file(result_dir: Path, case_name: str) -> Path:
     """按优先级查找最合适的数据文件。"""
-    # 优先找 case 专属文件
     specific = sorted(result_dir.glob(f'active_sets_{case_name}_*.json'))
     if specific:
-        return specific[-1]   # 取最新的
-    # 退而求其次找任意文件
+        return specific[-1]
     any_files = sorted(result_dir.glob('active_sets_*.json'))
     if any_files:
         log(f"未找到 {case_name} 专属文件，使用: {any_files[-1].name}")
         return any_files[-1]
     return None
+
+
+# ──────────────────────── 模式实现 ────────────────────────
+
+def run_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS,
+                  DUAL_EPOCHS, DUAL_BATCH_SIZE, MAX_ITER, NN_EPOCHS, save_dir):
+    """V3 代理约束训练，返回 (dual_predictor, trainers)。"""
+    n_samples = len(all_samples)
+    print("\n" + "=" * 70)
+    log(f"开始代理训练: {n_samples} 样本，dual_epochs={DUAL_EPOCHS}，"
+        f"bcd_iter={MAX_ITER}，nn_epochs={NN_EPOCHS}")
+    print("=" * 70)
+
+    dual_predictor, trainers = train_complete_model(
+        ppc, all_samples, T_delta=T_DELTA,
+        unit_ids=UNIT_IDS,
+        dual_epochs=DUAL_EPOCHS,
+        dual_batch_size=DUAL_BATCH_SIZE,
+        surrogate_max_iter=MAX_ITER,
+        surrogate_nn_epochs=NN_EPOCHS,
+        save_dir=save_dir,
+    )
+    return dual_predictor, trainers
+
+
+def print_surrogate_results(trainers, all_samples):
+    """打印代理训练结果摘要。"""
+    n_samples = len(all_samples)
+    print("\n" + "=" * 70)
+    log("训练结果验证")
+    print("=" * 70)
+
+    for unit_id, trainer in trainers.items():
+        T = trainer.T
+        nc = trainer.num_coupling_constraints
+        print(f"\n机组 {unit_id}:")
+        print(f"  alpha_values shape: {trainer.alpha_values.shape}  "
+              f"(期望: ({n_samples}, {nc}))")
+        print(f"  beta_values  shape: {trainer.beta_values.shape}")
+        print(f"  gamma_values shape: {trainer.gamma_values.shape}")
+        print(f"  delta_values shape: {trainer.delta_values.shape}  (RHS，非负)")
+
+        print(f"  样本0 时序约束示例（最多5条）:")
+        x0 = trainer.x[0]
+        for t in range(min(5, nc)):
+            if t + 2 >= T:
+                break
+            a = trainer.alpha_values[0, t]
+            b = trainer.beta_values[0, t]
+            g = trainer.gamma_values[0, t]
+            d = trainer.delta_values[0, t]
+            lhs = a * x0[t] + b * x0[t + 1] + g * x0[t + 2]
+            viol = max(0.0, lhs - d)
+            print(f"    t={t}: {a:.3f}*x[{t}] + {b:.3f}*x[{t+1}] "
+                  f"+ {g:.3f}*x[{t+2}] <= {d:.3f}  "
+                  f"(lhs={lhs:.3f}, viol={viol:.4f})")
+
+        integrality = float(np.sum(x0 * (1 - x0)))
+        print(f"  整数性指标(样本0): {integrality:.6f}  (0=完全整数)")
+
+
+def run_bcd(ppc, data_file, MAX_SAMPLES, T_DELTA, MAX_ITER, result_dir):
+    """BCD 主代理训练，返回 Agent_NN_BCD 实例。"""
+    log("模式: BCD 主代理训练（Agent_NN_BCD）")
+    log(f"通过 ActiveSetReader 加载数据: {data_file.name}")
+
+    all_samples_bcd = load_active_set_from_json(str(data_file))
+    if MAX_SAMPLES and len(all_samples_bcd) > MAX_SAMPLES:
+        log(f"  截取前 {MAX_SAMPLES} 个样本（共 {len(all_samples_bcd)}）")
+        all_samples_bcd = all_samples_bcd[:MAX_SAMPLES]
+    log(f"  使用 {len(all_samples_bcd)} 个样本")
+
+    print("\n" + "=" * 70)
+    log(f"初始化 Agent_NN_BCD，max_iter={MAX_ITER}")
+    print("=" * 70)
+
+    agent = Agent_NN_BCD(ppc, all_samples_bcd, T_DELTA)
+
+    print("\n" + "=" * 70)
+    log("开始 BCD 迭代训练")
+    print("=" * 70)
+
+    agent.iter(max_iter=MAX_ITER)
+
+    # 保存模型
+    save_path = str(result_dir / 'bcd_model')
+    try:
+        agent.save_model_parameters(save_path)
+        log(f"BCD 模型参数保存至: {save_path}")
+    except Exception as e:
+        log(f"模型保存失败（非致命）: {e}")
+
+    return agent
+
+
+def run_feasibility_pump_test(ppc, all_samples, dual_predictor, trainers,
+                               T_DELTA, FP_TEST_SAMPLES):
+    """对多个样本运行可行性泵并汇总结果。"""
+    test_n = min(FP_TEST_SAMPLES, len(all_samples))
+    print("\n" + "=" * 70)
+    log(f"可行性泵测试: {test_n} 个样本")
+    print("=" * 70)
+
+    results = []
+    for i in range(test_n):
+        sample = all_samples[i]
+        pd_data = sample['pd_data']   # (nb, T)
+        log(f"  样本 {i + 1}/{test_n}，pd_data shape={pd_data.shape}")
+        try:
+            x_result, success = recover_integer_solution(
+                pd_data, trainers, dual_predictor, ppc, T_DELTA,
+                verbose=True,
+            )
+        except Exception as e:
+            log(f"    异常: {e}")
+            import traceback
+            traceback.print_exc()
+            results.append((i, False, None))
+            continue
+
+        status = "成功" if success else "失败"
+        log(f"    可行性泵结果: {status}")
+        results.append((i, success, x_result))
+
+    n_success = sum(1 for _, s, _ in results if s)
+    print("\n" + "=" * 70)
+    log(f"可行性泵完成: {n_success}/{test_n} 样本找到可行解")
+    print("=" * 70)
+    return results
 
 
 # ──────────────────────── 主函数 ────────────────────────
@@ -119,19 +269,19 @@ def main():
     start_time = time.time()
 
     print("=" * 70)
-    print("V3 三时段耦合约束训练脚本")
+    print(f"训练脚本  模式: {MODE}")
     print("=" * 70)
 
     # ── 配置 ──────────────────────────────────────────────
     CASE_NAME       = 'case30'      # 'case14' / 'case30' / 'case39'
-    USE_JSON_DATA   = True          # True=从 JSON 加载；False=自动生成测试数据
     MAX_SAMPLES     = 30            # 最多使用多少个样本（None=全部）
     T_DELTA         = 1.0
     DUAL_EPOCHS     = 50
     DUAL_BATCH_SIZE = 8
-    MAX_ITER        = 20            # BCD 迭代次数
-    NN_EPOCHS       = 50            # 每次 BCD 迭代中 NN 训练轮数
+    MAX_ITER        = 20            # 迭代次数（BCD / surrogate BCD 轮数）
+    NN_EPOCHS       = 50            # surrogate 模式每次 BCD 迭代的 NN 训练轮数
     UNIT_IDS        = None          # None = 所有机组；或如 [0, 1, 2]
+    FP_TEST_SAMPLES = 3             # feasibility_pump 模式：测试样本数
 
     result_dir = Path(__file__).parent / 'result'
     result_dir.mkdir(exist_ok=True)
@@ -152,91 +302,56 @@ def main():
     n_buses = ppc['bus'].shape[0]
     log(f"  {n_units} 机组，{n_buses} 节点")
 
-    # ── 准备数据 ─────────────────────────────────────────
-    if USE_JSON_DATA:
-        data_file = pick_data_file(result_dir, CASE_NAME)
-        if data_file is None:
-            log("未找到 JSON 数据文件，改为自动生成测试数据")
-            USE_JSON_DATA = False
+    # ── 查找数据文件 ─────────────────────────────────────
+    data_file = pick_data_file(result_dir, CASE_NAME)
+    if data_file is None:
+        log(f"错误: 在 {result_dir} 中未找到 {CASE_NAME} 的 JSON 数据文件。")
+        log("请先运行 ActiveSetLearner 生成数据，或在 result/ 目录下放置")
+        log(f"命名为 active_sets_{CASE_NAME}_*.json 的数据文件后重试。")
+        sys.exit(1)
 
-    if USE_JSON_DATA:
-        all_samples = load_json_data(data_file)
-        if MAX_SAMPLES and len(all_samples) > MAX_SAMPLES:
-            log(f"  截取前 {MAX_SAMPLES} 个样本（共 {len(all_samples)}）")
-            all_samples = all_samples[:MAX_SAMPLES]
-        T_from_data = all_samples[0]['pd_data'].shape[1]
-        log(f"  样本 T={T_from_data}，使用 {len(all_samples)} 个样本")
-    else:
-        T_GEN = 8
-        N_GEN = 20
-        log(f"自动生成 {N_GEN} 个测试样本 (T={T_GEN})")
-        all_samples = generate_test_data(ppc, T=T_GEN, n_samples=N_GEN)
-
-    n_samples = len(all_samples)
-
-    # ── 训练 ─────────────────────────────────────────────
-    print("\n" + "=" * 70)
-    log(f"开始完整训练: {n_samples} 样本，dual_epochs={DUAL_EPOCHS}，"
-        f"bcd_iter={MAX_ITER}，nn_epochs={NN_EPOCHS}")
-    print("=" * 70)
-
+    # ── 执行模式分支 ─────────────────────────────────────
     try:
-        dual_predictor, trainers = train_complete_model(
-            ppc, all_samples, T_delta=T_DELTA,
-            unit_ids=UNIT_IDS,
-            dual_epochs=DUAL_EPOCHS,
-            dual_batch_size=DUAL_BATCH_SIZE,
-            surrogate_max_iter=MAX_ITER,
-            surrogate_nn_epochs=NN_EPOCHS,
-            save_dir=save_dir,
-        )
+        if MODE == 'bcd':
+            # BCD 通过 ActiveSetReader 加载（含 unit_commitment_matrix）
+            run_bcd(ppc, data_file, MAX_SAMPLES, T_DELTA, MAX_ITER, result_dir)
+
+        elif MODE in ('surrogate', 'feasibility_pump'):
+            # 加载并规范化样本（v3 格式）
+            all_samples = load_json_data(data_file)
+            if MAX_SAMPLES and len(all_samples) > MAX_SAMPLES:
+                log(f"  截取前 {MAX_SAMPLES} 个样本（共 {len(all_samples)}）")
+                all_samples = all_samples[:MAX_SAMPLES]
+            T_from_data = all_samples[0]['pd_data'].shape[1]
+            log(f"  样本 T={T_from_data}，使用 {len(all_samples)} 个样本")
+
+            # 代理约束训练（两个模式都需要）
+            dual_predictor, trainers = run_surrogate(
+                ppc, all_samples, T_DELTA, UNIT_IDS,
+                DUAL_EPOCHS, DUAL_BATCH_SIZE, MAX_ITER, NN_EPOCHS, save_dir,
+            )
+            print_surrogate_results(trainers, all_samples)
+
+            if MODE == 'feasibility_pump':
+                run_feasibility_pump_test(
+                    ppc, all_samples, dual_predictor, trainers,
+                    T_DELTA, FP_TEST_SAMPLES,
+                )
+
+        else:
+            log(f"未知模式: '{MODE}'，可选: 'surrogate' | 'bcd' | 'feasibility_pump'")
+            sys.exit(1)
+
     except Exception as e:
-        log(f"训练失败: {e}")
+        log(f"执行失败: {e}")
         import traceback
         traceback.print_exc()
         sys.exit(1)
 
-    # ── 验证结果（V3 参数语义）──────────────────────────
-    print("\n" + "=" * 70)
-    log("训练结果验证")
-    print("=" * 70)
-
-    for unit_id, trainer in trainers.items():
-        T = trainer.T
-        nc = trainer.num_coupling_constraints
-        print(f"\n机组 {unit_id}:")
-        print(f"  alpha_values shape: {trainer.alpha_values.shape}  "
-              f"(期望: ({n_samples}, {nc}))")
-        print(f"  beta_values  shape: {trainer.beta_values.shape}")
-        print(f"  gamma_values shape: {trainer.gamma_values.shape}")
-        print(f"  delta_values shape: {trainer.delta_values.shape}  (RHS，非负)")
-
-        # 显示样本0的前几条约束（V3：alpha*x[t] + beta*x[t+1] + gamma*x[t+2] <= delta）
-        print(f"  样本0 时序约束示例（最多5条）:")
-        x0 = trainer.x[0]
-        for t in range(min(5, nc)):
-            if t + 2 >= T:
-                break
-            a = trainer.alpha_values[0, t]
-            b = trainer.beta_values[0, t]
-            g = trainer.gamma_values[0, t]
-            d = trainer.delta_values[0, t]
-            lhs = a * x0[t] + b * x0[t + 1] + g * x0[t + 2]
-            viol = max(0.0, lhs - d)
-            print(f"    t={t}: {a:.3f}*x[{t}] + {b:.3f}*x[{t+1}] "
-                  f"+ {g:.3f}*x[{t+2}] <= {d:.3f}  "
-                  f"(lhs={lhs:.3f}, viol={viol:.4f})")
-
-        # 整数性指标
-        integrality = float(np.sum(x0 * (1 - x0)))
-        print(f"  整数性指标(样本0): {integrality:.6f}  (0=完全整数)")
-
     # ── 汇总 ─────────────────────────────────────────────
     total_time = time.time() - start_time
     print("\n" + "=" * 70)
-    log(f"训练完成！共 {len(trainers)} 个机组，"
-        f"耗时 {total_time/60:.1f} 分钟")
-    log(f"模型保存至: {save_dir}")
+    log(f"完成！模式={MODE}，耗时 {total_time / 60:.1f} 分钟")
     print("=" * 70)
 
 

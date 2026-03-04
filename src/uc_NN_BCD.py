@@ -296,6 +296,25 @@ def load_active_set_from_json(json_filepath: str, sample_id: Optional[int] = Non
         return all_samples_data
 
 
+def _get_uc_matrix_from_sample(sample: dict, ng: int, T: int) -> Optional[np.ndarray]:
+    """从样本数据中提取 unit_commitment 矩阵 (ng, T)。
+    优先读 unit_commitment_matrix，若无则从 active_set 解析，返回 np.ndarray(ng, T) 或 None。
+    """
+    uc = sample.get('unit_commitment_matrix', None)
+    if isinstance(uc, np.ndarray) and uc.ndim == 2 and uc.shape == (ng, T):
+        return uc
+    # 从 active_set 解析
+    if 'active_set' in sample:
+        x_sol = np.zeros((ng, T))
+        for item in sample['active_set']:
+            if isinstance(item, list) and len(item) == 2 and isinstance(item[0], list):
+                g, t = item[0]
+                if 0 <= g < ng and 0 <= t < T:
+                    x_sol[g, t] = item[1]
+        return x_sol
+    return None
+
+
 class Agent_NN_BCD:
     """
     结合BCD迭代和神经网络更新的混合方法
@@ -381,118 +400,209 @@ class Agent_NN_BCD:
             self.theta_net = None
             self.zeta_net = None
             self.device = None
-    
+
+    def _solve_lp_with_fixed_x(self, Pd: np.ndarray, x_vals: np.ndarray):
+        """以固定 x 矩阵构建纯 LP，求解后返回连续变量解和对偶变量字典。
+
+        Args:
+            Pd: 负荷矩阵 (nb, T)
+            x_vals: 固定的机组启停矩阵 (ng, T)，取值 0 或 1
+
+        Returns:
+            (pg_sol, coc_sol, cpower_sol, lambda_dict) 或 (None, None, None, None) 若失败
+        """
+        try:
+            lp = gp.Model('lp_fixed_x')
+            lp.Params.OutputFlag = 0
+
+            pg = lp.addVars(self.ng, self.T, lb=0, name='pg')
+            coc = lp.addVars(self.ng, self.T - 1, lb=0, name='coc')
+            cpower = lp.addVars(self.ng, self.T, lb=0, name='cpower')
+
+            # 功率平衡约束
+            for t in range(self.T):
+                lp.addConstr(
+                    gp.quicksum(pg[g, t] for g in range(self.ng)) == np.sum(Pd[:, t]),
+                    name=f'power_balance_{t}'
+                )
+
+            # 发电上下限约束（x 为常数）
+            for g in range(self.ng):
+                for t in range(self.T):
+                    xgt = float(x_vals[g, t])
+                    lp.addConstr(pg[g, t] >= self.gen[g, PMIN] * xgt, name=f'pg_lower_{g}_{t}')
+                    lp.addConstr(pg[g, t] <= self.gen[g, PMAX] * xgt, name=f'pg_upper_{g}_{t}')
+
+            # 爬坡约束（x 为常数）
+            Ru = 0.4 * self.gen[:, PMAX] / self.T_delta
+            Rd = 0.4 * self.gen[:, PMAX] / self.T_delta
+            for g in range(self.ng):
+                for t in range(1, self.T):
+                    rhs_up = Ru[g] * float(x_vals[g, t - 1]) + self.gen[g, PMAX] * (1 - float(x_vals[g, t - 1]))
+                    rhs_dn = Rd[g] * float(x_vals[g, t]) + self.gen[g, PMAX] * (1 - float(x_vals[g, t]))
+                    lp.addConstr(pg[g, t] - pg[g, t - 1] <= rhs_up, name=f'ramp_up_{g}_{t}')
+                    lp.addConstr(pg[g, t - 1] - pg[g, t] <= rhs_dn, name=f'ramp_down_{g}_{t}')
+
+            # 启停成本约束（x 为常数）
+            start_cost = self.gencost[:, 1]
+            shut_cost = self.gencost[:, 2]
+            for t in range(1, self.T):
+                for g in range(self.ng):
+                    xg_t = float(x_vals[g, t])
+                    xg_t1 = float(x_vals[g, t - 1])
+                    lp.addConstr(coc[g, t - 1] >= start_cost[g] * (xg_t - xg_t1), name=f'start_cost_{g}_{t}')
+                    lp.addConstr(coc[g, t - 1] >= shut_cost[g] * (xg_t1 - xg_t), name=f'shut_cost_{g}_{t}')
+                    lp.addConstr(coc[g, t - 1] >= 0, name=f'coc_nonneg_{g}_{t}')
+
+            # 发电成本约束（x 为常数）
+            for t in range(self.T):
+                for g in range(self.ng):
+                    xgt = float(x_vals[g, t])
+                    lp.addConstr(
+                        cpower[g, t] >= self.gencost[g, -2] / self.T_delta * pg[g, t] +
+                        self.gencost[g, -1] / self.T_delta * xgt,
+                        name=f'cpower_{g}_{t}'
+                    )
+
+            # 目标函数
+            obj = (gp.quicksum(cpower[g, t] for g in range(self.ng) for t in range(self.T)) +
+                   gp.quicksum(coc[g, t] for g in range(self.ng) for t in range(self.T - 1)))
+            lp.setObjective(obj, GRB.MINIMIZE)
+            lp.optimize()
+
+            if lp.status == GRB.OPTIMAL:
+                pg_sol = np.array([[pg[g, t].X for t in range(self.T)] for g in range(self.ng)])
+                coc_sol = np.array([[coc[g, t].X for t in range(self.T - 1)] for g in range(self.ng)])
+                cpower_sol = np.array([[cpower[g, t].X for t in range(self.T)] for g in range(self.ng)])
+                lambda_dict = self.extract_dual_variables_as_arrays(lp)
+                return pg_sol, coc_sol, cpower_sol, lambda_dict
+            else:
+                return None, None, None, None
+        except Exception as e:
+            print(f"❌ _solve_lp_with_fixed_x 失败: {e}", flush=True)
+            return None, None, None, None
+
     def initialize_solve(self):
-        """初始化求解，获得初始x和lambda（参考uc_dfsm_bcd.py）"""
+        """初始化求解，获得初始x和lambda（参考uc_dfsm_bcd.py）
+
+        策略：
+        1. 若数据集中有 unit_commitment_matrix → 直接用，跳过 MILP
+        2. 若无 → 求解 MILP 获取 x
+        3. 无论哪种情况，用固定 x 的 LP 获取对偶变量（MILP 不返回有效对偶变量）
+        """
         pg_sol = []
         x_sol = []
         coc_sol = []
         cpower_sol = []
         lambda_sol = []
-        
+
         for sample_id in range(self.n_samples):
             Pd = self.active_set_data[sample_id]['pd_data']
-            model = gp.Model('initial_solve')
-            model.Params.OutputFlag = 0
-            
-            # 主要变量
-            pg = model.addVars(self.ng, self.T, lb=0, name='pg')
-            x = model.addVars(self.ng, self.T, vtype=GRB.BINARY, name='x')
-            coc = model.addVars(self.ng, self.T-1, lb=0, name='coc')
-            cpower = model.addVars(self.ng, self.T, lb=0, name='cpower')
-            
-            # 功率平衡约束
-            for t in range(self.T):
-                model.addConstr(
-                    gp.quicksum(pg[g, t] for g in range(self.ng)) == gp.quicksum(Pd[:, t]),
-                    name=f'power_balance_{t}'
-                )
-            
-            # 发电上下限约束
-            for g in range(self.ng):
-                for t in range(self.T):
-                    model.addConstr(pg[g, t] >= self.gen[g, PMIN] * x[g, t], name=f'pg_lower_{g}_{t}')
-                    model.addConstr(pg[g, t] <= self.gen[g, PMAX] * x[g, t], name=f'pg_upper_{g}_{t}')
-            
-            # 爬坡约束
-            Ru = 0.4 * self.gen[:, PMAX] / self.T_delta
-            Rd = 0.4 * self.gen[:, PMAX] / self.T_delta
-            for g in range(self.ng):
-                for t in range(1, self.T):
-                    model.addConstr(pg[g, t] - pg[g, t-1] <= Ru[g] * x[g, t-1] + self.gen[g, PMAX] * (1 - x[g, t-1]), 
-                                  name=f'ramp_up_{g}_{t}')
-                    model.addConstr(pg[g, t-1] - pg[g, t] <= Rd[g] * x[g, t] + self.gen[g, PMAX] * (1 - x[g, t]), 
-                                  name=f'ramp_down_{g}_{t}')
-            
-            # 最小开关机时间约束
-            Ton = min(4, self.T)
-            Toff = min(4, self.T)
-            for g in range(self.ng):
-                for t in range(1, Ton+1):
-                    for t1 in range(self.T - t):
-                        model.addConstr(x[g, t1+1] - x[g, t1] <= x[g, t1+t], name=f'min_on_{g}_{t}_{t1}')
-            for g in range(self.ng):
-                for t in range(1, Toff+1):
-                    for t1 in range(self.T - t):
-                        model.addConstr(-x[g, t1+1] + x[g, t1] <= 1 - x[g, t1+t], name=f'min_off_{g}_{t}_{t1}')
-            
-            # 启停成本
-            start_cost = self.gencost[:, 1]
-            shut_cost = self.gencost[:, 2]
-            for t in range(1, self.T):
-                for g in range(self.ng):
-                    model.addConstr(coc[g, t-1] >= start_cost[g] * (x[g, t] - x[g, t-1]), name=f'start_cost_{g}_{t}')
-                    model.addConstr(coc[g, t-1] >= shut_cost[g] * (x[g, t-1] - x[g, t]), name=f'shut_cost_{g}_{t}')
-                    model.addConstr(coc[g, t-1] >= 0, name=f'coc_nonneg_{g}_{t}')
-            
-            # 发电成本
-            for t in range(self.T):
-                for g in range(self.ng):
-                    model.addConstr(cpower[g, t] >= self.gencost[g, -2]/self.T_delta * pg[g, t] + self.gencost[g, -1]/self.T_delta * x[g, t],
-                                  name=f'cpower_{g}_{t}')
-            
-            # 目标函数
-            primal_obj = (gp.quicksum(cpower[g, t] for g in range(self.ng) for t in range(self.T)) +
-                         gp.quicksum(coc[g, t] for g in range(self.ng) for t in range(self.T-1)))
-            model.setObjective(primal_obj, GRB.MINIMIZE)
-            model.setParam("Presolve", 2)
-            model.Params.OutputFlag = 0
-            model.optimize()
-            
-            if model.status == GRB.OPTIMAL:
-                pg_sol_sample = np.array([[pg[g, t].X for t in range(self.T)] for g in range(self.ng)])
-                x_sol_sample = np.array([[x[g, t].X for t in range(self.T)] for g in range(self.ng)])
-                coc_sol_sample = np.array([[coc[g, t].X for t in range(self.T-1)] for g in range(self.ng)])
-                cpower_sol_sample = np.array([[cpower[g, t].X for t in range(self.T)] for g in range(self.ng)])
-                
-                # 提取对偶变量（使用extract_dual_variables_as_arrays方法）
-                lambda_sol_sample = self.extract_dual_variables_as_arrays(model)
-                
-                pg_sol.append(pg_sol_sample)
-                x_sol.append(x_sol_sample)
-                coc_sol.append(coc_sol_sample)
-                cpower_sol.append(cpower_sol_sample)
-                lambda_sol.append(lambda_sol_sample)
+
+            # 1. 尝试从数据集读取 x
+            x_from_data = _get_uc_matrix_from_sample(
+                self.active_set_data[sample_id], self.ng, self.T)
+
+            if x_from_data is not None:
+                # 数据集中有 x：直接用 LP 求解
+                pg_s, coc_s, cpower_s, lambda_s = self._solve_lp_with_fixed_x(Pd, x_from_data)
+                if pg_s is not None:
+                    pg_sol.append(pg_s)
+                    x_sol.append(x_from_data.copy())
+                    coc_sol.append(coc_s)
+                    cpower_sol.append(cpower_s)
+                    lambda_sol.append(lambda_s)
+                    continue
+                else:
+                    print(f"警告: 样本 {sample_id} LP（固定x）求解失败，回退到零值", flush=True)
             else:
-                print(f"警告: 样本 {sample_id} 的模型求解失败，状态: {model.status}", flush=True)
-                # 使用零值作为默认值
-                pg_sol_sample = np.zeros((self.ng, self.T))
-                x_sol_sample = np.zeros((self.ng, self.T))
-                coc_sol_sample = np.zeros((self.ng, self.T-1))
-                cpower_sol_sample = np.zeros((self.ng, self.T))
-                lambda_sol_sample = self._create_empty_lambda_dict()
-                
-                pg_sol.append(pg_sol_sample)
-                x_sol.append(x_sol_sample)
-                coc_sol.append(coc_sol_sample)
-                cpower_sol.append(cpower_sol_sample)
-                lambda_sol.append(lambda_sol_sample)
-        
+                # 2. 无 x：求解 MILP 获取 x
+                model = gp.Model('initial_solve_milp')
+                model.Params.OutputFlag = 0
+
+                pg = model.addVars(self.ng, self.T, lb=0, name='pg')
+                x = model.addVars(self.ng, self.T, vtype=GRB.BINARY, name='x')
+                coc = model.addVars(self.ng, self.T - 1, lb=0, name='coc')
+                cpower = model.addVars(self.ng, self.T, lb=0, name='cpower')
+
+                for t in range(self.T):
+                    model.addConstr(
+                        gp.quicksum(pg[g, t] for g in range(self.ng)) == np.sum(Pd[:, t]),
+                        name=f'power_balance_{t}'
+                    )
+                for g in range(self.ng):
+                    for t in range(self.T):
+                        model.addConstr(pg[g, t] >= self.gen[g, PMIN] * x[g, t], name=f'pg_lower_{g}_{t}')
+                        model.addConstr(pg[g, t] <= self.gen[g, PMAX] * x[g, t], name=f'pg_upper_{g}_{t}')
+
+                Ru = 0.4 * self.gen[:, PMAX] / self.T_delta
+                Rd = 0.4 * self.gen[:, PMAX] / self.T_delta
+                for g in range(self.ng):
+                    for t in range(1, self.T):
+                        model.addConstr(pg[g, t] - pg[g, t - 1] <= Ru[g] * x[g, t - 1] + self.gen[g, PMAX] * (1 - x[g, t - 1]),
+                                        name=f'ramp_up_{g}_{t}')
+                        model.addConstr(pg[g, t - 1] - pg[g, t] <= Rd[g] * x[g, t] + self.gen[g, PMAX] * (1 - x[g, t]),
+                                        name=f'ramp_down_{g}_{t}')
+
+                Ton = min(4, self.T)
+                Toff = min(4, self.T)
+                for g in range(self.ng):
+                    for t in range(1, Ton + 1):
+                        for t1 in range(self.T - t):
+                            model.addConstr(x[g, t1 + 1] - x[g, t1] <= x[g, t1 + t], name=f'min_on_{g}_{t}_{t1}')
+                for g in range(self.ng):
+                    for t in range(1, Toff + 1):
+                        for t1 in range(self.T - t):
+                            model.addConstr(-x[g, t1 + 1] + x[g, t1] <= 1 - x[g, t1 + t], name=f'min_off_{g}_{t}_{t1}')
+
+                start_cost = self.gencost[:, 1]
+                shut_cost = self.gencost[:, 2]
+                for t in range(1, self.T):
+                    for g in range(self.ng):
+                        model.addConstr(coc[g, t - 1] >= start_cost[g] * (x[g, t] - x[g, t - 1]), name=f'start_cost_{g}_{t}')
+                        model.addConstr(coc[g, t - 1] >= shut_cost[g] * (x[g, t - 1] - x[g, t]), name=f'shut_cost_{g}_{t}')
+                        model.addConstr(coc[g, t - 1] >= 0, name=f'coc_nonneg_{g}_{t}')
+
+                for t in range(self.T):
+                    for g in range(self.ng):
+                        model.addConstr(cpower[g, t] >= self.gencost[g, -2] / self.T_delta * pg[g, t] +
+                                        self.gencost[g, -1] / self.T_delta * x[g, t],
+                                        name=f'cpower_{g}_{t}')
+
+                primal_obj = (gp.quicksum(cpower[g, t] for g in range(self.ng) for t in range(self.T)) +
+                              gp.quicksum(coc[g, t] for g in range(self.ng) for t in range(self.T - 1)))
+                model.setObjective(primal_obj, GRB.MINIMIZE)
+                model.setParam("Presolve", 2)
+                model.optimize()
+
+                if model.status == GRB.OPTIMAL:
+                    x_milp = np.array([[x[g, t].X for t in range(self.T)] for g in range(self.ng)])
+                    # 用 MILP 得到的 x 求解 LP 获取有效对偶变量
+                    pg_s, coc_s, cpower_s, lambda_s = self._solve_lp_with_fixed_x(Pd, x_milp)
+                    if pg_s is not None:
+                        pg_sol.append(pg_s)
+                        x_sol.append(x_milp)
+                        coc_sol.append(coc_s)
+                        cpower_sol.append(cpower_s)
+                        lambda_sol.append(lambda_s)
+                        continue
+                    else:
+                        print(f"警告: 样本 {sample_id} LP（MILP x）求解失败，回退到零值", flush=True)
+                else:
+                    print(f"警告: 样本 {sample_id} MILP 求解失败，状态: {model.status}", flush=True)
+
+            # Fallback：使用零值
+            pg_sol.append(np.zeros((self.ng, self.T)))
+            x_sol.append(np.zeros((self.ng, self.T)))
+            coc_sol.append(np.zeros((self.ng, self.T - 1)))
+            cpower_sol.append(np.zeros((self.ng, self.T)))
+            lambda_sol.append(self._create_empty_lambda_dict())
+
         pg_sol = np.array(pg_sol)
         x_sol = np.array(x_sol)
         coc_sol = np.array(coc_sol)
         cpower_sol = np.array(cpower_sol)
-        
+
         return pg_sol, x_sol, coc_sol, cpower_sol, lambda_sol
     
     def extract_dual_variables(self, model):
@@ -1413,7 +1523,10 @@ class Agent_NN_BCD:
 
         # 二进制变量偏差
         # 确保unit_commitment_matrix是正确的形状 (ng, T)
-        unit_commitment_matrix = self.active_set_data[sample_id].get('unit_commitment_matrix', None)
+        unit_commitment_matrix = _get_uc_matrix_from_sample(
+            self.active_set_data[sample_id], self.ng, self.T)
+        if unit_commitment_matrix is None:
+            unit_commitment_matrix = self.x[sample_id]  # fallback 到当前 x
 
         for g in range(self.ng):
             for t in range(self.T):
@@ -3107,28 +3220,10 @@ class Agent_NN_BCD:
             x_LP_refined = sol_LP_refined[1]
             
             # 计算与整数解的差异
-            # 确保unit_commitment_matrix是正确的形状 (ng, T)
-            unit_commitment_matrix = self.active_set_data[sample_id]['unit_commitment_matrix']
-            if isinstance(unit_commitment_matrix, np.ndarray):
-                if unit_commitment_matrix.ndim == 1:
-                    # 如果是一维数组，重塑为二维
-                    if unit_commitment_matrix.size == self.ng * self.T:
-                        x_int = unit_commitment_matrix.reshape(self.ng, self.T)
-                    else:
-                        print(f"警告: 样本 {sample_id} 的unit_commitment_matrix大小不匹配，跳过", flush=True)
-                        continue
-                elif unit_commitment_matrix.ndim == 2:
-                    # 确保形状正确
-                    if unit_commitment_matrix.shape == (self.ng, self.T):
-                        x_int = unit_commitment_matrix
-                    else:
-                        print(f"警告: 样本 {sample_id} 的unit_commitment_matrix形状不匹配 {unit_commitment_matrix.shape}，期望 ({self.ng}, {self.T})，跳过", flush=True)
-                        continue
-                else:
-                    print(f"警告: 样本 {sample_id} 的unit_commitment_matrix维度不正确，跳过", flush=True)
-                    continue
-            else:
-                print(f"警告: 样本 {sample_id} 的unit_commitment_matrix不是数组，跳过", flush=True)
+            x_int = _get_uc_matrix_from_sample(
+                self.active_set_data[sample_id], self.ng, self.T)
+            if x_int is None:
+                print(f"警告: 样本 {sample_id} 缺少 unit_commitment_matrix，跳过", flush=True)
                 continue
             
             differ_LP += np.sum(np.abs(x_LP - x_int))
