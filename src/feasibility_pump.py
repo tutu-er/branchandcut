@@ -15,7 +15,9 @@ from gurobipy import GRB
 from typing import Dict, List, Optional, Tuple
 
 from pypower.ext2int import ext2int
+from pypower.makePTDF import makePTDF
 from pypower.idx_gen import GEN_BUS, PMIN, PMAX
+from pypower.idx_brch import RATE_A, BR_STATUS
 
 from uc_NN_subproblem_v3 import SubproblemSurrogateTrainer
 
@@ -75,6 +77,45 @@ def _add_surrogate_constraints(
                 a * x_vars[t_k] + b * x_vars[t_k1] + c * x_vars[t_k2] <= r,
                 name=f'{prefix}surr_{k}'
             )
+
+
+# ========================== 内部辅助：DC 潮流数据预计算 ==========================
+
+def _build_ptdf_data(ppc_int: dict) -> tuple:
+    """计算 DC 潮流约束所需的 PTDF 矩阵与发电机-总线关联矩阵。
+
+    Args:
+        ppc_int: ext2int 处理后的 PyPower 案例字典（总线已 0-indexed）。
+
+    Returns:
+        PTDF:         (nl, nb) 功率转移分布因子矩阵（无量纲）。
+        ptdf_g:       (nl, ng) PTDF @ G_bus，即 pg 变量的线路潮流系数（MW/MW）。
+        branch_limit: (nl,)   线路热容量上限，RATE_A（MW）。
+        active_lines: 需施加约束的线路索引列表（RATE_A > 0 且线路在线）。
+    """
+    gen    = ppc_int['gen']
+    branch = ppc_int['branch']
+    ng     = gen.shape[0]
+    nb     = ppc_int['bus'].shape[0]
+    nl     = branch.shape[0]
+
+    PTDF = makePTDF(ppc_int['baseMVA'], ppc_int['bus'], branch)  # (nl, nb)
+
+    # 发电机-总线关联矩阵（ext2int 后总线 0-indexed）
+    G_bus = np.zeros((nb, ng))
+    for g in range(ng):
+        bus_idx = int(gen[g, GEN_BUS])
+        G_bus[bus_idx, g] = 1.0
+
+    ptdf_g       = PTDF @ G_bus            # (nl, ng)
+    branch_limit = branch[:, RATE_A]       # (nl,) MW
+
+    # 仅约束有热容限制（RATE_A > 0）且在线（BR_STATUS = 1）的线路
+    active_lines = [
+        l for l in range(nl)
+        if branch_limit[l] > 1e-6 and branch[l, BR_STATUS] > 0
+    ]
+    return PTDF, ptdf_g, branch_limit, active_lines
 
 
 # ========================== 内部辅助：单机组 LP（多代理约束） ==========================
@@ -340,6 +381,23 @@ def solve_global_LP_relaxation(
             x_g = {t: x[g, t] for t in range(T)}
             _add_surrogate_constraints(model, x_g, alphas, betas, gammas, deltas, T, prefix=f'g{g}_')
 
+    # DC 线路潮流约束（PTDF 方法）
+    # 假设 pd_data 形状为 (nb, T)，行顺序与 ext2int 后的总线顺序一致
+    try:
+        _PTDF, ptdf_g, branch_limit, active_lines = _build_ptdf_data(ppc_int)
+        ptdf_Pd = _PTDF @ pd_data   # (nl, T)：负荷对各线路潮流的贡献
+        for l in active_lines:
+            limit = float(branch_limit[l])
+            for t in range(T):
+                flow_expr = (
+                    gp.quicksum(float(ptdf_g[l, g]) * pg[g, t] for g in range(ng))
+                    - float(ptdf_Pd[l, t])
+                )
+                model.addConstr(flow_expr <= limit,  name=f'flow_upper_{l}_{t}')
+                model.addConstr(flow_expr >= -limit, name=f'flow_lower_{l}_{t}')
+    except Exception as _dc_err:
+        print(f"  警告: DC 潮流约束构建失败（{_dc_err}），跳过线路约束", flush=True)
+
     # 目标：最小化总发电成本
     obj = gp.quicksum(cpower[g, t] for g in range(ng) for t in range(T))
     model.setObjective(obj, GRB.MINIMIZE)
@@ -428,6 +486,25 @@ def check_uc_feasibility(
             == float(Pd_sum[t])
         )
 
+    # 检查3：DC 线路潮流约束（作为硬约束加入 LP）
+    # 功率平衡含松弛变量；若 LP 因线路约束不可行则说明网络拥塞
+    _dc_lines_added = False
+    try:
+        _PTDF, ptdf_g, branch_limit, active_lines = _build_ptdf_data(ppc_int)
+        ptdf_Pd = _PTDF @ pd_data   # (nl, T)
+        for l in active_lines:
+            limit = float(branch_limit[l])
+            for t in range(T):
+                flow_expr = (
+                    gp.quicksum(float(ptdf_g[l, g]) * pg[g, t] for g in range(ng))
+                    - float(ptdf_Pd[l, t])
+                )
+                model.addConstr(flow_expr <= limit)
+                model.addConstr(flow_expr >= -limit)
+        _dc_lines_added = True
+    except Exception:
+        pass   # DC 约束不可用时退化为仅检查功率平衡
+
     obj = gp.quicksum(slack_pos[t] + slack_neg[t] for t in range(T))
     model.setObjective(obj, GRB.MINIMIZE)
     model.optimize()
@@ -438,6 +515,8 @@ def check_uc_feasibility(
             return False, f"功率平衡不可行: 总松弛量={total_slack:.4f} MW"
         return True, "可行"
 
+    if model.status == GRB.INFEASIBLE and _dc_lines_added:
+        return False, "DC 线路潮流约束不可行（网络拥塞）"
     return False, f"可行性 LP 求解失败: status={model.status}"
 
 
@@ -485,6 +564,22 @@ def run_feasibility_pump(
     Rd_co = 0.3 * gen[:, PMAX]
     Ton = min(int(4 * T_delta), T - 1)
     Toff = min(int(4 * T_delta), T - 1)
+
+    # 预计算 DC 潮流数据（循环外一次性完成，避免重复构建 PTDF）
+    _dc_available = False
+    _ptdf_g = None
+    _ptdf_Pd = None
+    _branch_limit = None
+    _active_lines = []
+    try:
+        _PTDF, _ptdf_g, _branch_limit, _active_lines = _build_ptdf_data(ppc_int)
+        _ptdf_Pd = _PTDF @ pd_data   # (nl, T)
+        _dc_available = True
+        if verbose:
+            print(f"  FP: DC 潮流约束已启用（{len(_active_lines)} 条有效线路）", flush=True)
+    except Exception as _e:
+        if verbose:
+            print(f"  FP 警告: DC 潮流约束不可用（{_e}）", flush=True)
 
     history: List[tuple] = []
     no_improve_count = 0
@@ -546,6 +641,18 @@ def run_feasibility_pump(
                 else:
                     model.addConstr(d[g, t] >= x[g, t] - x_ref)
                     model.addConstr(d[g, t] >= x_ref - x[g, t])
+
+        # DC 线路潮流约束（使用预计算的 PTDF 数据）
+        if _dc_available:
+            for l in _active_lines:
+                limit = float(_branch_limit[l])
+                for t in range(T):
+                    flow_expr = (
+                        gp.quicksum(float(_ptdf_g[l, g]) * pg[g, t] for g in range(ng))
+                        - float(_ptdf_Pd[l, t])
+                    )
+                    model.addConstr(flow_expr <= limit)
+                    model.addConstr(flow_expr >= -limit)
 
         # 目标：最小化 L1 距离（仅对非可信变量）
         obj = gp.quicksum(
