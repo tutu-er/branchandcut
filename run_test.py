@@ -71,6 +71,18 @@ TEST_SAMPLES = 3   # 测试/评估样本数
 
 import numpy as np
 
+# matplotlib 为可选依赖，绘图功能在不可用时自动跳过
+try:
+    import matplotlib
+    matplotlib.use('Agg')   # 非交互后端，兼容无显示环境
+    import matplotlib.pyplot as plt
+    import matplotlib.gridspec as gridspec
+    from matplotlib.colors import Normalize
+    from matplotlib.cm import ScalarMappable
+    MPL_AVAILABLE = True
+except ImportError:
+    MPL_AVAILABLE = False
+
 _ROOT = Path(__file__).parent
 sys.path.insert(0, str(_ROOT / 'src'))
 
@@ -138,6 +150,403 @@ def pick_data_file(result_dir: Path, case_name: str) -> Path:
         log(f"未找到 {case_name} 专属文件，使用: {any_files[-1].name}")
         return any_files[-1]
     return None
+
+
+# ──────────────────────── 绘图工具 ────────────────────────
+
+# IEEE/学术风格全局设置
+_MPL_STYLE = {
+    'font.family':        'serif',
+    'font.size':          10,
+    'axes.titlesize':     11,
+    'axes.titleweight':   'bold',
+    'axes.labelsize':     10,
+    'xtick.labelsize':    9,
+    'ytick.labelsize':    9,
+    'legend.fontsize':    9,
+    'legend.framealpha':  0.85,
+    'figure.dpi':         120,
+    'savefig.dpi':        300,
+    'savefig.bbox':       'tight',
+    'axes.spines.top':    False,
+    'axes.spines.right':  False,
+    'axes.grid':          True,
+    'grid.alpha':         0.3,
+    'grid.linestyle':     '--',
+    'axes.prop_cycle':    matplotlib.cycler(
+        color=['#2166AC', '#D6604D', '#4DAC26', '#8073AC',
+               '#F4A582', '#92C5DE', '#A1D76A', '#E9A3C9']
+    ) if MPL_AVAILABLE else None,
+}
+
+
+def _apply_style() -> None:
+    """应用学术绘图风格（matplotlib 可用时）。"""
+    if not MPL_AVAILABLE:
+        return
+    params = {k: v for k, v in _MPL_STYLE.items() if v is not None}
+    plt.rcParams.update(params)
+
+
+def _save_fig(fig: 'plt.Figure', path: Path, label: str) -> None:
+    """保存图像（PNG + PDF），并在终端打印路径。"""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(str(path.with_suffix('.png')))
+    fig.savefig(str(path.with_suffix('.pdf')))
+    plt.close(fig)
+    log(f"  图像已保存: {path.with_suffix('.png')} / .pdf  [{label}]")
+
+
+def plot_surrogate_analysis(trainers: dict, all_samples: list,
+                            fig_dir: Path, case_name: str) -> None:
+    """绘制 surrogate 模型三张分析图：系数分布、约束违反热图、整数性得分。
+
+    Args:
+        trainers:    {unit_id: SubproblemSurrogateTrainer} 字典。
+        all_samples: v3 格式样本列表。
+        fig_dir:     图像输出目录。
+        case_name:   算例名，用于图标题和文件名。
+    """
+    if not MPL_AVAILABLE:
+        log("matplotlib 不可用，跳过绘图")
+        return
+
+    _apply_style()
+    unit_ids = sorted(trainers.keys())
+    n_units = len(unit_ids)
+
+    # ── 图 1：代理约束系数分布（2×2 violin） ─────────────────
+    log("绘制图1：代理约束系数分布...")
+    fig1, axes = plt.subplots(2, 2, figsize=(9, 6))
+    fig1.suptitle(
+        f'Surrogate Constraint Coefficient Distributions  [{case_name}]',
+        fontsize=12, fontweight='bold', y=1.01
+    )
+
+    coef_info = [
+        ('alpha_values', r'$\alpha$ (Coefficient of $x_t$)',     axes[0, 0]),
+        ('beta_values',  r'$\beta$ (Coefficient of $x_{t+1}$)',  axes[0, 1]),
+        ('gamma_values', r'$\gamma$ (Coefficient of $x_{t+2}$)', axes[1, 0]),
+        ('delta_values', r'$\delta$ (RHS / Slack)',               axes[1, 1]),
+    ]
+
+    colors = ['#2166AC', '#D6604D', '#4DAC26', '#8073AC']
+
+    for (attr, ylabel, ax), color in zip(coef_info, colors):
+        data_per_unit = []
+        labels = []
+        for uid in unit_ids:
+            arr = getattr(trainers[uid], attr)   # (n_samples, nc)
+            data_per_unit.append(arr.ravel())
+            labels.append(f'G{uid}')
+
+        parts = ax.violinplot(
+            data_per_unit,
+            positions=range(n_units),
+            showmedians=True,
+            showextrema=True,
+        )
+        for pc in parts['bodies']:
+            pc.set_facecolor(color)
+            pc.set_alpha(0.6)
+        for key in ('cmedians', 'cmins', 'cmaxes', 'cbars'):
+            if key in parts:
+                parts[key].set_color('#333333')
+                parts[key].set_linewidth(1.2)
+
+        ax.set_xticks(range(n_units))
+        ax.set_xticklabels(labels, fontsize=8)
+        ax.set_ylabel(ylabel)
+        ax.set_xlabel('Generator Unit')
+
+    fig1.tight_layout()
+    _save_fig(fig1, fig_dir / f'{case_name}_surrogate_coefficients', '系数分布')
+
+    # ── 图 2：约束违反热图（units × time） ────────────────────
+    log("绘制图2：约束违反热图...")
+    # 取所有单元中最小的 nc 作为公共时间轴
+    nc_list = [trainers[uid].num_coupling_constraints for uid in unit_ids]
+    nc_common = min(nc_list)
+    n_samples_plot = len(all_samples)
+
+    viol_matrix = np.zeros((n_units, nc_common))   # (ng, nc)
+    for gi, uid in enumerate(unit_ids):
+        tr = trainers[uid]
+        ns = min(n_samples_plot, tr.alpha_values.shape[0])
+        for s in range(ns):
+            x_s = np.asarray(tr.x[s], dtype=float)   # (T,)
+            for t in range(nc_common):
+                if t + 2 >= tr.T:
+                    break
+                lhs = (tr.alpha_values[s, t] * x_s[t]
+                       + tr.beta_values[s, t] * x_s[t + 1]
+                       + tr.gamma_values[s, t] * x_s[t + 2])
+                viol_matrix[gi, t] += max(0.0, lhs - tr.delta_values[s, t])
+        viol_matrix[gi] /= ns
+
+    fig2, ax2 = plt.subplots(figsize=(min(14, nc_common * 0.55 + 2), max(3, n_units * 0.5 + 1.5)))
+    im = ax2.imshow(
+        viol_matrix, aspect='auto', cmap='RdYlGn_r',
+        interpolation='nearest',
+        norm=Normalize(vmin=0, vmax=max(viol_matrix.max(), 1e-6)),
+    )
+    cbar = fig2.colorbar(im, ax=ax2, fraction=0.03, pad=0.02)
+    cbar.set_label('Mean Constraint Violation', fontsize=9)
+
+    ax2.set_yticks(range(n_units))
+    ax2.set_yticklabels([f'G{uid}' for uid in unit_ids], fontsize=8)
+    ax2.set_xlabel('Coupling Constraint Index (Time Period $t$)')
+    ax2.set_ylabel('Generator Unit')
+    ax2.set_title(
+        f'Mean Surrogate Constraint Violation  [{case_name}]  '
+        f'(avg over {n_samples_plot} samples)',
+        fontweight='bold'
+    )
+    # 在格子上标注数值（仅当格子足够大时）
+    if nc_common <= 30 and n_units <= 15:
+        for gi in range(n_units):
+            for t in range(nc_common):
+                val = viol_matrix[gi, t]
+                color_txt = 'white' if val > viol_matrix.max() * 0.6 else '#333333'
+                ax2.text(t, gi, f'{val:.2f}', ha='center', va='center',
+                         fontsize=6, color=color_txt)
+
+    fig2.tight_layout()
+    _save_fig(fig2, fig_dir / f'{case_name}_surrogate_violation_heatmap', '违反热图')
+
+    # ── 图 3：整数性得分（每机组，跨样本均值 ± 标准差） ─────
+    log("绘制图3：整数性得分...")
+    integ_means, integ_stds = [], []
+    for uid in unit_ids:
+        tr = trainers[uid]
+        ns = tr.alpha_values.shape[0]
+        scores = []
+        for s in range(ns):
+            x_s = np.asarray(tr.x[s], dtype=float)
+            scores.append(float(np.sum(x_s * (1.0 - x_s))))
+        integ_means.append(np.mean(scores))
+        integ_stds.append(np.std(scores))
+
+    fig3, ax3 = plt.subplots(figsize=(max(5, n_units * 0.65 + 1.5), 4))
+    xpos = np.arange(n_units)
+    bars = ax3.bar(
+        xpos, integ_means, yerr=integ_stds,
+        capsize=4, width=0.6,
+        color='#2166AC', alpha=0.75, edgecolor='#144E7A', linewidth=0.8,
+        error_kw=dict(elinewidth=1.2, ecolor='#555555', capthick=1.2),
+    )
+    ax3.axhline(0, color='#333333', linewidth=0.8, linestyle='-')
+    ax3.set_xticks(xpos)
+    ax3.set_xticklabels([f'G{uid}' for uid in unit_ids], fontsize=9)
+    ax3.set_xlabel('Generator Unit')
+    ax3.set_ylabel(r'Integrality Score  $\sum x_i(1-x_i)$')
+    ax3.set_title(
+        f'Per-Unit Integrality Score  [{case_name}]  '
+        f'(mean ± std over {trainers[unit_ids[0]].alpha_values.shape[0]} samples)',
+        fontweight='bold'
+    )
+    # 在每根柱子顶部标注均值
+    for bar, mean in zip(bars, integ_means):
+        ax3.text(
+            bar.get_x() + bar.get_width() / 2,
+            bar.get_height() + max(integ_stds) * 0.05,
+            f'{mean:.3f}', ha='center', va='bottom', fontsize=7.5, color='#222222'
+        )
+
+    fig3.tight_layout()
+    _save_fig(fig3, fig_dir / f'{case_name}_surrogate_integrality', '整数性得分')
+
+
+def plot_fp_results(fp_results: list, fig_dir: Path, case_name: str) -> None:
+    """绘制可行性泵测试汇总图：成功率饼图 + 每样本结果条形图。
+
+    Args:
+        fp_results: run_fp_test 返回的 [(idx, success, x_result), ...] 列表。
+        fig_dir:    图像输出目录。
+        case_name:  算例名。
+    """
+    if not MPL_AVAILABLE or not fp_results:
+        return
+
+    _apply_style()
+    n_total = len(fp_results)
+    n_success = sum(1 for _, s, _ in fp_results if s)
+    n_fail = n_total - n_success
+
+    fig, (ax_pie, ax_bar) = plt.subplots(1, 2, figsize=(9, 4))
+    fig.suptitle(
+        f'Feasibility Pump Test Results  [{case_name}]',
+        fontsize=12, fontweight='bold'
+    )
+
+    # 饼图
+    wedge_colors = ['#4DAC26', '#D6604D']
+    wedges, texts, autotexts = ax_pie.pie(
+        [n_success, n_fail],
+        labels=['Success', 'Failure'],
+        autopct='%1.1f%%',
+        colors=wedge_colors,
+        startangle=90,
+        wedgeprops=dict(linewidth=1.2, edgecolor='white'),
+    )
+    for at in autotexts:
+        at.set_fontsize(9)
+    ax_pie.set_title(f'Overall ({n_success}/{n_total} succeeded)', fontsize=10)
+    ax_pie.grid(False)
+
+    # 每样本条形图
+    sample_ids = [r[0] for r in fp_results]
+    colors_bar = ['#4DAC26' if r[1] else '#D6604D' for r in fp_results]
+    # 用 1/0 高度表示成功/失败；高度 = 成功1, 失败0.3（视觉区分）
+    heights = [1.0 if r[1] else 0.3 for r in fp_results]
+    ax_bar.bar(
+        range(n_total), heights,
+        color=colors_bar, alpha=0.85, edgecolor='white', linewidth=0.8,
+    )
+    ax_bar.set_xticks(range(n_total))
+    ax_bar.set_xticklabels([f'#{i}' for i in sample_ids], fontsize=8)
+    ax_bar.set_yticks([0.3, 1.0])
+    ax_bar.set_yticklabels(['Failure', 'Success'], fontsize=9)
+    ax_bar.set_xlabel('Sample Index')
+    ax_bar.set_title('Per-Sample Outcome', fontsize=10)
+    ax_bar.set_ylim(0, 1.35)
+    ax_bar.grid(axis='x', alpha=0)
+
+    from matplotlib.patches import Patch
+    ax_bar.legend(
+        handles=[Patch(facecolor='#4DAC26', label='Success'),
+                 Patch(facecolor='#D6604D', label='Failure')],
+        loc='upper right', framealpha=0.85,
+    )
+
+    fig.tight_layout()
+    _save_fig(fig, fig_dir / f'{case_name}_fp_results', 'FP 测试结果')
+
+
+def plot_bcd_analysis(agent, fig_dir: Path, case_name: str) -> None:
+    """绘制 BCD 模型两张分析图：θ/ζ 参数直方图 + 网络权重分布。
+
+    Args:
+        agent:     Agent_NN_BCD 实例（已加载模型参数）。
+        fig_dir:   图像输出目录。
+        case_name: 算例名。
+    """
+    if not MPL_AVAILABLE:
+        log("matplotlib 不可用，跳过绘图")
+        return
+
+    _apply_style()
+
+    # ── 图 1：θ / ζ 参数直方图 ────────────────────────────
+    has_theta = hasattr(agent, 'theta_values') and agent.theta_values
+    has_zeta  = hasattr(agent, 'zeta_values')  and agent.zeta_values
+
+    if has_theta or has_zeta:
+        log("绘制图1：θ / ζ 参数直方图...")
+        ncols = int(has_theta) + int(has_zeta)
+        fig1, axes1 = plt.subplots(1, ncols, figsize=(5 * ncols, 4))
+        if ncols == 1:
+            axes1 = [axes1]
+        fig1.suptitle(
+            f'BCD Surrogate Parameter Distributions  [{case_name}]',
+            fontsize=12, fontweight='bold'
+        )
+
+        ax_idx = 0
+        for flag, attr, label, color in [
+            (has_theta, 'theta_values', r'$\theta$ Values', '#2166AC'),
+            (has_zeta,  'zeta_values',  r'$\zeta$ Values',  '#D6604D'),
+        ]:
+            if not flag:
+                continue
+            vals = np.array(list(getattr(agent, attr).values()), dtype=float)
+            ax = axes1[ax_idx]
+            n_bins = min(50, max(10, len(vals) // 5))
+            ax.hist(vals, bins=n_bins, color=color, alpha=0.72,
+                    edgecolor='white', linewidth=0.6, density=True)
+            # KDE 曲线
+            try:
+                from scipy.stats import gaussian_kde
+                kde = gaussian_kde(vals, bw_method='scott')
+                xs = np.linspace(vals.min(), vals.max(), 300)
+                ax.plot(xs, kde(xs), color='#333333', linewidth=1.5,
+                        linestyle='--', label='KDE')
+                ax.legend()
+            except Exception:
+                pass
+
+            ax.axvline(vals.mean(), color='#333333', linewidth=1.2,
+                       linestyle=':', label=f'Mean={vals.mean():.3f}')
+            ax.set_xlabel(label)
+            ax.set_ylabel('Density')
+            ax.set_title(
+                f'{label}  (n={len(vals)}, '
+                f'mean={vals.mean():.3f}, std={vals.std():.3f})'
+            )
+            ax_idx += 1
+
+        fig1.tight_layout()
+        _save_fig(fig1, fig_dir / f'{case_name}_bcd_param_hist', 'θ/ζ 直方图')
+
+    # ── 图 2：神经网络权重层分布（violin） ────────────────────
+    import torch
+
+    net_specs = []
+    if hasattr(agent, 'theta_net') and agent.theta_net is not None:
+        net_specs.append((agent.theta_net, r'$\theta$-Net', '#2166AC'))
+    if hasattr(agent, 'zeta_net') and agent.zeta_net is not None:
+        net_specs.append((agent.zeta_net, r'$\zeta$-Net', '#D6604D'))
+
+    if not net_specs:
+        return
+
+    log("绘制图2：神经网络权重层分布...")
+    n_nets = len(net_specs)
+    fig2, axes2 = plt.subplots(1, n_nets, figsize=(6 * n_nets, 5))
+    if n_nets == 1:
+        axes2 = [axes2]
+    fig2.suptitle(
+        f'Neural Network Weight Distributions  [{case_name}]',
+        fontsize=12, fontweight='bold'
+    )
+
+    for ax, (net, net_label, color) in zip(axes2, net_specs):
+        layer_data, layer_labels = [], []
+        for name, param in net.named_parameters():
+            if param.requires_grad:
+                w = param.detach().cpu().numpy().ravel()
+                if len(w) > 0:
+                    layer_data.append(w)
+                    # 缩短名字：weight → W, bias → b
+                    short = name.replace('weight', 'W').replace('bias', 'b')
+                    layer_labels.append(short)
+
+        if not layer_data:
+            ax.text(0.5, 0.5, 'No parameters', transform=ax.transAxes,
+                    ha='center', va='center', fontsize=11)
+            continue
+
+        parts = ax.violinplot(
+            layer_data,
+            positions=range(len(layer_data)),
+            showmedians=True, showextrema=True,
+        )
+        for pc in parts['bodies']:
+            pc.set_facecolor(color)
+            pc.set_alpha(0.55)
+        for key in ('cmedians', 'cmins', 'cmaxes', 'cbars'):
+            if key in parts:
+                parts[key].set_color('#333333')
+                parts[key].set_linewidth(1.1)
+
+        ax.axhline(0, color='#999999', linewidth=0.8, linestyle='--')
+        ax.set_xticks(range(len(layer_labels)))
+        ax.set_xticklabels(layer_labels, fontsize=8, rotation=30, ha='right')
+        ax.set_ylabel('Weight Value')
+        ax.set_title(f'{net_label} Layer Weights')
+
+    fig2.tight_layout()
+    _save_fig(fig2, fig_dir / f'{case_name}_bcd_weight_dist', '权重分布')
 
 
 # ──────────────────────── 模式实现 ────────────────────────
@@ -216,8 +625,8 @@ def run_fp_test(ppc, all_samples: list, dual_predictor, trainers: dict,
 
 
 def test_surrogate(ppc, all_samples: list, T_DELTA: float,
-                   model_dir: str, unit_ids) -> None:
-    """加载 surrogate 模型，打印参数摘要，可选运行 FP。"""
+                   model_dir: str, unit_ids, fig_dir: Path) -> None:
+    """加载 surrogate 模型，打印参数摘要，绘图，可选运行 FP。"""
     print("\n" + "=" * 70)
     log(f"加载 surrogate 模型: {model_dir}")
     print("=" * 70)
@@ -236,13 +645,22 @@ def test_surrogate(ppc, all_samples: list, T_DELTA: float,
     log(f"已加载 {len(trainers)} 个机组的代理约束模型")
     print_surrogate_results(trainers, all_samples[:TEST_SAMPLES])
 
+    # 绘制 surrogate 分析图
+    print("\n" + "=" * 70)
+    log("生成 surrogate 分析图表...")
+    print("=" * 70)
+    plot_surrogate_analysis(trainers, all_samples, fig_dir, CASE_NAME)
+
     if RUN_FP:
-        run_fp_test(ppc, all_samples, dual_predictor, trainers, T_DELTA, TEST_SAMPLES)
+        fp_results = run_fp_test(
+            ppc, all_samples, dual_predictor, trainers, T_DELTA, TEST_SAMPLES
+        )
+        plot_fp_results(fp_results, fig_dir, CASE_NAME)
 
 
 def test_bcd(ppc, data_file: Path, bcd_model_path: str,
-             MAX_SAMPLES, T_DELTA: float) -> None:
-    """加载 BCD 模型，初始化 agent，报告参数统计。"""
+             MAX_SAMPLES, T_DELTA: float, fig_dir: Path) -> None:
+    """加载 BCD 模型，初始化 agent，报告参数统计，绘图。"""
     print("\n" + "=" * 70)
     log(f"加载 BCD 模型: {bcd_model_path}")
     print("=" * 70)
@@ -290,6 +708,12 @@ def test_bcd(ppc, data_file: Path, bcd_model_path: str,
         log(f"  zeta_values  数量: {n_zeta}，"
             f"均值={np.mean(vals):.4f}，标准差={np.std(vals):.4f}")
 
+    # 绘制 BCD 分析图
+    print("\n" + "=" * 70)
+    log("生成 BCD 分析图表...")
+    print("=" * 70)
+    plot_bcd_analysis(agent, fig_dir, CASE_NAME)
+
     log("BCD 测试完成（如需评估解质量，请使用 run_training.py MODE='both' + RUN_FP=True）")
 
 
@@ -309,6 +733,9 @@ def main():
     UNIT_IDS    = None   # None = 所有机组；或如 [0, 1, 2]
 
     result_dir = Path(__file__).parent / 'result'
+    fig_dir    = result_dir / 'figures'
+    fig_dir.mkdir(parents=True, exist_ok=True)
+    log(f"图像输出目录: {fig_dir}")
 
     # ── 加载 PyPower 案例 ────────────────────────────────
     log(f"加载 PyPower 案例: {CASE_NAME}")
@@ -345,11 +772,11 @@ def main():
 
             # 将相对路径解析为绝对路径
             model_dir = str((Path(__file__).parent / MODEL_DIR).resolve())
-            test_surrogate(ppc, all_samples, T_DELTA, model_dir, UNIT_IDS)
+            test_surrogate(ppc, all_samples, T_DELTA, model_dir, UNIT_IDS, fig_dir)
 
         elif MODE == 'bcd':
             bcd_path = str((Path(__file__).parent / BCD_MODEL_PATH).resolve())
-            test_bcd(ppc, data_file, bcd_path, MAX_SAMPLES, T_DELTA)
+            test_bcd(ppc, data_file, bcd_path, MAX_SAMPLES, T_DELTA, fig_dir)
 
         else:
             log(f"未知模式: '{MODE}'，可选: 'surrogate' | 'bcd'")
