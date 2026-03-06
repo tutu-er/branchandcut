@@ -62,10 +62,10 @@ RUN_FP    = True        # surrogate / both 模式：是否运行可行性泵测�
 CASE_NAME = 'case30'   # 'case14' / 'case30' / 'case39'
 
 # surrogate / both 模式：已训练 surrogate 模型目录（训练时输出的带时间戳路径）
-MODEL_DIR = 'result/subproblem_models_case30_20240101_120000'
+MODEL_DIR = 'result/subproblem_models_case30_20260306_171140'
 
 # bcd / both 模式：已训练 BCD 模型 .pth 文件路径
-BCD_MODEL_PATH = 'result/bcd_model_case30_20240101_120000.pth'
+BCD_MODEL_PATH = 'result/bcd_model_case30_20260306_171140.pth'
 
 TEST_SAMPLES = 3   # 测试/评估样本数
 
@@ -108,9 +108,9 @@ if MODE in ('bcd', 'both'):
         print(f"BCD 模块导入失败: {e}")
         sys.exit(1)
 
-if RUN_FP and MODE in ('surrogate', 'both'):
+if MODE in ('surrogate', 'both'):
     try:
-        from feasibility_pump import recover_integer_solution
+        from feasibility_pump import recover_integer_solution, solve_global_LP_relaxation
     except ImportError as e:
         print(f"feasibility_pump 模块导入失败: {e}")
         sys.exit(1)
@@ -440,8 +440,8 @@ def plot_bcd_analysis(agent, fig_dir: Path, case_name: str) -> None:
     _apply_style()
 
     # ── 图 1：θ / ζ 参数直方图 ────────────────────────────
-    has_theta = hasattr(agent, 'theta_values') and agent.theta_values
-    has_zeta  = hasattr(agent, 'zeta_values')  and agent.zeta_values
+    has_theta = hasattr(agent, 'theta_values') and bool(agent.theta_values)
+    has_zeta  = hasattr(agent, 'zeta_values')  and bool(agent.zeta_values)
 
     if has_theta or has_zeta:
         log("绘制图1：θ / ζ 参数直方图...")
@@ -632,7 +632,7 @@ def plot_both_analysis(agent, trainers: dict, fig_dir: Path, case_name: str) -> 
 
     # ── (c) BCD θ 分布 ─────────────────────────────────────
     ax_c = axes[1, 0]
-    has_theta = hasattr(agent, 'theta_values') and agent.theta_values
+    has_theta = hasattr(agent, 'theta_values') and bool(agent.theta_values)
     if has_theta:
         theta_vals = np.array(list(agent.theta_values.values()), dtype=float)
         n_bins = min(50, max(10, len(theta_vals) // 5))
@@ -658,7 +658,7 @@ def plot_both_analysis(agent, trainers: dict, fig_dir: Path, case_name: str) -> 
 
     # ── (d) BCD ζ 分布 ─────────────────────────────────────
     ax_d = axes[1, 1]
-    has_zeta = hasattr(agent, 'zeta_values') and agent.zeta_values
+    has_zeta = hasattr(agent, 'zeta_values') and bool(agent.zeta_values)
     if has_zeta:
         zeta_vals = np.array(list(agent.zeta_values.values()), dtype=float)
         n_bins = min(50, max(10, len(zeta_vals) // 5))
@@ -725,6 +725,193 @@ def print_surrogate_results(trainers: dict, all_samples: list) -> None:
         print(f"  整数性指标(样本0): {integrality:.6f}  (0=完全整数)")
 
 
+def _extract_true_solution(sample: dict, shape: tuple) -> np.ndarray:
+    """从样本字典中还原真实 UC 解矩阵 (ng, T)。"""
+    ng, T = shape
+    x_true = np.zeros((ng, T), dtype=float)
+    if 'unit_commitment_matrix' in sample:
+        uc = np.array(sample['unit_commitment_matrix'], dtype=float)
+        r = min(uc.shape[0], ng)
+        c = min(uc.shape[1] if uc.ndim > 1 else T, T)
+        x_true[:r, :c] = uc[:r, :c]
+    elif 'active_set' in sample:
+        for item in sample['active_set']:
+            if isinstance(item, list) and len(item) == 2 and isinstance(item[0], list):
+                g, t = item[0]
+                if g < ng and t < T:
+                    x_true[g, t] = float(item[1])
+    return x_true
+
+
+def plot_lp_vs_true(x_LP_list: list, x_true_list: list,
+                    fig_dir: Path, case_name: str) -> None:
+    """绘制全局 LP 松弛解与真实解的对比图（5 面板）。
+
+    面板布局 (2 行)：
+      上行 (3 格): (a) 平均 LP 松弛热图  (b) 平均真实解热图  (c) 均值绝对差热图
+      下行 (2 格): (d) 逐样本 Hamming 距离柱状图  (e) 逐样本整数性间隙柱状图
+
+    Args:
+        x_LP_list:   [n_test] 每个样本的 LP 松弛解 (ng, T)。
+        x_true_list: [n_test] 每个样本的真实二值解 (ng, T)。
+        fig_dir:     图像输出目录。
+        case_name:   算例名。
+    """
+    if not MPL_AVAILABLE or not x_LP_list:
+        return
+
+    _apply_style()
+    n = len(x_LP_list)
+
+    x_LP_arr   = np.stack(x_LP_list,   axis=0)   # (n, ng, T)
+    x_true_arr = np.stack(x_true_list, axis=0)   # (n, ng, T)
+
+    x_LP_mean   = x_LP_arr.mean(axis=0)                     # (ng, T)
+    x_true_mean = x_true_arr.mean(axis=0)                   # (ng, T)
+    x_diff_mean = np.abs(x_LP_mean - x_true_mean)           # (ng, T)
+
+    x_LP_rounded = (x_LP_arr >= 0.5).astype(int)
+    hamming_dists = [int(np.sum(x_LP_rounded[i] != x_true_arr[i].astype(int)))
+                     for i in range(n)]
+    integ_gaps = [float(np.mean(np.minimum(x_LP_arr[i], 1.0 - x_LP_arr[i])))
+                  for i in range(n)]
+
+    fig = plt.figure(figsize=(15, 9))
+    fig.suptitle(
+        f'Global LP Relaxation vs. True UC Solution  [{case_name}]',
+        fontsize=13, fontweight='bold', y=1.01
+    )
+    gs = gridspec.GridSpec(2, 3, figure=fig, hspace=0.45, wspace=0.38)
+
+    ax_lp   = fig.add_subplot(gs[0, 0])
+    ax_true = fig.add_subplot(gs[0, 1])
+    ax_diff = fig.add_subplot(gs[0, 2])
+    ax_ham  = fig.add_subplot(gs[1, 0:2])
+    ax_gap  = fig.add_subplot(gs[1, 2])
+
+    _cbar_kw = dict(fraction=0.045, pad=0.03)
+    ng, T_ = x_LP_mean.shape
+    yticks = range(ng)
+    ylabels = [f'G{g}' for g in yticks]
+
+    # (a) 平均 LP 松弛热图
+    im_lp = ax_lp.imshow(x_LP_mean, aspect='auto', cmap='Blues', vmin=0, vmax=1,
+                          interpolation='nearest')
+    fig.colorbar(im_lp, ax=ax_lp, **_cbar_kw)
+    ax_lp.set_yticks(yticks); ax_lp.set_yticklabels(ylabels, fontsize=7)
+    ax_lp.set_xlabel('Time Period $t$'); ax_lp.set_ylabel('Generator')
+    ax_lp.set_title(r'(a) Mean LP Relaxation $\bar{x}^{LP}$', loc='left', fontsize=10)
+
+    # (b) 平均真实解热图
+    im_true = ax_true.imshow(x_true_mean, aspect='auto', cmap='Oranges', vmin=0, vmax=1,
+                              interpolation='nearest')
+    fig.colorbar(im_true, ax=ax_true, **_cbar_kw)
+    ax_true.set_yticks(yticks); ax_true.set_yticklabels(ylabels, fontsize=7)
+    ax_true.set_xlabel('Time Period $t$'); ax_true.set_ylabel('Generator')
+    ax_true.set_title(r'(b) Mean True Solution $\bar{x}^*$', loc='left', fontsize=10)
+
+    # (c) 均值绝对差热图
+    im_diff = ax_diff.imshow(x_diff_mean, aspect='auto', cmap='RdYlGn_r', vmin=0, vmax=1,
+                              interpolation='nearest')
+    fig.colorbar(im_diff, ax=ax_diff, **_cbar_kw)
+    ax_diff.set_yticks(yticks); ax_diff.set_yticklabels(ylabels, fontsize=7)
+    ax_diff.set_xlabel('Time Period $t$'); ax_diff.set_ylabel('Generator')
+    ax_diff.set_title(r'(c) Mean $|\bar{x}^{LP} - \bar{x}^*|$', loc='left', fontsize=10)
+
+    # (d) 逐样本 Hamming 距离
+    xpos = np.arange(n)
+    bars_h = ax_ham.bar(xpos, hamming_dists, color='#2166AC', alpha=0.75,
+                        edgecolor='#144E7A', linewidth=0.8, width=0.6)
+    for bar, h in zip(bars_h, hamming_dists):
+        ax_ham.text(bar.get_x() + bar.get_width() / 2,
+                    bar.get_height() + max(hamming_dists) * 0.02,
+                    str(h), ha='center', va='bottom', fontsize=8)
+    ax_ham.set_xticks(xpos)
+    ax_ham.set_xticklabels([f'Sample #{i}' for i in range(n)], fontsize=9)
+    ax_ham.set_ylabel('Hamming Distance (bits)')
+    ax_ham.set_title(
+        r'(d) Rounded LP vs. True: Hamming Distance  '
+        fr'(mean={np.mean(hamming_dists):.1f})',
+        loc='left', fontsize=10
+    )
+
+    # (e) 逐样本整数性间隙
+    bars_g = ax_gap.bar(xpos, integ_gaps, color='#D6604D', alpha=0.75,
+                        edgecolor='#7B1A0A', linewidth=0.8, width=0.6)
+    for bar, g_val in zip(bars_g, integ_gaps):
+        ax_gap.text(bar.get_x() + bar.get_width() / 2,
+                    bar.get_height() + max(integ_gaps) * 0.02,
+                    f'{g_val:.3f}', ha='center', va='bottom', fontsize=7.5)
+    ax_gap.set_xticks(xpos)
+    ax_gap.set_xticklabels([f'#{i}' for i in range(n)], fontsize=9)
+    ax_gap.set_ylabel(r'Mean $\min(x^{LP},\,1-x^{LP})$')
+    ax_gap.set_title('(e) LP Integrality Gap', loc='left', fontsize=10)
+
+    fig.tight_layout()
+    _save_fig(fig, fig_dir / f'{case_name}_lp_vs_true', 'LP 与真实解对比')
+
+
+def run_lp_compare_test(ppc, all_samples: list, dual_predictor, trainers: dict,
+                        T_DELTA: float, n_test: int,
+                        fig_dir: Path) -> list:
+    """求解全局 LP 松弛，与真实解对比并绘图，返回 (x_LP, x_true) 列表。
+
+    此函数在可行性泵之前运行，评估 LP 松弛解的质量。
+
+    Args:
+        ppc:            PyPower 案例字典。
+        all_samples:    v3 格式样本列表。
+        dual_predictor: 对偶变量预测器（.predict(pd_data) -> lambda）。
+        trainers:       {unit_id: SubproblemSurrogateTrainer}。
+        T_DELTA:        时间间隔。
+        n_test:         测试样本数。
+        fig_dir:        图像输出目录。
+
+    Returns:
+        [(x_LP, x_true), ...] 列表，每项对应一个样本。
+    """
+    test_n = min(n_test, len(all_samples))
+    print("\n" + "=" * 70)
+    log(f"LP 松弛解质量评估: {test_n} 个样本")
+    print("=" * 70)
+
+    x_LP_list, x_true_list = [], []
+
+    for i in range(test_n):
+        sample = all_samples[i]
+        pd_data = sample['pd_data']
+        log(f"  样本 {i + 1}/{test_n}，pd_data shape={pd_data.shape}")
+
+        try:
+            lambda_val = dual_predictor.predict(pd_data)
+            x_LP = solve_global_LP_relaxation(ppc, pd_data, T_DELTA, trainers, lambda_val)
+        except Exception as e:
+            log(f"    LP 求解失败: {e}")
+            continue
+
+        x_true = _extract_true_solution(sample, x_LP.shape)
+
+        x_LP_rounded = (x_LP >= 0.5).astype(int)
+        hamming  = int(np.sum(x_LP_rounded != x_true.astype(int)))
+        integ    = float(np.mean(np.minimum(x_LP, 1.0 - x_LP)))
+        accuracy = float(np.mean(x_LP_rounded == x_true.astype(int))) * 100
+        log(f"    整数性间隙={integ:.4f}  Hamming={hamming}  四舍五入精度={accuracy:.1f}%")
+
+        x_LP_list.append(x_LP)
+        x_true_list.append(x_true)
+
+    print("\n" + "=" * 70)
+    if x_LP_list:
+        mean_hamming = np.mean([int(np.sum((x_LP_list[i] >= 0.5).astype(int)
+                                           != x_true_list[i].astype(int)))
+                                for i in range(len(x_LP_list))])
+        log(f"LP 评估完成: 平均 Hamming 距离 = {mean_hamming:.1f} bits")
+        print("=" * 70)
+        plot_lp_vs_true(x_LP_list, x_true_list, fig_dir, CASE_NAME)
+
+    return list(zip(x_LP_list, x_true_list))
+
+
 def run_fp_test(ppc, all_samples: list, dual_predictor, trainers: dict,
                 T_DELTA: float, n_test: int) -> list:
     """对多个样本运行可行性泵并汇总结果。"""
@@ -787,6 +974,13 @@ def test_surrogate(ppc, all_samples: list, T_DELTA: float,
     log("生成 surrogate 分析图表...")
     print("=" * 70)
     plot_surrogate_analysis(trainers, all_samples, fig_dir, CASE_NAME)
+
+    # LP 松弛解质量评估（在可行性泵之前）
+    print("\n" + "=" * 70)
+    log("LP 松弛解质量评估（FP 前置分析）...")
+    print("=" * 70)
+    run_lp_compare_test(ppc, all_samples, dual_predictor, trainers,
+                        T_DELTA, TEST_SAMPLES, fig_dir)
 
     if RUN_FP:
         fp_results = run_fp_test(
@@ -924,7 +1118,11 @@ def test_both(ppc, data_file: Path, all_samples: list, T_DELTA: float,
     print("=" * 70)
     plot_both_analysis(agent, trainers, fig_dir, CASE_NAME)
 
-    # ── Step 4: 可行性泵（全体代理约束） ──────────────────
+    # ── Step 4: LP 评估 + 可行性泵（全体代理约束） ────────
+    log("── Step 4/4  LP 松弛解质量评估（FP 前置分析）")
+    run_lp_compare_test(ppc, all_samples, dual_predictor, trainers,
+                        T_DELTA, TEST_SAMPLES, fig_dir)
+
     if RUN_FP:
         log("── Step 4/4  以全体代理约束运行可行性泵")
         fp_results = run_fp_test(
