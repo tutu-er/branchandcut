@@ -332,6 +332,7 @@ def solve_global_LP_relaxation(
     pg = model.addVars(ng, T, lb=0, name='pg')
     x = model.addVars(ng, T, lb=0, ub=1, name='x')
     cpower = model.addVars(ng, T, lb=0, name='cpower')
+    coc = model.addVars(ng, T - 1, lb=0, name='coc')   # 启停成本
 
     # 功率平衡
     for t in range(T):
@@ -347,6 +348,8 @@ def solve_global_LP_relaxation(
     Rd_co = 0.3 * gen[:, PMAX]
     Ton = min(int(4 * T_delta), T - 1)
     Toff = min(int(4 * T_delta), T - 1)
+    start_cost = gencost[:, 1]   # gencost 第 1 列：启动成本
+    shut_cost  = gencost[:, 2]   # gencost 第 2 列：关机成本
 
     # 代理约束惩罚系数（大 M）：保证 LP 始终可行，违反代理约束时以高代价惩罚
     # 取值参考 BCD 中 penalty_factor 量级，比发电成本大一个数量级
@@ -377,6 +380,17 @@ def solve_global_LP_relaxation(
         for tau in range(1, Toff + 1):
             for t1 in range(T - tau):
                 model.addConstr(-x[g, t1+1] + x[g, t1] <= 1 - x[g, t1+tau])
+
+        # 启停成本（参考 BCD / uc_cplex.py）
+        for t in range(1, T):
+            model.addConstr(
+                coc[g, t-1] >= start_cost[g] * (x[g, t] - x[g, t-1]),
+                name=f'start_cost_{g}_{t}'
+            )
+            model.addConstr(
+                coc[g, t-1] >= shut_cost[g] * (x[g, t-1] - x[g, t]),
+                name=f'shut_cost_{g}_{t}'
+            )
 
         # 发电成本
         for t in range(T):
@@ -469,10 +483,133 @@ def solve_global_LP_relaxation(
                 )
                 surr_slacks.append(_slack)
 
-    # 目标：发电成本 + M × Σ 代理约束违背量（软约束惩罚）
-    obj = gp.quicksum(cpower[g, t] for g in range(ng) for t in range(T))
+    # 目标：发电成本 + 启停成本 + M × Σ 代理约束违背量（软约束惩罚）
+    obj = (gp.quicksum(cpower[g, t] for g in range(ng) for t in range(T))
+           + gp.quicksum(coc[g, t] for g in range(ng) for t in range(T - 1)))
     if surr_slacks:
         obj += M_SURR * gp.quicksum(surr_slacks)
+    model.setObjective(obj, GRB.MINIMIZE)
+    model.optimize()
+
+    if model.status == GRB.OPTIMAL:
+        return np.array([[x[g, t].X for t in range(T)] for g in range(ng)])
+
+    print(f"  警告: 全局 LP 松弛求解失败 (status={model.status})，返回零矩阵", flush=True)
+    return np.zeros((ng, T))
+
+def solve_global_LP_relaxation_without_surrogate(
+    ppc: dict,
+    pd_data: np.ndarray,
+    T_delta: float
+) -> np.ndarray:
+    """
+    构建完整 UC LP 松弛（x ∈ [0,1]），加入 V3 代理约束 + BCD theta/zeta 代理约束，求解得 x_LP。
+
+    Args:
+        ppc: PyPower 案例数据
+        pd_data: (nb_load, T) 负荷数据
+        T_delta: 时间间隔（小时）
+        trainers: {unit_id: trainer}
+        lambda_val: (T,) 功率平衡对偶变量（用于查询代理约束参数）
+        agent: （可选）已训练的 Agent_NN_BCD 实例；若提供则额外加入其
+            theta/zeta 参数化代理约束（M-penalty 软约束形式）
+
+    Returns:
+        x_LP: (ng, T) LP 松弛解；若不可行返回零矩阵
+    """
+    ppc_int = ext2int(ppc)
+    gen = ppc_int['gen']
+    gencost = ppc_int['gencost']
+    ng = gen.shape[0]
+    T = pd_data.shape[1]
+    Pd_sum = np.sum(pd_data, axis=0)  # (T,)
+
+    model = gp.Model('global_LP_relaxation')
+    model.Params.OutputFlag = 0
+
+    pg = model.addVars(ng, T, lb=0, name='pg')
+    x = model.addVars(ng, T, lb=0, ub=1, name='x')
+    cpower = model.addVars(ng, T, lb=0, name='cpower')
+    coc = model.addVars(ng, T - 1, lb=0, name='coc')   # 启停成本
+
+    # 功率平衡
+    for t in range(T):
+        model.addConstr(
+            gp.quicksum(pg[g, t] for g in range(ng)) == float(Pd_sum[t]),
+            name=f'pb_{t}'
+        )
+
+    # 爬坡参数（与 UnitCommitmentModel 一致）
+    Ru = 0.4 * gen[:, PMAX] / T_delta
+    Rd = 0.4 * gen[:, PMAX] / T_delta
+    Ru_co = 0.3 * gen[:, PMAX]
+    Rd_co = 0.3 * gen[:, PMAX]
+    Ton = min(int(4 * T_delta), T - 1)
+    Toff = min(int(4 * T_delta), T - 1)
+    start_cost = gencost[:, 1]   # gencost 第 1 列：启动成本
+    shut_cost  = gencost[:, 2]   # gencost 第 2 列：关机成本
+
+    for g in range(ng):
+        # 发电上下限
+        for t in range(T):
+            model.addConstr(pg[g, t] >= gen[g, PMIN] * x[g, t])
+            model.addConstr(pg[g, t] <= gen[g, PMAX] * x[g, t])
+
+        # 爬坡约束
+        for t in range(1, T):
+            model.addConstr(
+                pg[g, t] - pg[g, t-1] <= Ru[g] * x[g, t-1] + Ru_co[g] * (1 - x[g, t-1])
+            )
+            model.addConstr(
+                pg[g, t-1] - pg[g, t] <= Rd[g] * x[g, t] + Rd_co[g] * (1 - x[g, t])
+            )
+
+        # 最小开关机时间
+        for tau in range(1, Ton + 1):
+            for t1 in range(T - tau):
+                model.addConstr(x[g, t1+1] - x[g, t1] <= x[g, t1+tau])
+        for tau in range(1, Toff + 1):
+            for t1 in range(T - tau):
+                model.addConstr(-x[g, t1+1] + x[g, t1] <= 1 - x[g, t1+tau])
+
+        # 启停成本（参考 BCD / uc_cplex.py）
+        for t in range(1, T):
+            model.addConstr(
+                coc[g, t-1] >= start_cost[g] * (x[g, t] - x[g, t-1]),
+                name=f'start_cost_{g}_{t}'
+            )
+            model.addConstr(
+                coc[g, t-1] >= shut_cost[g] * (x[g, t-1] - x[g, t]),
+                name=f'shut_cost_{g}_{t}'
+            )
+
+        # 发电成本
+        for t in range(T):
+            model.addConstr(
+                cpower[g, t] >= gencost[g, -2] / T_delta * pg[g, t]
+                               + gencost[g, -1] / T_delta * x[g, t]
+            )
+
+    # DC 线路潮流约束（PTDF 方法，硬约束）
+    # 假设 pd_data 形状为 (nb, T)，行顺序与 ext2int 后的总线顺序一致
+    try:
+        _PTDF, ptdf_g, branch_limit, active_lines = _build_ptdf_data(ppc_int)
+        ptdf_Pd = _PTDF @ pd_data   # (nl, T)：负荷对各线路潮流的贡献
+        for l in active_lines:
+            limit = float(branch_limit[l])
+            for t in range(T):
+                flow_expr = (
+                    gp.quicksum(float(ptdf_g[l, g]) * pg[g, t] for g in range(ng))
+                    - float(ptdf_Pd[l, t])
+                )
+                model.addConstr(flow_expr <= limit,  name=f'flow_upper_{l}_{t}')
+                model.addConstr(flow_expr >= -limit, name=f'flow_lower_{l}_{t}')
+    except Exception as _dc_err:
+        print(f"  警告: DC 潮流约束构建失败（{_dc_err}），跳过线路约束", flush=True)
+
+    # 目标：发电成本 + 启停成本
+    obj = (gp.quicksum(cpower[g, t] for g in range(ng) for t in range(T))
+           + gp.quicksum(coc[g, t] for g in range(ng) for t in range(T - 1)))
     model.setObjective(obj, GRB.MINIMIZE)
     model.optimize()
 
