@@ -1,8 +1,9 @@
 import numpy as np
 from collections import defaultdict
-import cvxpy as cp
 import pandas as pd
 import pypower
+import pypower.case39
+import pypower.case30
 import pypower.case14
 import pypower.case9
 import pypower.idx_bus
@@ -18,9 +19,6 @@ root_dir = Path(__file__).resolve().parent.parent
 sys.path.append(str(root_dir))
 
 from src.case39_pypower import get_case39_pypower
-from src.ed_cvxpy import EconomicDispatchCVXPY
-from src.uc_cvxpy import UnitCommitmentModelCVXPY
-
 from src.uc_gurobipy import UnitCommitmentModel
 from src.ed_gurobipy import EconomicDispatchGurobi
 
@@ -57,49 +55,40 @@ class ActiveSetLearner:
 
     def _solve_optimization(self, Pd):
         """求解优化问题并返回活动集和对偶变量λ
-        
+
         注意：求解MILP获取活动集（包含x），然后用x求解LP获取λ
         """
         # Step 1: 求解 UC (MILP) 获取机组状态 x
-        # uc = UnitCommitmentModel(self.ppc, Pd, self.T_delta)
-        uc = UnitCommitmentModelCVXPY(self.ppc, Pd, self.T_delta)
+        uc = UnitCommitmentModel(self.ppc, Pd, self.T_delta)
         pg_sol, x_sol, total_cost = uc.solve()
-        
+
         # Step 2: 用 x 求解 ED (LP) 获取对偶变量 λ
-        # ed = EconomicDispatchGurobi(self.ppc, Pd, self.T_delta, x_sol)
-        ed = EconomicDispatchCVXPY(self.ppc, Pd, self.T_delta, x_sol)
+        ed = EconomicDispatchGurobi(self.ppc, Pd, self.T_delta, x_sol)
         pg_sol, total_cost = ed.solve()
-        
+
         # Step 3: 提取功率平衡约束的对偶变量 λ（前T个约束）
         T = Pd.shape[1]
         lambda_vals = []
         for t in range(T):
-            # 功率平衡约束是 ed.constraints 的前 T 个约束
-            dual_val = ed.constraints[t].dual_value
-            if dual_val is None:
-                lambda_vals.append(0.0)
-            else:
-                lambda_vals.append(float(dual_val))
-        
+            constr = ed.model.getConstrByName(f'power_balance_{t}')
+            lambda_vals.append(float(constr.Pi) if constr is not None else 0.0)
+
         # Step 4: 构建活动集（包含 x 和活跃约束索引）
         # 将x_sol转为[[g,t],value]的list（保持JSON格式一致）
         x_sol_list = [[[i, j], int(x_sol[i, j])] for i in range(x_sol.shape[0]) for j in range(x_sol.shape[1])]
-        # 确定活动约束（仅考虑不等式约束）
+        # 确定活动约束：Gurobi LP中对偶变量非零即为活跃约束
         active = []
         active.extend(x_sol_list)
-        for i in range(len(ed.constraints)):
-            dual_val = ed.constraints[i].dual_value
-            dual_val = np.atleast_1d(dual_val)  # Ensure it's always an array
-            for j in range(ed.constraints[i].size):
-                if abs(dual_val[j]) > 1e-6:
-                    active.append(i)
-        
+        for i, constr in enumerate(ed.model.getConstrs()):
+            if abs(constr.Pi) > 1e-6:
+                active.append(i)
+
         # 转换为可哈希的frozenset（用于集合操作）
         def make_hashable(item):
             if isinstance(item, list):
                 return tuple(tuple(x) if isinstance(x, list) else x for x in item)
             return item
-        
+
         return frozenset(make_hashable(item) for item in active), lambda_vals
 
     def save_active_sets_json(self, filename=None):
@@ -248,16 +237,16 @@ if __name__ == "__main__":
     
     load_df = pd.read_csv('src/load.csv', header=None)
     Pd_base = load_df.values
-    Pd_base = np.sum(Pd_base[:, ::4], axis=0)  # 假设每4个时段合并为一个
+    Pd_base = np.sum(Pd_base, axis=0)  # 假设每4个时段合并为一个
     
-    ppc = pypower.case9.case9()
+    ppc = pypower.case30.case30()
     
     Pd = ppc['bus'][:, pypower.idx_bus.PD]  # 假设Pd为bus数据中的Pd列
     Pd = Pd[:, None] * Pd_base[None, :] / np.max(Pd_base)  # 归一化负荷
     
     ppc['branch'][:, pypower.idx_brch.RATE_A] = ppc['branch'][:, pypower.idx_brch.RATE_A]
     
-    learner = ActiveSetLearner(alpha=0.50, delta=0.05, epsilon=0.20, ppc=ppc, T_delta=1, Pd=Pd, case_name='case9')
+    learner = ActiveSetLearner(alpha=0.90, delta=0.05, epsilon=0.020, ppc=ppc, T_delta=1, Pd=Pd, case_name='case30')
     active_sets = learner.run(max_samples=200)
     
     print(f"发现的活动集数量: {len(active_sets)}")

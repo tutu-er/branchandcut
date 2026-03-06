@@ -65,7 +65,6 @@ class EconomicDispatchGurobi:
         self.model.setParam("Presolve", 2)
 
     def solve(self):
-        self.model.Params.OutputFlag = 1
         self.model.optimize()
         if self.model.status == GRB.OPTIMAL:
             pg_sol = np.array([[self.pg[g, t].X for t in range(self.T)] for g in range(self.ng)])
