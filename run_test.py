@@ -853,7 +853,7 @@ def plot_lp_vs_true(x_LP_list: list, x_true_list: list,
 
 def run_lp_compare_test(ppc, all_samples: list, dual_predictor, trainers: dict,
                         T_DELTA: float, n_test: int,
-                        fig_dir: Path) -> list:
+                        fig_dir: Path, agent=None) -> list:
     """求解全局 LP 松弛，与真实解对比并绘图，返回 (x_LP, x_true) 列表。
 
     此函数在可行性泵之前运行，评估 LP 松弛解的质量。
@@ -866,6 +866,7 @@ def run_lp_compare_test(ppc, all_samples: list, dual_predictor, trainers: dict,
         T_DELTA:        时间间隔。
         n_test:         测试样本数。
         fig_dir:        图像输出目录。
+        agent:          （可选）已训练的 Agent_NN_BCD 实例，用于加入 theta/zeta 约束。
 
     Returns:
         [(x_LP, x_true), ...] 列表，每项对应一个样本。
@@ -884,7 +885,8 @@ def run_lp_compare_test(ppc, all_samples: list, dual_predictor, trainers: dict,
 
         try:
             lambda_val = dual_predictor.predict(pd_data)
-            x_LP = solve_global_LP_relaxation(ppc, pd_data, T_DELTA, trainers, lambda_val)
+            x_LP = solve_global_LP_relaxation(ppc, pd_data, T_DELTA, trainers, lambda_val,
+                                              agent=agent)
         except Exception as e:
             log(f"    LP 求解失败: {e}")
             continue
@@ -1121,7 +1123,7 @@ def test_both(ppc, data_file: Path, all_samples: list, T_DELTA: float,
     # ── Step 4: LP 评估 + 可行性泵（全体代理约束） ────────
     log("── Step 4/4  LP 松弛解质量评估（FP 前置分析）")
     run_lp_compare_test(ppc, all_samples, dual_predictor, trainers,
-                        T_DELTA, TEST_SAMPLES, fig_dir)
+                        T_DELTA, TEST_SAMPLES, fig_dir, agent=agent)
 
     if RUN_FP:
         log("── Step 4/4  以全体代理约束运行可行性泵")

@@ -301,10 +301,11 @@ def solve_global_LP_relaxation(
     pd_data: np.ndarray,
     T_delta: float,
     trainers: Dict[int, 'SubproblemSurrogateTrainer'],
-    lambda_val: np.ndarray
+    lambda_val: np.ndarray,
+    agent=None,
 ) -> np.ndarray:
     """
-    构建完整 UC LP 松弛（x ∈ [0,1]），加入各机组代理约束，求解得 x_LP。
+    构建完整 UC LP 松弛（x ∈ [0,1]），加入 V3 代理约束 + BCD theta/zeta 代理约束，求解得 x_LP。
 
     Args:
         ppc: PyPower 案例数据
@@ -312,6 +313,8 @@ def solve_global_LP_relaxation(
         T_delta: 时间间隔（小时）
         trainers: {unit_id: trainer}
         lambda_val: (T,) 功率平衡对偶变量（用于查询代理约束参数）
+        agent: （可选）已训练的 Agent_NN_BCD 实例；若提供则额外加入其
+            theta/zeta 参数化代理约束（M-penalty 软约束形式）
 
     Returns:
         x_LP: (ng, T) LP 松弛解；若不可行返回零矩阵
@@ -421,6 +424,50 @@ def solve_global_LP_relaxation(
                 model.addConstr(flow_expr >= -limit, name=f'flow_lower_{l}_{t}')
     except Exception as _dc_err:
         print(f"  警告: DC 潮流约束构建失败（{_dc_err}），跳过线路约束", flush=True)
+
+    # BCD theta/zeta 代理约束（M-penalty 软约束）
+    # theta 约束：DCPF 参数化约束，形式 Σ theta_{branch,unit,t}*x[unit,t] <= theta_rhs_{branch,t}
+    # zeta  约束：按变量参数化约束，形式 zeta_{unit,t}*x[unit,t] <= zeta_rhs_{unit,t}
+    if agent is not None:
+        _ua = getattr(agent, '_current_union_analysis', None)
+        _tv = getattr(agent, 'theta_values', {}) or {}
+        _zv = getattr(agent, 'zeta_values', {}) or {}
+
+        # --- theta 约束 ---
+        _uc = (_ua or {}).get('union_constraints', [])
+        for _ci in _uc:
+            _bid  = _ci['branch_id']
+            _ts   = _ci['time_slot']
+            _nzc  = _ci.get('nonzero_pg_coefficients', [])
+            _lhs  = gp.LinExpr()
+            for _ci2 in _nzc:
+                _uid   = _ci2['unit_id']
+                _tname = f'theta_branch_{_bid}_unit_{_uid}_time_{_ts}'
+                _coeff = float(_tv.get(_tname, 0.0))
+                if abs(_coeff) > 1e-10 and _uid < ng and _ts < T:
+                    _lhs += _coeff * x[_uid, _ts]
+            _rhs_name = f'theta_rhs_branch_{_bid}_time_{_ts}'
+            _rhs = float(_tv.get(_rhs_name, 1.0))
+            _slack = model.addVar(lb=0, name=f'theta_slack_{_bid}_{_ts}')
+            model.addConstr(_lhs - _rhs <= _slack, name=f'theta_surr_{_bid}_{_ts}')
+            surr_slacks.append(_slack)
+
+        # --- zeta 约束 ---
+        _zuc = (_ua or {}).get('union_zeta_constraints', [])
+        for _zc in _zuc:
+            _uid  = _zc['unit_id']
+            _ts   = _zc['time_slot']
+            _zname = f'zeta_unit_{_uid}_time_{_ts}'
+            _coeff = float(_zv.get(_zname, 0.0))
+            _rhs_name = f'zeta_rhs_unit_{_uid}_time_{_ts}'
+            _rhs = float(_zv.get(_rhs_name, 1.0))
+            if abs(_coeff) > 1e-10 and _uid < ng and _ts < T:
+                _slack = model.addVar(lb=0, name=f'zeta_slack_{_uid}_{_ts}')
+                model.addConstr(
+                    _coeff * x[_uid, _ts] - _rhs <= _slack,
+                    name=f'zeta_surr_{_uid}_{_ts}'
+                )
+                surr_slacks.append(_slack)
 
     # 目标：发电成本 + M × Σ 代理约束违背量（软约束惩罚）
     obj = gp.quicksum(cpower[g, t] for g in range(ng) for t in range(T))
