@@ -1,15 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-训练脚本（多模式）
-- surrogate: V3 三时段代理约束训练（uc_NN_subproblem_v3）
-- bcd:       BCD 主代理训练（uc_NN_BCD，Agent_NN_BCD）
-- both:      BCD 训练 → 提取功率平衡对偶变量注入样本 → surrogate 训练
+测试脚本（多模式）
+- surrogate: 加载已训练的 V3 代理约束模型，输出参数摘要，可选运行可行性泵
+- bcd:       加载已训练的 BCD 神经网络模型，报告参数统计
 
-可选标志 RUN_FP=True：训练后运行 feasibility_pump 可行性泵测试
-（bcd 模式不支持 RUN_FP，请改用 both 模式）
-
-修改顶部的 MODE / RUN_FP 变量切换执行模式。
+修改顶部的 MODE / MODEL_DIR / BCD_MODEL_PATH 等变量切换执行模式。
 """
 
 import sys
@@ -20,6 +16,7 @@ from datetime import datetime
 from pathlib import Path
 
 # ──────────────────────── 依赖检查 ────────────────────────
+
 
 def check_and_install_dependencies():
     dependencies = {
@@ -49,23 +46,31 @@ def check_and_install_dependencies():
             return False
     return True
 
+
 if not check_and_install_dependencies():
     sys.exit(1)
 
 # ──────────────────────── 模式配置 ────────────────────────
 #
-#   'surrogate' - V3 三时段代理约束训练
-#   'bcd'       - BCD 主代理训练（Agent_NN_BCD）
-#   'both'      - BCD 训练 → lambda 注入 → surrogate 训练
+#   'surrogate' - 加载 V3 代理约束模型并测试
+#   'bcd'       - 加载 BCD 神经网络模型并报告参数统计
 #
-MODE   = 'both'
-RUN_FP = True        # True → 训练后运行 feasibility_pump 测试（bcd 模式不支持）
+MODE      = 'surrogate'
+RUN_FP    = True        # surrogate 模式：是否运行可行性泵测试
+CASE_NAME = 'case30'   # 'case14' / 'case30' / 'case39'
+
+# surrogate 模式：指定已训练模型目录（训练时输出的带时间戳路径）
+MODEL_DIR = 'result/subproblem_models_case30_20240101_120000'
+
+# bcd 模式：指定已训练 BCD 模型 .pth 文件路径
+BCD_MODEL_PATH = 'result/bcd_model_case30_20240101_120000.pth'
+
+TEST_SAMPLES = 3   # 测试/评估样本数
 
 # ──────────────────────── 导入 ────────────────────────
 
 import numpy as np
 
-# 添加 src/ 到模块搜索路径
 _ROOT = Path(__file__).parent
 sys.path.insert(0, str(_ROOT / 'src'))
 
@@ -74,9 +79,7 @@ try:
     import pypower.case30
     import pypower.case39
     from uc_NN_subproblem_v3 import (
-        train_dual_predictor_from_data,
-        train_subproblem_surrogate_from_data,
-        train_complete_model,
+        load_trained_models,
         ActiveSetReader,
     )
 except ImportError as e:
@@ -84,25 +87,24 @@ except ImportError as e:
     print("请确保在项目根目录运行此脚本，且 src/ 目录存在")
     sys.exit(1)
 
-# BCD 模式额外导入
-if MODE in ('bcd', 'both'):
+if MODE == 'bcd':
     try:
         from uc_NN_BCD import load_active_set_from_json, Agent_NN_BCD
     except ImportError as e:
         print(f"BCD 模块导入失败: {e}")
         sys.exit(1)
 
-# 可行性泵额外导入
-if RUN_FP:
+if RUN_FP and MODE == 'surrogate':
     try:
         from feasibility_pump import recover_integer_solution
     except ImportError as e:
         print(f"feasibility_pump 模块导入失败: {e}")
         sys.exit(1)
 
-# ──────────────────────── 工具函数 / 辅助函数 ────────────────────────
+# ──────────────────────── 工具函数 ────────────────────────
 
-def log(msg):
+
+def log(msg: str) -> None:
     ts = datetime.now().strftime("%H:%M:%S")
     print(f"[{ts}] {msg}", flush=True)
 
@@ -126,22 +128,6 @@ def load_json_data(data_file: Path) -> list:
     return all_samples
 
 
-def inject_bcd_lambda(all_samples: list, bcd_lambdas: list, T: int) -> None:
-    """将 BCD 求解的功率平衡对偶变量注入样本，供 v3 dual predictor 使用。
-
-    Args:
-        all_samples: v3 格式样本列表，注入后每条样本含 'lambda' 字段。
-        bcd_lambdas: Agent_NN_BCD.lambda_ 列表，每项为含 'lambda_power_balance' 的 dict。
-        T: 时段数，用于生成零向量默认值。
-    """
-    for i, sample in enumerate(all_samples):
-        if i >= len(bcd_lambdas):
-            break
-        lam_dict = bcd_lambdas[i]
-        pb = lam_dict.get('lambda_power_balance', np.zeros(T))
-        sample['lambda'] = np.asarray(pb, dtype=float)
-
-
 def pick_data_file(result_dir: Path, case_name: str) -> Path:
     """按优先级查找最合适的数据文件。"""
     specific = sorted(result_dir.glob(f'active_sets_{case_name}_*.json'))
@@ -156,32 +142,12 @@ def pick_data_file(result_dir: Path, case_name: str) -> Path:
 
 # ──────────────────────── 模式实现 ────────────────────────
 
-def run_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS,
-                  DUAL_EPOCHS, DUAL_BATCH_SIZE, MAX_ITER, NN_EPOCHS, save_dir):
-    """V3 代理约束训练，返回 (dual_predictor, trainers)。"""
-    n_samples = len(all_samples)
-    print("\n" + "=" * 70)
-    log(f"开始代理训练: {n_samples} 样本，dual_epochs={DUAL_EPOCHS}，"
-        f"bcd_iter={MAX_ITER}，nn_epochs={NN_EPOCHS}")
-    print("=" * 70)
 
-    dual_predictor, trainers = train_complete_model(
-        ppc, all_samples, T_delta=T_DELTA,
-        unit_ids=UNIT_IDS,
-        dual_epochs=DUAL_EPOCHS,
-        dual_batch_size=DUAL_BATCH_SIZE,
-        surrogate_max_iter=MAX_ITER,
-        surrogate_nn_epochs=NN_EPOCHS,
-        save_dir=save_dir,
-    )
-    return dual_predictor, trainers
-
-
-def print_surrogate_results(trainers, all_samples):
+def print_surrogate_results(trainers: dict, all_samples: list) -> None:
     """打印代理训练结果摘要。"""
     n_samples = len(all_samples)
     print("\n" + "=" * 70)
-    log("训练结果验证")
+    log("模型参数摘要")
     print("=" * 70)
 
     for unit_id, trainer in trainers.items():
@@ -194,8 +160,8 @@ def print_surrogate_results(trainers, all_samples):
         print(f"  gamma_values shape: {trainer.gamma_values.shape}")
         print(f"  delta_values shape: {trainer.delta_values.shape}  (RHS，非负)")
 
-        print(f"  样本0 时序约束示例（最多5条）:")
         x0 = trainer.x[0]
+        print(f"  样本0 时序约束示例（最多5条）:")
         for t in range(min(5, nc)):
             if t + 2 >= T:
                 break
@@ -213,46 +179,10 @@ def print_surrogate_results(trainers, all_samples):
         print(f"  整数性指标(样本0): {integrality:.6f}  (0=完全整数)")
 
 
-def run_bcd(ppc, data_file, MAX_SAMPLES, T_DELTA, MAX_ITER, result_dir,
-            case_name: str = 'case', timestamp: str = ''):
-    """BCD 主代理训练，返回 Agent_NN_BCD 实例。"""
-    log("模式: BCD 主代理训练（Agent_NN_BCD）")
-    log(f"通过 ActiveSetReader 加载数据: {data_file.name}")
-
-    all_samples_bcd = load_active_set_from_json(str(data_file))
-    if MAX_SAMPLES and len(all_samples_bcd) > MAX_SAMPLES:
-        log(f"  截取前 {MAX_SAMPLES} 个样本（共 {len(all_samples_bcd)}）")
-        all_samples_bcd = all_samples_bcd[:MAX_SAMPLES]
-    log(f"  使用 {len(all_samples_bcd)} 个样本")
-
-    print("\n" + "=" * 70)
-    log(f"初始化 Agent_NN_BCD，max_iter={MAX_ITER}")
-    print("=" * 70)
-
-    agent = Agent_NN_BCD(ppc, all_samples_bcd, T_DELTA)
-
-    print("\n" + "=" * 70)
-    log("开始 BCD 迭代训练")
-    print("=" * 70)
-
-    agent.iter(max_iter=MAX_ITER)
-
-    # 保存模型（含算例名和时间戳）
-    suffix = f'_{case_name}_{timestamp}' if timestamp else f'_{case_name}'
-    save_path = str(result_dir / f'bcd_model{suffix}.pth')
-    try:
-        agent.save_model_parameters(save_path)
-        log(f"BCD 模型参数保存至: {save_path}")
-    except Exception as e:
-        log(f"模型保存失败（非致命）: {e}")
-
-    return agent
-
-
-def run_feasibility_pump_test(ppc, all_samples, dual_predictor, trainers,
-                               T_DELTA, FP_TEST_SAMPLES):
+def run_fp_test(ppc, all_samples: list, dual_predictor, trainers: dict,
+                T_DELTA: float, n_test: int) -> list:
     """对多个样本运行可行性泵并汇总结果。"""
-    test_n = min(FP_TEST_SAMPLES, len(all_samples))
+    test_n = min(n_test, len(all_samples))
     print("\n" + "=" * 70)
     log(f"可行性泵测试: {test_n} 个样本")
     print("=" * 70)
@@ -260,7 +190,7 @@ def run_feasibility_pump_test(ppc, all_samples, dual_predictor, trainers,
     results = []
     for i in range(test_n):
         sample = all_samples[i]
-        pd_data = sample['pd_data']   # (nb, T)
+        pd_data = sample['pd_data']
         log(f"  样本 {i + 1}/{test_n}，pd_data shape={pd_data.shape}")
         try:
             x_result, success = recover_integer_solution(
@@ -285,30 +215,100 @@ def run_feasibility_pump_test(ppc, all_samples, dual_predictor, trainers,
     return results
 
 
+def test_surrogate(ppc, all_samples: list, T_DELTA: float,
+                   model_dir: str, unit_ids) -> None:
+    """加载 surrogate 模型，打印参数摘要，可选运行 FP。"""
+    print("\n" + "=" * 70)
+    log(f"加载 surrogate 模型: {model_dir}")
+    print("=" * 70)
+
+    if not Path(model_dir).exists():
+        log(f"错误: 模型目录不存在: {model_dir}")
+        log("请先运行 run_training.py 生成模型，或修改 MODEL_DIR 配置")
+        sys.exit(1)
+
+    dual_predictor, trainers = load_trained_models(
+        ppc, all_samples, T_DELTA,
+        load_dir=model_dir,
+        unit_ids=unit_ids,
+    )
+
+    log(f"已加载 {len(trainers)} 个机组的代理约束模型")
+    print_surrogate_results(trainers, all_samples[:TEST_SAMPLES])
+
+    if RUN_FP:
+        run_fp_test(ppc, all_samples, dual_predictor, trainers, T_DELTA, TEST_SAMPLES)
+
+
+def test_bcd(ppc, data_file: Path, bcd_model_path: str,
+             MAX_SAMPLES, T_DELTA: float) -> None:
+    """加载 BCD 模型，初始化 agent，报告参数统计。"""
+    print("\n" + "=" * 70)
+    log(f"加载 BCD 模型: {bcd_model_path}")
+    print("=" * 70)
+
+    model_path = Path(bcd_model_path)
+    if not model_path.exists():
+        log(f"错误: BCD 模型文件不存在: {bcd_model_path}")
+        log("请先运行 run_training.py MODE='bcd' 生成模型，或修改 BCD_MODEL_PATH 配置")
+        sys.exit(1)
+
+    log(f"通过 load_active_set_from_json 加载数据: {data_file.name}")
+    all_samples_bcd = load_active_set_from_json(str(data_file))
+    if MAX_SAMPLES and len(all_samples_bcd) > MAX_SAMPLES:
+        all_samples_bcd = all_samples_bcd[:MAX_SAMPLES]
+    log(f"  使用 {len(all_samples_bcd)} 个样本")
+
+    agent = Agent_NN_BCD(ppc, all_samples_bcd, T_DELTA)
+    agent.load_model_parameters(str(model_path))
+    log("BCD 模型加载成功")
+
+    # 报告 theta / zeta 参数统计
+    print("\n" + "=" * 70)
+    log("BCD 模型参数统计")
+    print("=" * 70)
+
+    if hasattr(agent, 'theta_net') and agent.theta_net is not None:
+        import torch
+        total_params = sum(p.numel() for p in agent.theta_net.parameters())
+        log(f"  theta_net 参数量: {total_params:,}")
+
+    if hasattr(agent, 'zeta_net') and agent.zeta_net is not None:
+        import torch
+        total_params = sum(p.numel() for p in agent.zeta_net.parameters())
+        log(f"  zeta_net  参数量: {total_params:,}")
+
+    if hasattr(agent, 'theta_values') and agent.theta_values:
+        n_theta = len(agent.theta_values)
+        vals = list(agent.theta_values.values())
+        log(f"  theta_values 数量: {n_theta}，"
+            f"均值={np.mean(vals):.4f}，标准差={np.std(vals):.4f}")
+
+    if hasattr(agent, 'zeta_values') and agent.zeta_values:
+        n_zeta = len(agent.zeta_values)
+        vals = list(agent.zeta_values.values())
+        log(f"  zeta_values  数量: {n_zeta}，"
+            f"均值={np.mean(vals):.4f}，标准差={np.std(vals):.4f}")
+
+    log("BCD 测试完成（如需评估解质量，请使用 run_training.py MODE='both' + RUN_FP=True）")
+
+
 # ──────────────────────── 主函数 ────────────────────────
+
 
 def main():
     start_time = time.time()
 
     print("=" * 70)
-    print(f"训练脚本  模式: {MODE}")
+    print(f"测试脚本  模式: {MODE}  算例: {CASE_NAME}")
     print("=" * 70)
 
     # ── 配置 ──────────────────────────────────────────────
-    CASE_NAME       = 'case30'      # 'case14' / 'case30' / 'case39'
-    MAX_SAMPLES     = None            # 最多使用多少个样本（None=全部）
-    T_DELTA         = 1.0
-    DUAL_EPOCHS     = 50
-    DUAL_BATCH_SIZE = 8
-    MAX_ITER        = 20            # 迭代次数（BCD / surrogate BCD 轮数）
-    NN_EPOCHS       = 50            # surrogate 模式每次 BCD 迭代的 NN 训练轮数
-    UNIT_IDS        = None          # None = 所有机组；或如 [0, 1, 2]
-    FP_TEST_SAMPLES = 3             # feasibility_pump 模式：测试样本数
+    MAX_SAMPLES = None   # 最多使用多少个样本（None=全部）
+    T_DELTA     = 1.0
+    UNIT_IDS    = None   # None = 所有机组；或如 [0, 1, 2]
 
     result_dir = Path(__file__).parent / 'result'
-    result_dir.mkdir(exist_ok=True)
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    save_dir = str(result_dir / f'subproblem_models_{CASE_NAME}_{timestamp}')
 
     # ── 加载 PyPower 案例 ────────────────────────────────
     log(f"加载 PyPower 案例: {CASE_NAME}")
@@ -335,15 +335,7 @@ def main():
 
     # ── 执行模式分支 ─────────────────────────────────────
     try:
-        if MODE == 'bcd':
-            # BCD 通过 ActiveSetReader 加载（含 unit_commitment_matrix）
-            run_bcd(ppc, data_file, MAX_SAMPLES, T_DELTA, MAX_ITER, result_dir,
-                    case_name=CASE_NAME, timestamp=timestamp)
-            if RUN_FP:
-                log("警告: bcd 模式不支持 RUN_FP（需要 trainers），请改用 both 模式")
-
-        elif MODE == 'surrogate':
-            # 加载并规范化样本（v3 格式）
+        if MODE == 'surrogate':
             all_samples = load_json_data(data_file)
             if MAX_SAMPLES and len(all_samples) > MAX_SAMPLES:
                 log(f"  截取前 {MAX_SAMPLES} 个样本（共 {len(all_samples)}）")
@@ -351,54 +343,16 @@ def main():
             T_from_data = all_samples[0]['pd_data'].shape[1]
             log(f"  样本 T={T_from_data}，使用 {len(all_samples)} 个样本")
 
-            dual_predictor, trainers = run_surrogate(
-                ppc, all_samples, T_DELTA, UNIT_IDS,
-                DUAL_EPOCHS, DUAL_BATCH_SIZE, MAX_ITER, NN_EPOCHS, save_dir,
-            )
-            print_surrogate_results(trainers, all_samples)
+            # 将相对路径解析为绝对路径
+            model_dir = str((Path(__file__).parent / MODEL_DIR).resolve())
+            test_surrogate(ppc, all_samples, T_DELTA, model_dir, UNIT_IDS)
 
-            if RUN_FP:
-                run_feasibility_pump_test(
-                    ppc, all_samples, dual_predictor, trainers,
-                    T_DELTA, FP_TEST_SAMPLES,
-                )
-
-        elif MODE == 'both':
-            # Step 1: BCD 训练
-            agent = run_bcd(ppc, data_file, MAX_SAMPLES, T_DELTA, MAX_ITER, result_dir,
-                            case_name=CASE_NAME, timestamp=timestamp)
-
-            # Step 2: 加载 v3 格式样本
-            all_samples = load_json_data(data_file)
-            if MAX_SAMPLES and len(all_samples) > MAX_SAMPLES:
-                log(f"  截取前 {MAX_SAMPLES} 个样本（共 {len(all_samples)}）")
-                all_samples = all_samples[:MAX_SAMPLES]
-            T_from_data = all_samples[0]['pd_data'].shape[1]
-            log(f"  样本 T={T_from_data}，使用 {len(all_samples)} 个样本")
-
-            # Step 3: 注入 BCD 求解的功率平衡对偶变量
-            if hasattr(agent, 'lambda_') and agent.lambda_:
-                log(f"注入 BCD lambda（{len(agent.lambda_)} 条）→ 样本 'lambda' 字段")
-                inject_bcd_lambda(all_samples, agent.lambda_, T_from_data)
-            else:
-                log("警告: agent.lambda_ 为空，surrogate 训练将自行求解 LP 获取对偶变量")
-
-            # Step 4: surrogate 训练（使用 BCD 的 lambda 初始化）
-            dual_predictor, trainers = run_surrogate(
-                ppc, all_samples, T_DELTA, UNIT_IDS,
-                DUAL_EPOCHS, DUAL_BATCH_SIZE, MAX_ITER, NN_EPOCHS, save_dir,
-            )
-            print_surrogate_results(trainers, all_samples)
-
-            # Step 5: 可选 FP 测试
-            if RUN_FP:
-                run_feasibility_pump_test(
-                    ppc, all_samples, dual_predictor, trainers,
-                    T_DELTA, FP_TEST_SAMPLES,
-                )
+        elif MODE == 'bcd':
+            bcd_path = str((Path(__file__).parent / BCD_MODEL_PATH).resolve())
+            test_bcd(ppc, data_file, bcd_path, MAX_SAMPLES, T_DELTA)
 
         else:
-            log(f"未知模式: '{MODE}'，可选: 'surrogate' | 'bcd' | 'both'")
+            log(f"未知模式: '{MODE}'，可选: 'surrogate' | 'bcd'")
             sys.exit(1)
 
     except Exception as e:
