@@ -4,6 +4,7 @@
 测试脚本（多模式）
 - surrogate: 加载已训练的 V3 代理约束模型，输出参数摘要，可选运行可行性泵
 - bcd:       加载已训练的 BCD 神经网络模型，报告参数统计
+- both:      联合加载 BCD + surrogate 模型，以全体代理约束评估解质量，可选 FP
 
 修改顶部的 MODE / MODEL_DIR / BCD_MODEL_PATH 等变量切换执行模式。
 """
@@ -54,15 +55,16 @@ if not check_and_install_dependencies():
 #
 #   'surrogate' - 加载 V3 代理约束模型并测试
 #   'bcd'       - 加载 BCD 神经网络模型并报告参数统计
+#   'both'      - 联合加载 BCD + surrogate，以全体代理约束评估（需同时配置下面两个路径）
 #
-MODE      = 'surrogate'
-RUN_FP    = True        # surrogate 模式：是否运行可行性泵测试
+MODE      = 'both'
+RUN_FP    = True        # surrogate / both 模式：是否运行可行性泵测试
 CASE_NAME = 'case30'   # 'case14' / 'case30' / 'case39'
 
-# surrogate 模式：指定已训练模型目录（训练时输出的带时间戳路径）
+# surrogate / both 模式：已训练 surrogate 模型目录（训练时输出的带时间戳路径）
 MODEL_DIR = 'result/subproblem_models_case30_20240101_120000'
 
-# bcd 模式：指定已训练 BCD 模型 .pth 文件路径
+# bcd / both 模式：已训练 BCD 模型 .pth 文件路径
 BCD_MODEL_PATH = 'result/bcd_model_case30_20240101_120000.pth'
 
 TEST_SAMPLES = 3   # 测试/评估样本数
@@ -99,14 +101,14 @@ except ImportError as e:
     print("请确保在项目根目录运行此脚本，且 src/ 目录存在")
     sys.exit(1)
 
-if MODE == 'bcd':
+if MODE in ('bcd', 'both'):
     try:
         from uc_NN_BCD import load_active_set_from_json, Agent_NN_BCD
     except ImportError as e:
         print(f"BCD 模块导入失败: {e}")
         sys.exit(1)
 
-if RUN_FP and MODE == 'surrogate':
+if RUN_FP and MODE in ('surrogate', 'both'):
     try:
         from feasibility_pump import recover_integer_solution
     except ImportError as e:
@@ -549,6 +551,141 @@ def plot_bcd_analysis(agent, fig_dir: Path, case_name: str) -> None:
     _save_fig(fig2, fig_dir / f'{case_name}_bcd_weight_dist', '权重分布')
 
 
+def plot_both_analysis(agent, trainers: dict, fig_dir: Path, case_name: str) -> None:
+    """绘制 BCD-Surrogate 联合特征图：4 面板综合约束刻画。
+
+    面板布局 (2×2)：
+      (a) 各机组代理约束 RHS (δ) 均值 — 约束紧度
+      (b) 各机组代理系数耦合强度 √(ᾱ²+β̄²+γ̄²) — 时序耦合程度
+      (c) BCD θ 参数分布（直方图+KDE）
+      (d) BCD ζ 参数分布（直方图+KDE）
+
+    Args:
+        agent:     Agent_NN_BCD 实例（已加载模型）。
+        trainers:  {unit_id: SubproblemSurrogateTrainer} 字典。
+        fig_dir:   图像输出目录。
+        case_name: 算例名。
+    """
+    if not MPL_AVAILABLE:
+        return
+
+    _apply_style()
+    unit_ids = sorted(trainers.keys())
+    n_units  = len(unit_ids)
+
+    fig, axes = plt.subplots(2, 2, figsize=(11, 8))
+    fig.suptitle(
+        f'BCD–Surrogate Joint Constraint Characterization  [{case_name}]',
+        fontsize=13, fontweight='bold', y=1.01
+    )
+
+    # ── (a) 各机组代理约束 RHS δ 均值（violin） ──────────────
+    ax_a = axes[0, 0]
+    delta_per_unit = [trainers[uid].delta_values.ravel() for uid in unit_ids]
+    parts_a = ax_a.violinplot(
+        delta_per_unit, positions=range(n_units),
+        showmedians=True, showextrema=True,
+    )
+    for pc in parts_a['bodies']:
+        pc.set_facecolor('#8073AC')
+        pc.set_alpha(0.6)
+    for key in ('cmedians', 'cmins', 'cmaxes', 'cbars'):
+        if key in parts_a:
+            parts_a[key].set_color('#333333')
+            parts_a[key].set_linewidth(1.1)
+    ax_a.set_xticks(range(n_units))
+    ax_a.set_xticklabels([f'G{uid}' for uid in unit_ids], fontsize=8)
+    ax_a.set_xlabel('Generator Unit')
+    ax_a.set_ylabel(r'$\delta$ (RHS Bound)')
+    ax_a.set_title(r'(a) Surrogate Constraint Tightness $\delta$', loc='left', fontsize=10)
+
+    # ── (b) 各机组时序耦合强度 ─────────────────────────────
+    ax_b = axes[0, 1]
+    coupling_strength = []
+    for uid in unit_ids:
+        tr = trainers[uid]
+        a_mean = np.abs(tr.alpha_values).mean(axis=1)   # (n_samples,)
+        b_mean = np.abs(tr.beta_values).mean(axis=1)
+        g_mean = np.abs(tr.gamma_values).mean(axis=1)
+        strength = np.sqrt(a_mean**2 + b_mean**2 + g_mean**2)  # (n_samples,)
+        coupling_strength.append(strength)
+
+    means = [s.mean() for s in coupling_strength]
+    stds  = [s.std()  for s in coupling_strength]
+    xpos  = np.arange(n_units)
+    bars  = ax_b.bar(
+        xpos, means, yerr=stds, capsize=4, width=0.6,
+        color='#4DAC26', alpha=0.72, edgecolor='#2A7A15', linewidth=0.8,
+        error_kw=dict(elinewidth=1.2, ecolor='#555555', capthick=1.2),
+    )
+    for bar, m in zip(bars, means):
+        ax_b.text(
+            bar.get_x() + bar.get_width() / 2,
+            bar.get_height() + max(stds) * 0.08,
+            f'{m:.3f}', ha='center', va='bottom', fontsize=7.5
+        )
+    ax_b.set_xticks(xpos)
+    ax_b.set_xticklabels([f'G{uid}' for uid in unit_ids], fontsize=8)
+    ax_b.set_xlabel('Generator Unit')
+    ax_b.set_ylabel(r'$\sqrt{\bar\alpha^2+\bar\beta^2+\bar\gamma^2}$')
+    ax_b.set_title(r'(b) Temporal Coupling Strength', loc='left', fontsize=10)
+
+    # ── (c) BCD θ 分布 ─────────────────────────────────────
+    ax_c = axes[1, 0]
+    has_theta = hasattr(agent, 'theta_values') and agent.theta_values
+    if has_theta:
+        theta_vals = np.array(list(agent.theta_values.values()), dtype=float)
+        n_bins = min(50, max(10, len(theta_vals) // 5))
+        ax_c.hist(theta_vals, bins=n_bins, color='#2166AC', alpha=0.65,
+                  edgecolor='white', linewidth=0.5, density=True)
+        try:
+            from scipy.stats import gaussian_kde
+            kde = gaussian_kde(theta_vals, bw_method='scott')
+            xs = np.linspace(theta_vals.min(), theta_vals.max(), 300)
+            ax_c.plot(xs, kde(xs), color='#0A3F70', linewidth=1.8,
+                      linestyle='--', label='KDE')
+        except Exception:
+            pass
+        ax_c.axvline(theta_vals.mean(), color='#D6604D', linewidth=1.4,
+                     linestyle=':', label=f'mean={theta_vals.mean():.3f}')
+        ax_c.legend(fontsize=8)
+        ax_c.set_xlabel(r'$\theta$ value')
+    else:
+        ax_c.text(0.5, 0.5, 'theta_values not available',
+                  transform=ax_c.transAxes, ha='center', va='center')
+    ax_c.set_ylabel('Density')
+    ax_c.set_title(r'(c) BCD $\theta$ Parameter Distribution', loc='left', fontsize=10)
+
+    # ── (d) BCD ζ 分布 ─────────────────────────────────────
+    ax_d = axes[1, 1]
+    has_zeta = hasattr(agent, 'zeta_values') and agent.zeta_values
+    if has_zeta:
+        zeta_vals = np.array(list(agent.zeta_values.values()), dtype=float)
+        n_bins = min(50, max(10, len(zeta_vals) // 5))
+        ax_d.hist(zeta_vals, bins=n_bins, color='#D6604D', alpha=0.65,
+                  edgecolor='white', linewidth=0.5, density=True)
+        try:
+            from scipy.stats import gaussian_kde
+            kde = gaussian_kde(zeta_vals, bw_method='scott')
+            xs = np.linspace(zeta_vals.min(), zeta_vals.max(), 300)
+            ax_d.plot(xs, kde(xs), color='#7B1A0A', linewidth=1.8,
+                      linestyle='--', label='KDE')
+        except Exception:
+            pass
+        ax_d.axvline(zeta_vals.mean(), color='#2166AC', linewidth=1.4,
+                     linestyle=':', label=f'mean={zeta_vals.mean():.3f}')
+        ax_d.legend(fontsize=8)
+        ax_d.set_xlabel(r'$\zeta$ value')
+    else:
+        ax_d.text(0.5, 0.5, 'zeta_values not available',
+                  transform=ax_d.transAxes, ha='center', va='center')
+    ax_d.set_ylabel('Density')
+    ax_d.set_title(r'(d) BCD $\zeta$ Parameter Distribution', loc='left', fontsize=10)
+
+    fig.tight_layout()
+    _save_fig(fig, fig_dir / f'{case_name}_both_joint_characterization', 'BCD-Surrogate 联合图')
+
+
 # ──────────────────────── 模式实现 ────────────────────────
 
 
@@ -658,6 +795,54 @@ def test_surrogate(ppc, all_samples: list, T_DELTA: float,
         plot_fp_results(fp_results, fig_dir, CASE_NAME)
 
 
+def _print_bcd_stats(agent) -> None:
+    """打印 BCD agent 模型参数统计摘要（辅助函数）。"""
+    print("\n" + "=" * 70)
+    log("BCD 模型参数统计")
+    print("=" * 70)
+
+    if hasattr(agent, 'theta_net') and agent.theta_net is not None:
+        total_params = sum(p.numel() for p in agent.theta_net.parameters())
+        log(f"  theta_net 参数量: {total_params:,}")
+
+    if hasattr(agent, 'zeta_net') and agent.zeta_net is not None:
+        total_params = sum(p.numel() for p in agent.zeta_net.parameters())
+        log(f"  zeta_net  参数量: {total_params:,}")
+
+    if hasattr(agent, 'theta_values') and agent.theta_values:
+        vals = np.array(list(agent.theta_values.values()), dtype=float)
+        log(f"  theta_values 数量: {len(vals)}，"
+            f"均值={vals.mean():.4f}，标准差={vals.std():.4f}，"
+            f"范围=[{vals.min():.4f}, {vals.max():.4f}]")
+
+    if hasattr(agent, 'zeta_values') and agent.zeta_values:
+        vals = np.array(list(agent.zeta_values.values()), dtype=float)
+        log(f"  zeta_values  数量: {len(vals)}，"
+            f"均值={vals.mean():.4f}，标准差={vals.std():.4f}，"
+            f"范围=[{vals.min():.4f}, {vals.max():.4f}]")
+
+
+def _load_bcd_agent(ppc, data_file: Path, bcd_model_path: str,
+                    MAX_SAMPLES, T_DELTA: float):
+    """加载 BCD 数据并恢复 Agent_NN_BCD 模型参数，返回 agent。"""
+    model_path = Path(bcd_model_path)
+    if not model_path.exists():
+        log(f"错误: BCD 模型文件不存在: {bcd_model_path}")
+        log("请先运行 run_training.py MODE='bcd'/'both' 生成模型，或修改 BCD_MODEL_PATH 配置")
+        sys.exit(1)
+
+    log(f"通过 load_active_set_from_json 加载数据: {data_file.name}")
+    all_samples_bcd = load_active_set_from_json(str(data_file))
+    if MAX_SAMPLES and len(all_samples_bcd) > MAX_SAMPLES:
+        all_samples_bcd = all_samples_bcd[:MAX_SAMPLES]
+    log(f"  使用 {len(all_samples_bcd)} 个 BCD 样本")
+
+    agent = Agent_NN_BCD(ppc, all_samples_bcd, T_DELTA)
+    agent.load_model_parameters(str(model_path))
+    log("BCD 模型加载成功")
+    return agent
+
+
 def test_bcd(ppc, data_file: Path, bcd_model_path: str,
              MAX_SAMPLES, T_DELTA: float, fig_dir: Path) -> None:
     """加载 BCD 模型，初始化 agent，报告参数统计，绘图。"""
@@ -665,56 +850,89 @@ def test_bcd(ppc, data_file: Path, bcd_model_path: str,
     log(f"加载 BCD 模型: {bcd_model_path}")
     print("=" * 70)
 
-    model_path = Path(bcd_model_path)
-    if not model_path.exists():
-        log(f"错误: BCD 模型文件不存在: {bcd_model_path}")
-        log("请先运行 run_training.py MODE='bcd' 生成模型，或修改 BCD_MODEL_PATH 配置")
-        sys.exit(1)
+    agent = _load_bcd_agent(ppc, data_file, bcd_model_path, MAX_SAMPLES, T_DELTA)
+    _print_bcd_stats(agent)
 
-    log(f"通过 load_active_set_from_json 加载数据: {data_file.name}")
-    all_samples_bcd = load_active_set_from_json(str(data_file))
-    if MAX_SAMPLES and len(all_samples_bcd) > MAX_SAMPLES:
-        all_samples_bcd = all_samples_bcd[:MAX_SAMPLES]
-    log(f"  使用 {len(all_samples_bcd)} 个样本")
-
-    agent = Agent_NN_BCD(ppc, all_samples_bcd, T_DELTA)
-    agent.load_model_parameters(str(model_path))
-    log("BCD 模型加载成功")
-
-    # 报告 theta / zeta 参数统计
-    print("\n" + "=" * 70)
-    log("BCD 模型参数统计")
-    print("=" * 70)
-
-    if hasattr(agent, 'theta_net') and agent.theta_net is not None:
-        import torch
-        total_params = sum(p.numel() for p in agent.theta_net.parameters())
-        log(f"  theta_net 参数量: {total_params:,}")
-
-    if hasattr(agent, 'zeta_net') and agent.zeta_net is not None:
-        import torch
-        total_params = sum(p.numel() for p in agent.zeta_net.parameters())
-        log(f"  zeta_net  参数量: {total_params:,}")
-
-    if hasattr(agent, 'theta_values') and agent.theta_values:
-        n_theta = len(agent.theta_values)
-        vals = list(agent.theta_values.values())
-        log(f"  theta_values 数量: {n_theta}，"
-            f"均值={np.mean(vals):.4f}，标准差={np.std(vals):.4f}")
-
-    if hasattr(agent, 'zeta_values') and agent.zeta_values:
-        n_zeta = len(agent.zeta_values)
-        vals = list(agent.zeta_values.values())
-        log(f"  zeta_values  数量: {n_zeta}，"
-            f"均值={np.mean(vals):.4f}，标准差={np.std(vals):.4f}")
-
-    # 绘制 BCD 分析图
     print("\n" + "=" * 70)
     log("生成 BCD 分析图表...")
     print("=" * 70)
     plot_bcd_analysis(agent, fig_dir, CASE_NAME)
 
-    log("BCD 测试完成（如需评估解质量，请使用 run_training.py MODE='both' + RUN_FP=True）")
+    log("BCD 测试完成（如需评估解质量，请使用 MODE='both' + RUN_FP=True）")
+
+
+def test_both(ppc, data_file: Path, all_samples: list, T_DELTA: float,
+              model_dir: str, bcd_model_path: str,
+              MAX_SAMPLES, unit_ids, fig_dir: Path) -> None:
+    """联合加载 BCD + surrogate 模型，以全体代理约束评估解质量，可选运行 FP。
+
+    流程：
+      1. 加载 BCD 模型 → 打印参数统计
+      2. 加载 surrogate 全体代理约束模型 → 打印约束摘要
+      3. 生成各自分析图 + 联合表征图
+      4. （可选）使用全体代理约束运行可行性泵
+
+    Args:
+        ppc:            PyPower 案例字典。
+        data_file:      JSON 数据文件路径（BCD 格式，含 unit_commitment_matrix）。
+        all_samples:    v3 格式样本列表（已预处理）。
+        T_DELTA:        时间间隔。
+        model_dir:      surrogate 模型目录（绝对路径）。
+        bcd_model_path: BCD .pth 文件路径（绝对路径）。
+        MAX_SAMPLES:    BCD 数据最多使用样本数。
+        unit_ids:       机组 ID 列表（None = 全部）。
+        fig_dir:        图像输出目录。
+    """
+    print("\n" + "=" * 70)
+    log("模式: both — 联合评估 BCD 神经网络 + 全体 V3 代理约束")
+    print("=" * 70)
+
+    # ── Step 1: 加载 BCD 模型 ──────────────────────────────
+    log("── Step 1/4  加载 BCD 模型")
+    agent = _load_bcd_agent(ppc, data_file, bcd_model_path, MAX_SAMPLES, T_DELTA)
+    _print_bcd_stats(agent)
+
+    # ── Step 2: 加载 surrogate 全体代理约束模型 ───────────
+    log("── Step 2/4  加载全体代理约束模型")
+    if not Path(model_dir).exists():
+        log(f"错误: surrogate 模型目录不存在: {model_dir}")
+        log("请先运行 run_training.py 生成模型，或修改 MODEL_DIR 配置")
+        sys.exit(1)
+
+    dual_predictor, trainers = load_trained_models(
+        ppc, all_samples, T_DELTA,
+        load_dir=model_dir,
+        unit_ids=unit_ids,
+    )
+    log(f"已加载 {len(trainers)} 个机组的代理约束模型（全体约束）")
+    print_surrogate_results(trainers, all_samples[:TEST_SAMPLES])
+
+    # ── Step 3: 绘图 ───────────────────────────────────────
+    log("── Step 3/4  生成分析图表")
+    print("\n" + "=" * 70)
+    log("生成 surrogate 分析图...")
+    print("=" * 70)
+    plot_surrogate_analysis(trainers, all_samples, fig_dir, CASE_NAME)
+
+    print("\n" + "=" * 70)
+    log("生成 BCD 分析图...")
+    print("=" * 70)
+    plot_bcd_analysis(agent, fig_dir, CASE_NAME)
+
+    print("\n" + "=" * 70)
+    log("生成 BCD-Surrogate 联合约束表征图...")
+    print("=" * 70)
+    plot_both_analysis(agent, trainers, fig_dir, CASE_NAME)
+
+    # ── Step 4: 可行性泵（全体代理约束） ──────────────────
+    if RUN_FP:
+        log("── Step 4/4  以全体代理约束运行可行性泵")
+        fp_results = run_fp_test(
+            ppc, all_samples, dual_predictor, trainers, T_DELTA, TEST_SAMPLES
+        )
+        plot_fp_results(fp_results, fig_dir, CASE_NAME)
+    else:
+        log("── Step 4/4  跳过可行性泵（RUN_FP=False）")
 
 
 # ──────────────────────── 主函数 ────────────────────────
@@ -778,8 +996,22 @@ def main():
             bcd_path = str((Path(__file__).parent / BCD_MODEL_PATH).resolve())
             test_bcd(ppc, data_file, bcd_path, MAX_SAMPLES, T_DELTA, fig_dir)
 
+        elif MODE == 'both':
+            # both 模式需要同时加载 v3 格式样本（供 surrogate 用）
+            all_samples = load_json_data(data_file)
+            if MAX_SAMPLES and len(all_samples) > MAX_SAMPLES:
+                log(f"  截取前 {MAX_SAMPLES} 个样本（共 {len(all_samples)}）")
+                all_samples = all_samples[:MAX_SAMPLES]
+            T_from_data = all_samples[0]['pd_data'].shape[1]
+            log(f"  样本 T={T_from_data}，使用 {len(all_samples)} 个样本")
+
+            model_dir  = str((Path(__file__).parent / MODEL_DIR).resolve())
+            bcd_path   = str((Path(__file__).parent / BCD_MODEL_PATH).resolve())
+            test_both(ppc, data_file, all_samples, T_DELTA,
+                      model_dir, bcd_path, MAX_SAMPLES, UNIT_IDS, fig_dir)
+
         else:
-            log(f"未知模式: '{MODE}'，可选: 'surrogate' | 'bcd'")
+            log(f"未知模式: '{MODE}'，可选: 'surrogate' | 'bcd' | 'both'")
             sys.exit(1)
 
     except Exception as e:
