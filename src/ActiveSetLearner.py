@@ -14,6 +14,7 @@ from pathlib import Path
 import io
 import sys
 import re
+import contextlib
 
 root_dir = Path(__file__).resolve().parent.parent
 sys.path.append(str(root_dir))
@@ -43,7 +44,7 @@ class ActiveSetLearner:
             k = max(int((self.alpha-self.epsilon) * n),1)  # 最多1%的成功样本
             upper_bound = beta.ppf(1 - self.delta, k + 1, n - k)
             if upper_bound < self.alpha:
-                print(f"Required sample size: {n}, k = {k}, Upper Bound = {upper_bound:.4f}")
+                print(f"Required sample size: {n}, k = {k}, Upper Bound = {upper_bound:.4f}", flush=True)
                 break
         self.W = n
     
@@ -154,7 +155,7 @@ class ActiveSetLearner:
         with open(filepath, 'w', encoding='utf-8') as f:
             json.dump(data, f, separators=(',', ':'), ensure_ascii=False)
         
-        print(f"Active sets和对应Pd数据已保存为JSON文件（紧凑格式）: {filepath}")
+        print(f"Active sets和对应Pd数据已保存为JSON文件（紧凑格式）: {filepath}", flush=True)
         return str(filepath)
 
     def save_active_sets_mapping_json(self, filename=None):
@@ -179,7 +180,7 @@ class ActiveSetLearner:
         with open(filepath, 'w', encoding='utf-8') as f:
             json.dump(mapping, f, indent=2, ensure_ascii=False)
         
-        print(f"活动集映射关系已保存为JSON文件: {filepath}")
+        print(f"活动集映射关系已保存为JSON文件: {filepath}", flush=True)
         return str(filepath)
 
     def run(self, max_samples=22000):
@@ -197,21 +198,23 @@ class ActiveSetLearner:
         while True:
             # 计算窗口大小
             iter_count += 1
-            print(f"迭代{iter_count}: 当前窗口WM={WM}, 当前M={M}")
+            print(f"迭代{iter_count}: 当前窗口WM={WM}, 当前M={M}", flush=True)
             # 采样
             for idx in range(WM):
                 if M >= M_max:
                     break
                 Pd = self._generate_random_Pd(rng=idx)
-                active_set, lambda_vals = self._solve_optimization(Pd)
+                # 静默求解器输出，避免打断进度条
+                with contextlib.redirect_stdout(io.StringIO()):
+                    active_set, lambda_vals = self._solve_optimization(Pd)
                 samples.append((Pd, active_set, lambda_vals))
                 # 进度条显示
                 bar_len = 30
                 percent = (idx + 1) / WM
                 filled_len = int(bar_len * percent)
                 bar = '█' * filled_len + '-' * (bar_len - filled_len)
-                print(f"\r  采样进度: |{bar}| {percent:.0%}", end='')
-            print()
+                print(f"\r  采样进度: |{bar}| {percent:.0%}", end='', flush=True)
+            print(flush=True)
             # 计算发现率
             window_samples = samples[-WM:]
             new_active_sets = set()
@@ -220,10 +223,10 @@ class ActiveSetLearner:
                     new_active_sets.add(active_set)
             O.update(new_active_sets)
             RM_W = len(new_active_sets) / WM
-            print(f"  发现率RM_W={RM_W:.4f}，目标发现率R={alpha - epsilon:.4f}，累计活动集数={len(O)}")
+            print(f"  发现率RM_W={RM_W:.4f}，目标发现率R={alpha - epsilon:.4f}，累计活动集数={len(O)}", flush=True)
             # 检查停止条件
             if RM_W < alpha - epsilon or M >= M_max:
-                print("  停止条件触发，算法终止。")
+                print("  停止条件触发，算法终止。", flush=True)
                 break
             M = M + 1
         self.samples = samples
@@ -246,15 +249,15 @@ if __name__ == "__main__":
     
     ppc['branch'][:, pypower.idx_brch.RATE_A] = ppc['branch'][:, pypower.idx_brch.RATE_A]
     
-    learner = ActiveSetLearner(alpha=0.90, delta=0.05, epsilon=0.020, ppc=ppc, T_delta=1, Pd=Pd, case_name='case30')
+    learner = ActiveSetLearner(alpha=0.70, delta=0.05, epsilon=0.10, ppc=ppc, T_delta=1, Pd=Pd, case_name='case30')
     active_sets = learner.run(max_samples=200)
     
-    print(f"发现的活动集数量: {len(active_sets)}")
-    print("示例活动集:", list(active_sets)[:3])
+    print(f"发现的活动集数量: {len(active_sets)}", flush=True)
+    print("示例活动集:", list(active_sets)[:3], flush=True)
 
     # 保存完整数据（包含Pd数值）
     json_filename = learner.save_active_sets_json()
-    print(f"完整JSON文件已保存: {json_filename}")
+    print(f"完整JSON文件已保存: {json_filename}", flush=True)
     
     # 保存轻量级映射关系
     # mapping_filename = learner.save_active_sets_mapping_json()
@@ -266,6 +269,6 @@ if __name__ == "__main__":
     
     # 使用集合预测（简单示例）
     if test_active_set in learner.observed_active_sets:
-        print("成功预测活动集!")
+        print("成功预测活动集!", flush=True)
     else:
-        print("需要进一步学习的新活动集")
+        print("需要进一步学习的新活动集", flush=True)

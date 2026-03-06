@@ -110,7 +110,7 @@ if MODE in ('bcd', 'both'):
 
 if MODE in ('surrogate', 'both'):
     try:
-        from feasibility_pump import recover_integer_solution, solve_global_LP_relaxation
+        from feasibility_pump import recover_integer_solution, solve_global_LP_relaxation, solve_global_LP_relaxation_without_surrogate
     except ImportError as e:
         print(f"feasibility_pump 模块导入失败: {e}")
         sys.exit(1)
@@ -885,6 +885,7 @@ def run_lp_compare_test(ppc, all_samples: list, dual_predictor, trainers: dict,
 
         try:
             lambda_val = dual_predictor.predict(pd_data)
+            x_LP_init = solve_global_LP_relaxation_without_surrogate(ppc, pd_data, T_DELTA)
             x_LP = solve_global_LP_relaxation(ppc, pd_data, T_DELTA, trainers, lambda_val,
                                               agent=agent)
         except Exception as e:

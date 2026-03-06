@@ -301,7 +301,7 @@ def main():
     DUAL_EPOCHS     = 50
     DUAL_BATCH_SIZE = 8
     MAX_ITER        = 20            # 迭代次数（BCD / surrogate BCD 轮数）
-    NN_EPOCHS       = 50            # surrogate 模式每次 BCD 迭代的 NN 训练轮数
+    NN_EPOCHS       = 20            # surrogate 模式每次 BCD 迭代的 NN 训练轮数
     UNIT_IDS        = None          # None = 所有机组；或如 [0, 1, 2]
     FP_TEST_SAMPLES = 3             # feasibility_pump 模式：测试样本数
 
