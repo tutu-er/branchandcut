@@ -345,6 +345,13 @@ def solve_global_LP_relaxation(
     Ton = min(int(4 * T_delta), T - 1)
     Toff = min(int(4 * T_delta), T - 1)
 
+    # 代理约束惩罚系数（大 M）：保证 LP 始终可行，违反代理约束时以高代价惩罚
+    # 取值参考 BCD 中 penalty_factor 量级，比发电成本大一个数量级
+    M_SURR = 1e5
+    surr_slacks: list = []          # 收集所有代理约束松弛变量，用于构造惩罚项
+
+    T_triples = max(1, T - 2)       # 预计算三时段约束索引范围
+
     for g in range(ng):
         # 发电上下限
         for t in range(T):
@@ -375,13 +382,30 @@ def solve_global_LP_relaxation(
                                + gencost[g, -1] / T_delta * x[g, t]
             )
 
-        # V3 三时段代理约束（仅对已训练机组）
+        # V3 全局代理约束（所有已训练机组）——软约束形式（M-penalty）
+        # 参考 BCD 中对原始约束的处理：slack_k >= lhs - delta; obj += M * slack_k
+        # 这样即使代理约束紧张时 LP 仍可行，违背量以大 M 惩罚
         if g in trainers:
-            alphas, betas, gammas, deltas = trainers[g].get_surrogate_params(pd_data, lambda_val)
-            x_g = {t: x[g, t] for t in range(T)}
-            _add_surrogate_constraints(model, x_g, alphas, betas, gammas, deltas, T, prefix=f'g{g}_')
+            alphas, betas, gammas, deltas = trainers[g].get_surrogate_params(
+                pd_data, lambda_val
+            )
+            for k in range(len(alphas)):
+                t_k  = k % T_triples
+                t_k1 = min(t_k + 1, T - 1)
+                t_k2 = min(t_k + 2, T - 1)
+                a = float(alphas[k])
+                b = float(betas[k])
+                c = float(gammas[k])
+                r = float(deltas[k])
+                if abs(a) > 1e-10 or abs(b) > 1e-10 or abs(c) > 1e-10:
+                    slack_k = model.addVar(lb=0, name=f'g{g}_surr_slack_{k}')
+                    model.addConstr(
+                        a * x[g, t_k] + b * x[g, t_k1] + c * x[g, t_k2] - r <= slack_k,
+                        name=f'g{g}_surr_{k}'
+                    )
+                    surr_slacks.append(slack_k)
 
-    # DC 线路潮流约束（PTDF 方法）
+    # DC 线路潮流约束（PTDF 方法，硬约束）
     # 假设 pd_data 形状为 (nb, T)，行顺序与 ext2int 后的总线顺序一致
     try:
         _PTDF, ptdf_g, branch_limit, active_lines = _build_ptdf_data(ppc_int)
@@ -398,8 +422,10 @@ def solve_global_LP_relaxation(
     except Exception as _dc_err:
         print(f"  警告: DC 潮流约束构建失败（{_dc_err}），跳过线路约束", flush=True)
 
-    # 目标：最小化总发电成本
+    # 目标：发电成本 + M × Σ 代理约束违背量（软约束惩罚）
     obj = gp.quicksum(cpower[g, t] for g in range(ng) for t in range(T))
+    if surr_slacks:
+        obj += M_SURR * gp.quicksum(surr_slacks)
     model.setObjective(obj, GRB.MINIMIZE)
     model.optimize()
 

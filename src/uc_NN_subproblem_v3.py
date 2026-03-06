@@ -39,8 +39,9 @@ except ImportError:
     PYPOWER_AVAILABLE = False
     print("警告: pypower未安装，测试代码可能无法运行", flush=True)
 
-# 设置输出缓冲
-sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', line_buffering=True)
+# 设置输出缓冲（用 reconfigure 原地修改，避免替换 stdout 导致 buffer 被 GC 关闭）
+if hasattr(sys.stdout, 'reconfigure'):
+    sys.stdout.reconfigure(encoding='utf-8', line_buffering=True)
 
 
 # ========================== 数据加载工具 ==========================
@@ -702,7 +703,7 @@ class SubproblemSurrogateTrainer:
         self.rho_primal = 1e-2
         self.rho_dual = 1e-2
         self.rho_opt = 1e-2
-        self.gamma = 1e-3
+        self.gamma = 1e-2
         self.mu_lower_bound = 0.1
         self.iter_number = 0
         

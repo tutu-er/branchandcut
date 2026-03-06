@@ -58,7 +58,7 @@ if not check_and_install_dependencies():
 #   'both'      - 联合加载 BCD + surrogate，以全体代理约束评估（需同时配置下面两个路径）
 #
 MODE      = 'both'
-RUN_FP    = True        # surrogate / both 模式：是否运行可行性泵测试
+RUN_FP    = False       # surrogate / both 模式：是否运行可行性泵测试
 CASE_NAME = 'case30'   # 'case14' / 'case30' / 'case39'
 
 # surrogate / both 模式：已训练 surrogate 模型目录（训练时输出的带时间戳路径）
