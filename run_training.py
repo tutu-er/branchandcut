@@ -16,6 +16,7 @@ import sys
 import subprocess
 import time
 import json
+import re
 from datetime import datetime
 from pathlib import Path
 
@@ -75,10 +76,9 @@ try:
     import pypower.case39
     from uc_NN_subproblem_v3 import (
         train_dual_predictor_from_data,
-        train_subproblem_surrogate_from_data,
-        train_complete_model,
         ActiveSetReader,
     )
+    from uc_NN_subproblem_v3_parallel import ParallelSubproblemSurrogateTrainer
 except ImportError as e:
     print(f"模块导入失败: {e}")
     print("请确保在项目根目录运行此脚本，且 src/ 目录存在")
@@ -88,6 +88,7 @@ except ImportError as e:
 if MODE in ('bcd', 'both'):
     try:
         from uc_NN_BCD import load_active_set_from_json, Agent_NN_BCD
+        from uc_NN_BCD_parallel import ParallelAgent_NN_BCD
     except ImportError as e:
         print(f"BCD 模块导入失败: {e}")
         sys.exit(1)
@@ -142,12 +143,22 @@ def inject_bcd_lambda(all_samples: list, bcd_lambdas: list, T: int) -> None:
         sample['lambda'] = np.asarray(pb, dtype=float)
 
 
+def _file_timestamp_key(path: Path) -> str:
+    """从文件名中提取 YYYYMMDD_HHMMSS 时间戳作为排序键；若无则回退到文件修改时间。"""
+    m = re.search(r'(\d{8}_\d{6})', path.stem)
+    if m:
+        return m.group(1)
+    return str(path.stat().st_mtime)
+
+
 def pick_data_file(result_dir: Path, case_name: str) -> Path:
-    """按优先级查找最合适的数据文件。"""
-    specific = sorted(result_dir.glob(f'active_sets_{case_name}_*.json'))
+    """按优先级查找最合适的数据文件，优先选择时间戳最新的文件。"""
+    specific = sorted(result_dir.glob(f'active_sets_{case_name}_*.json'),
+                      key=_file_timestamp_key)
     if specific:
         return specific[-1]
-    any_files = sorted(result_dir.glob('active_sets_*.json'))
+    any_files = sorted(result_dir.glob('active_sets_*.json'),
+                       key=_file_timestamp_key)
     if any_files:
         log(f"未找到 {case_name} 专属文件，使用: {any_files[-1].name}")
         return any_files[-1]
@@ -157,23 +168,48 @@ def pick_data_file(result_dir: Path, case_name: str) -> Path:
 # ──────────────────────── 模式实现 ────────────────────────
 
 def run_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS,
-                  DUAL_EPOCHS, DUAL_BATCH_SIZE, MAX_ITER, NN_EPOCHS, save_dir):
-    """V3 代理约束训练，返回 (dual_predictor, trainers)。"""
+                  DUAL_EPOCHS, DUAL_BATCH_SIZE, MAX_ITER, NN_EPOCHS, save_dir,
+                  n_workers: int = 4):
+    """V3 代理约束训练（样本级并行），返回 (dual_predictor, trainers)。"""
+    import os
+    from pypower.ext2int import ext2int
+
+    ppc_int = ext2int(ppc)
+    ng = ppc_int['gen'].shape[0]
+    unit_ids = UNIT_IDS if UNIT_IDS is not None else list(range(ng))
+
     n_samples = len(all_samples)
     print("\n" + "=" * 70)
-    log(f"开始代理训练: {n_samples} 样本，dual_epochs={DUAL_EPOCHS}，"
+    log(f"开始并行代理训练: {n_samples} 样本，{len(unit_ids)} 机组，"
+        f"n_workers={n_workers}，dual_epochs={DUAL_EPOCHS}，"
         f"bcd_iter={MAX_ITER}，nn_epochs={NN_EPOCHS}")
     print("=" * 70)
 
-    dual_predictor, trainers = train_complete_model(
+    # 步骤 1：对偶变量预测器（串行，NN 训练无需并行化）
+    dual_save_path = os.path.join(save_dir, 'dual_predictor.pth') if save_dir else None
+    dual_predictor = train_dual_predictor_from_data(
         ppc, all_samples, T_delta=T_DELTA,
-        unit_ids=UNIT_IDS,
-        dual_epochs=DUAL_EPOCHS,
-        dual_batch_size=DUAL_BATCH_SIZE,
-        surrogate_max_iter=MAX_ITER,
-        surrogate_nn_epochs=NN_EPOCHS,
-        save_dir=save_dir,
+        num_epochs=DUAL_EPOCHS, batch_size=DUAL_BATCH_SIZE,
+        save_path=dual_save_path,
     )
+
+    # 步骤 2：逐机组并行训练代理约束（Level-2 线程并行）
+    if save_dir:
+        os.makedirs(save_dir, exist_ok=True)
+
+    trainers = {}
+    for i, g in enumerate(unit_ids):
+        log(f"  机组 {g} ({i+1}/{len(unit_ids)}) — 样本级并行 n_workers={n_workers}")
+        trainer = ParallelSubproblemSurrogateTrainer(
+            ppc, all_samples, T_DELTA, g,
+            lambda_predictor=dual_predictor,
+            n_workers=n_workers,
+        )
+        trainer.iter(max_iter=MAX_ITER, nn_epochs=NN_EPOCHS)
+        trainers[g] = trainer
+        if save_dir:
+            trainer.save(os.path.join(save_dir, f'surrogate_unit_{g}.pth'))
+
     return dual_predictor, trainers
 
 
@@ -214,8 +250,8 @@ def print_surrogate_results(trainers, all_samples):
 
 
 def run_bcd(ppc, data_file, MAX_SAMPLES, T_DELTA, MAX_ITER, result_dir,
-            case_name: str = 'case', timestamp: str = ''):
-    """BCD 主代理训练，返回 Agent_NN_BCD 实例。"""
+            case_name: str = 'case', timestamp: str = '', n_workers: int = 4):
+    """BCD 主代理训练（样本级并行），返回 ParallelAgent_NN_BCD 实例。"""
     log("模式: BCD 主代理训练（Agent_NN_BCD）")
     log(f"通过 ActiveSetReader 加载数据: {data_file.name}")
 
@@ -226,10 +262,10 @@ def run_bcd(ppc, data_file, MAX_SAMPLES, T_DELTA, MAX_ITER, result_dir,
     log(f"  使用 {len(all_samples_bcd)} 个样本")
 
     print("\n" + "=" * 70)
-    log(f"初始化 Agent_NN_BCD，max_iter={MAX_ITER}")
+    log(f"初始化 ParallelAgent_NN_BCD，max_iter={MAX_ITER}，n_workers={n_workers}")
     print("=" * 70)
 
-    agent = Agent_NN_BCD(ppc, all_samples_bcd, T_DELTA)
+    agent = ParallelAgent_NN_BCD(ppc, all_samples_bcd, T_DELTA, n_workers=n_workers)
 
     print("\n" + "=" * 70)
     log("开始 BCD 迭代训练")
@@ -296,7 +332,7 @@ def main():
 
     # ── 配置 ──────────────────────────────────────────────
     CASE_NAME       = 'case30'      # 'case14' / 'case30' / 'case39'
-    MAX_SAMPLES     = None            # 最多使用多少个样本（None=全部）
+    MAX_SAMPLES     = 30           # 最多使用多少个样本（None=全部）
     T_DELTA         = 1.0
     DUAL_EPOCHS     = 50
     DUAL_BATCH_SIZE = 8
@@ -304,8 +340,9 @@ def main():
     NN_EPOCHS       = 20            # surrogate 模式每次 BCD 迭代的 NN 训练轮数
     UNIT_IDS        = None          # None = 所有机组；或如 [0, 1, 2]
     FP_TEST_SAMPLES = 3             # feasibility_pump 模式：测试样本数
+    N_WORKERS       = 4             # 样本级并行线程数（Level-2）；设为 1 退化为串行
 
-    result_dir = Path(__file__).parent / 'result'
+    result_dir = Path(__file__).parent / 'result' / 'active_set'
     result_dir.mkdir(exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     save_dir = str(result_dir / f'subproblem_models_{CASE_NAME}_{timestamp}')
@@ -338,7 +375,7 @@ def main():
         if MODE == 'bcd':
             # BCD 通过 ActiveSetReader 加载（含 unit_commitment_matrix）
             run_bcd(ppc, data_file, MAX_SAMPLES, T_DELTA, MAX_ITER, result_dir,
-                    case_name=CASE_NAME, timestamp=timestamp)
+                    case_name=CASE_NAME, timestamp=timestamp, n_workers=N_WORKERS)
             if RUN_FP:
                 log("警告: bcd 模式不支持 RUN_FP（需要 trainers），请改用 both 模式")
 
@@ -354,6 +391,7 @@ def main():
             dual_predictor, trainers = run_surrogate(
                 ppc, all_samples, T_DELTA, UNIT_IDS,
                 DUAL_EPOCHS, DUAL_BATCH_SIZE, MAX_ITER, NN_EPOCHS, save_dir,
+                n_workers=N_WORKERS,
             )
             print_surrogate_results(trainers, all_samples)
 
@@ -366,7 +404,7 @@ def main():
         elif MODE == 'both':
             # Step 1: BCD 训练
             agent = run_bcd(ppc, data_file, MAX_SAMPLES, T_DELTA, MAX_ITER, result_dir,
-                            case_name=CASE_NAME, timestamp=timestamp)
+                            case_name=CASE_NAME, timestamp=timestamp, n_workers=N_WORKERS)
 
             # Step 2: 加载 v3 格式样本
             all_samples = load_json_data(data_file)
@@ -387,6 +425,7 @@ def main():
             dual_predictor, trainers = run_surrogate(
                 ppc, all_samples, T_DELTA, UNIT_IDS,
                 DUAL_EPOCHS, DUAL_BATCH_SIZE, MAX_ITER, NN_EPOCHS, save_dir,
+                n_workers=N_WORKERS,
             )
             print_surrogate_results(trainers, all_samples)
 
