@@ -12,6 +12,7 @@ import sys
 import io
 import time
 import json
+from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -1326,7 +1327,13 @@ class Agent_NN_BCD:
         # 保存变量名列表
         self.theta_var_names = list(self.theta_values.keys())
         self.zeta_var_names = list(self.zeta_values.keys())
-        
+
+        # 预建名称→索引映射，避免热路径中重复创建
+        self._theta_name_to_idx = {name: idx for idx, name in enumerate(self.theta_var_names)}
+        self._zeta_name_to_idx = {name: idx for idx, name in enumerate(self.zeta_var_names)}
+        # union_analysis 缓存失效标记
+        self._cached_union_analysis_id = None
+
         print(f"✓ 初始化神经网络:", flush=True)
         print(f"  - 设备: {self.device}", flush=True)
         print(f"  - 输入维度: {input_dim}", flush=True)
@@ -1355,6 +1362,66 @@ class Agent_NN_BCD:
             'Rd_co':         torch.tensor(0.3 * self.gen[:, PMAX], dtype=torch.float32, device=dev),
         }
         self._empty_tensor = torch.zeros(0, device=dev)
+        # 热路径常量张量：避免循环内 torch.tensor(scalar) 触发 CUDA 分配
+        self._const_zero = torch.tensor(0.0, device=dev)
+        self._const_one = torch.tensor(1.0, device=dev)
+        self._default_mu_tensor = torch.tensor(
+            getattr(self, 'dual_para_bound', 0.1), dtype=torch.float32, device=dev
+        )
+
+    def _preprocess_union_analysis_cache(self, union_analysis) -> None:
+        """将 union_analysis 预处理为结构化元组，消除 loss 热路径中的字符串格式化与字典扫描。
+
+        结果写入:
+            _cached_theta_constraints: list[(branch_id, time_slot, constraint_type,
+                                            coeff_list[(unit_id, theta_idx)], rhs_idx)]
+            _dual_theta_lookup: dict[(unit_id, time_slot)] -> list[(theta_idx, branch_id)]
+            _cached_zeta_constraints: list[(unit_id, time_slot, zeta_idx, rhs_idx)]
+            _dual_zeta_lookup: dict[(unit_id, time_slot)] -> list[zeta_idx]
+        """
+        cached_theta: list = []
+        dual_theta_lookup: dict = defaultdict(list)
+
+        if self.enable_theta_constraints and union_analysis and 'union_constraints' in union_analysis:
+            for constraint_info in union_analysis['union_constraints']:
+                branch_id = constraint_info['branch_id']
+                time_slot = constraint_info['time_slot']
+                constraint_type = constraint_info.get('constraint_type', 'dcpf_upper')
+                nonzero_coefficients = constraint_info['nonzero_pg_coefficients']
+
+                coeff_list: list = []
+                for coeff_info in nonzero_coefficients:
+                    unit_id = coeff_info['unit_id']
+                    theta_name = f'theta_branch_{branch_id}_unit_{unit_id}_time_{time_slot}'
+                    theta_idx = self._theta_name_to_idx.get(theta_name, -1)
+                    if theta_idx >= 0:
+                        coeff_list.append((unit_id, theta_idx))
+                        dual_theta_lookup[(unit_id, time_slot)].append((theta_idx, branch_id))
+
+                theta_rhs_name = f'theta_rhs_branch_{branch_id}_time_{time_slot}'
+                rhs_idx = self._theta_name_to_idx.get(theta_rhs_name, -1)
+                cached_theta.append((branch_id, time_slot, constraint_type, coeff_list, rhs_idx))
+
+        cached_zeta: list = []
+        dual_zeta_lookup: dict = defaultdict(list)
+
+        if self.enable_zeta_constraints and union_analysis and 'union_zeta_constraints' in union_analysis:
+            for constraint in union_analysis['union_zeta_constraints']:
+                unit_id = constraint['unit_id']
+                time_slot = constraint['time_slot']
+                zeta_name = f'zeta_unit_{unit_id}_time_{time_slot}'
+                zeta_idx = self._zeta_name_to_idx.get(zeta_name, -1)
+                zeta_rhs_name = f'zeta_rhs_unit_{unit_id}_time_{time_slot}'
+                rhs_idx = self._zeta_name_to_idx.get(zeta_rhs_name, -1)
+                if zeta_idx >= 0:
+                    cached_zeta.append((unit_id, time_slot, zeta_idx, rhs_idx))
+                    dual_zeta_lookup[(unit_id, time_slot)].append(zeta_idx)
+
+        self._cached_theta_constraints = cached_theta
+        self._dual_theta_lookup: dict = dict(dual_theta_lookup)
+        self._cached_zeta_constraints = cached_zeta
+        self._dual_zeta_lookup: dict = dict(dual_zeta_lookup)
+        self._cached_union_analysis_id = id(union_analysis)
 
     def _refresh_iter_tensor_cache(self):
         """每次 BCD 迭代整批转换 x/mu/ita/lambda，避免 loss 内逐张量创建（Tier 3）。"""
@@ -2414,11 +2481,6 @@ class Agent_NN_BCD:
         Ru_co = ct['Ru_co']
         Rd_co = ct['Rd_co']
 
-        if not hasattr(self, '_theta_name_to_idx'):
-            self._theta_name_to_idx = {name: idx for idx, name in enumerate(self.theta_var_names)}
-        if not hasattr(self, '_zeta_name_to_idx'):
-            self._zeta_name_to_idx = {name: idx for idx, name in enumerate(self.zeta_var_names)}
-
         # mu, ita: Tier3 缓存（view，无拷贝）
         mu  = self._mu_cache[sample_id]   # (nl, T)
         ita = self._ita_cache[sample_id]  # (ng, T)
@@ -2456,120 +2518,65 @@ class Agent_NN_BCD:
             mu = mu_tensor.view(self.nl, self.T)
         else:
             mu = mu_tensor  # 已经是(nl, T)的形状
-        
+
         if ita_tensor.dim() == 1:
             ita = ita_tensor.view(self.ng, self.T)
         else:
             ita = ita_tensor  # 已经是(ng, T)的形状
-        
-        if not hasattr(self, '_theta_name_to_idx'):
-            self._theta_name_to_idx = {name: idx for idx, name in enumerate(self.theta_var_names)}
-        if not hasattr(self, '_zeta_name_to_idx'):
-            self._zeta_name_to_idx = {name: idx for idx, name in enumerate(self.zeta_var_names)}
-        
+
+        # 如果 union_analysis 对象发生变化，重建约束元数据缓存
+        if id(union_analysis) != self._cached_union_analysis_id:
+            self._preprocess_union_analysis_cache(union_analysis)
+
         obj_primal = torch.tensor(0.0, device=device, requires_grad=True)
         obj_opt = torch.tensor(0.0, device=device, requires_grad=True)
         obj_dual = torch.tensor(0.0, device=device, requires_grad=True)
         obj_constraint_violation = torch.tensor(0.0, device=device, requires_grad=True)
-        
-        # x_LP: 与上方 x 相同数据（已从 Tier3 缓存取得）
-        x_LP = x
-        
+
         lambda_weight = getattr(self, 'constraint_violation_weight', 1.0)
         epsilon = getattr(self, 'constraint_violation_epsilon', 1e-3)
-        
-        # 计算theta相关的参数化约束损失（根据enable_theta_constraints选择）
-        if self.enable_theta_constraints and union_analysis and 'union_constraints' in union_analysis:
-            union_constraints = union_analysis['union_constraints']
-            
-            for constraint_info in union_constraints:
-                branch_id = constraint_info['branch_id']
-                time_slot = constraint_info['time_slot']
-                constraint_type = constraint_info.get('constraint_type', 'dcpf_upper')
-                nonzero_coefficients = constraint_info['nonzero_pg_coefficients']
-                
-                lhs_expr = torch.tensor(0.0, device=device)
-                
-                for coeff_info in nonzero_coefficients:
-                    unit_id = coeff_info['unit_id']
-                    theta_name = f'theta_branch_{branch_id}_unit_{unit_id}_time_{time_slot}'
-                    theta_idx = self._theta_name_to_idx.get(theta_name, -1)
-                    if theta_idx >= 0:
-                        theta = theta_tensor[theta_idx]
-                        lhs_expr = lhs_expr + theta * x[unit_id, time_slot]
-                
-                theta_rhs_name = f'theta_rhs_branch_{branch_id}_time_{time_slot}'
-                theta_rhs_idx = self._theta_name_to_idx.get(theta_rhs_name, -1)
-                if theta_rhs_idx >= 0:
-                    theta_rhs = theta_tensor[theta_rhs_idx]
-                else:
-                    theta_rhs = torch.tensor(1.0, device=device)
-                
-                violation = lhs_expr - theta_rhs
-                obj_primal = obj_primal + torch.relu(violation)
-                
-                if branch_id < self.nl:
-                    obj_opt = obj_opt + torch.abs(violation) * mu[branch_id, time_slot]
-                else:
-                    default_mu = torch.tensor(getattr(self, 'dual_para_bound', 0.1), device=device)
-                    obj_opt = obj_opt + torch.abs(violation) * default_mu
-                
-                lhs_expr_x_LP = torch.tensor(0.0, device=device)
-                for coeff_info in nonzero_coefficients:
-                    unit_id = coeff_info['unit_id']
-                    theta_name = f'theta_branch_{branch_id}_unit_{unit_id}_time_{time_slot}'
-                    theta_idx = self._theta_name_to_idx.get(theta_name, -1)
-                    if theta_idx >= 0:
-                        theta = theta_tensor[theta_idx]
-                        lhs_expr_x_LP = lhs_expr_x_LP + theta * x_LP[unit_id, time_slot]
-                
-                theta_rhs_name = f'theta_rhs_branch_{branch_id}_time_{time_slot}'
-                theta_rhs_idx = self._theta_name_to_idx.get(theta_rhs_name, -1)
-                if theta_rhs_idx >= 0:
-                    d_value = theta_tensor[theta_rhs_idx]
-                else:
-                    d_value = torch.tensor(1.0, device=device)
-                
-                constraint_violation = torch.relu(d_value + epsilon - lhs_expr_x_LP)
-                obj_constraint_violation = obj_constraint_violation + lambda_weight * constraint_violation
-        
-        # 计算zeta相关的参数化约束损失（根据enable_zeta_constraints选择）
-        if self.enable_zeta_constraints and union_analysis and 'union_zeta_constraints' in union_analysis:
-            union_zeta_constraints = union_analysis['union_zeta_constraints']
-            
-            for constraint in union_zeta_constraints:
-                unit_id = constraint['unit_id']
-                time_slot = constraint['time_slot']
-                
-                zeta_name = f'zeta_unit_{unit_id}_time_{time_slot}'
-                zeta_idx = self._zeta_name_to_idx.get(zeta_name, -1)
-                if zeta_idx >= 0:
-                    zeta = zeta_tensor[zeta_idx]
-                    lhs_expr = zeta * x[unit_id, time_slot]
-                    
-                    zeta_rhs_name = f'zeta_rhs_unit_{unit_id}_time_{time_slot}'
-                    zeta_rhs_idx = self._zeta_name_to_idx.get(zeta_rhs_name, -1)
-                    if zeta_rhs_idx >= 0:
-                        zeta_rhs = zeta_tensor[zeta_rhs_idx]
-                    else:
-                        zeta_rhs = torch.tensor(1.0, device=device)
-                    
-                    violation = lhs_expr - zeta_rhs
-                    obj_primal = obj_primal + torch.relu(violation)
-                    obj_opt = obj_opt + torch.abs(violation) * ita[unit_id, time_slot]
-                    
-                    lhs_expr_x_LP = zeta * x_LP[unit_id, time_slot]
-                    
-                    zeta_rhs_name = f'zeta_rhs_unit_{unit_id}_time_{time_slot}'
-                    zeta_rhs_idx = self._zeta_name_to_idx.get(zeta_rhs_name, -1)
-                    if zeta_rhs_idx >= 0:
-                        d_value = zeta_tensor[zeta_rhs_idx]
-                    else:
-                        d_value = torch.tensor(1.0, device=device)
-                    
-                    constraint_violation = torch.relu(d_value + epsilon - lhs_expr_x_LP)
-                    obj_constraint_violation = obj_constraint_violation + lambda_weight * constraint_violation
-        
+
+        # 预缓存常量张量（避免循环内 torch.tensor 分配）
+        _one = self._const_one
+        _default_mu = self._default_mu_tensor
+
+        # 计算theta相关的参数化约束损失（使用预处理缓存，无字符串格式化）
+        for branch_id, time_slot, _ctype, coeff_list, rhs_idx in self._cached_theta_constraints:
+            lhs_expr = 0.0
+            for unit_id, theta_idx in coeff_list:
+                lhs_expr = lhs_expr + theta_tensor[theta_idx] * x[unit_id, time_slot]
+
+            theta_rhs = theta_tensor[rhs_idx] if rhs_idx >= 0 else _one
+
+            violation = lhs_expr - theta_rhs
+            obj_primal = obj_primal + torch.relu(violation)
+
+            if branch_id < self.nl:
+                obj_opt = obj_opt + torch.abs(violation) * mu[branch_id, time_slot]
+            else:
+                obj_opt = obj_opt + torch.abs(violation) * _default_mu
+
+            # lhs_expr_x_LP == lhs_expr（x_LP = x，冗余循环已消除）
+            d_value = theta_rhs
+            constraint_violation = torch.relu(d_value + epsilon - lhs_expr)
+            obj_constraint_violation = obj_constraint_violation + lambda_weight * constraint_violation
+
+        # 计算zeta相关的参数化约束损失（使用预处理缓存）
+        for unit_id, time_slot, zeta_idx, rhs_idx in self._cached_zeta_constraints:
+            zeta = zeta_tensor[zeta_idx]
+            lhs_expr = zeta * x[unit_id, time_slot]
+
+            zeta_rhs = zeta_tensor[rhs_idx] if rhs_idx >= 0 else _one
+
+            violation = lhs_expr - zeta_rhs
+            obj_primal = obj_primal + torch.relu(violation)
+            obj_opt = obj_opt + torch.abs(violation) * ita[unit_id, time_slot]
+
+            # lhs_expr_x_LP == lhs_expr（x_LP = x，冗余赋值已消除）
+            d_value = zeta_rhs
+            constraint_violation = torch.relu(d_value + epsilon - lhs_expr)
+            obj_constraint_violation = obj_constraint_violation + lambda_weight * constraint_violation
+
         # 计算对偶约束损失
         for g in range(self.ng):
             for t in range(self.T):
@@ -2577,12 +2584,12 @@ class Agent_NN_BCD:
                 dual_expr = dual_expr + lambda_x_upper[g, t] - lambda_x_lower[g, t]
                 dual_expr = dual_expr + gen_PMIN[g] * lambda_pg_lower[g, t]
                 dual_expr = dual_expr - gen_PMAX[g] * lambda_pg_upper[g, t]
-                                
+
                 if t > 0:
                     dual_expr = dual_expr + (Rd_co[g] - Rd[g]) * lambda_ramp_down[g, t-1]
                 if t < self.T - 1:
                     dual_expr = dual_expr + (Ru_co[g] - Ru[g]) * lambda_ramp_up[g, t]
-                
+
                 for tau in range(1, Ton + 1):
                     for t1 in range(self.T - tau):
                         if t == t1 + 1:
@@ -2591,7 +2598,7 @@ class Agent_NN_BCD:
                             dual_expr = dual_expr - lambda_min_on[g, tau-1, t1]
                         if t == t1 + tau:
                             dual_expr = dual_expr - lambda_min_on[g, tau-1, t1]
-                
+
                 for tau in range(1, Toff + 1):
                     for t1 in range(self.T - tau):
                         if t == t1 + 1:
@@ -2600,58 +2607,26 @@ class Agent_NN_BCD:
                             dual_expr = dual_expr + lambda_min_off[g, tau-1, t1]
                         if t == t1 + tau:
                             dual_expr = dual_expr + lambda_min_off[g, tau-1, t1]
-                
+
                 if t > 0:
                     dual_expr = dual_expr + start_cost[g] * lambda_start_cost[g, t-1]
                     dual_expr = dual_expr - shut_cost[g] * lambda_shut_cost[g, t-1]
                 if t < self.T - 1:
                     dual_expr = dual_expr - start_cost[g] * lambda_start_cost[g, t]
                     dual_expr = dual_expr + shut_cost[g] * lambda_shut_cost[g, t]
-                
-                # 参数化约束的对偶贡献（theta相关）
-                if self.enable_theta_constraints and union_analysis and 'union_constraints' in union_analysis:
-                    union_constraints = union_analysis['union_constraints']
-                    
-                    for constraint_info in union_constraints:
-                        branch_id = constraint_info['branch_id']
-                        time_slot = constraint_info['time_slot']
-                        if time_slot != t:
-                            continue
-                        constraint_type = constraint_info.get('constraint_type', 'dcpf_upper')
-                        nonzero_coefficients = constraint_info['nonzero_pg_coefficients']
-                        
-                        for coeff_info in nonzero_coefficients:
-                            unit_id = coeff_info['unit_id']
-                            if unit_id != g:
-                                continue
-                            
-                            theta_name = f'theta_branch_{branch_id}_unit_{unit_id}_time_{time_slot}'
-                            theta_idx = self._theta_name_to_idx.get(theta_name, -1)
-                            if theta_idx >= 0:
-                                theta = theta_tensor[theta_idx]
-                                if branch_id < self.nl:
-                                    dual_expr = dual_expr + theta * mu[branch_id, time_slot]
-                                else:
-                                    default_mu = torch.tensor(getattr(self, 'dual_para_bound', 0.1), device=device)
-                                    dual_expr = dual_expr + theta * default_mu
-                
-                # 参数化约束的对偶贡献（zeta相关）
-                if self.enable_zeta_constraints and union_analysis and 'union_zeta_constraints' in union_analysis:
-                    union_zeta_constraints = union_analysis['union_zeta_constraints']
-                    
-                    for constraint in union_zeta_constraints:
-                        constraint_unit_id = constraint['unit_id']
-                        time_slot = constraint['time_slot']
-                        
-                        if time_slot != t or constraint_unit_id != g:
-                            continue
-                        
-                        zeta_name = f'zeta_unit_{constraint_unit_id}_time_{time_slot}'
-                        zeta_idx = self._zeta_name_to_idx.get(zeta_name, -1)
-                        if zeta_idx >= 0:
-                            zeta = zeta_tensor[zeta_idx]
-                            dual_expr = dual_expr + zeta * ita[constraint_unit_id, time_slot]
-                
+
+                # 参数化约束的对偶贡献（theta相关）——使用查找表，O(1) 替代全量扫描
+                for theta_idx, branch_id in self._dual_theta_lookup.get((g, t), []):
+                    theta = theta_tensor[theta_idx]
+                    if branch_id < self.nl:
+                        dual_expr = dual_expr + theta * mu[branch_id, t]
+                    else:
+                        dual_expr = dual_expr + theta * _default_mu
+
+                # 参数化约束的对偶贡献（zeta相关）——使用查找表
+                for zeta_idx in self._dual_zeta_lookup.get((g, t), []):
+                    dual_expr = dual_expr + zeta_tensor[zeta_idx] * ita[g, t]
+
                 obj_dual = obj_dual + torch.abs(dual_expr)
         
         # Fischer-Burmeister函数处理互补松弛条件
