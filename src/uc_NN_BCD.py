@@ -1332,7 +1332,45 @@ class Agent_NN_BCD:
         print(f"  - 输入维度: {input_dim}", flush=True)
         print(f"  - theta输出维度: {self.theta_output_dim}", flush=True)
         print(f"  - zeta输出维度: {self.zeta_output_dim}", flush=True)
-    
+
+        # 预计算常量张量（Tier 1）和特征缓存（Tier 2）
+        self._precompute_constant_tensors()
+        self._features_cache = torch.stack([
+            torch.tensor(np.array(self._extract_features(s)), dtype=torch.float32)
+            for s in range(self.n_samples)
+        ]).to(self.device)  # shape: (n_samples, input_dim)
+
+    def _precompute_constant_tensors(self):
+        """预计算训练全程不变的常量张量，避免每次 loss 调用时重建（Tier 1）。"""
+        dev = self.device
+        self._ct = {
+            'gen_PMIN':      torch.tensor(self.gen[:, PMIN], dtype=torch.float32, device=dev),
+            'gen_PMAX':      torch.tensor(self.gen[:, PMAX], dtype=torch.float32, device=dev),
+            'gencost_fixed': torch.tensor(self.gencost[:, -1] / self.T_delta, dtype=torch.float32, device=dev),
+            'start_cost':    torch.tensor(self.gencost[:, 1], dtype=torch.float32, device=dev),
+            'shut_cost':     torch.tensor(self.gencost[:, 2], dtype=torch.float32, device=dev),
+            'Ru':            torch.tensor(0.4 * self.gen[:, PMAX] / self.T_delta, dtype=torch.float32, device=dev),
+            'Rd':            torch.tensor(0.4 * self.gen[:, PMAX] / self.T_delta, dtype=torch.float32, device=dev),
+            'Ru_co':         torch.tensor(0.3 * self.gen[:, PMAX], dtype=torch.float32, device=dev),
+            'Rd_co':         torch.tensor(0.3 * self.gen[:, PMAX], dtype=torch.float32, device=dev),
+        }
+        self._empty_tensor = torch.zeros(0, device=dev)
+
+    def _refresh_iter_tensor_cache(self):
+        """每次 BCD 迭代整批转换 x/mu/ita/lambda，避免 loss 内逐张量创建（Tier 3）。"""
+        dev = self.device
+        self._x_cache   = torch.tensor(self.x,   dtype=torch.float32, device=dev)   # (n_samples, ng, T)
+        self._mu_cache  = torch.tensor(self.mu,  dtype=torch.float32, device=dev)   # (n_samples, nl, T)
+        self._ita_cache = torch.tensor(self.ita, dtype=torch.float32, device=dev)   # (n_samples, ng, T)
+        self._lambda_cache = []
+        for s in range(self.n_samples):
+            d = self.lambda_[s]
+            self._lambda_cache.append({
+                k: torch.tensor(np.array(v), dtype=torch.float32, device=dev)
+                for k, v in d.items()
+                if isinstance(v, (list, np.ndarray)) and len(v) > 0
+            })
+
     def _extract_features(self, sample_id):
         """从样本中提取特征（参考uc_NN.py）"""
         pd_data = self.active_set_data[sample_id]['pd_data']
@@ -1896,11 +1934,8 @@ class Agent_NN_BCD:
             
             # 对每个样本单独进行训练
             for sample_id in range(self.n_samples):
-                # 提取特征
-                features = self._extract_features(sample_id)
-                features_tensor = torch.tensor(np.array(features), dtype=torch.float32).unsqueeze(0)
-                if self.device:
-                    features_tensor = features_tensor.to(self.device)
+                # 从缓存取特征（view，无拷贝）
+                features_tensor = self._features_cache[sample_id:sample_id+1]
                 
                 # 前向传播
                 theta_output = self.theta_net(features_tensor)
@@ -1941,11 +1976,7 @@ class Agent_NN_BCD:
                 print(f"[NN-theta/zeta] epoch {epoch+1}/{num_epochs}, avg_loss = {avg_loss:.6f}", flush=True)
         
         # 更新theta和zeta值（使用第一个样本的预测值）
-        sample_id = 0
-        features = self._extract_features(sample_id)
-        features_tensor = torch.tensor(np.array(features), dtype=torch.float32).unsqueeze(0)
-        if self.device:
-            features_tensor = features_tensor.to(self.device)
+        features_tensor = self._features_cache[0:1]
         
         self.theta_net.eval()
         self.zeta_net.eval()
@@ -1958,7 +1989,7 @@ class Agent_NN_BCD:
         
         return theta_values_new, zeta_values_new
     
-    def iter(self, max_iter=20, union_analysis=None):
+    def iter(self, max_iter=20, nn_epochs=10, union_analysis=None):
         """
         主迭代循环（参考uc_dfsm_bcd.py）
         - 迭代PG块（更新x, pg）
@@ -2011,8 +2042,12 @@ class Agent_NN_BCD:
                 self.mu[sample_id, :, :] = np.where(np.abs(mu_sol) < EPS, 0, mu_sol)
                 self.ita[sample_id, :, :] = np.where(np.abs(ita_sol) < EPS, 0, ita_sol)
             
-            # 3. 使用神经网络更新theta和zeta
-            theta_values_new, zeta_values_new = self.iter_with_theta_zeta_neural_network(union_analysis=union_analysis, num_epochs=10)
+            # 3. 刷新迭代级张量缓存（整批转换，避免 loss 内逐张量创建）
+            if TORCH_AVAILABLE and hasattr(self, 'device'):
+                self._refresh_iter_tensor_cache()
+
+            # 4. 使用神经网络更新theta和zeta
+            theta_values_new, zeta_values_new = self.iter_with_theta_zeta_neural_network(union_analysis=union_analysis, num_epochs=nn_epochs)
             if theta_values_new is None or zeta_values_new is None:
                 print("❌ Theta/Zeta神经网络更新失败，终止迭代", flush=True)
                 break
@@ -2343,50 +2378,50 @@ class Agent_NN_BCD:
         if union_analysis is None:
             union_analysis = self._current_union_analysis
         
-        # 预先计算不依赖于神经网络输出的部分
+        # 从 Tier1/Tier3 缓存读取，避免每次调用重建张量
         # ============================================
         # 重要：使用BCD迭代得到的变量值（从iter_with_pg_block和iter_with_dual_block得到）
         # ============================================
-        # x: 从iter_with_pg_block得到（原始变量）
-        x = torch.tensor(self.x[sample_id], dtype=torch.float32, device=device)  # (ng, T)
-        
-        # lambda: 从iter_with_dual_block得到（对偶变量）
-        # 注意：self.lambda_[sample_id] 是在iter_with_dual_block中更新后存储的
-        lambda_dict = self.lambda_[sample_id]
-        lambda_cpower = torch.tensor(np.array(lambda_dict.get('lambda_cpower', [])), dtype=torch.float32, device=device)  # (ng, T)
-        lambda_pg_lower = torch.tensor(np.array(lambda_dict.get('lambda_pg_lower', [])), dtype=torch.float32, device=device)  # (ng, T)
-        lambda_pg_upper = torch.tensor(np.array(lambda_dict.get('lambda_pg_upper', [])), dtype=torch.float32, device=device)  # (ng, T)
-        lambda_ramp_down = torch.tensor(np.array(lambda_dict.get('lambda_ramp_down', [])), dtype=torch.float32, device=device)  # (ng, T-1)
-        lambda_ramp_up = torch.tensor(np.array(lambda_dict.get('lambda_ramp_up', [])), dtype=torch.float32, device=device)  # (ng, T-1)
-        lambda_min_on = torch.tensor(np.array(lambda_dict.get('lambda_min_on', [])), dtype=torch.float32, device=device)  # (ng, Ton, T)
-        lambda_min_off = torch.tensor(np.array(lambda_dict.get('lambda_min_off', [])), dtype=torch.float32, device=device)  # (ng, Toff, T)
-        lambda_start_cost = torch.tensor(np.array(lambda_dict.get('lambda_start_cost', [])), dtype=torch.float32, device=device)  # (ng, T-1)
-        lambda_shut_cost = torch.tensor(np.array(lambda_dict.get('lambda_shut_cost', [])), dtype=torch.float32, device=device)  # (ng, T-1)
-        lambda_x_upper = torch.tensor(np.array(lambda_dict.get('lambda_x_upper', [])), dtype=torch.float32, device=device)  # (ng, T)
-        lambda_x_lower = torch.tensor(np.array(lambda_dict.get('lambda_x_lower', [])), dtype=torch.float32, device=device)  # (ng, T)
-        
-        gen_PMIN = torch.tensor(self.gen[:, PMIN], dtype=torch.float32, device=device)
-        gen_PMAX = torch.tensor(self.gen[:, PMAX], dtype=torch.float32, device=device)
-        gencost_fixed = torch.tensor(self.gencost[:, -1] / self.T_delta, dtype=torch.float32, device=device)
-        start_cost = torch.tensor(self.gencost[:, 1], dtype=torch.float32, device=device)
-        shut_cost = torch.tensor(self.gencost[:, 2], dtype=torch.float32, device=device)
-        
+        # x: Tier3 缓存（view，无拷贝）
+        x = self._x_cache[sample_id]  # (ng, T)
+
+        # lambda: Tier3 缓存
+        lc = self._lambda_cache[sample_id]
+        et = self._empty_tensor  # 空张量占位
+        lambda_cpower     = lc.get('lambda_cpower',     et)
+        lambda_pg_lower   = lc.get('lambda_pg_lower',   et)
+        lambda_pg_upper   = lc.get('lambda_pg_upper',   et)
+        lambda_ramp_down  = lc.get('lambda_ramp_down',  et)
+        lambda_ramp_up    = lc.get('lambda_ramp_up',    et)
+        lambda_min_on     = lc.get('lambda_min_on',     et)
+        lambda_min_off    = lc.get('lambda_min_off',    et)
+        lambda_start_cost = lc.get('lambda_start_cost', et)
+        lambda_shut_cost  = lc.get('lambda_shut_cost',  et)
+        lambda_x_upper    = lc.get('lambda_x_upper',    et)
+        lambda_x_lower    = lc.get('lambda_x_lower',    et)
+
+        # Tier1 常量张量
+        ct = self._ct
+        gen_PMIN      = ct['gen_PMIN']
+        gen_PMAX      = ct['gen_PMAX']
+        gencost_fixed = ct['gencost_fixed']
+        start_cost    = ct['start_cost']
+        shut_cost     = ct['shut_cost']
         Ton = min(4, self.T)
         Toff = min(4, self.T)
-        Ru = torch.tensor(0.4 * self.gen[:, PMAX] / self.T_delta, dtype=torch.float32, device=device)
-        Rd = torch.tensor(0.4 * self.gen[:, PMAX] / self.T_delta, dtype=torch.float32, device=device)
-        Ru_co = torch.tensor(0.3 * self.gen[:, PMAX], dtype=torch.float32, device=device)
-        Rd_co = torch.tensor(0.3 * self.gen[:, PMAX], dtype=torch.float32, device=device)
-        
+        Ru    = ct['Ru']
+        Rd    = ct['Rd']
+        Ru_co = ct['Ru_co']
+        Rd_co = ct['Rd_co']
+
         if not hasattr(self, '_theta_name_to_idx'):
             self._theta_name_to_idx = {name: idx for idx, name in enumerate(self.theta_var_names)}
         if not hasattr(self, '_zeta_name_to_idx'):
             self._zeta_name_to_idx = {name: idx for idx, name in enumerate(self.zeta_var_names)}
-        
-        # 从self.mu和self.ita中选择特定sample_id的数据
-        # self.mu的形状是(n_samples, nl, T)，self.ita的形状是(n_samples, ng, T)
-        mu = torch.tensor(self.mu[sample_id], dtype=torch.float32, device=device)  # (nl, T)
-        ita = torch.tensor(self.ita[sample_id], dtype=torch.float32, device=device)  # (ng, T)
+
+        # mu, ita: Tier3 缓存（view，无拷贝）
+        mu  = self._mu_cache[sample_id]   # (nl, T)
+        ita = self._ita_cache[sample_id]  # (ng, T)
         
         use_fb_for_loss = getattr(self, 'use_fischer_burmeister', False)
         
@@ -2437,8 +2472,8 @@ class Agent_NN_BCD:
         obj_dual = torch.tensor(0.0, device=device, requires_grad=True)
         obj_constraint_violation = torch.tensor(0.0, device=device, requires_grad=True)
         
-        # x_LP: 从iter_with_pg_block得到的LP松弛解（用于约束违反惩罚项计算）
-        x_LP = torch.tensor(self.x[sample_id], dtype=torch.float32, device=device)  # (ng, T)
+        # x_LP: 与上方 x 相同数据（已从 Tier3 缓存取得）
+        x_LP = x
         
         lambda_weight = getattr(self, 'constraint_violation_weight', 1.0)
         epsilon = getattr(self, 'constraint_violation_epsilon', 1e-3)
