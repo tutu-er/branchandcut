@@ -2292,7 +2292,7 @@ class Agent_NN:
                 x_round3 = np.round(self.heuristic_sol_x_spec(sample_id, x_LP, x_LP_refined)).astype(int)
                 self.plot_sample0_binary_comparison(x_true, x_round1, x_round2,
                                                     labels=("True optimum", "LP Optimized", "BCD-Neural Optimized"),
-                                                    save_path="result/fig/sample0_binary_comparison.png",
+                                                    save_path="result/figures/sample0_binary_comparison.png",
                                                     show=True)
                 
                 # 求解ED问题并比较最优值
@@ -2455,7 +2455,7 @@ class Agent_NN:
     # --------------------------------------------------------------------------
     def plot_sample0_binary_comparison(self, x_true: np.ndarray, x_round1: np.ndarray, x_round2: np.ndarray,
                                         labels: tuple = ("Ground Truth", "Standard Rounding", "BCD-Neural Optimized"),
-                                        save_path: str = "result/fig/binary_comparison_pro.pdf", show: bool = True) -> None:
+                                        save_path: str = "result/figures/binary_comparison_pro.pdf", show: bool = True) -> None:
         """绘制二进制变量比较图"""
         ng, T = self.ng, self.T
         m_true = np.array(x_true).reshape(ng, T)
@@ -2531,7 +2531,7 @@ if __name__ == "__main__":
         exit(1)
     
     # 加载active_set数据
-    json_file = "result/active_sets_20251221_161355.json"
+    json_file = "result/active_set/active_sets_20251221_161355.json"
     active_set_data = load_active_set_from_json(json_file)
     
     # 准备ppc数据
@@ -2564,7 +2564,7 @@ if __name__ == "__main__":
     
     # 保存结果
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    save_path = f'result/theta_zeta_values_final_{timestamp}.json'
+    save_path = f'result/theta_zeta/theta_zeta_values_final_{timestamp}.json'
     agent.save_theta_values(save_path)
     
     save_path = f'result/net/model_parameters_final_{timestamp}_{case}.pth'

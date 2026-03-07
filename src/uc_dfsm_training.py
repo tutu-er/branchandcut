@@ -1,3 +1,4 @@
+import os
 import numpy as np
 import gurobipy as gp
 from gurobipy import GRB
@@ -1846,7 +1847,7 @@ class UnitCommitmentModel:
         
 if __name__ == "__main__":
     # 方法1: 直接读取JSON文件分析
-    json_file = "result/active_sets_20250803_025349.json"  # 替换为您的JSON文件路径
+    json_file = "result/active_set/active_sets_20250803_025349.json"  # 替换为您的JSON文件路径
     
     try:
         sample_id = 12
@@ -1957,7 +1958,8 @@ if __name__ == "__main__":
                 }
             }
             
-            info_file = f"result/constraint_matrices_info_{timestamp}.json"
+            info_file = f"result/constraint_matrices/constraint_matrices_info_{timestamp}.json"
+            os.makedirs(os.path.dirname(info_file), exist_ok=True)
             with open(info_file, 'w', encoding='utf-8') as f:
                 json.dump(matrix_info, f, indent=2, ensure_ascii=False)
             

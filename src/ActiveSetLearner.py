@@ -102,9 +102,9 @@ class ActiveSetLearner:
             n = len(self.samples)
             filename = f"active_sets_{case_tag}_T{T}_n{n}_{timestamp}.json"
 
-        # 创建result目录（如果不存在）
-        result_dir = Path('result')
-        result_dir.mkdir(exist_ok=True)
+        # 创建result/active_set目录（如果不存在）
+        result_dir = Path('result') / 'active_set'
+        result_dir.mkdir(parents=True, exist_ok=True)
 
         # 将frozenset转换为list便于JSON序列化
         active_sets_list = [list(active_set) for active_set in self.observed_active_sets]
@@ -168,10 +168,10 @@ class ActiveSetLearner:
             n = len(self.samples)
             filename = f"active_sets_mapping_{case_tag}_T{T}_n{n}_{timestamp}.json"
         
-        # 创建result目录（如果不存在）
-        result_dir = Path('result')
-        result_dir.mkdir(exist_ok=True)
-        
+        # 创建result/active_set目录（如果不存在）
+        result_dir = Path('result') / 'active_set'
+        result_dir.mkdir(parents=True, exist_ok=True)
+
         # 生成映射关系
         mapping = {f"样本{i+1}": {"Pd": sample[0].tolist(), "活动集": list(sample[1])} for i, sample in enumerate(self.samples)}
         

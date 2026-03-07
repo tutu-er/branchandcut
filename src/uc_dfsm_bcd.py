@@ -4236,7 +4236,7 @@ class Iter_BCD:
             time.sleep(1)
             pass
         
-        self.save_theta_values(f'result/theta_values_final_{datetime.now().strftime("%Y%m%d_%H%M%S")}.json')
+        self.save_theta_values(f'result/theta_zeta/theta_values_final_{datetime.now().strftime("%Y%m%d_%H%M%S")}.json')
         return self.theta_values
 
     def solve_LP_with_theta_constraints(self, sample_id, theta_values, zeta_values, union_analysis=None):
@@ -4781,7 +4781,7 @@ class Iter_BCD:
             
         
 if __name__ == "__main__":
-    json_file = "result/active_sets_20251221_161355.json" 
+    json_file = "result/active_set/active_sets_20251221_161355.json"
     
     active_set_data = load_active_set_from_json(json_file)
     
@@ -4794,7 +4794,7 @@ if __name__ == "__main__":
 
     iter_bcd = Iter_BCD(ppc, active_set_data=active_set_data, T_delta=T_delta, use_theta=False, use_zeta=True)
     # iter_bcd.iter(max_iter=20)  # 运行迭代
-    iter_bcd.load_theta_values('result/theta_values_final_20251202_205941.json')
+    iter_bcd.load_theta_values('result/theta_zeta/theta_values_final_20251202_205941.json')
     iter_bcd.analyse_surrogate_model_totle()
     
     ## TODO : 目前参数下可能会迭代dual块爆炸，看运气
