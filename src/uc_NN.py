@@ -1665,6 +1665,31 @@ class Agent_NN:
             self._theta_name_to_idx = {name: idx for idx, name in enumerate(self.theta_var_names)}
         if not hasattr(self, '_zeta_name_to_idx'):
             self._zeta_name_to_idx = {name: idx for idx, name in enumerate(self.zeta_var_names)}
+
+        # 预建 theta/zeta 查找表（在 g,t 热循环外，O(1) 替代 O(|constraints|) 扫描）
+        # theta_lookup_diff: (time_slot, unit_id) -> [(theta_idx, branch_id), ...]
+        theta_lookup_diff: dict[tuple[int, int], list[tuple[int, int]]] = {}
+        if self.enable_theta_constraints and union_analysis and 'union_constraints' in union_analysis:
+            for _ci in union_analysis['union_constraints']:
+                _b_id = _ci['branch_id']
+                _t_s = _ci['time_slot']
+                for _coeff in _ci.get('nonzero_pg_coefficients', []):
+                    _u_id = _coeff['unit_id']
+                    _tname = f'theta_branch_{_b_id}_unit_{_u_id}_time_{_t_s}'
+                    _tidx = self._theta_name_to_idx.get(_tname, -1)
+                    if _tidx >= 0:
+                        theta_lookup_diff.setdefault((_t_s, _u_id), []).append((_tidx, _b_id))
+
+        # zeta_lookup_diff: (time_slot, unit_id) -> zeta_idx
+        zeta_lookup_diff: dict[tuple[int, int], int] = {}
+        if self.enable_zeta_constraints and union_analysis and 'union_zeta_constraints' in union_analysis:
+            for _c in union_analysis['union_zeta_constraints']:
+                _u_id = _c['unit_id']
+                _t_s = _c['time_slot']
+                _zname = f'zeta_unit_{_u_id}_time_{_t_s}'
+                _zidx = self._zeta_name_to_idx.get(_zname, -1)
+                if _zidx >= 0:
+                    zeta_lookup_diff[(_t_s, _u_id)] = _zidx
         
         mu = torch.tensor(self.mu[sample_id], dtype=torch.float32, device=device)
         ita = torch.tensor(self.ita[sample_id], dtype=torch.float32, device=device)
@@ -1761,22 +1786,22 @@ class Agent_NN:
                     dual_expr = dual_expr + (Ru_co[g] - Ru[g]) * lambda_ramp_up[g, t]
                 
                 for tau in range(1, Ton + 1):
-                    for t1 in range(self.T - tau):
-                        if t == t1 + 1:
-                            dual_expr = dual_expr + lambda_min_on[g, tau-1, t1]
-                        if t == t1:
-                            dual_expr = dual_expr - lambda_min_on[g, tau-1, t1]
-                        if t == t1 + tau:
-                            dual_expr = dual_expr - lambda_min_on[g, tau-1, t1]
-                
+                    lmon_g_tau = lambda_min_on[g, tau - 1]  # (T,)
+                    if 0 < t <= self.T - tau:     # t1 = t-1
+                        dual_expr = dual_expr + lmon_g_tau[t - 1]
+                    if t < self.T - tau:          # t1 = t
+                        dual_expr = dual_expr - lmon_g_tau[t]
+                    if tau <= t < self.T:         # t1 = t-tau
+                        dual_expr = dual_expr - lmon_g_tau[t - tau]
+
                 for tau in range(1, Toff + 1):
-                    for t1 in range(self.T - tau):
-                        if t == t1 + 1:
-                            dual_expr = dual_expr - lambda_min_off[g, tau-1, t1]
-                        if t == t1:
-                            dual_expr = dual_expr + lambda_min_off[g, tau-1, t1]
-                        if t == t1 + tau:
-                            dual_expr = dual_expr + lambda_min_off[g, tau-1, t1]
+                    lmoff_g_tau = lambda_min_off[g, tau - 1]  # (T,)
+                    if 0 < t <= self.T - tau:     # t1 = t-1
+                        dual_expr = dual_expr - lmoff_g_tau[t - 1]
+                    if t < self.T - tau:          # t1 = t
+                        dual_expr = dual_expr + lmoff_g_tau[t]
+                    if tau <= t < self.T:         # t1 = t-tau
+                        dual_expr = dual_expr + lmoff_g_tau[t - tau]
                 
                 if t > 0:
                     dual_expr = dual_expr + start_cost[g] * lambda_start_cost[g, t-1]
@@ -1785,42 +1810,18 @@ class Agent_NN:
                     dual_expr = dual_expr - start_cost[g] * lambda_start_cost[g, t]
                     dual_expr = dual_expr + shut_cost[g] * lambda_shut_cost[g, t]
                 
-                # 参数化约束的对偶贡献
-                if self.enable_theta_constraints and union_analysis and 'union_constraints' in union_analysis:
-                    for constraint_info in union_analysis['union_constraints']:
-                        branch_id = constraint_info['branch_id']
-                        time_slot = constraint_info['time_slot']
-                        if time_slot != t:
-                            continue
-                        
-                        for coeff_info in constraint_info.get('nonzero_pg_coefficients', []):
-                            unit_id = coeff_info['unit_id']
-                            if unit_id != g:
-                                continue
-                            
-                            theta_name = f'theta_branch_{branch_id}_unit_{unit_id}_time_{time_slot}'
-                            theta_idx = self._theta_name_to_idx.get(theta_name, -1)
-                            if theta_idx >= 0:
-                                theta = theta_tensor[theta_idx]
-                                if branch_id < self.nl:
-                                    dual_expr = dual_expr + theta * mu[branch_id, time_slot]
-                                else:
-                                    default_mu = torch.tensor(self.dual_para_bound, device=device)
-                                    dual_expr = dual_expr + theta * default_mu
-                
-                if self.enable_zeta_constraints and union_analysis and 'union_zeta_constraints' in union_analysis:
-                    for constraint in union_analysis['union_zeta_constraints']:
-                        constraint_unit_id = constraint['unit_id']
-                        time_slot_c = constraint['time_slot']
-                        
-                        if time_slot_c != t or constraint_unit_id != g:
-                            continue
-                        
-                        zeta_name = f'zeta_unit_{constraint_unit_id}_time_{time_slot_c}'
-                        zeta_idx = self._zeta_name_to_idx.get(zeta_name, -1)
-                        if zeta_idx >= 0:
-                            zeta = zeta_tensor[zeta_idx]
-                            dual_expr = dual_expr + zeta * ita[constraint_unit_id, time_slot_c]
+                # 参数化约束的对偶贡献（O(1) 查找，表在循环外预建）
+                for _tidx, _bid in theta_lookup_diff.get((t, g), []):
+                    _theta = theta_tensor[_tidx]
+                    if _bid < self.nl:
+                        dual_expr = dual_expr + _theta * mu[_bid, t]
+                    else:
+                        default_mu = torch.tensor(self.dual_para_bound, device=device)
+                        dual_expr = dual_expr + _theta * default_mu
+
+                _zidx = zeta_lookup_diff.get((t, g), -1)
+                if _zidx >= 0:
+                    dual_expr = dual_expr + zeta_tensor[_zidx] * ita[g, t]
                 
                 obj_dual = obj_dual + torch.abs(dual_expr)
         

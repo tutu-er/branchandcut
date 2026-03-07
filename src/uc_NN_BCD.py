@@ -2175,7 +2175,31 @@ class Agent_NN_BCD:
         branch_limit = self.branch[:, RATE_A]
         # 预计算 PTDF @ G，避免在循环内重复计算
         PTDF_G = PTDF @ G  # shape: (nl, ng)
-        
+
+        # 预建 theta/zeta 查找表（theta_values 在迭代中不变，只需构建一次）
+        # theta_lookup: (time_slot, unit_id) -> [(branch_id, theta_val), ...]
+        theta_lookup: dict[tuple[int, int], list[tuple[int, float]]] = {}
+        if (self.enable_theta_constraints and union_analysis
+                and 'union_constraints' in union_analysis
+                and self.theta_values is not None):
+            for _c in union_analysis['union_constraints']:
+                _b_id = _c['branch_id']
+                _t_s = _c['time_slot']
+                for _coeff in _c['nonzero_pg_coefficients']:
+                    _u_id = _coeff['unit_id']
+                    _name = f'theta_branch_{_b_id}_unit_{_u_id}_time_{_t_s}'
+                    _val = self.theta_values.get(_name, 0.0)
+                    theta_lookup.setdefault((_t_s, _u_id), []).append((_b_id, _val))
+
+        # zeta_lookup: (time_slot, unit_id) -> zeta_val
+        zeta_lookup: dict[tuple[int, int], float] = {}
+        if (self.enable_zeta_constraints and union_analysis
+                and 'union_zeta_constraints' in union_analysis
+                and self.zeta_values is not None):
+            for _c in union_analysis['union_zeta_constraints']:
+                _name = f'zeta_unit_{_c["unit_id"]}_time_{_c["time_slot"]}'
+                zeta_lookup[(_c['time_slot'], _c['unit_id'])] = self.zeta_values.get(_name, 0.0)
+
         for sample_id in range(self.n_samples):
             Pd = self.active_set_data[sample_id]['pd_data']
             pg = self.pg[sample_id, :, :]
@@ -2330,14 +2354,12 @@ class Agent_NN_BCD:
                             dual_expr -= self.lambda_[sample_id]['lambda_ramp_up'][g, t]
                             dual_expr += self.lambda_[sample_id]['lambda_ramp_down'][g, t]
 
-                        # DCPF约束贡献 - 使用预计算的 PTDF_G
+                        # DCPF约束贡献 - 使用预计算的 PTDF_G（向量化）
                         ptdfg_col = PTDF_G[:, g]  # (nl,)
-                        for l in range(self.nl):
-                            pg_coeff = ptdfg_col[l]
-                            dual_expr += pg_coeff * (
-                                self.lambda_[sample_id]['lambda_dcpf_upper'][l, t]
-                                - self.lambda_[sample_id]['lambda_dcpf_lower'][l, t]
-                            )
+                        dual_expr += float(ptdfg_col @ (
+                            self.lambda_[sample_id]['lambda_dcpf_upper'][:, t]
+                            - self.lambda_[sample_id]['lambda_dcpf_lower'][:, t]
+                        ))
 
                         # 对偶约束：梯度 = 0
                         obj_dual += abs(dual_expr)
@@ -2362,25 +2384,25 @@ class Agent_NN_BCD:
                         if t < self.T - 1:
                             dual_expr += (Ru_co[g] - Ru[g]) * self.lambda_[sample_id]['lambda_ramp_up'][g, t]
 
-                        # 最小开机时间约束贡献
+                        # 最小开机时间约束贡献（直接索引，O(Ton) 替代 O(Ton*T)）
                         for tau in range(1, Ton + 1):
-                            for t1 in range(self.T - tau):
-                                if t == t1 + 1:
-                                    dual_expr += self.lambda_[sample_id]['lambda_min_on'][g, tau-1, t1]
-                                if t == t1:
-                                    dual_expr -= self.lambda_[sample_id]['lambda_min_on'][g, tau-1, t1]
-                                if t == t1 + tau:
-                                    dual_expr -= self.lambda_[sample_id]['lambda_min_on'][g, tau-1, t1]
+                            lmon = self.lambda_[sample_id]['lambda_min_on'][g, tau - 1]
+                            if 0 < t <= self.T - tau:     # t1 = t-1
+                                dual_expr += lmon[t - 1]
+                            if t < self.T - tau:          # t1 = t
+                                dual_expr -= lmon[t]
+                            if tau <= t < self.T:         # t1 = t-tau
+                                dual_expr -= lmon[t - tau]
 
-                        # 最小关机时间约束贡献
+                        # 最小关机时间约束贡献（直接索引，O(Toff) 替代 O(Toff*T)）
                         for tau in range(1, Toff + 1):
-                            for t1 in range(self.T - tau):
-                                if t == t1 + 1:
-                                    dual_expr -= self.lambda_[sample_id]['lambda_min_off'][g, tau-1, t1]
-                                if t == t1:
-                                    dual_expr += self.lambda_[sample_id]['lambda_min_off'][g, tau-1, t1]
-                                if t == t1 + tau:
-                                    dual_expr += self.lambda_[sample_id]['lambda_min_off'][g, tau-1, t1]
+                            lmoff = self.lambda_[sample_id]['lambda_min_off'][g, tau - 1]
+                            if 0 < t <= self.T - tau:     # t1 = t-1
+                                dual_expr -= lmoff[t - 1]
+                            if t < self.T - tau:          # t1 = t
+                                dual_expr += lmoff[t]
+                            if tau <= t < self.T:         # t1 = t-tau
+                                dual_expr += lmoff[t - tau]
 
                         # 启停成本约束贡献
                         if t > 0:
@@ -2390,41 +2412,17 @@ class Agent_NN_BCD:
                             dual_expr -= start_cost[g] * self.lambda_[sample_id]['lambda_start_cost'][g, t]
                             dual_expr += shut_cost[g] * self.lambda_[sample_id]['lambda_shut_cost'][g, t]
 
-                        # theta 相关的对偶约束贡献
-                        if self.enable_theta_constraints and union_analysis and 'union_constraints' in union_analysis and self.theta_values is not None:
-                            union_constraints = union_analysis['union_constraints']
-                            for constraint_info in union_constraints:
-                                branch_id = constraint_info['branch_id']
-                                time_slot = constraint_info['time_slot']
-                                if time_slot != t:
-                                    continue
-                                nonzero_coefficients = constraint_info['nonzero_pg_coefficients']
+                        # theta 相关的对偶约束贡献（O(1) 查找，表在循环外预建）
+                        for _branch_id, _theta_val in theta_lookup.get((t, g), []):
+                            if _branch_id < self.nl:
+                                dual_expr += _theta_val * self.mu[sample_id, _branch_id, t]
+                            else:
+                                dual_expr += _theta_val * getattr(self, 'dual_para_bound', 0.1)
 
-                                for coeff_info in nonzero_coefficients:
-                                    unit_id = coeff_info['unit_id']
-                                    if unit_id != g:
-                                        continue
-                                    theta_name = f'theta_branch_{branch_id}_unit_{unit_id}_time_{time_slot}'
-                                    theta = self.theta_values.get(theta_name, 0.0)
-                                    if branch_id < self.nl:
-                                        dual_expr += theta * self.mu[sample_id, branch_id, time_slot]
-                                    else:
-                                        # 虚拟支路使用默认 mu
-                                        default_mu = getattr(self, 'dual_para_bound', 0.1)
-                                        dual_expr += theta * default_mu
-
-                        # zeta 相关的对偶约束贡献
-                        if self.enable_zeta_constraints and union_analysis and 'union_zeta_constraints' in union_analysis and self.zeta_values is not None:
-                            union_zeta_constraints = union_analysis['union_zeta_constraints']
-                            for constraint in union_zeta_constraints:
-                                constraint_unit_id = constraint['unit_id']
-                                time_slot = constraint['time_slot']
-                                if time_slot != t or constraint_unit_id != g:
-                                    continue
-
-                                zeta_name = f'zeta_unit_{constraint_unit_id}_time_{time_slot}'
-                                zeta = self.zeta_values.get(zeta_name, 0.0)
-                                dual_expr += zeta * self.ita[sample_id, constraint_unit_id, time_slot]
+                        # zeta 相关的对偶约束贡献（O(1) 查找）
+                        _zeta_val = zeta_lookup.get((t, g), 0.0)
+                        if _zeta_val:
+                            dual_expr += _zeta_val * self.ita[sample_id, g, t]
 
                         # 对偶约束：梯度 = 0
                         obj_dual += abs(dual_expr)
