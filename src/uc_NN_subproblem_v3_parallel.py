@@ -1,77 +1,77 @@
 """
 uc_NN_subproblem_v3_parallel.py
+================================
+并行版 subproblem_v3 训练，分两个并行层级：
 
-SubproblemSurrogateTrainer 并行训练版本（新建文件，不修改原始实现）。
+Level 1（机组级，跨进程）
+    train_all_surrogates_parallel() 用 ProcessPoolExecutor 并发训练各机组。
+    受 Gurobi 许可证限制，默认最多 4 个并发进程（可通过 n_workers 调整）。
 
-并行层级设计：
-  Level 1 — 机组级并行（ProcessPoolExecutor）：
-    各机组完全独立，每个 worker 进程独立构建 trainer 并运行 iter()，
-    返回可序列化的结果 dict 由主进程汇总。
+Level 2（样本级，跨线程）
+    ParallelSubproblemSurrogateTrainer 继承 SubproblemSurrogateTrainer，
+    重写 iter()，在 primal/dual block 内用 ThreadPoolExecutor 并发提交各样本。
+    Gurobi 求解时释放 GIL，线程并发有效；结果收集后由主线程顺序写入状态。
+    NN block 保持串行（批次化训练，不需改动）。
 
-  Level 2 — 样本级并行（ThreadPoolExecutor）：
-    继承 SubproblemSurrogateTrainer，重写 iter()，
-    primal/dual block 内并发提交各样本的 Gurobi 求解。
-    Gurobi 在求解时释放 GIL，线程并发有效。
-    NN block 保持串行（批次化训练）。
-
-注意：并发 Gurobi 进程数受许可证限制，默认不超过 4。
-
-用法：
-    python src/uc_NN_subproblem_v3_parallel.py
+用法
+----
+    from uc_NN_subproblem_v3_parallel import (
+        ParallelSubproblemSurrogateTrainer,
+        train_all_surrogates_parallel,
+    )
 """
 
+import copy
 import os
 import sys
 import time
-import json
-from datetime import datetime
-from pathlib import Path
-from typing import Dict, List, Optional, Tuple
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
-from multiprocessing import cpu_count
+from pathlib import Path
+from typing import Dict, List, Optional
 
 import numpy as np
 
-# 将项目根目录添加到 sys.path（src/ 下所有文件均需此步骤）
-_PROJECT_ROOT = str(Path(__file__).resolve().parent.parent)
-_SRC_DIR = str(Path(__file__).resolve().parent)
-for _p in [_PROJECT_ROOT, _SRC_DIR]:
+# ── 路径设置（worker 进程也需要能 import src.*）──────────────
+_SRC_DIR = Path(__file__).resolve().parent
+_ROOT_DIR = _SRC_DIR.parent
+for _p in [str(_SRC_DIR), str(_ROOT_DIR)]:
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from src.uc_NN_subproblem_v3 import (
+from uc_NN_subproblem_v3 import (
     SubproblemSurrogateTrainer,
-    generate_test_data,
-    load_active_set_from_json,
-    train_all_subproblem_surrogates,
     _extract_lambda_power_balance,
-    TORCH_AVAILABLE,
+    generate_test_data,
+    train_all_subproblem_surrogates,
 )
-from pypower.ext2int import ext2int
-
-if hasattr(sys.stdout, 'reconfigure'):
-    sys.stdout.reconfigure(encoding='utf-8', line_buffering=True)
 
 
-# ========================== Level 2: 样本级并行（线程）==========================
+# ════════════════════════════════════════════════════════════════════
+# Level 2：样本级并行（线程）
+# ════════════════════════════════════════════════════════════════════
 
 class ParallelSubproblemSurrogateTrainer(SubproblemSurrogateTrainer):
-    """
-    样本级线程并行版的 SubproblemSurrogateTrainer。
+    """样本级线程并行的 BCD 训练器。
 
-    重写 iter()：primal/dual block 内用 ThreadPoolExecutor 并发各样本
-    的 Gurobi 求解，收集结果后主线程顺序更新共享状态。
-    NN block 保持串行（批次训练，无需改动）。
+    继承自 SubproblemSurrogateTrainer，重写 iter() 在 primal/dual block
+    内使用 ThreadPoolExecutor 并发求解各样本的 Gurobi 子问题。
+    NN block 保持串行（批次化训练）。
 
     Args:
-        n_workers: 线程数，默认 min(n_samples, 4)。
-        其余参数同 SubproblemSurrogateTrainer。
+        ppc: PyPower 案例数据。
+        active_set_data: 活动集数据列表。
+        T_delta: 时间间隔。
+        unit_id: 机组索引。
+        lambda_predictor: 已训练的对偶变量预测器（可选）。
+        max_constraints: 最大约束数量。
+        device: 计算设备。
+        n_workers: 并发线程数，默认 min(n_samples, 4)。
     """
 
     def __init__(
         self,
         ppc,
-        active_set_data,
+        active_set_data: List[Dict],
         T_delta: float,
         unit_id: int,
         lambda_predictor=None,
@@ -79,106 +79,115 @@ class ParallelSubproblemSurrogateTrainer(SubproblemSurrogateTrainer):
         device=None,
         n_workers: int = 4,
     ):
-        # n_workers 须在 super().__init__() 前赋值，因为父类 __init__ 会打印信息
-        self.n_workers = n_workers
         super().__init__(
             ppc, active_set_data, T_delta, unit_id,
             lambda_predictor=lambda_predictor,
             max_constraints=max_constraints,
             device=device,
         )
-
-    # ── 单样本 worker（供线程池调用）────────────────────────────────────────
-
-    def _run_primal_sample(
-        self, sample_id: int
-    ) -> Tuple[int, Optional[np.ndarray], Optional[np.ndarray],
-               Optional[np.ndarray], Optional[np.ndarray]]:
-        """单样本原始块求解，复制参数数组保证线程安全。"""
-        alphas = self.alpha_values[sample_id].copy()
-        betas  = self.beta_values[sample_id].copy()
-        gammas = self.gamma_values[sample_id].copy()
-        deltas = self.delta_values[sample_id].copy()
-        pg_sol, x_sol, coc_sol, cpower_sol = self.iter_with_primal_block(
-            sample_id, alphas, betas, gammas, deltas
-        )
-        return sample_id, pg_sol, x_sol, coc_sol, cpower_sol
-
-    def _run_dual_sample(
-        self, sample_id: int
-    ) -> Tuple[int, Optional[dict], Optional[np.ndarray]]:
-        """单样本对偶块求解，复制参数数组保证线程安全。"""
-        alphas = self.alpha_values[sample_id].copy()
-        betas  = self.beta_values[sample_id].copy()
-        gammas = self.gamma_values[sample_id].copy()
-        deltas = self.delta_values[sample_id].copy()
-        lambda_inherent_sol, mu_sol = self.iter_with_dual_block(
-            sample_id, alphas, betas, gammas, deltas
-        )
-        return sample_id, lambda_inherent_sol, mu_sol
-
-    # ── 主迭代循环（重写）────────────────────────────────────────────────────
+        self.n_workers = min(n_workers, self.n_samples)
 
     def iter(self, max_iter: int = 20, nn_epochs: int = 10):
-        """
-        主 BCD 迭代循环（样本级线程并行版本）。
+        """主 BCD 迭代循环（样本级线程并行版本）。
 
-        primal/dual block 内并发提交各样本 Gurobi 求解，
-        等所有 future 完成后，主线程按 sample_id 顺序更新共享状态。
+        primal/dual block 内并发提交各样本；结果收集后主线程顺序更新状态。
         NN block 保持串行。
         """
-        n_workers = min(self.n_workers, self.n_samples)
         prefix = f"[Unit-{self.unit_id}]"
         print(
-            f"{prefix} 开始并行BCD迭代 (V3, 样本线程数={n_workers})...",
+            f"{prefix} 开始样本级并行BCD迭代 "
+            f"(n_workers={self.n_workers}, max_iter={max_iter}, nn_epochs={nn_epochs})",
             flush=True,
         )
 
         EPS = 1e-10
 
         for i in range(max_iter):
-            print(f"{prefix} 迭代 {i+1}/{max_iter}", flush=True)
+            print(f"{prefix} 🔄 迭代 {i+1}/{max_iter}", flush=True)
             self.iter_number = i
 
-            # ── 1. 并行原始块 ──────────────────────────────────────────────
+            # ── 1. Primal block（线程并行） ──────────────────────────
+            # 提前复制参数，避免线程间共享可变数组
+            primal_args = [
+                (
+                    s,
+                    self.alpha_values[s].copy(),
+                    self.beta_values[s].copy(),
+                    self.gamma_values[s].copy(),
+                    self.delta_values[s].copy(),
+                )
+                for s in range(self.n_samples)
+            ]
+
             primal_results: Dict[int, tuple] = {}
-            with ThreadPoolExecutor(max_workers=n_workers) as executor:
-                futures = {
-                    executor.submit(self._run_primal_sample, s): s
-                    for s in range(self.n_samples)
+            with ThreadPoolExecutor(max_workers=self.n_workers) as executor:
+                future_to_sid = {
+                    executor.submit(
+                        self.iter_with_primal_block,
+                        s, alphas, betas, gammas, deltas,
+                    ): s
+                    for s, alphas, betas, gammas, deltas in primal_args
                 }
-                for fut in as_completed(futures):
-                    s_id, pg_sol, x_sol, coc_sol, cpower_sol = fut.result()
-                    if pg_sol is not None:
-                        primal_results[s_id] = (pg_sol, x_sol, coc_sol, cpower_sol)
+                for future in as_completed(future_to_sid):
+                    s = future_to_sid[future]
+                    try:
+                        primal_results[s] = future.result()
+                    except Exception as exc:
+                        print(f"{prefix} primal_block sample={s} 异常: {exc}", flush=True)
+                        primal_results[s] = (None, None, None, None)
 
-            for s_id, (pg_sol, x_sol, coc_sol, cpower_sol) in primal_results.items():
-                self.pg[s_id] = np.where(np.abs(pg_sol) < EPS, 0.0, pg_sol)
-                self.x[s_id]  = np.where(np.abs(x_sol)  < EPS, 0.0, x_sol)
-                self.x[s_id]  = np.where(np.abs(self.x[s_id] - 1) < EPS, 1.0, self.x[s_id])
-                self.coc[s_id]    = np.where(np.abs(coc_sol)    < EPS, 0.0, coc_sol)
-                self.cpower[s_id] = np.where(np.abs(cpower_sol) < EPS, 0.0, cpower_sol)
+            # 顺序写入状态（避免并发写）
+            for s in range(self.n_samples):
+                pg_sol, x_sol, coc_sol, cpower_sol = primal_results[s]
+                if pg_sol is not None:
+                    self.pg[s]     = np.where(np.abs(pg_sol) < EPS, 0, pg_sol)
+                    self.x[s]      = np.where(np.abs(x_sol) < EPS, 0, x_sol)
+                    self.x[s]      = np.where(np.abs(self.x[s] - 1) < EPS, 1, self.x[s])
+                    self.coc[s]    = np.where(np.abs(coc_sol) < EPS, 0, coc_sol)
+                    self.cpower[s] = np.where(np.abs(cpower_sol) < EPS, 0, cpower_sol)
 
-            # ── 2. 并行对偶块 ──────────────────────────────────────────────
+            # ── 2. Dual block（线程并行） ────────────────────────────
             lb_mu = 0.0 if self.iter_number >= 50 else self.mu_lower_bound
+
+            dual_args = [
+                (
+                    s,
+                    self.alpha_values[s].copy(),
+                    self.beta_values[s].copy(),
+                    self.gamma_values[s].copy(),
+                    self.delta_values[s].copy(),
+                )
+                for s in range(self.n_samples)
+            ]
+
             dual_results: Dict[int, tuple] = {}
-            with ThreadPoolExecutor(max_workers=n_workers) as executor:
-                futures = {
-                    executor.submit(self._run_dual_sample, s): s
-                    for s in range(self.n_samples)
+            with ThreadPoolExecutor(max_workers=self.n_workers) as executor:
+                future_to_sid = {
+                    executor.submit(
+                        self.iter_with_dual_block,
+                        s, alphas, betas, gammas, deltas,
+                    ): s
+                    for s, alphas, betas, gammas, deltas in dual_args
                 }
-                for fut in as_completed(futures):
-                    s_id, lam_inh, mu_sol = fut.result()
-                    if lam_inh is not None:
-                        dual_results[s_id] = (lam_inh, mu_sol)
+                for future in as_completed(future_to_sid):
+                    s = future_to_sid[future]
+                    try:
+                        dual_results[s] = future.result()
+                    except Exception as exc:
+                        print(f"{prefix} dual_block sample={s} 异常: {exc}", flush=True)
+                        dual_results[s] = (None, None)
 
-            for s_id, (lam_inh, mu_sol) in dual_results.items():
-                self.lambda_inherent[s_id] = lam_inh
-                self.mu[s_id] = np.maximum(mu_sol, lb_mu)
+            # 顺序写入状态
+            for s in range(self.n_samples):
+                lambda_inherent_sol, mu_sol = dual_results[s]
+                if lambda_inherent_sol is not None:
+                    self.lambda_inherent[s] = lambda_inherent_sol
+                    self.mu[s] = np.maximum(mu_sol, lb_mu)
 
-            # ── 3. NN block（串行）────────────────────────────────────────
+            # ── 3. NN block（串行，批次化训练） ──────────────────────
             self.iter_with_surrogate_nn(num_epochs=nn_epochs)
 
+            # ── 计算并打印违反量 ─────────────────────────────────────
             obj_primal, obj_dual, obj_opt = self.cal_viol()
             obj_primal = obj_primal if abs(obj_primal) >= 1e-12 else 0.0
             obj_dual   = obj_dual   if abs(obj_dual)   >= 1e-12 else 0.0
@@ -194,132 +203,132 @@ class ParallelSubproblemSurrogateTrainer(SubproblemSurrogateTrainer):
             self.rho_dual   += self.gamma * obj_dual
             self.rho_opt    += self.gamma * obj_opt
 
-            print(
-                f"{prefix}   rho_p={self.rho_primal:.4f}, "
-                f"rho_d={self.rho_dual:.4f}, rho_o={self.rho_opt:.4f}",
-                flush=True,
-            )
-
-        print(f"{prefix} ✓ V3三时段耦合代理约束训练完成", flush=True)
+        print(f"{prefix} ✓ 样本级并行训练完成", flush=True)
 
 
-# ========================== Level 1: 机组级并行（进程）==========================
-
-def _embed_lambda_into_data(
-    active_set_data: List[Dict], lambda_vals: np.ndarray
-) -> List[Dict]:
-    """
-    将预计算的 lambda_vals 嵌入 active_set_data 的浅拷贝。
-
-    嵌入后子进程读取到 'lambda' 字段，跳过 LP 求解（优化性能）。
-    lambda_vals: (n_samples, T)
-    """
-    embedded = []
-    for i, sample in enumerate(active_set_data):
-        s = dict(sample)
-        # 以 list 格式嵌入（_extract_lambda_power_balance 支持 list）
-        s['lambda'] = lambda_vals[i].tolist()
-        embedded.append(s)
-    return embedded
-
+# ════════════════════════════════════════════════════════════════════
+# Level 1：机组级并行（进程）
+# ════════════════════════════════════════════════════════════════════
 
 def _train_unit_worker(args: dict) -> dict:
-    """
-    顶层可 pickle 的机组训练 worker 函数（供 ProcessPoolExecutor 调用）。
+    """顶层可 pickle 的 worker 函数（供 ProcessPoolExecutor 调用）。
 
-    每个 worker 进程独立构建 trainer、运行 iter()，返回序列化结果 dict。
-    lambda_vals 已由主进程预嵌入 active_set_data，子进程无需重复求解 LP。
+    在子进程中构建 trainer，运行 iter()，返回序列化状态 dict。
 
     Args:
-        args: 包含以下键的字典
-            unit_id           (int)  : 机组索引
-            ppc               (dict) : PyPower 案例数据（含 numpy arrays，可 pickle）
-            active_set_data   (list) : 已嵌入 lambda 的样本数据
-            T_delta           (float): 时间间隔，默认 1.0
-            max_iter          (int)  : BCD 最大迭代次数
-            nn_epochs         (int)  : NN 训练轮数/迭代
-            save_dir          (str|None): 可选保存目录
-            use_sample_parallel (bool): 是否启用 Level 2 线程并行
-            sample_n_workers  (int)  : Level 2 线程数
-            max_constraints   (int)  : 最大约束数
+        args: 包含以下键的字典：
+            ppc, active_set_data, lambda_vals (np.ndarray | None),
+            unit_id, T_delta, max_iter, nn_epochs,
+            sample_n_workers, use_sample_parallel, save_dir.
 
     Returns:
-        序列化友好的结果 dict，包含 numpy arrays + 标量；
-        失败时返回 {'unit_id': ..., 'success': False, 'error': ...}。
+        包含 unit_id 和 alpha/beta/gamma/delta/mu/rho 的状态字典。
     """
-    # 子进程重新设置 sys.path
-    import sys
-    from pathlib import Path
+    # 子进程路径修复（Windows spawn 不继承父进程 sys.path）
+    _src = str(Path(__file__).resolve().parent)
     _root = str(Path(__file__).resolve().parent.parent)
-    _src  = str(Path(__file__).resolve().parent)
-    for _p in [_root, _src]:
+    for _p in [_src, _root]:
         if _p not in sys.path:
             sys.path.insert(0, _p)
 
-    import os
-    import numpy as np
+    from uc_NN_subproblem_v3 import SubproblemSurrogateTrainer
 
     unit_id             = args['unit_id']
     ppc                 = args['ppc']
-    active_set_data     = args['active_set_data']
-    T_delta             = args.get('T_delta', 1.0)
-    max_iter            = args.get('max_iter', 20)
-    nn_epochs           = args.get('nn_epochs', 10)
-    save_dir            = args.get('save_dir')
-    use_sample_parallel = args.get('use_sample_parallel', True)
+    active_set_data     = copy.deepcopy(args['active_set_data'])
+    lambda_vals         = args.get('lambda_vals')   # (n_samples, T) ndarray or None
+    T_delta             = args['T_delta']
+    max_iter            = args['max_iter']
+    nn_epochs           = args['nn_epochs']
     sample_n_workers    = args.get('sample_n_workers', 4)
-    max_constraints     = args.get('max_constraints', 20)
+    use_sample_parallel = args.get('use_sample_parallel', True)
+    save_dir            = args.get('save_dir')
 
     prefix = f"[Unit-{unit_id}]"
-    print(f"{prefix} 子进程启动，开始训练...", flush=True)
+    print(f"{prefix} worker 启动 (pid={os.getpid()})", flush=True)
 
-    try:
-        if use_sample_parallel:
-            from src.uc_NN_subproblem_v3_parallel import ParallelSubproblemSurrogateTrainer
-            trainer = ParallelSubproblemSurrogateTrainer(
-                ppc, active_set_data, T_delta, unit_id,
-                lambda_predictor=None,
-                max_constraints=max_constraints,
-                n_workers=sample_n_workers,
-            )
-        else:
-            from src.uc_NN_subproblem_v3 import SubproblemSurrogateTrainer
-            trainer = SubproblemSurrogateTrainer(
-                ppc, active_set_data, T_delta, unit_id,
-                lambda_predictor=None,
-                max_constraints=max_constraints,
-            )
+    # 将预计算的 lambda_vals 注入 active_set_data，避免子进程重复求解 LP
+    if lambda_vals is not None:
+        for i, sample in enumerate(active_set_data):
+            sample['lambda'] = lambda_vals[i].tolist()
 
-        trainer.iter(max_iter=max_iter, nn_epochs=nn_epochs)
+    # 构建 trainer
+    if use_sample_parallel:
+        # 导入并行 trainer（子进程中重新 import，无问题）
+        from uc_NN_subproblem_v3_parallel import ParallelSubproblemSurrogateTrainer
+        trainer = ParallelSubproblemSurrogateTrainer(
+            ppc, active_set_data, T_delta, unit_id,
+            lambda_predictor=None,
+            n_workers=sample_n_workers,
+        )
+    else:
+        trainer = SubproblemSurrogateTrainer(
+            ppc, active_set_data, T_delta, unit_id,
+            lambda_predictor=None,
+        )
 
-        if save_dir:
-            os.makedirs(save_dir, exist_ok=True)
-            trainer.save(os.path.join(save_dir, f'surrogate_unit_{unit_id}.pth'))
+    trainer.iter(max_iter=max_iter, nn_epochs=nn_epochs)
 
-        print(f"{prefix} 训练完成", flush=True)
+    if save_dir:
+        os.makedirs(save_dir, exist_ok=True)
+        trainer.save(os.path.join(save_dir, f'surrogate_unit_{unit_id}.pth'))
 
-        return {
-            'unit_id':      unit_id,
-            'alpha_values': trainer.alpha_values,
-            'beta_values':  trainer.beta_values,
-            'gamma_values': trainer.gamma_values,
-            'delta_values': trainer.delta_values,
-            'mu':           trainer.mu,
-            'rho_primal':   trainer.rho_primal,
-            'rho_dual':     trainer.rho_dual,
-            'rho_opt':      trainer.rho_opt,
-            'success':      True,
-        }
+    print(f"{prefix} worker 完成", flush=True)
 
-    except Exception as exc:
-        import traceback
-        print(f"{prefix} 训练失败: {exc}", flush=True)
-        traceback.print_exc()
-        return {
-            'unit_id': unit_id,
-            'success': False,
-            'error':   str(exc),
-        }
+    return {
+        'unit_id':      unit_id,
+        'alpha_values': trainer.alpha_values,
+        'beta_values':  trainer.beta_values,
+        'gamma_values': trainer.gamma_values,
+        'delta_values': trainer.delta_values,
+        'mu':           trainer.mu,
+        'rho_primal':   trainer.rho_primal,
+        'rho_dual':     trainer.rho_dual,
+        'rho_opt':      trainer.rho_opt,
+    }
+
+
+def _precompute_lambda_vals(
+    ppc,
+    active_set_data: List[Dict],
+    T_delta: float,
+) -> np.ndarray:
+    """在主进程中预计算所有样本的 lambda_vals (n_samples, T)。
+
+    优先从 active_set_data 中读取已有 lambda 字段；
+    若缺失则通过创建临时 trainer（unit=0）触发 _solve_for_lambda()。
+
+    Args:
+        ppc: PyPower 案例数据。
+        active_set_data: 活动集数据列表。
+        T_delta: 时间间隔。
+
+    Returns:
+        lambda_vals 数组，shape (n_samples, T)。
+    """
+    n_samples = len(active_set_data)
+    T = active_set_data[0]['pd_data'].shape[1]
+
+    # 若所有样本都有 lambda，直接提取
+    all_have_lambda = all(
+        'lambda' in s and s['lambda'] is not None
+        for s in active_set_data
+    )
+    if all_have_lambda:
+        vals = np.array([
+            _extract_lambda_power_balance(s['lambda'], T)
+            for s in active_set_data
+        ])
+        print(f"✓ 从数据中读取 {n_samples} 个样本的 lambda_vals", flush=True)
+        return vals
+
+    # 否则创建 unit=0 的临时 trainer 触发 lambda 计算（各机组共享同一组 lambda）
+    print("预计算 lambda_vals（unit=0 临时 trainer）...", flush=True)
+    tmp = SubproblemSurrogateTrainer(
+        ppc, active_set_data, T_delta, unit_id=0,
+        lambda_predictor=None,
+    )
+    return tmp.lambda_vals.copy()
 
 
 def train_all_surrogates_parallel(
@@ -327,303 +336,262 @@ def train_all_surrogates_parallel(
     active_set_data: List[Dict],
     T_delta: float = 1.0,
     lambda_predictor=None,
-    unit_ids: List[int] = None,
+    unit_ids: Optional[List[int]] = None,
     max_iter: int = 20,
     nn_epochs: int = 10,
-    save_dir: str = None,
+    save_dir: Optional[str] = None,
     device=None,
-    n_workers: int = None,
+    n_workers: Optional[int] = None,
     sample_n_workers: int = 4,
     use_sample_parallel: bool = True,
 ) -> Dict[int, dict]:
-    """
-    机组级并行训练所有机组代理约束（Level 1：进程级并行）。
+    """并行训练所有机组的子问题代理约束（Level 1：机组级进程并行）。
 
-    流程：
-      1. 若提供 lambda_predictor，主进程预计算 lambda_vals 并嵌入数据，
-         避免子进程重复求解 LP。
-      2. 用 ProcessPoolExecutor 并发各机组 _train_unit_worker。
-      3. 收集各进程结果 dict，以 {unit_id: state_dict} 形式返回。
-
-    注意：
-      - 并发进程数受 Gurobi 许可证限制，建议 n_workers <= 4。
-      - device 参数保留但不传给子进程（CUDA 在 spawn 模式下不安全）。
-      - Windows 下 ProcessPoolExecutor 默认使用 spawn，需要
-        主脚本有 `if __name__ == '__main__':` 保护。
+    注意：并发进程数受 Gurobi 许可证限制，默认上限为 4。
+    若持有学术或完整许可证，可适当增大 n_workers。
 
     Args:
-        ppc: PyPower 案例数据
-        active_set_data: 活动集数据列表
-        T_delta: 时间间隔
-        lambda_predictor: 已训练的对偶变量预测器（可选）
-        unit_ids: 要训练的机组 ID 列表（默认全部机组）
-        max_iter: BCD 最大迭代次数
-        nn_epochs: 每次 BCD 迭代中 NN 训练轮数
-        save_dir: 模型保存目录（可选）
-        device: 保留参数（子进程不使用）
-        n_workers: 并行进程数（默认 min(len(unit_ids), cpu_count(), 4)）
-        sample_n_workers: 每进程内样本并行线程数（Level 2）
-        use_sample_parallel: 是否在子进程内启用 Level 2 线程并行
+        ppc: PyPower 案例数据。
+        active_set_data: 活动集数据列表。
+        T_delta: 时间间隔。
+        lambda_predictor: 已训练的对偶变量预测器；若传入，在主进程提取 lambda_vals。
+        unit_ids: 要训练的机组 ID 列表，默认所有机组。
+        max_iter: BCD 最大迭代次数。
+        nn_epochs: 每次 BCD 迭代内 NN 训练轮数。
+        save_dir: 模型保存目录（可选）。
+        device: 计算设备（子进程重新初始化，此参数目前未传递至子进程）。
+        n_workers: 并发进程数，默认 min(len(unit_ids), 4)（Gurobi 许可证限制）。
+        sample_n_workers: 每个进程内的样本级线程数（Level 2）。
+        use_sample_parallel: 是否在子进程内启用 Level 2 线程并行。
 
     Returns:
-        {unit_id: state_dict}，成功的机组包含 alpha/beta/gamma/delta/mu 等 numpy arrays；
-        失败的机组包含 {'success': False, 'error': ...}。
+        {unit_id: state_dict} 字典，state_dict 含 alpha/beta/gamma/delta/mu/rho。
     """
+    from pypower.ext2int import ext2int
     ppc_int = ext2int(ppc)
     ng = ppc_int['gen'].shape[0]
 
     if unit_ids is None:
         unit_ids = list(range(ng))
 
-    # 默认进程数：受许可证限制不超过 4
+    # Gurobi 许可证限制：默认并发进程上限 4
+    MAX_GUROBI_CONCURRENT = 4
     if n_workers is None:
-        n_workers = min(len(unit_ids), cpu_count(), 4)
+        n_workers = min(len(unit_ids), MAX_GUROBI_CONCURRENT)
+    n_workers = max(1, n_workers)
 
     print("=" * 60, flush=True)
     print(
-        f"机组级并行训练 ({len(unit_ids)} 个机组, {n_workers} 进程, "
-        f"Level2={'启用' if use_sample_parallel else '禁用'})",
+        f"并行训练所有机组代理约束 "
+        f"({len(unit_ids)} 个机组, n_workers={n_workers})",
         flush=True,
     )
     print("=" * 60, flush=True)
 
-    # 若有 lambda_predictor，主进程预计算并嵌入数据（避免子进程重复 LP 求解）
+    # 预计算 lambda_vals（主进程一次，避免每个 worker 重复计算）
     if lambda_predictor is not None:
-        print("主进程预计算 lambda_vals（使用 predictor）...", flush=True)
         n_samples = len(active_set_data)
-        T = active_set_data[0]['pd_data'].shape[1]
-        lambda_vals = np.zeros((n_samples, T))
-        for i, sample in enumerate(active_set_data):
-            lambda_vals[i] = lambda_predictor.predict(sample['pd_data'])
-        worker_data = _embed_lambda_into_data(active_set_data, lambda_vals)
+        lambda_vals = np.array([
+            lambda_predictor.predict(active_set_data[i]['pd_data'])
+            for i in range(n_samples)
+        ])
+        print(
+            f"✓ 从 lambda_predictor 提取 lambda_vals shape={lambda_vals.shape}",
+            flush=True,
+        )
     else:
-        # 子进程自行从样本数据读取 lambda（或内部求解 LP）
-        worker_data = active_set_data
+        lambda_vals = _precompute_lambda_vals(ppc, active_set_data, T_delta)
 
-    # 构建每个机组的 worker args
+    # 构造每个 worker 的参数 dict
     worker_args = [
         {
-            'unit_id':             unit_id,
-            'ppc':                 ppc,
-            'active_set_data':     worker_data,
-            'T_delta':             T_delta,
-            'max_iter':            max_iter,
-            'nn_epochs':           nn_epochs,
-            'save_dir':            save_dir,
+            'ppc':                ppc,
+            'active_set_data':    active_set_data,
+            'lambda_vals':        lambda_vals,
+            'unit_id':            g,
+            'T_delta':            T_delta,
+            'max_iter':           max_iter,
+            'nn_epochs':          nn_epochs,
+            'sample_n_workers':   sample_n_workers,
             'use_sample_parallel': use_sample_parallel,
-            'sample_n_workers':    sample_n_workers,
-            'max_constraints':     20,
+            'save_dir':           save_dir,
         }
-        for unit_id in unit_ids
+        for g in unit_ids
     ]
 
     results: Dict[int, dict] = {}
-    t0 = time.time()
 
     with ProcessPoolExecutor(max_workers=n_workers) as executor:
-        future_to_unit = {
-            executor.submit(_train_unit_worker, a): a['unit_id']
-            for a in worker_args
+        future_to_uid = {
+            executor.submit(_train_unit_worker, args): args['unit_id']
+            for args in worker_args
         }
-        for fut in as_completed(future_to_unit):
-            uid = future_to_unit[fut]
+        for future in as_completed(future_to_uid):
+            uid = future_to_uid[future]
             try:
-                result = fut.result()
-                results[uid] = result
-                status = "完成" if result.get('success') else f"失败: {result.get('error')}"
-                print(f"[主进程] 机组 {uid} {status}", flush=True)
+                state = future.result()
+                results[uid] = state
+                print(f"✓ 机组 {uid} 并行训练完成", flush=True)
             except Exception as exc:
-                print(f"[主进程] 机组 {uid} 进程异常: {exc}", flush=True)
-                results[uid] = {'unit_id': uid, 'success': False, 'error': str(exc)}
+                print(f"✗ 机组 {uid} 训练失败: {exc}", flush=True)
+                import traceback
+                traceback.print_exc()
 
-    elapsed = time.time() - t0
-    n_ok = sum(1 for r in results.values() if r.get('success'))
-    print(
-        f"\n✓ 机组级并行训练完成，{n_ok}/{len(unit_ids)} 个机组成功，"
-        f"耗时 {elapsed:.1f}s",
-        flush=True,
-    )
+    print(f"\n✓ 所有机组并行训练完成 ({len(results)}/{len(unit_ids)})", flush=True)
     return results
 
 
-# ========================== 测试主函数 ==========================
+# ════════════════════════════════════════════════════════════════════
+# __main__：功能验证与加速比对比
+# ════════════════════════════════════════════════════════════════════
 
-def _time_serial_single(ppc, active_set_data: List[Dict],
-                         unit_id: int, max_iter: int, nn_epochs: int) -> float:
-    """计时：单机组串行训练（基准对比用）。"""
-    t0 = time.time()
-    trainer = SubproblemSurrogateTrainer(
-        ppc, active_set_data, T_delta=1.0, unit_id=unit_id,
-        lambda_predictor=None, max_constraints=20,
-    )
-    trainer.iter(max_iter=max_iter, nn_epochs=nn_epochs)
-    return time.time() - t0
+if __name__ == '__main__':
+    from datetime import datetime
 
+    # ── 路径设置 ─────────────────────────────────────────────────────
+    _src = str(Path(__file__).resolve().parent)
+    _root = str(Path(__file__).resolve().parent.parent)
+    for _p in [_src, _root]:
+        if _p not in sys.path:
+            sys.path.insert(0, _p)
 
-def _time_parallel_single(ppc, active_set_data: List[Dict],
-                           unit_id: int, max_iter: int, nn_epochs: int,
-                           n_sample_workers: int) -> float:
-    """计时：单机组样本级并行训练（Level 2 对比）。"""
-    t0 = time.time()
-    trainer = ParallelSubproblemSurrogateTrainer(
-        ppc, active_set_data, T_delta=1.0, unit_id=unit_id,
-        lambda_predictor=None, max_constraints=20,
-        n_workers=n_sample_workers,
-    )
-    trainer.iter(max_iter=max_iter, nn_epochs=nn_epochs)
-    return time.time() - t0
-
-
-def main():
-    """
-    并行训练三种模式的速度对比测试。
-
-    测试流程：
-      1. 生成小规模测试数据（case39/case30, T=8, n_samples=5, unit_ids=[0,1,2]）
-      2. 串行训练所有机组，记录耗时
-      3. 机组级并行训练，记录耗时
-      4. 样本级并行训练（机组0），对比单机组串行，记录耗时
-      5. 打印加速比对比表
-      6. 验证结果并保存计时 JSON
-
-    验证：并行版结果（alpha 量级）与串行版数量级相同。
-    """
-    # ── 加载测试案例 ──────────────────────────────────────────────────────
     try:
         import pypower.case39
         ppc = pypower.case39.case39()
-        case_name = "IEEE 39-bus"
     except ImportError:
-        try:
-            import pypower.case30
-            ppc = pypower.case30.case30()
-            case_name = "IEEE 30-bus"
-        except ImportError:
-            print("pypower 未安装，无法运行测试", flush=True)
-            return
+        print("错误: pypower 未安装", flush=True)
+        sys.exit(1)
 
-    print(f"使用 {case_name} 测试系统", flush=True)
-
-    # ── 测试参数 ──────────────────────────────────────────────────────────
-    T          = 8      # 时段数（较短，加快测试）
-    n_samples  = 5      # 样本数
-    unit_ids   = [0, 1, 2]
-    max_iter   = 3      # 少迭代，聚焦速度对比而非收敛质量
-    nn_epochs  = 3
-    n_proc     = min(len(unit_ids), 3)   # 进程数
-    n_thread   = min(n_samples, 4)       # 线程数
+    # ── 测试参数 ─────────────────────────────────────────────────────
+    T         = 8
+    N_SAMPLES = 5
+    UNIT_IDS  = [0, 1, 2]
+    MAX_ITER  = 3      # 保持迭代次数短，聚焦并行效果验证
+    NN_EPOCHS = 5
 
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    save_base = Path(_PROJECT_ROOT) / "result" / "subproblem_models" / f"parallel_test_{ts}"
-    save_base.mkdir(parents=True, exist_ok=True)
+    save_base = _root + f'/result/subproblem_models/parallel_test_{ts}'
+    os.makedirs(save_base, exist_ok=True)
 
+    print("=" * 60, flush=True)
     print(
-        f"\n配置: T={T}, n_samples={n_samples}, unit_ids={unit_ids}, "
-        f"max_iter={max_iter}, nn_epochs={nn_epochs}",
+        f"并行训练验证  T={T}, n_samples={N_SAMPLES}, "
+        f"units={UNIT_IDS}",
         flush=True,
     )
+    print(f"max_iter={MAX_ITER}, nn_epochs={NN_EPOCHS}", flush=True)
+    print("=" * 60, flush=True)
 
-    print(f"\n生成测试数据...", flush=True)
-    active_set_data = generate_test_data(ppc, T=T, n_samples=n_samples, seed=42)
+    # ── 生成测试数据 ─────────────────────────────────────────────────
+    active_set_data = generate_test_data(ppc, T=T, n_samples=N_SAMPLES, seed=42)
+
+    # 注入零值 lambda，避免子进程/线程调用 CVXPY 求 LP
+    T_actual = active_set_data[0]['pd_data'].shape[1]
+    for sample in active_set_data:
+        if 'lambda' not in sample:
+            sample['lambda'] = np.zeros(T_actual).tolist()
 
     timings: Dict[str, float] = {}
 
-    # ==================== 模式1：串行训练所有机组 ====================
-    print("\n" + "=" * 60, flush=True)
-    print("【模式1】串行训练（原始实现）", flush=True)
-    print("=" * 60, flush=True)
-    t0 = time.time()
+    # ── 1. 串行训练（baseline） ──────────────────────────────────────
+    print("\n" + "─" * 50, flush=True)
+    print("【串行训练】", flush=True)
+    data_serial = copy.deepcopy(active_set_data)
+    t0 = time.perf_counter()
     serial_trainers = train_all_subproblem_surrogates(
-        ppc, active_set_data, T_delta=1.0,
-        lambda_predictor=None, unit_ids=unit_ids,
-        max_iter=max_iter, nn_epochs=nn_epochs,
-        save_dir=str(save_base / "serial"),
+        ppc, data_serial, T_delta=1.0,
+        lambda_predictor=None,
+        unit_ids=UNIT_IDS,
+        max_iter=MAX_ITER, nn_epochs=NN_EPOCHS,
+        save_dir=os.path.join(save_base, 'serial'),
     )
-    timings['serial_all'] = time.time() - t0
-    print(f"串行耗时: {timings['serial_all']:.1f}s", flush=True)
+    timings['serial'] = time.perf_counter() - t0
+    print(f"串行完成，耗时 {timings['serial']:.2f}s", flush=True)
 
-    # ==================== 模式2：机组级并行训练 ====================
-    print("\n" + "=" * 60, flush=True)
-    print("【模式2】机组级并行训练（ProcessPoolExecutor）", flush=True)
-    print("=" * 60, flush=True)
-    t0 = time.time()
-    proc_results = train_all_surrogates_parallel(
-        ppc, active_set_data, T_delta=1.0,
-        lambda_predictor=None, unit_ids=unit_ids,
-        max_iter=max_iter, nn_epochs=nn_epochs,
-        save_dir=str(save_base / "process_parallel"),
-        n_workers=n_proc,
-        sample_n_workers=1,     # Level 2 禁用，单独对比
-        use_sample_parallel=False,
+    # ── 2. 机组级进程并行（Level 1，不含 Level 2） ───────────────────
+    print("\n" + "─" * 50, flush=True)
+    print("【机组级进程并行（Level 1）】", flush=True)
+    data_proc = copy.deepcopy(active_set_data)
+    t0 = time.perf_counter()
+    results_l1 = train_all_surrogates_parallel(
+        ppc, data_proc, T_delta=1.0,
+        lambda_predictor=None,
+        unit_ids=UNIT_IDS,
+        max_iter=MAX_ITER, nn_epochs=NN_EPOCHS,
+        save_dir=os.path.join(save_base, 'parallel_l1'),
+        n_workers=min(len(UNIT_IDS), 4),
+        use_sample_parallel=False,   # Level 1 only
     )
-    timings['process_parallel_all'] = time.time() - t0
-    print(f"机组级并行耗时: {timings['process_parallel_all']:.1f}s", flush=True)
+    timings['level1'] = time.perf_counter() - t0
+    print(f"Level-1 并行完成，耗时 {timings['level1']:.2f}s", flush=True)
 
-    # ==================== 模式3：样本级并行（机组0）vs 串行（机组0）====================
-    print("\n" + "=" * 60, flush=True)
-    print("【模式3a】串行训练单机组（机组0，基准）", flush=True)
-    print("=" * 60, flush=True)
-    timings['serial_unit0'] = _time_serial_single(
-        ppc, active_set_data, unit_ids[0], max_iter, nn_epochs
+    # ── 3. 样本级线程并行（Level 2，单机组验证） ─────────────────────
+    print("\n" + "─" * 50, flush=True)
+    print("【样本级线程并行（Level 2，单机组 unit=0）】", flush=True)
+    data_thread = copy.deepcopy(active_set_data)
+    t0 = time.perf_counter()
+    trainer_l2 = ParallelSubproblemSurrogateTrainer(
+        ppc, data_thread, 1.0, unit_id=0,
+        lambda_predictor=None,
+        n_workers=min(N_SAMPLES, 4),
     )
-    print(f"串行单机组耗时: {timings['serial_unit0']:.1f}s", flush=True)
+    trainer_l2.iter(max_iter=MAX_ITER, nn_epochs=NN_EPOCHS)
+    timings['level2_single'] = time.perf_counter() - t0
+    print(f"Level-2 并行（单机组）完成，耗时 {timings['level2_single']:.2f}s", flush=True)
 
-    print("\n" + "=" * 60, flush=True)
-    print("【模式3b】样本级并行训练（机组0，ThreadPoolExecutor）", flush=True)
-    print("=" * 60, flush=True)
-    timings['sample_parallel_unit0'] = _time_parallel_single(
-        ppc, active_set_data, unit_ids[0], max_iter, nn_epochs, n_thread
+    # ── 4. 双层并行（Level 1 + Level 2） ─────────────────────────────
+    print("\n" + "─" * 50, flush=True)
+    print("【双层并行（Level 1 + Level 2）】", flush=True)
+    data_both = copy.deepcopy(active_set_data)
+    t0 = time.perf_counter()
+    results_both = train_all_surrogates_parallel(
+        ppc, data_both, T_delta=1.0,
+        lambda_predictor=None,
+        unit_ids=UNIT_IDS,
+        max_iter=MAX_ITER, nn_epochs=NN_EPOCHS,
+        save_dir=os.path.join(save_base, 'parallel_both'),
+        n_workers=min(len(UNIT_IDS), 4),
+        sample_n_workers=min(N_SAMPLES, 4),
+        use_sample_parallel=True,    # Level 1 + Level 2
     )
-    print(f"样本级并行单机组耗时: {timings['sample_parallel_unit0']:.1f}s", flush=True)
+    timings['level1_l2'] = time.perf_counter() - t0
+    print(f"双层并行完成，耗时 {timings['level1_l2']:.2f}s", flush=True)
 
-    # ==================== 加速比对比表 ====================
+    # ── 结果验证：检查并行结果量级 ───────────────────────────────────
     print("\n" + "=" * 60, flush=True)
-    print("加速比对比", flush=True)
+    print("结果验证（alpha/delta 量级对比，串行 vs Level-1 并行）", flush=True)
     print("=" * 60, flush=True)
-    w = 38
-    print(f"{'模式':<{w}} {'耗时(s)':>8} {'加速比':>8}", flush=True)
-    print("-" * 60, flush=True)
+    for uid in UNIT_IDS:
+        s_trainer = serial_trainers.get(uid)
+        p_state   = results_l1.get(uid)
+        if s_trainer is None or p_state is None:
+            continue
+        s_alpha = float(np.mean(np.abs(s_trainer.alpha_values)))
+        p_alpha = float(np.mean(np.abs(p_state['alpha_values'])))
+        s_delta = float(np.mean(s_trainer.delta_values))
+        p_delta = float(np.mean(p_state['delta_values']))
+        print(
+            f"  Unit-{uid}: "
+            f"串行 alpha={s_alpha:.4f} delta={s_delta:.4f} | "
+            f"并行 alpha={p_alpha:.4f} delta={p_delta:.4f}",
+            flush=True,
+        )
 
-    s_all  = timings['serial_all']
-    p_all  = timings['process_parallel_all']
-    s_u0   = timings['serial_unit0']
-    sp_u0  = timings['sample_parallel_unit0']
-
-    sp_proc   = s_all  / p_all  if p_all  > 0 else float('inf')
-    sp_thread = s_u0   / sp_u0  if sp_u0  > 0 else float('inf')
-
+    # ── 加速比汇总表 ─────────────────────────────────────────────────
+    print("\n" + "=" * 60, flush=True)
+    print("加速比汇总表", flush=True)
+    print("=" * 60, flush=True)
+    ref = timings['serial']
     rows = [
-        ("串行（所有机组）",           s_all,  "1.00x"),
-        (f"机组级并行（{n_proc}进程）", p_all,  f"{sp_proc:.2f}x"),
-        ("串行（机组0）",              s_u0,   "(基准)"),
-        (f"样本级并行（{n_thread}线程，机组0）", sp_u0, f"{sp_thread:.2f}x"),
+        ("串行",               timings['serial'],        1.0),
+        ("Level-1 进程并行",   timings['level1'],        ref / timings['level1']),
+        ("Level-2 线程(单机)", timings['level2_single'], ref / timings['level2_single']),
+        ("Level-1+2 双层",     timings['level1_l2'],     ref / timings['level1_l2']),
     ]
-    for label, t, sp in rows:
-        print(f"{label:<{w}} {t:>8.1f} {sp:>8}", flush=True)
-    print("=" * 60, flush=True)
+    print(f"{'模式':<20} {'耗时(s)':>10} {'加速比':>10}", flush=True)
+    print("-" * 44, flush=True)
+    for name, t, speedup in rows:
+        print(f"{name:<20} {t:>10.2f} {speedup:>10.2f}x", flush=True)
 
-    # ==================== 结果验证 ====================
-    print("\n结果验证（alpha_values 均值对比，量级应相近）:", flush=True)
-    for uid in unit_ids:
-        if uid in serial_trainers and uid in proc_results:
-            r = proc_results[uid]
-            if r.get('success'):
-                s_alpha = serial_trainers[uid].alpha_values.mean()
-                p_alpha = r['alpha_values'].mean()
-                print(
-                    f"  机组 {uid}: serial_alpha_mean={s_alpha:.4f}, "
-                    f"process_alpha_mean={p_alpha:.4f}",
-                    flush=True,
-                )
-
-    # ==================== 保存计时结果 ====================
-    timing_file = save_base / "timings.json"
-    with open(timing_file, 'w', encoding='utf-8') as f:
-        json.dump(timings, f, indent=2, ensure_ascii=False)
-    print(f"\n计时结果已保存: {timing_file}", flush=True)
-    print("✓ 并行训练测试完成", flush=True)
-
-
-if __name__ == '__main__':
-    # Windows 下 ProcessPoolExecutor 使用 spawn，必须在此保护块内调用 main()
-    main()
+    print(f"\n结果已保存至: {save_base}", flush=True)
+    print("验证完成！", flush=True)
