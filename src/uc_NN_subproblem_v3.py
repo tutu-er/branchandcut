@@ -893,39 +893,50 @@ class SubproblemSurrogateTrainer:
                 print(f"  ⚠ 样本 {sample_id} 机组 {g}: 数据中既无 active_set 也无 "
                       f"unit_commitment_matrix，x_init 使用全零默认值", flush=True)
 
-            # 求解单机组LP（x固定），目标: cost - λᵀpg
+            # 求解单机组LP松弛，目标: cost - λᵀpg
             model = gp.Model('init_subproblem_LP')
             model.Params.OutputFlag = 0
 
-            pg     = model.addVars(self.T,   lb=0, name='pg')
-            coc    = model.addVars(self.T-1, lb=0, name='coc')
-            cpower = model.addVars(self.T,   lb=0, name='cpower')
+            pg     = model.addVars(self.T,   lb=0,       name='pg')
+            x      = model.addVars(self.T,   lb=0, ub=1, name='x')   # LP 松弛（连续）
+            coc    = model.addVars(self.T-1, lb=0,       name='coc')
+            cpower = model.addVars(self.T,   lb=0,       name='cpower')
 
-            # 发电上下限（x固定）
+            # 发电上下限（x 为松弛变量）
             for t in range(self.T):
-                model.addConstr(pg[t] >= Pmin * x_init[t], name=f'pg_lower_{t}')
-                model.addConstr(pg[t] <= Pmax * x_init[t], name=f'pg_upper_{t}')
+                model.addConstr(pg[t] >= Pmin * x[t], name=f'pg_lower_{t}')
+                model.addConstr(pg[t] <= Pmax * x[t], name=f'pg_upper_{t}')
 
             # 爬坡约束（与 dual block 一致：Ru_co=0.3*Pmax）
             for t in range(1, self.T):
                 model.addConstr(
-                    pg[t] - pg[t-1] <= Ru * x_init[t-1] + Ru_co * (1 - x_init[t-1]),
+                    pg[t] - pg[t-1] <= Ru * x[t-1] + Ru_co * (1 - x[t-1]),
                     name=f'ramp_up_{t}')
                 model.addConstr(
-                    pg[t-1] - pg[t] <= Rd * x_init[t] + Rd_co * (1 - x_init[t]),
+                    pg[t-1] - pg[t] <= Rd * x[t] + Rd_co * (1 - x[t]),
                     name=f'ramp_down_{t}')
 
-            # 最小开关机（x固定→常数约束，恒成立，跳过）
-            pass
+            # 最小开机时间（LP 松弛形式）
+            for tau in range(1, Ton + 1):
+                for t1 in range(self.T - tau):
+                    model.addConstr(
+                        x[t1+1] - x[t1] <= x[t1+tau],
+                        name=f'min_on_{tau}_{t1}')
+            # 最小关机时间（LP 松弛形式）
+            for tau in range(1, Toff + 1):
+                for t1 in range(self.T - tau):
+                    model.addConstr(
+                        -x[t1+1] + x[t1] <= 1 - x[t1+tau],
+                        name=f'min_off_{tau}_{t1}')
 
             # 启停成本
             for t in range(1, self.T):
-                model.addConstr(coc[t-1] >= sc  * (x_init[t] - x_init[t-1]), name=f'start_cost_{t}')
-                model.addConstr(coc[t-1] >= shc * (x_init[t-1] - x_init[t]), name=f'shut_cost_{t}')
+                model.addConstr(coc[t-1] >= sc  * (x[t] - x[t-1]), name=f'start_cost_{t}')
+                model.addConstr(coc[t-1] >= shc * (x[t-1] - x[t]), name=f'shut_cost_{t}')
 
             # 发电成本（等式约束，与 dual block 假设 lambda_cpower=1 一致）
             for t in range(self.T):
-                model.addConstr(cpower[t] == a * pg[t] + b * x_init[t], name=f'cpower_{t}')
+                model.addConstr(cpower[t] == a * pg[t] + b * x[t], name=f'cpower_{t}')
 
             # 目标: min cost - λᵀpg（用于提取有意义的对偶变量）
             obj = (gp.quicksum(cpower[t] for t in range(self.T)) +
@@ -935,8 +946,9 @@ class SubproblemSurrogateTrainer:
             model.optimize()
 
             if model.status == GRB.OPTIMAL:
+                x_lp = np.array([x[t].X for t in range(self.T)])    # LP 松弛解（连续）
                 self.pg[sample_id]     = np.array([pg[t].X     for t in range(self.T)])
-                self.x[sample_id]      = x_init.copy()
+                self.x[sample_id]      = x_lp                        # ← 连续松弛解
                 # 将 JSON 整数解存入 sample，作为 iter_with_primal_block 的持久锚点
                 # （不随 BCD 迭代更新，确保 x_true 始终指向原始 MILP 最优解）
                 self.active_set_data[sample_id]['x_true'] = x_init.copy()
@@ -953,9 +965,11 @@ class SubproblemSurrogateTrainer:
                                                    for t in range(1, self.T)]),
                     'lambda_ramp_down':  np.array([_get_pi(model, f'ramp_down_{t}')
                                                    for t in range(1, self.T)]),
-                    'lambda_min_on':     np.array([[0.0] * (self.T - tau)
+                    'lambda_min_on':     np.array([[_get_pi(model, f'min_on_{tau}_{t1}')
+                                                    for t1 in range(self.T - tau)]
                                                    for tau in range(1, Ton+1)],  dtype=object),
-                    'lambda_min_off':    np.array([[0.0] * (self.T - tau)
+                    'lambda_min_off':    np.array([[_get_pi(model, f'min_off_{tau}_{t1}')
+                                                    for t1 in range(self.T - tau)]
                                                    for tau in range(1, Toff+1)], dtype=object),
                     'lambda_start_cost': np.array([_get_pi(model, f'start_cost_{t}')
                                                    for t in range(1, self.T)]),

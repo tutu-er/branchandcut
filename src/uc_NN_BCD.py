@@ -380,7 +380,7 @@ class Agent_NN_BCD:
         self.zeta_vars = {}
         
         # 初始化求解（获得初始x和lambda）
-        self.pg, self.x, self.coc, self.cpower, self.lambda_ = self.initialize_solve()
+        self.pg, self.x, self.x_opt, self.coc, self.cpower, self.lambda_ = self.initialize_solve()
         
         # 如果没有提供union_analysis，则基于x_init创建
         if union_analysis is None:
@@ -485,16 +485,254 @@ class Agent_NN_BCD:
             print(f"❌ _solve_lp_with_fixed_x 失败: {e}", flush=True)
             return None, None, None, None
 
-    def initialize_solve(self):
-        """初始化求解，获得初始x和lambda（参考uc_dfsm_bcd.py）
+    def _solve_lp_relaxation(self, Pd: np.ndarray):
+        """求解 UC 的 LP 松弛（x ∈ [0,1]），用于获取连续初始点和对偶变量。
 
-        策略：
-        1. 若数据集中有 unit_commitment_matrix → 直接用，跳过 MILP
-        2. 若无 → 求解 MILP 获取 x
-        3. 无论哪种情况，用固定 x 的 LP 获取对偶变量（MILP 不返回有效对偶变量）
+        Args:
+            Pd: 负荷矩阵 (nb, T)
+
+        Returns:
+            (x_lp, pg_sol, coc_sol, cpower_sol, lambda_dict) 或全 None（若失败）
+        """
+        try:
+            lp = gp.Model('lp_relaxation')
+            lp.Params.OutputFlag = 0
+
+            pg = lp.addVars(self.ng, self.T, lb=0, name='pg')
+            x = lp.addVars(self.ng, self.T, vtype=GRB.CONTINUOUS, lb=0, ub=1, name='x')
+            coc = lp.addVars(self.ng, self.T - 1, lb=0, name='coc')
+            cpower = lp.addVars(self.ng, self.T, lb=0, name='cpower')
+
+            # 功率平衡约束
+            for t in range(self.T):
+                lp.addConstr(
+                    gp.quicksum(pg[g, t] for g in range(self.ng)) == np.sum(Pd[:, t]),
+                    name=f'power_balance_{t}'
+                )
+
+            # 发电上下限约束
+            for g in range(self.ng):
+                for t in range(self.T):
+                    lp.addConstr(pg[g, t] >= self.gen[g, PMIN] * x[g, t], name=f'pg_lower_{g}_{t}')
+                    lp.addConstr(pg[g, t] <= self.gen[g, PMAX] * x[g, t], name=f'pg_upper_{g}_{t}')
+
+            # 爬坡约束
+            Ru = 0.4 * self.gen[:, PMAX] / self.T_delta
+            Rd = 0.4 * self.gen[:, PMAX] / self.T_delta
+            for g in range(self.ng):
+                for t in range(1, self.T):
+                    lp.addConstr(pg[g, t] - pg[g, t - 1] <= Ru[g] * x[g, t - 1] + self.gen[g, PMAX] * (1 - x[g, t - 1]),
+                                 name=f'ramp_up_{g}_{t}')
+                    lp.addConstr(pg[g, t - 1] - pg[g, t] <= Rd[g] * x[g, t] + self.gen[g, PMAX] * (1 - x[g, t]),
+                                 name=f'ramp_down_{g}_{t}')
+
+            # 最小开关机时间约束（松弛版本）
+            Ton = min(4, self.T)
+            Toff = min(4, self.T)
+            for g in range(self.ng):
+                for t in range(1, Ton + 1):
+                    for t1 in range(self.T - t):
+                        lp.addConstr(x[g, t1 + 1] - x[g, t1] <= x[g, t1 + t], name=f'min_on_{g}_{t}_{t1}')
+            for g in range(self.ng):
+                for t in range(1, Toff + 1):
+                    for t1 in range(self.T - t):
+                        lp.addConstr(-x[g, t1 + 1] + x[g, t1] <= 1 - x[g, t1 + t], name=f'min_off_{g}_{t}_{t1}')
+
+            # 启停成本约束
+            start_cost = self.gencost[:, 1]
+            shut_cost = self.gencost[:, 2]
+            for t in range(1, self.T):
+                for g in range(self.ng):
+                    lp.addConstr(coc[g, t - 1] >= start_cost[g] * (x[g, t] - x[g, t - 1]), name=f'start_cost_{g}_{t}')
+                    lp.addConstr(coc[g, t - 1] >= shut_cost[g] * (x[g, t - 1] - x[g, t]), name=f'shut_cost_{g}_{t}')
+                    lp.addConstr(coc[g, t - 1] >= 0, name=f'coc_nonneg_{g}_{t}')
+
+            # 发电成本约束
+            for t in range(self.T):
+                for g in range(self.ng):
+                    lp.addConstr(
+                        cpower[g, t] >= self.gencost[g, -2] / self.T_delta * pg[g, t] +
+                        self.gencost[g, -1] / self.T_delta * x[g, t],
+                        name=f'cpower_{g}_{t}'
+                    )
+
+            # 目标函数
+            obj = (gp.quicksum(cpower[g, t] for g in range(self.ng) for t in range(self.T)) +
+                   gp.quicksum(coc[g, t] for g in range(self.ng) for t in range(self.T - 1)))
+            lp.setObjective(obj, GRB.MINIMIZE)
+            lp.optimize()
+
+            if lp.status == GRB.OPTIMAL:
+                x_lp = np.array([[x[g, t].X for t in range(self.T)] for g in range(self.ng)])
+                pg_sol = np.array([[pg[g, t].X for t in range(self.T)] for g in range(self.ng)])
+                coc_sol = np.array([[coc[g, t].X for t in range(self.T - 1)] for g in range(self.ng)])
+                cpower_sol = np.array([[cpower[g, t].X for t in range(self.T)] for g in range(self.ng)])
+                lambda_dict = self.extract_dual_variables_as_arrays(lp)
+                return x_lp, pg_sol, coc_sol, cpower_sol, lambda_dict
+            else:
+                print(f"警告: LP 松弛求解失败，状态: {lp.status}", flush=True)
+                return None, None, None, None, None
+        except Exception as e:
+            print(f"❌ _solve_lp_relaxation 失败: {e}", flush=True)
+            return None, None, None, None, None
+
+    def _normalize_lambda_from_data(self, raw_lambda) -> Optional[dict]:
+        """将 JSON 中的 lambda 数据规范化为 numpy 数组格式。
+
+        Args:
+            raw_lambda: active_set_data[sample_id].get('lambda', None)
+
+        Returns:
+            规范化的 lambda 字典（与 _create_empty_lambda_dict 格式相同），
+            或 None（raw_lambda 为 None 或键不完整）。
+        """
+        if raw_lambda is None:
+            return None
+
+        required_keys = [
+            'lambda_power_balance', 'lambda_pg_lower', 'lambda_pg_upper',
+            'lambda_ramp_up', 'lambda_ramp_down',
+        ]
+        # 检查关键字段是否存在
+        for key in required_keys:
+            if key not in raw_lambda:
+                return None
+
+        try:
+            Ton = min(4, self.T)
+            Toff = min(4, self.T)
+            result = {}
+
+            def _to_array(v, shape):
+                arr = np.array(v, dtype=np.float64)
+                if arr.shape == shape:
+                    return arr
+                return None
+
+            result['lambda_power_balance'] = _to_array(raw_lambda['lambda_power_balance'], (self.T,))
+            result['lambda_pg_lower'] = _to_array(raw_lambda['lambda_pg_lower'], (self.ng, self.T))
+            result['lambda_pg_upper'] = _to_array(raw_lambda['lambda_pg_upper'], (self.ng, self.T))
+            result['lambda_ramp_up'] = _to_array(raw_lambda['lambda_ramp_up'], (self.ng, self.T - 1))
+            result['lambda_ramp_down'] = _to_array(raw_lambda['lambda_ramp_down'], (self.ng, self.T - 1))
+
+            # 检查必需字段是否形状正确
+            for key in required_keys:
+                if result[key] is None:
+                    return None
+
+            # 可选字段，缺失则用零填充
+            def _opt(key, shape):
+                if key in raw_lambda:
+                    arr = _to_array(raw_lambda[key], shape)
+                    return arr if arr is not None else np.zeros(shape)
+                return np.zeros(shape)
+
+            result['lambda_min_on'] = _opt('lambda_min_on', (self.ng, Ton, self.T))
+            result['lambda_min_off'] = _opt('lambda_min_off', (self.ng, Toff, self.T))
+            result['lambda_start_cost'] = _opt('lambda_start_cost', (self.ng, self.T - 1))
+            result['lambda_shut_cost'] = _opt('lambda_shut_cost', (self.ng, self.T - 1))
+            result['lambda_coc_nonneg'] = _opt('lambda_coc_nonneg', (self.ng, self.T - 1))
+            result['lambda_cpower'] = _opt('lambda_cpower', (self.ng, self.T))
+            result['lambda_dcpf_upper'] = _opt('lambda_dcpf_upper', (self.nl, self.T))
+            result['lambda_dcpf_lower'] = _opt('lambda_dcpf_lower', (self.nl, self.T))
+            result['lambda_x_upper'] = _opt('lambda_x_upper', (self.ng, self.T))
+            result['lambda_x_lower'] = _opt('lambda_x_lower', (self.ng, self.T))
+            return result
+        except Exception as e:
+            print(f"警告: _normalize_lambda_from_data 转换失败: {e}", flush=True)
+            return None
+
+    def _solve_milp_for_x_opt(self, Pd: np.ndarray) -> Optional[np.ndarray]:
+        """求解 MILP 获取真值 x（仅返回 x，不返回对偶变量）。
+
+        Args:
+            Pd: 负荷矩阵 (nb, T)
+
+        Returns:
+            x_milp 的 numpy 数组 (ng, T)，或 None（求解失败）。
+        """
+        try:
+            model = gp.Model('milp_x_opt')
+            model.Params.OutputFlag = 0
+
+            pg = model.addVars(self.ng, self.T, lb=0, name='pg')
+            x = model.addVars(self.ng, self.T, vtype=GRB.BINARY, name='x')
+            coc = model.addVars(self.ng, self.T - 1, lb=0, name='coc')
+            cpower = model.addVars(self.ng, self.T, lb=0, name='cpower')
+
+            for t in range(self.T):
+                model.addConstr(
+                    gp.quicksum(pg[g, t] for g in range(self.ng)) == np.sum(Pd[:, t]),
+                    name=f'power_balance_{t}'
+                )
+            for g in range(self.ng):
+                for t in range(self.T):
+                    model.addConstr(pg[g, t] >= self.gen[g, PMIN] * x[g, t], name=f'pg_lower_{g}_{t}')
+                    model.addConstr(pg[g, t] <= self.gen[g, PMAX] * x[g, t], name=f'pg_upper_{g}_{t}')
+
+            Ru = 0.4 * self.gen[:, PMAX] / self.T_delta
+            Rd = 0.4 * self.gen[:, PMAX] / self.T_delta
+            for g in range(self.ng):
+                for t in range(1, self.T):
+                    model.addConstr(pg[g, t] - pg[g, t - 1] <= Ru[g] * x[g, t - 1] + self.gen[g, PMAX] * (1 - x[g, t - 1]),
+                                    name=f'ramp_up_{g}_{t}')
+                    model.addConstr(pg[g, t - 1] - pg[g, t] <= Rd[g] * x[g, t] + self.gen[g, PMAX] * (1 - x[g, t]),
+                                    name=f'ramp_down_{g}_{t}')
+
+            Ton = min(4, self.T)
+            Toff = min(4, self.T)
+            for g in range(self.ng):
+                for t in range(1, Ton + 1):
+                    for t1 in range(self.T - t):
+                        model.addConstr(x[g, t1 + 1] - x[g, t1] <= x[g, t1 + t], name=f'min_on_{g}_{t}_{t1}')
+            for g in range(self.ng):
+                for t in range(1, Toff + 1):
+                    for t1 in range(self.T - t):
+                        model.addConstr(-x[g, t1 + 1] + x[g, t1] <= 1 - x[g, t1 + t], name=f'min_off_{g}_{t}_{t1}')
+
+            start_cost = self.gencost[:, 1]
+            shut_cost = self.gencost[:, 2]
+            for t in range(1, self.T):
+                for g in range(self.ng):
+                    model.addConstr(coc[g, t - 1] >= start_cost[g] * (x[g, t] - x[g, t - 1]), name=f'start_cost_{g}_{t}')
+                    model.addConstr(coc[g, t - 1] >= shut_cost[g] * (x[g, t - 1] - x[g, t]), name=f'shut_cost_{g}_{t}')
+                    model.addConstr(coc[g, t - 1] >= 0, name=f'coc_nonneg_{g}_{t}')
+
+            for t in range(self.T):
+                for g in range(self.ng):
+                    model.addConstr(cpower[g, t] >= self.gencost[g, -2] / self.T_delta * pg[g, t] +
+                                    self.gencost[g, -1] / self.T_delta * x[g, t],
+                                    name=f'cpower_{g}_{t}')
+
+            primal_obj = (gp.quicksum(cpower[g, t] for g in range(self.ng) for t in range(self.T)) +
+                          gp.quicksum(coc[g, t] for g in range(self.ng) for t in range(self.T - 1)))
+            model.setObjective(primal_obj, GRB.MINIMIZE)
+            model.setParam("Presolve", 2)
+            model.optimize()
+
+            if model.status == GRB.OPTIMAL:
+                return np.array([[x[g, t].X for t in range(self.T)] for g in range(self.ng)])
+            else:
+                print(f"警告: _solve_milp_for_x_opt 求解失败，状态: {model.status}", flush=True)
+                return None
+        except Exception as e:
+            print(f"❌ _solve_milp_for_x_opt 失败: {e}", flush=True)
+            return None
+
+    def initialize_solve(self):
+        """初始化求解：self.x 取 LP 松弛解，self.x_opt 取 MILP/数据集真值。
+
+        流程（每个样本）：
+        1. 求 LP 松弛 → x_lp（self.x 初值）+ 对偶变量（备用）
+        2. 尝试从数据中规范化对偶变量；若无则用 LP 松弛对偶
+        3. 获取真值 x_opt：优先数据集，否则求 MILP，最终回退到 x_lp
+
+        Returns:
+            (pg_sol, x_sol, x_opt_sol, coc_sol, cpower_sol, lambda_sol)
         """
         pg_sol = []
         x_sol = []
+        x_opt_sol = []
         coc_sol = []
         cpower_sol = []
         lambda_sol = []
@@ -502,111 +740,46 @@ class Agent_NN_BCD:
         for sample_id in range(self.n_samples):
             Pd = self.active_set_data[sample_id]['pd_data']
 
-            # 1. 尝试从数据集读取 x
-            x_from_data = _get_uc_matrix_from_sample(
-                self.active_set_data[sample_id], self.ng, self.T)
+            # A. 求 LP 松弛 → x_lp 及候选对偶
+            x_lp, pg_s, coc_s, cpower_s, lp_lambda = self._solve_lp_relaxation(Pd)
 
-            if x_from_data is not None:
-                # 数据集中有 x：直接用 LP 求解
-                pg_s, coc_s, cpower_s, lambda_s = self._solve_lp_with_fixed_x(Pd, x_from_data)
-                if pg_s is not None:
-                    pg_sol.append(pg_s)
-                    x_sol.append(x_from_data.copy())
-                    coc_sol.append(coc_s)
-                    cpower_sol.append(cpower_s)
-                    lambda_sol.append(lambda_s)
-                    continue
-                else:
-                    print(f"警告: 样本 {sample_id} LP（固定x）求解失败，回退到零值", flush=True)
-            else:
-                # 2. 无 x：求解 MILP 获取 x
-                model = gp.Model('initial_solve_milp')
-                model.Params.OutputFlag = 0
+            if x_lp is None:
+                print(f"警告: 样本 {sample_id} LP 松弛失败，使用零值回退", flush=True)
+                pg_sol.append(np.zeros((self.ng, self.T)))
+                x_sol.append(np.zeros((self.ng, self.T)))
+                x_opt_sol.append(np.zeros((self.ng, self.T), dtype=np.float64))
+                coc_sol.append(np.zeros((self.ng, self.T - 1)))
+                cpower_sol.append(np.zeros((self.ng, self.T)))
+                lambda_sol.append(self._create_empty_lambda_dict())
+                continue
 
-                pg = model.addVars(self.ng, self.T, lb=0, name='pg')
-                x = model.addVars(self.ng, self.T, vtype=GRB.BINARY, name='x')
-                coc = model.addVars(self.ng, self.T - 1, lb=0, name='coc')
-                cpower = model.addVars(self.ng, self.T, lb=0, name='cpower')
+            # B. 对偶变量：优先使用数据中已有的，否则用 LP 松弛结果
+            raw_lambda = self.active_set_data[sample_id].get('lambda', None)
+            lambda_s = self._normalize_lambda_from_data(raw_lambda)
+            if lambda_s is None:
+                lambda_s = lp_lambda if lp_lambda is not None else self._create_empty_lambda_dict()
 
-                for t in range(self.T):
-                    model.addConstr(
-                        gp.quicksum(pg[g, t] for g in range(self.ng)) == np.sum(Pd[:, t]),
-                        name=f'power_balance_{t}'
-                    )
-                for g in range(self.ng):
-                    for t in range(self.T):
-                        model.addConstr(pg[g, t] >= self.gen[g, PMIN] * x[g, t], name=f'pg_lower_{g}_{t}')
-                        model.addConstr(pg[g, t] <= self.gen[g, PMAX] * x[g, t], name=f'pg_upper_{g}_{t}')
+            # C. 获取真值 x_opt：优先数据集，否则求 MILP
+            x_opt = _get_uc_matrix_from_sample(self.active_set_data[sample_id], self.ng, self.T)
+            if x_opt is None:
+                x_milp = self._solve_milp_for_x_opt(Pd)
+                x_opt = x_milp if x_milp is not None else x_lp.copy()
 
-                Ru = 0.4 * self.gen[:, PMAX] / self.T_delta
-                Rd = 0.4 * self.gen[:, PMAX] / self.T_delta
-                for g in range(self.ng):
-                    for t in range(1, self.T):
-                        model.addConstr(pg[g, t] - pg[g, t - 1] <= Ru[g] * x[g, t - 1] + self.gen[g, PMAX] * (1 - x[g, t - 1]),
-                                        name=f'ramp_up_{g}_{t}')
-                        model.addConstr(pg[g, t - 1] - pg[g, t] <= Rd[g] * x[g, t] + self.gen[g, PMAX] * (1 - x[g, t]),
-                                        name=f'ramp_down_{g}_{t}')
-
-                Ton = min(4, self.T)
-                Toff = min(4, self.T)
-                for g in range(self.ng):
-                    for t in range(1, Ton + 1):
-                        for t1 in range(self.T - t):
-                            model.addConstr(x[g, t1 + 1] - x[g, t1] <= x[g, t1 + t], name=f'min_on_{g}_{t}_{t1}')
-                for g in range(self.ng):
-                    for t in range(1, Toff + 1):
-                        for t1 in range(self.T - t):
-                            model.addConstr(-x[g, t1 + 1] + x[g, t1] <= 1 - x[g, t1 + t], name=f'min_off_{g}_{t}_{t1}')
-
-                start_cost = self.gencost[:, 1]
-                shut_cost = self.gencost[:, 2]
-                for t in range(1, self.T):
-                    for g in range(self.ng):
-                        model.addConstr(coc[g, t - 1] >= start_cost[g] * (x[g, t] - x[g, t - 1]), name=f'start_cost_{g}_{t}')
-                        model.addConstr(coc[g, t - 1] >= shut_cost[g] * (x[g, t - 1] - x[g, t]), name=f'shut_cost_{g}_{t}')
-                        model.addConstr(coc[g, t - 1] >= 0, name=f'coc_nonneg_{g}_{t}')
-
-                for t in range(self.T):
-                    for g in range(self.ng):
-                        model.addConstr(cpower[g, t] >= self.gencost[g, -2] / self.T_delta * pg[g, t] +
-                                        self.gencost[g, -1] / self.T_delta * x[g, t],
-                                        name=f'cpower_{g}_{t}')
-
-                primal_obj = (gp.quicksum(cpower[g, t] for g in range(self.ng) for t in range(self.T)) +
-                              gp.quicksum(coc[g, t] for g in range(self.ng) for t in range(self.T - 1)))
-                model.setObjective(primal_obj, GRB.MINIMIZE)
-                model.setParam("Presolve", 2)
-                model.optimize()
-
-                if model.status == GRB.OPTIMAL:
-                    x_milp = np.array([[x[g, t].X for t in range(self.T)] for g in range(self.ng)])
-                    # 用 MILP 得到的 x 求解 LP 获取有效对偶变量
-                    pg_s, coc_s, cpower_s, lambda_s = self._solve_lp_with_fixed_x(Pd, x_milp)
-                    if pg_s is not None:
-                        pg_sol.append(pg_s)
-                        x_sol.append(x_milp)
-                        coc_sol.append(coc_s)
-                        cpower_sol.append(cpower_s)
-                        lambda_sol.append(lambda_s)
-                        continue
-                    else:
-                        print(f"警告: 样本 {sample_id} LP（MILP x）求解失败，回退到零值", flush=True)
-                else:
-                    print(f"警告: 样本 {sample_id} MILP 求解失败，状态: {model.status}", flush=True)
-
-            # Fallback：使用零值
-            pg_sol.append(np.zeros((self.ng, self.T)))
-            x_sol.append(np.zeros((self.ng, self.T)))
-            coc_sol.append(np.zeros((self.ng, self.T - 1)))
-            cpower_sol.append(np.zeros((self.ng, self.T)))
-            lambda_sol.append(self._create_empty_lambda_dict())
+            # D. 存储：self.x ← x_lp（连续），self.x_opt ← x_opt（真值）
+            pg_sol.append(pg_s)
+            x_sol.append(x_lp)
+            x_opt_sol.append(x_opt.astype(np.float64))
+            coc_sol.append(coc_s)
+            cpower_sol.append(cpower_s)
+            lambda_sol.append(lambda_s)
 
         pg_sol = np.array(pg_sol)
         x_sol = np.array(x_sol)
+        x_opt_sol = np.array(x_opt_sol)
         coc_sol = np.array(coc_sol)
         cpower_sol = np.array(cpower_sol)
 
-        return pg_sol, x_sol, coc_sol, cpower_sol, lambda_sol
+        return pg_sol, x_sol, x_opt_sol, coc_sol, cpower_sol, lambda_sol
     
     def extract_dual_variables(self, model):
         """

@@ -238,15 +238,15 @@ def collect_integer_solutions(
         x_LP_k = _solve_unit_LP_with_surrogate(trainer, lambda_val, alphas, betas, gammas, deltas)
         x_init_k[g] = round_to_integer(x_LP_k)
 
-        # 扰动代理参数，生成多组解
+        # 扰动 pd_data，重新查询代理参数，生成多组解
         for m in range(n_perturbations):
-            noise_a = 1.0 + perturb_std * rng.standard_normal(len(alphas))
-            noise_b = 1.0 + perturb_std * rng.standard_normal(len(betas))
-            noise_c = 1.0 + perturb_std * rng.standard_normal(len(gammas))
-            noise_r = 1.0 + perturb_std * rng.standard_normal(len(deltas))
+            noise = perturb_std * rng.standard_normal(pd_data.shape) * pd_data
+            pd_perturbed = pd_data + noise
+            alphas_m, betas_m, gammas_m, deltas_m = trainer.get_surrogate_params(
+                pd_perturbed, lambda_val
+            )
             x_LP_m = _solve_unit_LP_with_surrogate(
-                trainer, lambda_val,
-                alphas * noise_a, betas * noise_b, gammas * noise_c, deltas * noise_r
+                trainer, lambda_val, alphas_m, betas_m, gammas_m, deltas_m
             )
             x_init_k_m[g, m] = round_to_integer(x_LP_m)
 
@@ -503,16 +503,12 @@ def solve_global_LP_relaxation_without_surrogate(
     T_delta: float
 ) -> np.ndarray:
     """
-    构建完整 UC LP 松弛（x ∈ [0,1]），加入 V3 代理约束 + BCD theta/zeta 代理约束，求解得 x_LP。
+    构建完整 UC LP 松弛（x ∈ [0,1]），不含任何代理约束，仅含 UC 基础约束和 DC 潮流约束。
 
     Args:
         ppc: PyPower 案例数据
         pd_data: (nb_load, T) 负荷数据
         T_delta: 时间间隔（小时）
-        trainers: {unit_id: trainer}
-        lambda_val: (T,) 功率平衡对偶变量（用于查询代理约束参数）
-        agent: （可选）已训练的 Agent_NN_BCD 实例；若提供则额外加入其
-            theta/zeta 参数化代理约束（M-penalty 软约束形式）
 
     Returns:
         x_LP: (ng, T) LP 松弛解；若不可行返回零矩阵
@@ -738,6 +734,7 @@ def run_feasibility_pump(
     ppc: dict,
     pd_data: np.ndarray,
     T_delta: float,
+    x_pool: Optional[np.ndarray] = None,
     max_iter: int = 50,
     rng: Optional[np.random.Generator] = None,
     verbose: bool = False
@@ -746,6 +743,7 @@ def run_feasibility_pump(
     可行性泵主循环。
 
     在固定高可信度变量的条件下，通过"LP投影 → 四舍五入"循环寻找整数可行解。
+    从第二次迭代（iteration >= 1）起，若提供 x_pool，则将 x 约束为已知整数解的凸组合。
 
     Args:
         x_curr: (ng, T) 初始整数点（0/1 矩阵）
@@ -753,6 +751,7 @@ def run_feasibility_pump(
         ppc: PyPower 案例数据
         pd_data: (nb_load, T) 负荷数据
         T_delta: 时间间隔
+        x_pool: (n_pool, ng, T) 整数解池，iteration >= 1 时用于凸组合约束（可选）
         max_iter: 最大迭代次数
         rng: 随机数生成器（用于振荡扰动）
         verbose: 是否打印迭代信息
@@ -818,6 +817,19 @@ def run_feasibility_pump(
                 gp.quicksum(pg[g, t] for g in range(ng)) == float(Pd_sum[t]),
                 name=f'pb_{t}'
             )
+
+        # iteration >= 1 且提供了 x_pool：将 x 约束为整数解池的凸组合
+        if x_pool is not None and iteration >= 1:
+            n_pool = x_pool.shape[0]
+            omega = model.addVars(ng, n_pool, lb=0, name='omega')
+            for g in range(ng):
+                model.addConstr(gp.quicksum(omega[g, j] for j in range(n_pool)) == 1.0)
+                for t in range(T):
+                    model.addConstr(
+                        x[g, t] == gp.quicksum(
+                            float(x_pool[j, g, t]) * omega[g, j] for j in range(n_pool)
+                        )
+                    )
 
         for g in range(ng):
             # 发电上下限
@@ -994,12 +1006,19 @@ def recover_integer_solution(
     if verbose:
         print(f"  可信变量: {n_trusted}/{ng*T} ({100*n_trusted/(ng*T):.1f}%)", flush=True)
 
+    # 构建整数解池：x_init_k (ng,T) + x_init_k_m (ng, n_perturb, T) → (n_pool, ng, T)
+    x_pool = np.concatenate(
+        [x_init_k[np.newaxis],               # (1, ng, T)
+         x_init_k_m.transpose(1, 0, 2)],     # (n_perturb, ng, T)
+        axis=0
+    )
+
     # Step 5：可行性泵（第一轮：从全局 LP 整数化解出发）
     if verbose:
         print("Step 5: 运行可行性泵（初始点：全局 LP 四舍五入解）...", flush=True)
     x_result, success = run_feasibility_pump(
         x_init, trusted_mask, ppc, pd_data, T_delta,
-        max_iter=max_fp_iter, rng=rng, verbose=verbose
+        x_pool=x_pool, max_iter=max_fp_iter, rng=rng, verbose=verbose
     )
 
     if not success:
@@ -1008,7 +1027,7 @@ def recover_integer_solution(
             print("Step 5b: 可行性泵（初始点：子问题 LP 整数解）...", flush=True)
         x_result, success = run_feasibility_pump(
             x_init_k, trusted_mask, ppc, pd_data, T_delta,
-            max_iter=max_fp_iter, rng=rng, verbose=verbose
+            x_pool=x_pool, max_iter=max_fp_iter, rng=rng, verbose=verbose
         )
 
     if verbose:
