@@ -349,6 +349,8 @@ class Agent_NN_BCD:
         self.rho_dual = 1e-2
         self.rho_opt = 1e-2
         self.gamma = 1e-1  # 惩罚参数增长因子
+        self.theta_reg_weight = 1e-4   # theta L2 正则化权重
+        self.zeta_reg_weight = 1e-4    # zeta L2 正则化权重
         
         # 约束违反惩罚项的权重和epsilon参数
         self.constraint_violation_weight = 0
@@ -2670,8 +2672,12 @@ class Agent_NN_BCD:
                     fb_shut = fischer_burmeister(lambda_shut_cost[g, t-1], -g_shut)
                     obj_complementary = obj_complementary + fb_shut ** 2
         
-        loss = obj_primal * self.rho_primal + obj_dual * self.rho_dual + obj_opt * self.rho_opt
-        
+        # L2 正则化：控制 theta/zeta 参数大小
+        reg_loss = (self.theta_reg_weight * torch.sum(theta_tensor ** 2)
+                    + self.zeta_reg_weight * torch.sum(zeta_tensor ** 2))
+
+        loss = obj_primal * self.rho_primal + obj_dual * self.rho_dual + obj_opt * self.rho_opt + reg_loss
+
         return loss
       
     def _add_parametric_penalties_pg_block(self, model, x, sample_id, theta_values=None, union_analysis=None, PTDF=None, branch_limit=None):

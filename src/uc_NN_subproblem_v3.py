@@ -704,6 +704,7 @@ class SubproblemSurrogateTrainer:
         self.rho_dual = 1e-2
         self.rho_opt = 1e-2
         self.gamma = 1e-2
+        self.reg_weight = 1e-4   # alpha/beta/gamma L2 正则化权重
         self.mu_lower_bound = 0.1
         self.iter_number = 0
         
@@ -1582,10 +1583,16 @@ class SubproblemSurrogateTrainer:
 
             obj_dual = obj_dual + torch.abs(dual_expr)
         
-        # 总损失：仅含代理约束的三项BCD目标
+        # L2 正则化：控制 alpha/beta/gamma 参数大小
+        reg_loss = self.reg_weight * (torch.sum(alphas_tensor ** 2)
+                                      + torch.sum(betas_tensor ** 2)
+                                      + torch.sum(gammas_tensor ** 2))
+
+        # 总损失：三项BCD目标 + 正则化
         loss = (self.rho_primal * obj_primal +
                 self.rho_dual   * obj_dual   +
-                self.rho_opt    * obj_opt)
+                self.rho_opt    * obj_opt    +
+                reg_loss)
 
         return loss
     
