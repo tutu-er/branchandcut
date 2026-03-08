@@ -466,7 +466,7 @@ if __name__ == '__main__':
     T         = 8
     N_SAMPLES = 5
     UNIT_IDS  = [0, 1, 2]
-    MAX_ITER  = 3      # 保持迭代次数短，聚焦并行效果验证
+    MAX_ITER  = 7      # 保持迭代次数短，聚焦并行效果验证
     NN_EPOCHS = 5
 
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
