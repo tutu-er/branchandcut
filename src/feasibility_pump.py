@@ -939,6 +939,7 @@ def recover_integer_solution(
     lambda_predictor,
     ppc: dict,
     T_delta: float,
+    manager=None,
     n_perturbations: int = 5,
     conf_threshold: float = 0.15,
     max_fp_iter: int = 50,
@@ -951,6 +952,7 @@ def recover_integer_solution(
     Pipeline：
       1. 通过 lambda_predictor 获取对偶变量
       2. 求解全局 UC LP 松弛（含代理约束）→ x_LP，启发式四舍五入 → x_init
+         （若提供 manager，则使用 manager.solve_global 替代默认 LP 求解器）
       3. 各机组子问题 LP（+ 参数扰动）收集多组整数解
       4. 识别高可信度变量（整数性强 + 多来源一致）
       5. 可行性泵：从 x_init 出发；失败则从 x_init_k 再试
@@ -961,6 +963,8 @@ def recover_integer_solution(
         lambda_predictor: 对偶变量预测器，需支持 `predict(pd_data) -> (T,)`
         ppc: PyPower 案例数据
         T_delta: 时间间隔（小时）
+        manager: （可选）UnifiedSurrogateManager 实例；若提供则使用其
+            solve_global 方法求解全局 LP 松弛（同时包含 theta/zeta 和 V3 代理约束）
         n_perturbations: 参数扰动次数
         conf_threshold: LP 整数性置信阈值
         max_fp_iter: 可行性泵最大迭代次数
@@ -981,7 +985,10 @@ def recover_integer_solution(
     # Step 2：全局 LP 松弛 + 启发式四舍五入
     if verbose:
         print("Step 2: 求解全局 UC LP 松弛 ...", flush=True)
-    x_LP = solve_global_LP_relaxation(ppc, pd_data, T_delta, trainers, lambda_val)
+    if manager is not None:
+        x_LP = manager.solve_global(pd_data, lambda_val)
+    else:
+        x_LP = solve_global_LP_relaxation(ppc, pd_data, T_delta, trainers, lambda_val)
     x_init = round_to_integer(x_LP)
 
     integrality_gap = float(np.mean(np.minimum(x_LP, 1 - x_LP)))  # 平均到0或1的距离
