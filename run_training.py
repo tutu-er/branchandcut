@@ -257,17 +257,11 @@ def print_surrogate_results(trainers, all_samples):
         print(f"  整数性指标(样本0): {integrality:.6f}  (0=完全整数)")
 
 
-def run_bcd(ppc, data_file, MAX_SAMPLES, T_DELTA, MAX_ITER, result_dir,
+def run_bcd(ppc, all_samples: list, T_DELTA, MAX_ITER, result_dir,
             case_name: str = 'case', timestamp: str = '', n_workers: int = 4, NN_EPOCHS: int = 10):
     """BCD 主代理训练（样本级并行），返回 ParallelAgent_NN_BCD 实例。"""
     log("模式: BCD 主代理训练（Agent_NN_BCD）")
-    log(f"通过 ActiveSetReader 加载数据: {data_file.name}")
-
-    all_samples_bcd = load_active_set_from_json(str(data_file))
-    if MAX_SAMPLES and len(all_samples_bcd) > MAX_SAMPLES:
-        log(f"  截取前 {MAX_SAMPLES} 个样本（共 {len(all_samples_bcd)}）")
-        all_samples_bcd = all_samples_bcd[:MAX_SAMPLES]
-    log(f"  使用 {len(all_samples_bcd)} 个样本")
+    log(f"使用 {len(all_samples)} 个样本")
 
     print("\n" + "=" * 70)
     if n_workers <= 1:
@@ -278,10 +272,10 @@ def run_bcd(ppc, data_file, MAX_SAMPLES, T_DELTA, MAX_ITER, result_dir,
 
     if n_workers <= 1:
         log("使用串行 Agent_NN_BCD")
-        agent = Agent_NN_BCD(ppc, all_samples_bcd, T_DELTA)
+        agent = Agent_NN_BCD(ppc, all_samples, T_DELTA)
     else:
         log(f"使用并行 ParallelAgent_NN_BCD (n_workers={n_workers})")
-        agent = ParallelAgent_NN_BCD(ppc, all_samples_bcd, T_DELTA, n_workers=n_workers)
+        agent = ParallelAgent_NN_BCD(ppc, all_samples, T_DELTA, n_workers=n_workers)
 
     print("\n" + "=" * 70)
     log("开始 BCD 迭代训练")
@@ -391,7 +385,12 @@ def main():
     try:
         if MODE == 'bcd':
             # BCD 通过 ActiveSetReader 加载（含 unit_commitment_matrix）
-            run_bcd(ppc, data_file, MAX_SAMPLES, T_DELTA, MAX_ITER, result_dir,
+            log(f"通过 ActiveSetReader 加载数据: {data_file.name}")
+            all_samples_bcd = load_active_set_from_json(str(data_file))
+            if MAX_SAMPLES and len(all_samples_bcd) > MAX_SAMPLES:
+                log(f"  截取前 {MAX_SAMPLES} 个样本（共 {len(all_samples_bcd)}）")
+                all_samples_bcd = all_samples_bcd[:MAX_SAMPLES]
+            run_bcd(ppc, all_samples_bcd, T_DELTA, MAX_ITER, result_dir,
                     case_name=CASE_NAME, timestamp=timestamp, n_workers=N_WORKERS_BCD, NN_EPOCHS=NN_EPOCHS)
             if RUN_FP:
                 log("警告: bcd 模式不支持 RUN_FP（需要 trainers），请改用 both 模式")
@@ -420,7 +419,12 @@ def main():
 
         elif MODE == 'both':
             # Step 1: BCD 训练
-            agent = run_bcd(ppc, data_file, MAX_SAMPLES, T_DELTA, MAX_ITER, result_dir,
+            log(f"通过 ActiveSetReader 加载数据: {data_file.name}")
+            all_samples_bcd = load_active_set_from_json(str(data_file))
+            if MAX_SAMPLES and len(all_samples_bcd) > MAX_SAMPLES:
+                log(f"  截取前 {MAX_SAMPLES} 个样本（共 {len(all_samples_bcd)}）")
+                all_samples_bcd = all_samples_bcd[:MAX_SAMPLES]
+            agent = run_bcd(ppc, all_samples_bcd, T_DELTA, MAX_ITER, result_dir,
                             case_name=CASE_NAME, timestamp=timestamp, n_workers=N_WORKERS_BCD, NN_EPOCHS=NN_EPOCHS)
 
             # Step 2: 加载 v3 格式样本
