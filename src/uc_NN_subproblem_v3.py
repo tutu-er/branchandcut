@@ -618,12 +618,21 @@ def identify_sensitive_timesteps(x_vals, threshold_low=0.1, threshold_high=0.9, 
             # 整数性：sum(x*(1-x))，越大越差
             viol = sum(x * (1-x) for x in window)
             violations.append((t, viol))
-        
+
         # 按违反程度排序
         violations.sort(key=lambda item: item[1], reverse=True)
         sensitive = [t for t, _ in violations[:max_constraints]]
         sensitive.sort()  # 按时间顺序排列
-    
+
+    # 全整数回退：若无分数时段，按 |x[t]-0.5| 升序选最多 max_constraints 个三时段起点
+    if len(sensitive) == 0:
+        n_pick = min(max_constraints, T - 2)
+        candidates = list(range(T - 2))
+        candidates.sort(key=lambda t: min(abs(x_vals[t] - 0.5),
+                                          abs(x_vals[t+1] - 0.5),
+                                          abs(x_vals[t+2] - 0.5)))
+        sensitive = sorted(candidates[:n_pick])
+
     return sensitive
 
 
@@ -952,6 +961,13 @@ class SubproblemSurrogateTrainer:
                 # 将 JSON 整数解存入 sample，作为 iter_with_primal_block 的持久锚点
                 # （不随 BCD 迭代更新，确保 x_true 始终指向原始 MILP 最优解）
                 self.active_set_data[sample_id]['x_true'] = x_init.copy()
+
+                # 识别敏感时段（分数解 → 优先覆盖；全整数 → 按距0.5升序补齐）
+                self.sensitive_timesteps[sample_id] = identify_sensitive_timesteps(
+                    x_lp,
+                    threshold_low=0.1, threshold_high=0.9,
+                    max_constraints=self.max_constraints
+                )
                 self.coc[sample_id]    = np.array([coc[t].X    for t in range(self.T-1)])
                 self.cpower[sample_id] = np.array([cpower[t].X for t in range(self.T)])
 
@@ -1136,16 +1152,17 @@ class SubproblemSurrogateTrainer:
         for t in range(self.T):
             model.addConstr(cpower[t] == a * pg[t] + b * x[t], name=f'cpower_{t}')
 
-        # --- 代理耦合约束（软约束）---
-        for t in range(self.num_coupling_constraints):
-            if t + 2 < self.T:
-                coupling_lhs = alphas[t] * x[t] + betas[t] * x[t+1] + gammas[t] * x[t+2]
-                model.addConstr(surrogate_viols[t]    >= coupling_lhs - deltas[t], name=f'coupling_viol_{t}')
-                model.addConstr(surrogate_abs_vals[t] >= coupling_lhs - deltas[t], name=f'coupling_abs_pos_{t}')
-                model.addConstr(surrogate_abs_vals[t] >= deltas[t] - coupling_lhs, name=f'coupling_abs_neg_{t}')
-        obj_primal += gp.quicksum(surrogate_viols[t]    for t in range(self.num_coupling_constraints))
-        obj_opt    += gp.quicksum(surrogate_abs_vals[t] * mu_vals[t]
-                                  for t in range(self.num_coupling_constraints))
+        # --- 代理耦合约束（软约束，按 sensitive_timesteps 索引）---
+        sensitive_t = self.sensitive_timesteps[sample_id]
+        for k, t in enumerate(sensitive_t):
+            # sensitive_timesteps 已保证 t+2 < T
+            coupling_lhs = alphas[k] * x[t] + betas[k] * x[t+1] + gammas[k] * x[t+2]
+            model.addConstr(surrogate_viols[k]    >= coupling_lhs - deltas[k], name=f'coupling_viol_{k}')
+            model.addConstr(surrogate_abs_vals[k] >= coupling_lhs - deltas[k], name=f'coupling_abs_pos_{k}')
+            model.addConstr(surrogate_abs_vals[k] >= deltas[k] - coupling_lhs, name=f'coupling_abs_neg_{k}')
+        obj_primal += gp.quicksum(surrogate_viols[k]    for k in range(len(sensitive_t)))
+        obj_opt    += gp.quicksum(surrogate_abs_vals[k] * mu_vals[k]
+                                  for k in range(len(sensitive_t)))
 
         # --- 目标函数（参考BCD：无显式cost项，经济方向由对偶变量通过obj_opt传递）---
         model.setObjective(
@@ -1410,13 +1427,12 @@ class SubproblemSurrogateTrainer:
             if viol > 1e-10:
                 obj_opt += viol * lam_x_upper[t]
 
-        # 代理耦合约束：alpha[k]*x[k] + beta[k]*x[k+1] + gamma[k]*x[k+2] - delta[k] <= 0
-        for k in range(self.num_coupling_constraints):
-            if k + 2 < self.T:
-                lhs  = alphas[k] * x_val[k] + betas[k] * x_val[k + 1] + gammas[k] * x_val[k + 2]
-                viol = abs(lhs - deltas[k])
-                if viol > 1e-10:
-                    obj_opt += viol * mu[k]
+        # 代理耦合约束（按 sensitive_timesteps 索引）
+        for k, t in enumerate(self.sensitive_timesteps[sample_id]):
+            lhs  = alphas[k] * x_val[t] + betas[k] * x_val[t + 1] + gammas[k] * x_val[t + 2]
+            viol = abs(lhs - deltas[k])
+            if viol > 1e-10:
+                obj_opt += viol * mu[k]
 
         # ===== 设置目标函数并求解 =====
         model.setObjective(
@@ -1495,22 +1511,25 @@ class SubproblemSurrogateTrainer:
         mu_vals = torch.tensor(self.mu[sample_id],  dtype=torch.float32, device=device)  # (num_coupling_constraints,)
         
         # ========== 计算obj_primal ==========
-        # V3三时段约束违反量: Σ_t max(0, alpha_t*x_t + beta_t*x_{t+1} + gamma_t*x_{t+2} - delta_t)
+        # V3三时段约束违反量（按 sensitive_timesteps 索引）
         obj_primal = torch.tensor(0.0, device=device, requires_grad=True)
-        for t in range(self.num_coupling_constraints):
-            if t + 2 < self.T:  # 确保x[t+2]存在
-                coupling_lhs = alphas_tensor[t] * x_val[t] + betas_tensor[t] * x_val[t+1] + gammas_tensor[t] * x_val[t+2]
-                coupling_viol = torch.relu(coupling_lhs - deltas_tensor[t])
-                obj_primal = obj_primal + coupling_viol
-        
+        sensitive_t = self.sensitive_timesteps[sample_id]
+        for k, t in enumerate(sensitive_t):
+            coupling_lhs = (alphas_tensor[k] * x_val[t]
+                            + betas_tensor[k] * x_val[t+1]
+                            + gammas_tensor[k] * x_val[t+2])
+            coupling_viol = torch.relu(coupling_lhs - deltas_tensor[k])
+            obj_primal = obj_primal + coupling_viol
+
         # ========== 计算obj_opt ==========
-        # V3互补松弛: Σ_t |alpha_t*x_t + beta_t*x_{t+1} + gamma_t*x_{t+2} - delta_t| * mu_t
+        # V3互补松弛（按 sensitive_timesteps 索引）
         obj_opt = torch.tensor(0.0, device=device, requires_grad=True)
-        for t in range(self.num_coupling_constraints):
-            if t + 2 < self.T:
-                coupling_lhs = alphas_tensor[t] * x_val[t] + betas_tensor[t] * x_val[t+1] + gammas_tensor[t] * x_val[t+2]
-                coupling_abs = torch.abs(coupling_lhs - deltas_tensor[t])
-                obj_opt = obj_opt + coupling_abs * mu_vals[t]
+        for k, t in enumerate(sensitive_t):
+            coupling_lhs = (alphas_tensor[k] * x_val[t]
+                            + betas_tensor[k] * x_val[t+1]
+                            + gammas_tensor[k] * x_val[t+2])
+            coupling_abs = torch.abs(coupling_lhs - deltas_tensor[k])
+            obj_opt = obj_opt + coupling_abs * mu_vals[k]
         
         # ========== 计算obj_dual：x[t] KKT驻点条件（完整版） ==========
         # x[t]驻点：b + Pmin*lam_pg_lower[t] - Pmax*lam_pg_upper[t]
@@ -1586,14 +1605,15 @@ class SubproblemSurrogateTrainer:
                 lam_xl = lam_inh['lambda_x_lower']  # (T,)
                 inherent_const += float(lam_xu[t]) - float(lam_xl[t])
 
-            # 代理耦合约束贡献（含NN参数，可微分）
+            # 代理耦合约束贡献（含NN参数，可微分；按 sensitive_timesteps 索引）
             dual_expr = torch.tensor(inherent_const, dtype=torch.float32, device=device)
-            if t < self.num_coupling_constraints and t + 2 < self.T:
-                dual_expr = dual_expr + alphas_tensor[t] * mu_vals[t]
-            if t > 0 and (t - 1) < self.num_coupling_constraints and t + 1 < self.T:
-                dual_expr = dual_expr + betas_tensor[t - 1] * mu_vals[t - 1]
-            if t > 1 and (t - 2) < self.num_coupling_constraints:
-                dual_expr = dual_expr + gammas_tensor[t - 2] * mu_vals[t - 2]
+            for k, ts in enumerate(sensitive_t):
+                if ts == t:
+                    dual_expr = dual_expr + alphas_tensor[k] * mu_vals[k]
+                if ts + 1 == t:
+                    dual_expr = dual_expr + betas_tensor[k] * mu_vals[k]
+                if ts + 2 == t:
+                    dual_expr = dual_expr + gammas_tensor[k] * mu_vals[k]
 
             obj_dual = obj_dual + torch.abs(dual_expr)
         
