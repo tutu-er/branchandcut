@@ -36,6 +36,12 @@ from typing import Dict, List, Optional
 
 import numpy as np
 
+try:
+    import torch
+    TORCH_AVAILABLE = True
+except ImportError:
+    TORCH_AVAILABLE = False
+
 # ── 路径设置 ────────────────────────────────────────────────────────
 _SRC_DIR = Path(__file__).resolve().parent
 _ROOT_DIR = _SRC_DIR.parent
