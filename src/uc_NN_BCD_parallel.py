@@ -100,6 +100,7 @@ class ParallelAgent_NN_BCD(Agent_NN_BCD):
             union_analysis = self._current_union_analysis
 
         EPS = 1e-10
+        gamma = self.gamma_base / (self.n_samples * max_iter)
 
         print(
             f"[ParallelBCD] 开始并行BCD迭代 "
@@ -224,9 +225,9 @@ class ParallelAgent_NN_BCD(Agent_NN_BCD):
                 flush=True,
             )
 
-            self.rho_primal += self.gamma * obj_primal
-            self.rho_dual   += self.gamma * obj_dual
-            self.rho_opt    += self.gamma * obj_opt
+            self.rho_primal = min(self.rho_primal + gamma * obj_primal, self.rho_max)
+            self.rho_dual   = min(self.rho_dual   + gamma * obj_dual,   self.rho_max)
+            self.rho_opt    = min(self.rho_opt     + gamma * obj_opt,    self.rho_max)
 
             print(
                 f"[ParallelBCD] ρ_primal={self.rho_primal:.4f}, "
