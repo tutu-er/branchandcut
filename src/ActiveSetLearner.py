@@ -74,15 +74,10 @@ class ActiveSetLearner:
             constr = ed.model.getConstrByName(f'power_balance_{t}')
             lambda_vals.append(float(constr.Pi) if constr is not None else 0.0)
 
-        # Step 4: 构建活动集（包含 x 和活跃约束索引）
+        # Step 4: 构建活动集（只用二进制变量 x，不含 LP 活跃约束索引）
         # 将x_sol转为[[g,t],value]的list（保持JSON格式一致）
         x_sol_list = [[[i, j], int(x_sol[i, j])] for i in range(x_sol.shape[0]) for j in range(x_sol.shape[1])]
-        # 确定活动约束：Gurobi LP中对偶变量非零即为活跃约束
-        active = []
-        active.extend(x_sol_list)
-        for i, constr in enumerate(ed.model.getConstrs()):
-            if abs(constr.Pi) > 1e-6:
-                active.append(i)
+        active = list(x_sol_list)
 
         # 转换为可哈希的frozenset（用于集合操作）
         def make_hashable(item):

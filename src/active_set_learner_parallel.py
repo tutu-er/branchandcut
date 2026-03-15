@@ -50,16 +50,13 @@ def _solve_single_sample(args: tuple) -> dict | None:
             constr = ed.model.getConstrByName(f"power_balance_{t}")
             lambda_vals.append(float(constr.Pi) if constr is not None else 0.0)
 
-        # Step 4: 构建活动集
+        # Step 4: 构建活动集（只用二进制变量 x，不含 LP 活跃约束索引）
         x_sol_list = [
             [[i, j], int(x_sol[i, j])]
             for i in range(x_sol.shape[0])
             for j in range(x_sol.shape[1])
         ]
         active = list(x_sol_list)
-        for i, constr in enumerate(ed.model.getConstrs()):
-            if abs(constr.Pi) > 1e-6:
-                active.append(i)
 
         def make_hashable(item):
             if isinstance(item, list):
