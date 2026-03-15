@@ -1467,28 +1467,24 @@ class Agent_NN_BCD:
         
         # 创建theta网络
         self.theta_net = nn.Sequential(
-            nn.Linear(input_dim, 256),
-            nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(256, 512),
-            nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(512, 256),
-            nn.ReLU(),
-            nn.Linear(256, self.theta_output_dim)
+            nn.Linear(input_dim, 64),
+            nn.LeakyReLU(0.01),
+            nn.Dropout(0.3),
+            nn.Linear(64, 128),
+            nn.LeakyReLU(0.01),
+            nn.Dropout(0.3),
+            nn.Linear(128, self.theta_output_dim)
         )
-        
+
         # 创建zeta网络
         self.zeta_net = nn.Sequential(
-            nn.Linear(input_dim, 256),
-            nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(256, 512),
-            nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(512, 256),
-            nn.ReLU(),
-            nn.Linear(256, self.zeta_output_dim)
+            nn.Linear(input_dim, 64),
+            nn.LeakyReLU(0.01),
+            nn.Dropout(0.3),
+            nn.Linear(64, 128),
+            nn.LeakyReLU(0.01),
+            nn.Dropout(0.3),
+            nn.Linear(128, self.zeta_output_dim)
         )
         # 移动到设备
         if self.device:
@@ -2162,10 +2158,12 @@ class Agent_NN_BCD:
         if not TORCH_AVAILABLE or self.theta_net is None or self.zeta_net is None:
             print("警告: 神经网络不可用，跳过theta/zeta更新", flush=True)
             return self.theta_values, self.zeta_values
-        
+
         if union_analysis is None:
             union_analysis = self._current_union_analysis
-        
+
+        all_params = list(self.theta_net.parameters()) + list(self.zeta_net.parameters())
+        self.optimizer = optim.Adam(all_params, lr=1e-4)
         # 训练神经网络（num_epochs个epoch）
         self.theta_net.train()
         self.zeta_net.train()

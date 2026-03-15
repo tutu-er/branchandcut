@@ -258,25 +258,25 @@ class DualVariablePredictorNet(nn.Module):
         super(DualVariablePredictorNet, self).__init__()
         
         if hidden_dims is None:
-            hidden_dims = [256, 512, 256]
-        
+            hidden_dims = [64, 64]
+
         layers = []
         prev_dim = input_dim
-        
+
         for hidden_dim in hidden_dims:
             layers.append(nn.Linear(prev_dim, hidden_dim))
-            layers.append(nn.ReLU())
-            layers.append(nn.Dropout(0.1))
+            layers.append(nn.LeakyReLU(0.01))
+            layers.append(nn.Dropout(0.3))
             prev_dim = hidden_dim
-        
+
         layers.append(nn.Linear(prev_dim, output_dim))
         self.network = nn.Sequential(*layers)
         self._init_weights()
-    
+
     def _init_weights(self):
         for module in self.modules():
             if isinstance(module, nn.Linear):
-                nn.init.kaiming_normal_(module.weight, mode='fan_in', nonlinearity='relu')
+                nn.init.kaiming_normal_(module.weight, mode='fan_in', nonlinearity='leaky_relu')
                 if module.bias is not None:
                     nn.init.zeros_(module.bias)
     
@@ -528,15 +528,15 @@ class SubproblemSurrogateNet(nn.Module):
         self.max_constraints = max_constraints  # 最大约束数量
         
         if hidden_dims is None:
-            hidden_dims = [256, 512, 256]  # V3: 更大网络容量
-        
+            hidden_dims = [128, 128]
+
         # 统一的特征提取网络
         feature_layers = []
         prev_dim = input_dim
         for hidden_dim in hidden_dims:
             feature_layers.append(nn.Linear(prev_dim, hidden_dim))
-            feature_layers.append(nn.ReLU())
-            feature_layers.append(nn.Dropout(0.15))  # 增加dropout
+            feature_layers.append(nn.LeakyReLU(0.01))
+            feature_layers.append(nn.Dropout(0.3))
             prev_dim = hidden_dim
         self.feature_extractor = nn.Sequential(*feature_layers)
         
@@ -556,10 +556,10 @@ class SubproblemSurrogateNet(nn.Module):
     def _init_weights(self):
         for module in self.modules():
             if isinstance(module, nn.Linear):
-                nn.init.kaiming_normal_(module.weight, mode='fan_in', nonlinearity='relu')
+                nn.init.kaiming_normal_(module.weight, mode='fan_in', nonlinearity='leaky_relu')
                 if module.bias is not None:
                     nn.init.zeros_(module.bias)
-        
+
         # delta网络的偏置初始化为正值
         if hasattr(self.delta_net[0], 'bias') and self.delta_net[0].bias is not None:
             nn.init.constant_(self.delta_net[0].bias, 1.0)
@@ -1637,7 +1637,8 @@ class SubproblemSurrogateTrainer:
         """
         if not TORCH_AVAILABLE:
             return
-        
+
+        self.optimizer = optim.Adam(self.surrogate_net.parameters(), lr=5e-5)
         self.surrogate_net.train()
         
         for epoch in range(num_epochs):

@@ -57,7 +57,7 @@ if not check_and_install_dependencies():
 #   'bcd'       - 加载 BCD 神经网络模型并报告参数统计
 #   'both'      - 联合加载 BCD + surrogate，以全体代理约束评估（需同时配置下面两个路径）
 #
-MODE      = 'both'
+MODE      = 'BCD'
 RUN_FP    = False       # surrogate / both 模式：是否运行可行性泵测试
 CASE_NAME = 'case30'   # 'case14' / 'case30' / 'case39'
 
