@@ -7,6 +7,6 @@ pypower>=5.1
 gurobipy>=11.0
 
 # Optional — uncomment as needed
-# torch>=2.0
+torch>=2.0
 # cvxpy>=1.4
 # cplex>=22.1
