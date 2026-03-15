@@ -1,0 +1,12 @@
+numpy>=1.26
+pandas>=2.0
+scipy>=1.11
+matplotlib>=3.7
+seaborn>=0.13
+pypower>=5.1
+gurobipy>=11.0
+
+# Optional — uncomment as needed
+# torch>=2.0
+# cvxpy>=1.4
+# cplex>=22.1
