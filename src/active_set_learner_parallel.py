@@ -14,6 +14,8 @@ sys.path.append(str(root_dir))
 
 from src.ActiveSetLearner import ActiveSetLearner
 
+from pypower.idx_brch import RATE_A
+
 
 def _solve_single_sample(args: tuple) -> dict | None:
     """模块级 worker 函数，在子进程中求解单个样本。
@@ -226,7 +228,7 @@ class ParallelActiveSetLearner(ActiveSetLearner):
 
 if __name__ == "__main__":
     import pandas as pd
-    import pypower.case30
+    import pypower.case118
     import pypower.idx_bus
 
     load_df = pd.read_csv("src/load.csv", header=None)
@@ -236,19 +238,21 @@ if __name__ == "__main__":
     valid_steps = (Pd_base.size // group_size) * group_size
     Pd_base = Pd_base[:valid_steps].reshape(-1, group_size).sum(axis=1)
 
-    ppc = pypower.case30.case30()
+    ppc = pypower.case118.case118()
 
     Pd = ppc["bus"][:, pypower.idx_bus.PD]
-    Pd = Pd[:, None] * Pd_base[None, :] / np.max(Pd_base)
+    Pd = Pd[:, None] * Pd_base[None, :] / np.max(Pd_base) * 2.2
+    
+    ppc["branch"][:, RATE_A] = ppc["branch"][:, RATE_A] * 0.12
 
     learner = ParallelActiveSetLearner(
-        alpha=0.70,
-        delta=0.05,
+        alpha=0.75,
+        delta=0.15,
         epsilon=0.10,
         ppc=ppc,
         T_delta=1,
         Pd=Pd,
-        case_name="case30",
+        case_name="case118",
         n_workers=4,
         gurobi_threads=4,
     )

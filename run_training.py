@@ -346,11 +346,11 @@ def main():
     T_DELTA         = 1.0
     DUAL_EPOCHS     = 50
     DUAL_BATCH_SIZE = 8
-    MAX_ITER        = 20            # 迭代次数（BCD / surrogate BCD 轮数）
+    MAX_ITER        = 40            # 迭代次数（BCD / surrogate BCD 轮数）
     NN_EPOCHS       = 10            # surrogate 模式每次 BCD 迭代的 NN 训练轮数
     UNIT_IDS        = None          # None = 所有机组；或如 [0, 1, 2]
     FP_TEST_SAMPLES = 3             # feasibility_pump 模式：测试样本数
-    N_WORKERS_BCD   = 1             # 样本级并行线程数；1 = 串行（BCD 建议先用串行），>1 = 线程并行
+    N_WORKERS_BCD   = 4             # 样本级并行线程数；1 = 串行（BCD 建议先用串行），>1 = 线程并行
     N_WORKERS_SUBPROBLEM = 4             # 样本级并行线程数；1 = 串行（BCD 建议先用串行），>1 = 线程并行
     ACTIVE_SETS_FILE = None          # 指定 active_sets JSON 文件路径（None=自动查找最新）
 
