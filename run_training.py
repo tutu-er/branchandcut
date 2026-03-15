@@ -352,6 +352,7 @@ def main():
     FP_TEST_SAMPLES = 3             # feasibility_pump 模式：测试样本数
     N_WORKERS_BCD   = 1             # 样本级并行线程数；1 = 串行（BCD 建议先用串行），>1 = 线程并行
     N_WORKERS_SUBPROBLEM = 4             # 样本级并行线程数；1 = 串行（BCD 建议先用串行），>1 = 线程并行
+    ACTIVE_SETS_FILE = None          # 指定 active_sets JSON 文件路径（None=自动查找最新）
 
     result_dir = Path(__file__).parent / 'result' / 'active_set'
     result_dir.mkdir(exist_ok=True)
@@ -374,7 +375,16 @@ def main():
     log(f"  {n_units} 机组，{n_buses} 节点")
 
     # ── 查找数据文件 ─────────────────────────────────────
-    data_file = pick_data_file(result_dir, CASE_NAME)
+    if ACTIVE_SETS_FILE is not None:
+        data_file = Path(ACTIVE_SETS_FILE)
+        if not data_file.is_absolute():
+            data_file = Path(__file__).parent / data_file
+        if not data_file.exists():
+            log(f"错误: 指定的文件不存在: {data_file}")
+            sys.exit(1)
+        log(f"使用指定文件: {data_file}")
+    else:
+        data_file = pick_data_file(result_dir, CASE_NAME)
     if data_file is None:
         log(f"错误: 在 {result_dir} 中未找到 {CASE_NAME} 的 JSON 数据文件。")
         log("请先运行 ActiveSetLearner 生成数据，或在 result/ 目录下放置")

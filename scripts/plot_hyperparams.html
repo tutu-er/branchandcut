@@ -1,0 +1,335 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ActiveSetLearner 超参数可视化</title>
+    <script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/jstat@latest/dist/jstat.min.js"></script>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, "Microsoft YaHei", sans-serif;
+            background: #f5f7fa;
+            color: #333;
+        }
+        .header {
+            background: linear-gradient(135deg, #1a1a2e 0%, #16213e 50%, #0f3460 100%);
+            color: white;
+            padding: 24px 40px;
+        }
+        .header h1 { font-size: 22px; font-weight: 600; }
+        .header p { font-size: 13px; opacity: 0.7; margin-top: 6px; }
+
+        .main { display: flex; height: calc(100vh - 90px); }
+
+        /* 左侧控制面板 */
+        .controls {
+            width: 300px;
+            min-width: 300px;
+            background: white;
+            border-right: 1px solid #e0e0e0;
+            padding: 20px;
+            overflow-y: auto;
+        }
+        .control-group {
+            margin-bottom: 20px;
+        }
+        .control-group h3 {
+            font-size: 13px;
+            color: #666;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            margin-bottom: 12px;
+        }
+        .slider-row {
+            margin-bottom: 14px;
+        }
+        .slider-row label {
+            display: flex;
+            justify-content: space-between;
+            font-size: 14px;
+            margin-bottom: 4px;
+        }
+        .slider-row label .val {
+            font-weight: 700;
+            color: #0f3460;
+            font-family: "Consolas", monospace;
+        }
+        input[type="range"] {
+            width: 100%;
+            accent-color: #0f3460;
+        }
+
+        .info-box {
+            background: #eef2ff;
+            border-left: 3px solid #0f3460;
+            padding: 12px;
+            border-radius: 4px;
+            font-size: 13px;
+            line-height: 1.6;
+        }
+        .info-box .result {
+            font-size: 20px;
+            font-weight: 700;
+            color: #0f3460;
+            margin: 6px 0;
+        }
+
+        .formula-box {
+            background: #fff8e1;
+            border-left: 3px solid #f9a825;
+            padding: 12px;
+            border-radius: 4px;
+            font-size: 12px;
+            line-height: 1.8;
+            margin-top: 16px;
+            font-family: "Consolas", monospace;
+        }
+
+        /* 右侧图表 */
+        .charts {
+            flex: 1;
+            padding: 16px;
+            overflow-y: auto;
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            grid-template-rows: 1fr 1fr;
+            gap: 12px;
+        }
+        .chart-card {
+            background: white;
+            border-radius: 8px;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.08);
+            overflow: hidden;
+        }
+        .chart-card .plot { width: 100%; height: 100%; }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>ActiveSetLearner 超参数与 W / 停止条件交互可视化</h1>
+        <p>拖动左侧滑块调整 α, δ, ε，实时观察窗口大小 W 和停止条件的变化</p>
+    </div>
+
+    <div class="main">
+        <div class="controls">
+            <!-- 核心参数 -->
+            <div class="control-group">
+                <h3>核心超参数</h3>
+                <div class="slider-row">
+                    <label>α (未见概率上界) <span class="val" id="alpha-val">0.10</span></label>
+                    <input type="range" id="alpha" min="0.03" max="0.80" step="0.01" value="0.10">
+                </div>
+                <div class="slider-row">
+                    <label>δ (置信度参数) <span class="val" id="delta-val">0.01</span></label>
+                    <input type="range" id="delta" min="0.001" max="0.20" step="0.001" value="0.01">
+                </div>
+                <div class="slider-row">
+                    <label>ε (容差) <span class="val" id="epsilon-val">0.04</span></label>
+                    <input type="range" id="epsilon" min="0.005" max="0.20" step="0.005" value="0.04">
+                </div>
+            </div>
+
+            <!-- 计算结果 -->
+            <div class="control-group">
+                <h3>计算结果</h3>
+                <div class="info-box">
+                    窗口大小 W = <div class="result" id="W-result">—</div>
+                    停止阈值 α − ε = <span id="threshold-result" style="font-weight:700">—</span><br>
+                    含义：在连续 W 个样本中，新发现的活动集比例 < α − ε 时停止。
+                </div>
+            </div>
+
+            <!-- 公式说明 -->
+            <div class="control-group">
+                <h3>算法说明</h3>
+                <div class="formula-box">
+                    <b>_cal_W 逻辑：</b><br>
+                    对 n = 1, 2, …<br>
+                    &nbsp; k = max(⌊(α−ε)·n⌋, 1)<br>
+                    &nbsp; UB = Beta.ppf(1−δ, k+1, n−k)<br>
+                    &nbsp; 若 UB &lt; α → W = n<br><br>
+                    <b>停止条件：</b><br>
+                    R_M(W) &lt; α − ε<br>
+                    即窗口内发现率低于阈值
+                </div>
+            </div>
+        </div>
+
+        <div class="charts">
+            <div class="chart-card"><div id="plot1" class="plot"></div></div>
+            <div class="chart-card"><div id="plot2" class="plot"></div></div>
+            <div class="chart-card"><div id="plot3" class="plot"></div></div>
+            <div class="chart-card"><div id="plot4" class="plot"></div></div>
+        </div>
+    </div>
+
+    <script>
+    // ========== Beta 分布分位数（使用 jStat） ==========
+    function betaPPF(q, a, b) {
+        return jStat.beta.inv(q, a, b);
+    }
+
+    function computeW(alpha, delta, epsilon) {
+        const target = alpha - epsilon;
+        if (target <= 0) return NaN;
+        for (let n = 1; n <= 50000; n++) {
+            const k = Math.max(Math.floor(target * n), 1);
+            if (k >= n) continue;
+            const ub = betaPPF(1 - delta, k + 1, n - k);
+            if (ub < alpha) return n;
+        }
+        return 50000;
+    }
+
+    // ========== 读取当前参数 ==========
+    function getParams() {
+        const alpha = parseFloat(document.getElementById('alpha').value);
+        const delta = parseFloat(document.getElementById('delta').value);
+        const epsilon = parseFloat(document.getElementById('epsilon').value);
+        return { alpha, delta, epsilon };
+    }
+
+    // ========== 图1: W vs alpha 扫描 ==========
+    function plotWvsAlpha(fixDelta, fixEpsilon, currentAlpha) {
+        const alphas = [], Ws = [];
+        for (let a = 0.03; a <= 0.80; a += 0.02) {
+            if (a - fixEpsilon <= 0) continue;
+            alphas.push(a);
+            Ws.push(computeW(a, fixDelta, fixEpsilon));
+        }
+        const curW = computeW(currentAlpha, fixDelta, fixEpsilon);
+
+        Plotly.react('plot1', [
+            { x: alphas, y: Ws, mode: 'lines+markers', marker: { size: 4 }, line: { color: '#3b82f6' }, name: 'W' },
+            { x: [currentAlpha], y: [curW], mode: 'markers', marker: { size: 12, color: '#ef4444', symbol: 'diamond' }, name: '当前 α' }
+        ], {
+            title: { text: `W vs α  (δ=${fixDelta}, ε=${fixEpsilon})`, font: { size: 13 } },
+            xaxis: { title: 'α' },
+            yaxis: { title: 'W' },
+            margin: { t: 40, b: 50, l: 60, r: 20 },
+            showlegend: false,
+        }, { responsive: true });
+    }
+
+    // ========== 图2: W vs epsilon 扫描 ==========
+    function plotWvsEpsilon(fixAlpha, fixDelta, currentEpsilon) {
+        const epsilons = [], Ws = [];
+        for (let e = 0.005; e < fixAlpha - 0.005; e += 0.005) {
+            epsilons.push(e);
+            Ws.push(computeW(fixAlpha, fixDelta, e));
+        }
+        const curW = computeW(fixAlpha, fixDelta, currentEpsilon);
+
+        Plotly.react('plot2', [
+            { x: epsilons, y: Ws, mode: 'lines+markers', marker: { size: 4 }, line: { color: '#f97316' }, name: 'W' },
+            { x: [currentEpsilon], y: [curW], mode: 'markers', marker: { size: 12, color: '#ef4444', symbol: 'diamond' }, name: '当前 ε' }
+        ], {
+            title: { text: `W vs ε  (α=${fixAlpha}, δ=${fixDelta})`, font: { size: 13 } },
+            xaxis: { title: 'ε' },
+            yaxis: { title: 'W' },
+            margin: { t: 40, b: 50, l: 60, r: 20 },
+            showlegend: false,
+        }, { responsive: true });
+    }
+
+    // ========== 图3: 停止条件 — Beta 上界 vs 发现率 ==========
+    function plotStoppingCondition(alpha, delta, epsilon) {
+        const W = computeW(alpha, delta, epsilon);
+        const threshold = alpha - epsilon;
+        if (isNaN(W) || threshold <= 0) return;
+
+        const rates = [], ubs = [];
+        for (let r = 0; r <= 0.40; r += 0.002) {
+            let k = Math.max(Math.floor(r * W), 1);
+            k = Math.min(k, W - 1);
+            rates.push(r);
+            ubs.push(betaPPF(1 - delta, k + 1, W - k));
+        }
+
+        Plotly.react('plot3', [
+            { x: rates, y: ubs, mode: 'lines', line: { color: '#8b5cf6', width: 2.5 }, name: `Beta 上界 (W=${W})` },
+            { x: [0, 0.40], y: [alpha, alpha], mode: 'lines', line: { color: '#ef4444', dash: 'dash', width: 1.5 }, name: `α = ${alpha}` },
+            { x: [threshold, threshold], y: [0, 0.6], mode: 'lines', line: { color: '#3b82f6', dash: 'dot', width: 1.5 }, name: `α−ε = ${threshold.toFixed(3)}` },
+            // 停止区域
+            { x: [0, threshold, threshold, 0], y: [0, 0, 0.6, 0.6], fill: 'toself', fillcolor: 'rgba(59,130,246,0.08)', line: { width: 0 }, name: '停止区域', showlegend: true }
+        ], {
+            title: { text: '停止条件: 发现率 vs Beta 上界', font: { size: 13 } },
+            xaxis: { title: '发现率 R_M(W)', range: [0, 0.35] },
+            yaxis: { title: 'Beta 分布上界', range: [0, 0.5] },
+            margin: { t: 40, b: 50, l: 60, r: 20 },
+            legend: { font: { size: 10 }, x: 0.02, y: 0.98 },
+        }, { responsive: true });
+    }
+
+    // ========== 图4: W 热力图 (alpha × epsilon) ==========
+    function plotHeatmap(fixDelta) {
+        const alphas = [], epsilons = [];
+        for (let a = 0.05; a <= 0.50; a += 0.025) alphas.push(+a.toFixed(3));
+        for (let e = 0.01; e <= 0.12; e += 0.005) epsilons.push(+e.toFixed(3));
+
+        const z = [];
+        for (let i = 0; i < epsilons.length; i++) {
+            const row = [];
+            for (let j = 0; j < alphas.length; j++) {
+                if (epsilons[i] < alphas[j]) {
+                    row.push(computeW(alphas[j], fixDelta, epsilons[i]));
+                } else {
+                    row.push(null);
+                }
+            }
+            z.push(row);
+        }
+
+        Plotly.react('plot4', [{
+            x: alphas, y: epsilons, z: z,
+            type: 'heatmap',
+            colorscale: 'YlOrRd',
+            colorbar: { title: 'W' },
+            hoverongaps: false,
+        }], {
+            title: { text: `W 热力图 (δ=${fixDelta})`, font: { size: 13 } },
+            xaxis: { title: 'α' },
+            yaxis: { title: 'ε' },
+            margin: { t: 40, b: 50, l: 60, r: 20 },
+        }, { responsive: true });
+    }
+
+    // ========== 全部更新 ==========
+    function updateAll() {
+        const { alpha, delta, epsilon } = getParams();
+
+        // 更新显示值
+        document.getElementById('alpha-val').textContent = alpha.toFixed(2);
+        document.getElementById('delta-val').textContent = delta.toFixed(3);
+        document.getElementById('epsilon-val').textContent = epsilon.toFixed(3);
+
+        // 约束检查
+        const threshold = alpha - epsilon;
+        if (threshold <= 0) {
+            document.getElementById('W-result').textContent = '无效 (ε ≥ α)';
+            document.getElementById('threshold-result').textContent = threshold.toFixed(3);
+            return;
+        }
+
+        const W = computeW(alpha, delta, epsilon);
+        document.getElementById('W-result').textContent = isNaN(W) ? '—' : W;
+        document.getElementById('threshold-result').textContent = threshold.toFixed(3);
+
+        plotWvsAlpha(delta, epsilon, alpha);
+        plotWvsEpsilon(alpha, delta, epsilon);
+        plotStoppingCondition(alpha, delta, epsilon);
+        plotHeatmap(delta);
+    }
+
+    // ========== 绑定事件 ==========
+    document.getElementById('alpha').addEventListener('input', updateAll);
+    document.getElementById('delta').addEventListener('input', updateAll);
+    document.getElementById('epsilon').addEventListener('input', updateAll);
+
+    // 初始渲染
+    updateAll();
+    </script>
+</body>
+</html>

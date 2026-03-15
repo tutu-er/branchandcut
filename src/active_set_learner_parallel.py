@@ -19,12 +19,12 @@ def _solve_single_sample(args: tuple) -> dict | None:
     """模块级 worker 函数，在子进程中求解单个样本。
 
     Args:
-        args: (ppc, Pd, T_delta, gurobi_threads) 元组。
+        args: (ppc, Pd, T_delta, gurobi_threads, sample_id) 元组。
 
     Returns:
         包含 pd_data, active_set, lambda 的字典，求解失败返回 None。
     """
-    ppc, Pd, T_delta, gurobi_threads = args
+    ppc, Pd, T_delta, gurobi_threads, sample_id = args
 
     # 延迟导入，避免主进程 fork 时的序列化问题
     from src.uc_gurobipy import UnitCommitmentModel
@@ -68,7 +68,8 @@ def _solve_single_sample(args: tuple) -> dict | None:
         return {"pd_data": Pd, "active_set": active_set, "lambda": lambda_vals}
 
     except Exception as e:
-        print(f"  [Worker] 求解失败: {e}", flush=True)
+        # 在子进程中打印失败样本的标识，便于定位问题负荷
+        print(f"  [Worker] 样本 sample_id={sample_id} 求解失败: {e}", flush=True)
         return None
 
 
@@ -153,10 +154,10 @@ class ParallelActiveSetLearner(ActiveSetLearner):
                     pd_list.append(self._generate_random_Pd(rng=seed))
                 global_seed_counter += actual_wm
 
-                # 并行提交
+                # 并行提交，附带 sample_id（这里用全局 seed 标识）
                 args_list = [
-                    (self.ppc, pd, self.T_delta, self.gurobi_threads)
-                    for pd in pd_list
+                    (self.ppc, pd, self.T_delta, self.gurobi_threads, seed)
+                    for pd, seed in zip(pd_list, seeds)
                 ]
                 futures = {
                     pool.submit(_solve_single_sample, a): i
@@ -191,10 +192,14 @@ class ParallelActiveSetLearner(ActiveSetLearner):
                     )
                 print(flush=True)
 
-                # 按原始顺序收集有效结果
+                # 按原始顺序收集有效结果，并在主进程打印失败样本
                 new_active_sets = set()
-                for r in results:
+                for i, r in enumerate(results):
                     if r is None:
+                        print(
+                            f"  [Main] 样本 i={i}, seed={seeds[i]} 求解失败（worker 返回 None），已跳过。",
+                            flush=True,
+                        )
                         continue
                     samples.append((r["pd_data"], r["active_set"], r["lambda"]))
                     if r["active_set"] not in O:
@@ -227,6 +232,9 @@ if __name__ == "__main__":
     load_df = pd.read_csv("src/load.csv", header=None)
     Pd_base = load_df.values
     Pd_base = np.sum(Pd_base, axis=0)
+    group_size = 4
+    valid_steps = (Pd_base.size // group_size) * group_size
+    Pd_base = Pd_base[:valid_steps].reshape(-1, group_size).sum(axis=1)
 
     ppc = pypower.case30.case30()
 

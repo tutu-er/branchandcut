@@ -374,8 +374,9 @@ class Iter_BCD:
         self.rho_primal = 1e-3
         self.rho_dual = 1e-3
         self.rho_opt = 1e-5
-        
-        self.gamma = 1e-1
+
+        self.gamma_base = 1.0   # gamma 缩放基准
+        self.rho_max = 10.0     # rho 上限
         
         # 右端项u的缩放参数
         self.theta_u_scale = 300.0  # theta系列u的缩放因子
@@ -4175,6 +4176,7 @@ class Iter_BCD:
     def iter(self, max_iter=20, union_analysis=None):
         if union_analysis is None:
             union_analysis = self._current_union_analysis
+        gamma = self.gamma_base / (self.n_samples * max_iter)
         for i in range(max_iter):
             print(f"🔄 迭代 {i+1}/{max_iter} 开始")
             # 迭代PG块
@@ -4227,9 +4229,9 @@ class Iter_BCD:
             obj_opt = obj_opt if abs(obj_opt) >= EPS else 0.0
             
             print(f'obj_primal:{obj_primal}, obj_dual:{obj_dual}, obj_opt:{obj_opt}')
-            self.rho_primal += self.gamma * obj_primal
-            self.rho_dual += self.gamma * obj_dual
-            self.rho_opt += self.gamma * obj_opt
+            self.rho_primal = min(self.rho_primal + gamma * obj_primal, self.rho_max)
+            self.rho_dual = min(self.rho_dual + gamma * obj_dual, self.rho_max)
+            self.rho_opt = min(self.rho_opt + gamma * obj_opt, self.rho_max)
             print(f"当前惩罚参数: ρ_primal={self.rho_primal}, ρ_dual={self.rho_dual}, ρ_opt={self.rho_opt}")
             print("--------------------------------")
 

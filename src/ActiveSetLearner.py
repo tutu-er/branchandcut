@@ -199,10 +199,15 @@ class ActiveSetLearner:
                 if M >= M_max:
                     break
                 Pd = self._generate_random_Pd(rng=idx)
-                # 静默求解器输出，避免打断进度条
-                with contextlib.redirect_stdout(io.StringIO()):
-                    active_set, lambda_vals = self._solve_optimization(Pd)
-                samples.append((Pd, active_set, lambda_vals))
+                try:
+                    # 静默求解器输出，避免打断进度条
+                    with contextlib.redirect_stdout(io.StringIO()):
+                        active_set, lambda_vals = self._solve_optimization(Pd)
+                    samples.append((Pd, active_set, lambda_vals))
+                except Exception as e:
+                    # 在终端显式打印失败样本，便于排查不可行或求解异常
+                    print(f"  样本 idx={idx} 求解失败: {e}", flush=True)
+                    continue
                 # 进度条显示
                 bar_len = 30
                 percent = (idx + 1) / WM
@@ -235,7 +240,10 @@ if __name__ == "__main__":
     
     load_df = pd.read_csv('src/load.csv', header=None)
     Pd_base = load_df.values
-    Pd_base = np.sum(Pd_base, axis=0)  # 假设每4个时段合并为一个
+    Pd_base = np.sum(Pd_base, axis=0)
+    group_size = 4
+    valid_steps = (Pd_base.size // group_size) * group_size
+    Pd_base = Pd_base[:valid_steps].reshape(-1, group_size).sum(axis=1)
     
     ppc = pypower.case30.case30()
     
