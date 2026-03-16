@@ -113,8 +113,8 @@ class ParallelAgent_NN_BCD(Agent_NN_BCD):
             self.iter_number = i
 
             # 快照当前 theta/zeta（线程只读，不修改；提前取值避免迭代中途被 NN 块改变）
-            theta_snap = self.theta_values
-            zeta_snap  = self.zeta_values
+            theta_snap_list = self.theta_values_list
+            zeta_snap_list  = self.zeta_values_list
 
             # ── 1. PG 块（线程并行） ─────────────────────────────────
             pg_results: Dict[int, tuple] = {}
@@ -123,8 +123,8 @@ class ParallelAgent_NN_BCD(Agent_NN_BCD):
                     executor.submit(
                         self.iter_with_pg_block,
                         sample_id,
-                        theta_snap,
-                        zeta_snap,
+                        theta_snap_list[sample_id],
+                        zeta_snap_list[sample_id],
                         union_analysis,
                     ): sample_id
                     for sample_id in range(self.n_samples)
@@ -165,8 +165,8 @@ class ParallelAgent_NN_BCD(Agent_NN_BCD):
                     executor.submit(
                         self.iter_with_dual_block,
                         sample_id,
-                        theta_snap,
-                        zeta_snap,
+                        theta_snap_list[sample_id],
+                        zeta_snap_list[sample_id],
                         union_analysis,
                     ): sample_id
                     for sample_id in range(self.n_samples)
@@ -207,8 +207,10 @@ class ParallelAgent_NN_BCD(Agent_NN_BCD):
             if theta_new is None or zeta_new is None:
                 print("[ParallelBCD] ❌ NN 块更新失败，终止迭代", flush=True)
                 break
-            self.theta_values = theta_new
-            self.zeta_values  = zeta_new
+            self.theta_values_list = theta_new
+            self.zeta_values_list  = zeta_new
+            self.theta_values = self.theta_values_list[0]
+            self.zeta_values  = self.zeta_values_list[0]
 
             print(f"[ParallelBCD] ✅ 迭代 {i+1}/{max_iter} 完成", flush=True)
 
@@ -236,7 +238,7 @@ class ParallelAgent_NN_BCD(Agent_NN_BCD):
             )
             print("[ParallelBCD] " + "─" * 40, flush=True)
 
-        return self.theta_values, self.zeta_values
+        return self.theta_values_list, self.zeta_values_list
 
 
 # ════════════════════════════════════════════════════════════════════

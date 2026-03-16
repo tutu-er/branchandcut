@@ -394,8 +394,11 @@ class Agent_NN_BCD:
         self.add_zeta_variables_for_units(self._current_union_analysis)
         
         # 初始化theta和zeta值（直接优化系数，使用随机初始化）
-        self.theta_values, self.mu = self.initialize_theta_values(self._current_union_analysis)
-        self.zeta_values, self.ita = self.initialize_zeta_values(self._current_union_analysis)
+        self.theta_values_list, self.mu = self.initialize_theta_values(self._current_union_analysis)
+        self.zeta_values_list, self.ita = self.initialize_zeta_values(self._current_union_analysis)
+        # 兼容别名（供 _init_neural_network 取 var_names、feasibility_pump 等）
+        self.theta_values = self.theta_values_list[0]
+        self.zeta_values = self.zeta_values_list[0]
         
         # 初始化神经网络模型（用于更新theta和zeta）
         if TORCH_AVAILABLE:
@@ -1313,7 +1316,7 @@ class Agent_NN_BCD:
         
         if not union_analysis or 'union_constraints' not in union_analysis:
             print("警告: 没有union_analysis数据，无法初始化theta值")
-            return {}, np.zeros((self.n_samples, self.nl, self.T))
+            return [{} for _ in range(self.n_samples)], np.zeros((self.n_samples, self.nl, self.T))
         
         union_constraints = union_analysis['union_constraints']
         
@@ -1338,8 +1341,9 @@ class Agent_NN_BCD:
         # 初始化mu
         mu_init = np.zeros((self.n_samples, self.nl, self.T), dtype=float)
         
-        return initialization_values['theta_values'], mu_init
-    
+        base_dict = initialization_values['theta_values']
+        return [base_dict.copy() for _ in range(self.n_samples)], mu_init
+
     def initialize_zeta_values(self, union_analysis=None):
         """初始化zeta值（直接优化系数，参考uc_NN.py）"""
         if union_analysis is None:
@@ -1347,7 +1351,7 @@ class Agent_NN_BCD:
         
         if not union_analysis or 'union_zeta_constraints' not in union_analysis:
             print("警告: 没有union_analysis数据，无法初始化zeta值")
-            return {}, np.zeros((self.n_samples, self.ng, self.T))
+            return [{} for _ in range(self.n_samples)], np.zeros((self.n_samples, self.ng, self.T))
         
         union_constraints = union_analysis['union_zeta_constraints']
         
@@ -1369,7 +1373,8 @@ class Agent_NN_BCD:
         # 初始化ita
         ita_init = np.zeros((self.n_samples, self.ng, self.T), dtype=float)
         
-        return initialization_values['zeta_values'], ita_init
+        base_dict = initialization_values['zeta_values']
+        return [base_dict.copy() for _ in range(self.n_samples)], ita_init
     
     def add_theta_variables_for_branches(self, union_analysis=None):
         """为参数化约束添加theta变量（参考uc_NN.py）"""
@@ -2158,7 +2163,7 @@ class Agent_NN_BCD:
         """
         if not TORCH_AVAILABLE or self.theta_net is None or self.zeta_net is None:
             print("警告: 神经网络不可用，跳过theta/zeta更新", flush=True)
-            return self.theta_values, self.zeta_values
+            return self.theta_values_list, self.zeta_values_list
 
         if union_analysis is None:
             union_analysis = self._current_union_analysis
@@ -2216,19 +2221,20 @@ class Agent_NN_BCD:
                 avg_loss = epoch_total_loss / epoch_sample_count
                 print(f"[NN-theta/zeta] epoch {epoch+1}/{num_epochs}, avg_loss = {avg_loss:.6f}", flush=True)
         
-        # 更新theta和zeta值（使用第一个样本的预测值）
-        features_tensor = self._features_cache[0:1]
-        
+        # 更新theta和zeta值（per-sample 生成）
         self.theta_net.eval()
         self.zeta_net.eval()
+        theta_values_new_list = []
+        zeta_values_new_list = []
         with torch.no_grad():
-            theta_output = self.theta_net(features_tensor)
-            zeta_output = self.zeta_net(features_tensor)
-        
-        theta_values_new = self._tensor_to_theta_dict(theta_output[0])
-        zeta_values_new = self._tensor_to_zeta_dict(zeta_output[0])
-        
-        return theta_values_new, zeta_values_new
+            for sample_id in range(self.n_samples):
+                features_tensor = self._features_cache[sample_id:sample_id + 1]
+                theta_output = self.theta_net(features_tensor)
+                zeta_output = self.zeta_net(features_tensor)
+                theta_values_new_list.append(self._tensor_to_theta_dict(theta_output[0]))
+                zeta_values_new_list.append(self._tensor_to_zeta_dict(zeta_output[0]))
+
+        return theta_values_new_list, zeta_values_new_list
     
     def iter(self, max_iter=20, nn_epochs=10, union_analysis=None):
         """
@@ -2251,8 +2257,8 @@ class Agent_NN_BCD:
             for sample_id in range(self.n_samples):
                 pg_sol, x_sol, cpower_sol, coc_sol = self.iter_with_pg_block(
                     sample_id=sample_id,
-                    theta_values=self.theta_values,
-                    zeta_values=self.zeta_values,
+                    theta_values=self.theta_values_list[sample_id],
+                    zeta_values=self.zeta_values_list[sample_id],
                     union_analysis=union_analysis
                 )
                 if pg_sol is None:
@@ -2273,8 +2279,8 @@ class Agent_NN_BCD:
             for sample_id in range(self.n_samples):
                 lambda_sol, mu_sol, ita_sol = self.iter_with_dual_block(
                     sample_id=sample_id,
-                    theta_values=self.theta_values,
-                    zeta_values=self.zeta_values,
+                    theta_values=self.theta_values_list[sample_id],
+                    zeta_values=self.zeta_values_list[sample_id],
                     union_analysis=union_analysis
                 )
                 if lambda_sol is None or mu_sol is None:
@@ -2294,8 +2300,10 @@ class Agent_NN_BCD:
             if theta_values_new is None or zeta_values_new is None:
                 print("❌ Theta/Zeta神经网络更新失败，终止迭代", flush=True)
                 break
-            self.theta_values = theta_values_new
-            self.zeta_values = zeta_values_new
+            self.theta_values_list = theta_values_new
+            self.zeta_values_list = zeta_values_new
+            self.theta_values = self.theta_values_list[0]
+            self.zeta_values = self.zeta_values_list[0]
             
             print(f"✅ 迭代 {i+1}/{max_iter} 成功", flush=True)
             
@@ -2316,8 +2324,8 @@ class Agent_NN_BCD:
             print("--------------------------------", flush=True)
             time.sleep(1)
         
-        return self.theta_values, self.zeta_values
-    
+        return self.theta_values_list, self.zeta_values_list
+
     def cal_viol(self, union_analysis=None):
         """
         计算约束违反量（参考uc_dfsm_bcd.py）
@@ -2352,31 +2360,32 @@ class Agent_NN_BCD:
         # 预计算 PTDF @ G，避免在循环内重复计算
         PTDF_G = PTDF @ G  # shape: (nl, ng)
 
-        # 预建 theta/zeta 查找表（theta_values 在迭代中不变，只需构建一次）
-        # theta_lookup: (time_slot, unit_id) -> [(branch_id, theta_val), ...]
-        theta_lookup: dict[tuple[int, int], list[tuple[int, float]]] = {}
-        if (self.enable_theta_constraints and union_analysis
-                and 'union_constraints' in union_analysis
-                and self.theta_values is not None):
-            for _c in union_analysis['union_constraints']:
-                _b_id = _c['branch_id']
-                _t_s = _c['time_slot']
-                for _coeff in _c['nonzero_pg_coefficients']:
-                    _u_id = _coeff['unit_id']
-                    _name = f'theta_branch_{_b_id}_unit_{_u_id}_time_{_t_s}'
-                    _val = self.theta_values.get(_name, 0.0)
-                    theta_lookup.setdefault((_t_s, _u_id), []).append((_b_id, _val))
-
-        # zeta_lookup: (time_slot, unit_id) -> zeta_val
-        zeta_lookup: dict[tuple[int, int], float] = {}
-        if (self.enable_zeta_constraints and union_analysis
-                and 'union_zeta_constraints' in union_analysis
-                and self.zeta_values is not None):
-            for _c in union_analysis['union_zeta_constraints']:
-                _name = f'zeta_unit_{_c["unit_id"]}_time_{_c["time_slot"]}'
-                zeta_lookup[(_c['time_slot'], _c['unit_id'])] = self.zeta_values.get(_name, 0.0)
-
         for sample_id in range(self.n_samples):
+            # per-sample theta/zeta
+            sample_theta = self.theta_values_list[sample_id] if hasattr(self, 'theta_values_list') else self.theta_values
+            sample_zeta = self.zeta_values_list[sample_id] if hasattr(self, 'zeta_values_list') else self.zeta_values
+
+            # 预建 theta/zeta 查找表（per-sample）
+            theta_lookup: dict[tuple[int, int], list[tuple[int, float]]] = {}
+            if (self.enable_theta_constraints and union_analysis
+                    and 'union_constraints' in union_analysis
+                    and sample_theta is not None):
+                for _c in union_analysis['union_constraints']:
+                    _b_id = _c['branch_id']
+                    _t_s = _c['time_slot']
+                    for _coeff in _c['nonzero_pg_coefficients']:
+                        _u_id = _coeff['unit_id']
+                        _name = f'theta_branch_{_b_id}_unit_{_u_id}_time_{_t_s}'
+                        _val = sample_theta.get(_name, 0.0)
+                        theta_lookup.setdefault((_t_s, _u_id), []).append((_b_id, _val))
+
+            zeta_lookup: dict[tuple[int, int], float] = {}
+            if (self.enable_zeta_constraints and union_analysis
+                    and 'union_zeta_constraints' in union_analysis
+                    and sample_zeta is not None):
+                for _c in union_analysis['union_zeta_constraints']:
+                    _name = f'zeta_unit_{_c["unit_id"]}_time_{_c["time_slot"]}'
+                    zeta_lookup[(_c['time_slot'], _c['unit_id'])] = sample_zeta.get(_name, 0.0)
             Pd = self.active_set_data[sample_id]['pd_data']
             pg = self.pg[sample_id, :, :]
             x = self.x[sample_id, :, :]
@@ -2434,27 +2443,30 @@ class Agent_NN_BCD:
                         if sample_id < len(self.lambda_) and 'lambda_min_off' in self.lambda_[sample_id]:
                             obj_opt += abs(min_off_expr) * abs(self.lambda_[sample_id]['lambda_min_off'][g, t-1, t1])
             
-            # 启停成本约束
+            # 启停成本约束（对齐参考 uc_dfsm_bcd.py:4014-4027）
             for t in range(1, self.T):
                 for g in range(self.ng):
-                    coc_viol = abs(coc[g, t-1])
-                    obj_primal += coc_viol
-                    if sample_id < len(self.lambda_) and 'lambda_coc_nonneg' in self.lambda_[sample_id]:
-                        obj_opt += coc_viol * abs(self.lambda_[sample_id]['lambda_coc_nonneg'][g, t-1])
-                    
-                    start_cost_viol = abs(coc[g, t-1] - start_cost[g] * (x[g, t] - x[g, t-1]))
-                    shut_cost_viol = abs(coc[g, t-1] - shut_cost[g] * (x[g, t-1] - x[g, t]))
-                    obj_primal += start_cost_viol + shut_cost_viol
+                    start_cost_expr = start_cost[g] * (x[g, t] - x[g, t-1]) - coc[g, t-1]
+                    obj_primal += max(0, start_cost_expr)
+
+                    shut_cost_expr = shut_cost[g] * (x[g, t-1] - x[g, t]) - coc[g, t-1]
+                    obj_primal += max(0, shut_cost_expr)
+
                     if sample_id < len(self.lambda_) and 'lambda_start_cost' in self.lambda_[sample_id]:
-                        obj_opt += start_cost_viol * abs(self.lambda_[sample_id]['lambda_start_cost'][g, t-1])
+                        obj_opt += abs(start_cost_expr) * abs(self.lambda_[sample_id]['lambda_start_cost'][g, t-1])
                     if sample_id < len(self.lambda_) and 'lambda_shut_cost' in self.lambda_[sample_id]:
-                        obj_opt += shut_cost_viol * abs(self.lambda_[sample_id]['lambda_shut_cost'][g, t-1])
+                        obj_opt += abs(shut_cost_expr) * abs(self.lambda_[sample_id]['lambda_shut_cost'][g, t-1])
+
+                    if sample_id < len(self.lambda_) and 'lambda_coc_nonneg' in self.lambda_[sample_id]:
+                        obj_opt += coc[g, t-1] * abs(self.lambda_[sample_id]['lambda_coc_nonneg'][g, t-1])
             
-            # 发电成本约束
+            # 发电成本约束（对齐参考 uc_dfsm_bcd.py:4028-4034）
             for t in range(self.T):
                 for g in range(self.ng):
-                    cpower_viol = abs(cpower[g, t] - (self.gencost[g, -2]/self.T_delta * pg[g, t] + self.gencost[g, -1]/self.T_delta * x[g, t]))
-                    obj_primal += cpower_viol
+                    cpower_expr = self.gencost[g, -2]/self.T_delta * pg[g, t] + self.gencost[g, -1]/self.T_delta * x[g, t] - cpower[g, t]
+                    obj_primal += max(0, cpower_expr)
+                    if sample_id < len(self.lambda_) and 'lambda_cpower' in self.lambda_[sample_id]:
+                        obj_opt += abs(cpower_expr) * abs(self.lambda_[sample_id]['lambda_cpower'][g, t])
             
             # 潮流约束
             for t in range(self.T):
@@ -2469,7 +2481,7 @@ class Agent_NN_BCD:
                         obj_opt += dcpf_lower_viol * abs(self.lambda_[sample_id]['lambda_dcpf_lower'][l, t])
             
             # 参数化约束违反量（theta和zeta）
-            if self.enable_theta_constraints and union_analysis and 'union_constraints' in union_analysis and self.theta_values is not None:
+            if self.enable_theta_constraints and union_analysis and 'union_constraints' in union_analysis and sample_theta is not None:
                 union_constraints = union_analysis['union_constraints']
                 for constraint_info in union_constraints:
                     branch_id = constraint_info['branch_id']
@@ -2480,28 +2492,28 @@ class Agent_NN_BCD:
                     for coeff_info in nonzero_coefficients:
                         unit_id = coeff_info['unit_id']
                         theta_name = f'theta_branch_{branch_id}_unit_{unit_id}_time_{time_slot}'
-                        theta = self.theta_values.get(theta_name, 0.0)
+                        theta = sample_theta.get(theta_name, 0.0)
                         lhs_expr += theta * x[unit_id, time_slot]
                     
                     theta_rhs_name = f'theta_rhs_branch_{branch_id}_time_{time_slot}'
-                    theta_rhs = self.theta_values.get(theta_rhs_name, 1.0)
+                    theta_rhs = sample_theta.get(theta_rhs_name, 1.0)
                     violation = max(0, lhs_expr - theta_rhs)
                     obj_primal += violation
                     if branch_id < self.nl and sample_id < len(self.mu):
                         obj_opt += violation * abs(self.mu[sample_id, branch_id, time_slot])
             
-            if self.enable_zeta_constraints and union_analysis and 'union_zeta_constraints' in union_analysis and self.zeta_values is not None:
+            if self.enable_zeta_constraints and union_analysis and 'union_zeta_constraints' in union_analysis and sample_zeta is not None:
                 union_zeta_constraints = union_analysis['union_zeta_constraints']
                 for constraint in union_zeta_constraints:
                     unit_id = constraint['unit_id']
                     time_slot = constraint['time_slot']
                     
                     zeta_name = f'zeta_unit_{unit_id}_time_{time_slot}'
-                    zeta = self.zeta_values.get(zeta_name, 0.0)
+                    zeta = sample_zeta.get(zeta_name, 0.0)
                     lhs_expr = zeta * x[unit_id, time_slot]
                     
                     zeta_rhs_name = f'zeta_rhs_unit_{unit_id}_time_{time_slot}'
-                    zeta_rhs = self.zeta_values.get(zeta_rhs_name, 1.0)
+                    zeta_rhs = sample_zeta.get(zeta_rhs_name, 1.0)
                     violation = max(0, lhs_expr - zeta_rhs)
                     obj_primal += violation
                     if sample_id < len(self.ita):
@@ -2602,7 +2614,7 @@ class Agent_NN_BCD:
 
                         # 对偶约束：梯度 = 0
                         obj_dual += abs(dual_expr)
-        
+
         return obj_primal, obj_dual, obj_opt
     
     def loss_function_differentiable(self, sample_id, theta_tensor, zeta_tensor,
