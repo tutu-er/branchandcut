@@ -2472,13 +2472,16 @@ class Agent_NN_BCD:
             for t in range(self.T):
                 flow = PTDF @ (G @ pg[:, t] - Pd[:, t])
                 for l in range(self.branch.shape[0]):
-                    dcpf_upper_viol = abs(flow[l] - branch_limit[l])
-                    dcpf_lower_viol = abs(flow[l] + branch_limit[l])
-                    obj_primal += max(0, flow[l] - branch_limit[l]) + max(0, -flow[l] - branch_limit[l])
+                    dcpf_upper_viol = max(0, flow[l] - branch_limit[l])
+                    dcpf_lower_viol = max(0, -flow[l] - branch_limit[l])
+                    obj_primal += dcpf_upper_viol + dcpf_lower_viol
+                    
+                    abs_dcpf_upper_viol = abs(dcpf_upper_viol)
+                    abs_dcpf_lower_viol = abs(dcpf_lower_viol)
                     if sample_id < len(self.lambda_) and 'lambda_dcpf_upper' in self.lambda_[sample_id]:
-                        obj_opt += dcpf_upper_viol * abs(self.lambda_[sample_id]['lambda_dcpf_upper'][l, t])
+                        obj_opt += abs_dcpf_upper_viol * abs(self.lambda_[sample_id]['lambda_dcpf_upper'][l, t])
                     if sample_id < len(self.lambda_) and 'lambda_dcpf_lower' in self.lambda_[sample_id]:
-                        obj_opt += dcpf_lower_viol * abs(self.lambda_[sample_id]['lambda_dcpf_lower'][l, t])
+                        obj_opt += abs_dcpf_lower_viol * abs(self.lambda_[sample_id]['lambda_dcpf_lower'][l, t])
             
             # 参数化约束违反量（theta和zeta）
             if self.enable_theta_constraints and union_analysis and 'union_constraints' in union_analysis and sample_theta is not None:
@@ -2498,9 +2501,10 @@ class Agent_NN_BCD:
                     theta_rhs_name = f'theta_rhs_branch_{branch_id}_time_{time_slot}'
                     theta_rhs = sample_theta.get(theta_rhs_name, 1.0)
                     violation = max(0, lhs_expr - theta_rhs)
+                    abs_violation = abs(violation)
                     obj_primal += violation
                     if branch_id < self.nl and sample_id < len(self.mu):
-                        obj_opt += violation * abs(self.mu[sample_id, branch_id, time_slot])
+                        obj_opt += abs_violation * abs(self.mu[sample_id, branch_id, time_slot])
             
             if self.enable_zeta_constraints and union_analysis and 'union_zeta_constraints' in union_analysis and sample_zeta is not None:
                 union_zeta_constraints = union_analysis['union_zeta_constraints']
@@ -2515,9 +2519,10 @@ class Agent_NN_BCD:
                     zeta_rhs_name = f'zeta_rhs_unit_{unit_id}_time_{time_slot}'
                     zeta_rhs = sample_zeta.get(zeta_rhs_name, 1.0)
                     violation = max(0, lhs_expr - zeta_rhs)
+                    abs_violation = abs(violation)
                     obj_primal += violation
                     if sample_id < len(self.ita):
-                        obj_opt += violation * abs(self.ita[sample_id, unit_id, time_slot])
+                        obj_opt += abs_violation * abs(self.ita[sample_id, unit_id, time_slot])
             
             # === 对偶约束的违反量 obj_dual（参考 uc_dfsm_bcd.cal_viol） ===
             # pg 变量的对偶约束
