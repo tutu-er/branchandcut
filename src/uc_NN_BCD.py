@@ -1184,9 +1184,10 @@ class Agent_NN_BCD:
             )
             
             # 手动为每个时段添加M=4个包含所有机组的约束
-            M = 4
-            manual_constraints = self._add_manual_constraints_all_units(M)
-            union_constraints.extend(manual_constraints)
+            # M = 4
+            # manual_constraints = self._add_manual_constraints_all_units(M)
+            # union_constraints.extend(manual_constraints)
+            manual_constraints = []
         
         enable_zeta = getattr(self, 'enable_zeta_constraints', True)
         if enable_zeta:
@@ -2013,6 +2014,11 @@ class Agent_NN_BCD:
                 model.addConstr(dual_expr_x_abs >= -dual_expr, name=f'dual_expr_abs_x_neg_{g}_{t}')
                 obj_dual += dual_expr_x_abs
 
+        # cpower变量的对偶约束
+        for g in range(self.ng):
+            for t in range(self.T):
+                model.addConstr(lambda_cpower[g, t] == 1, name=f'dual_expr_cpower_solid_{g}_{t}')
+        
         # coc变量的对偶约束
         for g in range(self.ng):
             for t in range(self.T-1):
@@ -2025,11 +2031,6 @@ class Agent_NN_BCD:
                 model.addConstr(dual_expr_coc_abs >= dual_expr, name=f'dual_expr_abs_coc_pos_{g}_{t}')
                 model.addConstr(dual_expr_coc_abs >= -dual_expr, name=f'dual_expr_abs_coc_neg_{g}_{t}')
                 obj_dual += dual_expr_coc_abs
-
-        # cpower变量的对偶约束
-        for g in range(self.ng):
-            for t in range(self.T):
-                model.addConstr(lambda_cpower[g, t] == 1, name=f'dual_expr_cpower_solid_{g}_{t}')
 
         # 原问题约束违反量
         for t in range(self.T):
@@ -2149,7 +2150,10 @@ class Agent_NN_BCD:
             ita_sol = np.array([[ita[g, t].X for t in range(self.T)] for g in range(self.ng)])
             
             if sample_id <= 2:
-                print(f"dual_block, sample_id: {sample_id}, obj_dual: {obj_dual.getValue()}, obj_opt: {obj_opt.getValue()}")
+                print(
+                    f"dual_block, sample_id: {sample_id}, sample_obj_dual: {obj_dual.getValue()}, sample_obj_opt: {obj_opt.getValue()}",
+                    flush=True,
+                )
             
             return lambda_sol, mu_sol, ita_sol
         else:
@@ -2501,8 +2505,8 @@ class Agent_NN_BCD:
                     theta_rhs_name = f'theta_rhs_branch_{branch_id}_time_{time_slot}'
                     theta_rhs = sample_theta.get(theta_rhs_name, 1.0)
                     violation = lhs_expr - theta_rhs
-                    obj_primal += max(0, violation)
                     abs_violation = abs(violation)
+                    obj_primal += max(0, violation)
                     if branch_id < self.nl and sample_id < len(self.mu):
                         obj_opt += abs_violation * abs(self.mu[sample_id, branch_id, time_slot])
             
@@ -2519,8 +2523,8 @@ class Agent_NN_BCD:
                     zeta_rhs_name = f'zeta_rhs_unit_{unit_id}_time_{time_slot}'
                     zeta_rhs = sample_zeta.get(zeta_rhs_name, 1.0)
                     violation = lhs_expr - zeta_rhs
-                    obj_primal += max(0, violation)
                     abs_violation = abs(violation)
+                    obj_primal += max(0, violation)
                     if sample_id < len(self.ita):
                         obj_opt += abs_violation * abs(self.ita[sample_id, unit_id, time_slot])
             
@@ -2619,14 +2623,20 @@ class Agent_NN_BCD:
 
                         # 对偶约束：梯度 = 0
                         obj_dual += abs(dual_expr)
-
-                # coc 变量的对偶约束
+                
+                #cpower变量的对偶约束
                 for g in range(self.ng):
-                    for t in range(self.T - 1):
+                    for t in range(self.T):
+                        dual_expr = 1
+                        dual_expr -= self.lambda_[sample_id]['lambda_cpower'][g, t]
+                        obj_dual += abs(dual_expr)
+
+                #coc变量的对偶约束
+                for g in range(self.ng):
+                    for t in range(self.T-1):
                         dual_expr = 1
                         dual_expr -= self.lambda_[sample_id]['lambda_start_cost'][g, t]
                         dual_expr -= self.lambda_[sample_id]['lambda_shut_cost'][g, t]
-                        dual_expr -= self.lambda_[sample_id]['lambda_coc_nonneg'][g, t]
                         obj_dual += abs(dual_expr)
 
         return obj_primal, obj_dual, obj_opt
@@ -2731,10 +2741,6 @@ class Agent_NN_BCD:
         obj_primal = torch.tensor(0.0, device=device, requires_grad=True)
         obj_opt = torch.tensor(0.0, device=device, requires_grad=True)
         obj_dual = torch.tensor(0.0, device=device, requires_grad=True)
-        obj_constraint_violation = torch.tensor(0.0, device=device, requires_grad=True)
-
-        lambda_weight = getattr(self, 'constraint_violation_weight', 1.0)
-        epsilon = getattr(self, 'constraint_violation_epsilon', 1e-3)
 
         # 预缓存常量张量（避免循环内 torch.tensor 分配）
         _one = self._const_one
@@ -2767,7 +2773,7 @@ class Agent_NN_BCD:
             obj_primal = obj_primal + torch.relu(violation)
             obj_opt = obj_opt + torch.abs(violation) * ita[unit_id, time_slot]
 
-        # 计算对偶约束损失
+        # 计算X对偶约束损失
         for g in range(self.ng):
             for t in range(self.T):
                 dual_expr = gencost_fixed[g] * lambda_cpower[g, t]
@@ -2818,49 +2824,6 @@ class Agent_NN_BCD:
                     dual_expr = dual_expr + zeta_tensor[zeta_idx] * ita[g, t]
 
                 obj_dual = obj_dual + torch.abs(dual_expr)
-        
-        # Fischer-Burmeister函数处理互补松弛条件
-        obj_complementary = torch.tensor(0.0, device=device, requires_grad=True)
-        if use_fischer_burmeister:
-            eps = 1e-10
-            
-            def fischer_burmeister(a, b):
-                return a + b - torch.sqrt(a**2 + b**2 + eps)
-            
-            for g in range(self.ng):
-                for t in range(self.T):
-                    x_val = x[g, t]
-                    g_upper = x_val - 1.0
-                    fb_upper = fischer_burmeister(lambda_x_upper[g, t], -g_upper)
-                    obj_complementary = obj_complementary + fb_upper ** 2
-                    
-                    g_lower = -x_val
-                    fb_lower = fischer_burmeister(lambda_x_lower[g, t], -g_lower)
-                    obj_complementary = obj_complementary + fb_lower ** 2
-            
-            for g in range(self.ng):
-                for tau in range(1, Ton + 1):
-                    for t1 in range(self.T - tau):
-                        g_min_on = x[g, t1+1] - x[g, t1] - x[g, t1+tau]
-                        fb_min_on = fischer_burmeister(lambda_min_on[g, tau-1, t1], -g_min_on)
-                        obj_complementary = obj_complementary + fb_min_on ** 2
-            
-            for g in range(self.ng):
-                for tau in range(1, Toff + 1):
-                    for t1 in range(self.T - tau):
-                        g_min_off = -x[g, t1+1] + x[g, t1] - (1 - x[g, t1+tau])
-                        fb_min_off = fischer_burmeister(lambda_min_off[g, tau-1, t1], -g_min_off)
-                        obj_complementary = obj_complementary + fb_min_off ** 2
-            
-            for g in range(self.ng):
-                for t in range(1, self.T):
-                    g_start = (x[g, t] - x[g, t-1]) - 1.0
-                    fb_start = fischer_burmeister(lambda_start_cost[g, t-1], -g_start)
-                    obj_complementary = obj_complementary + fb_start ** 2
-                    
-                    g_shut = (x[g, t-1] - x[g, t]) - 1.0
-                    fb_shut = fischer_burmeister(lambda_shut_cost[g, t-1], -g_shut)
-                    obj_complementary = obj_complementary + fb_shut ** 2
         
         # L2 正则化：控制 theta/zeta 参数大小
         reg_loss = (self.theta_reg_weight * torch.sum(theta_tensor ** 2)
