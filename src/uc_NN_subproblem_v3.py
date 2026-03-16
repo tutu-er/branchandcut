@@ -1365,13 +1365,15 @@ class SubproblemSurrogateTrainer:
                 expr -= start_cost * lam_start_cost[t]
                 expr += shut_cost  * lam_shut_cost[t]
 
-            # 代理耦合约束对 x[t] 的贡献（线性，因为 alphas/betas/gammas 是常数）
-            if t < self.num_coupling_constraints and t + 2 < self.T:
-                expr += alphas[t] * mu[t]
-            if t > 0 and (t - 1) < self.num_coupling_constraints and t + 1 < self.T:
-                expr += betas[t - 1] * mu[t - 1]
-            if t > 1 and (t - 2) < self.num_coupling_constraints:
-                expr += gammas[t - 2] * mu[t - 2]
+            # 代理耦合约束对 x[t] 的贡献（按 sensitive_timesteps 索引）
+            sensitive_t = self.sensitive_timesteps[sample_id]
+            for k, ts in enumerate(sensitive_t):
+                if ts == t:
+                    expr += alphas[k] * mu[k]
+                if ts + 1 == t:
+                    expr += betas[k] * mu[k]
+                if ts + 2 == t:
+                    expr += gammas[k] * mu[k]
 
             # x 变量界约束（x ∈ [0,1]）
             expr += lam_x_upper[t] - lam_x_lower[t]
@@ -1769,11 +1771,11 @@ class SubproblemSurrogateTrainer:
             # obj_primal：所有原始可行性违反
             # ================================================================
 
-            # -- 代理耦合约束违反 --
-            for t in range(self.num_coupling_constraints):
-                if t + 2 < self.T:
-                    coupling_lhs = alphas[t]*x_val[t] + betas[t]*x_val[t+1] + gammas[t]*x_val[t+2]
-                    obj_primal += max(0.0, coupling_lhs - deltas[t])
+            # -- 代理耦合约束违反（按 sensitive_timesteps 索引）--
+            sensitive_t = self.sensitive_timesteps[sample_id]
+            for k, ts in enumerate(sensitive_t):
+                coupling_lhs = alphas[k]*x_val[ts] + betas[k]*x_val[ts+1] + gammas[k]*x_val[ts+2]
+                obj_primal += max(0.0, coupling_lhs - deltas[k])
 
             # -- 原问题固有约束违反（与primal block的obj_primal对应）--
             for t in range(self.T):
@@ -1800,11 +1802,10 @@ class SubproblemSurrogateTrainer:
             # obj_opt：所有互补松弛违反（与primal block的obj_opt对应）
             # ================================================================
 
-            # -- 代理耦合约束互补松弛 --
-            for t in range(self.num_coupling_constraints):
-                if t + 2 < self.T:
-                    coupling_lhs = alphas[t]*x_val[t] + betas[t]*x_val[t+1] + gammas[t]*x_val[t+2]
-                    obj_opt += abs(coupling_lhs - deltas[t]) * mu_vals[t]
+            # -- 代理耦合约束互补松弛（按 sensitive_timesteps 索引）--
+            for k, ts in enumerate(sensitive_t):
+                coupling_lhs = alphas[k]*x_val[ts] + betas[k]*x_val[ts+1] + gammas[k]*x_val[ts+2]
+                obj_opt += abs(coupling_lhs - deltas[k]) * mu_vals[k]
 
             # -- 原问题固有约束互补松弛 --
             if lam_inh is not None:
@@ -1890,13 +1891,15 @@ class SubproblemSurrogateTrainer:
                         x_stat -= sc_v  * float(lam_sc[t])
                         x_stat += shc_v * float(lam_shc[t])
                     x_stat += float(lam_inh['lambda_x_upper'][t]) - float(lam_inh['lambda_x_lower'][t])
-                # 代理耦合约束对偶贡献
-                if t < self.num_coupling_constraints and t + 2 < self.T:
-                    x_stat += alphas[t] * mu_vals[t]
-                if t > 0 and t-1 < self.num_coupling_constraints and t+1 < self.T:
-                    x_stat += betas[t-1] * mu_vals[t-1]
-                if t > 1 and t-2 < self.num_coupling_constraints:
-                    x_stat += gammas[t-2] * mu_vals[t-2]
+                # 代理耦合约束对偶贡献（按 sensitive_timesteps 索引）
+                sensitive_t = self.sensitive_timesteps[sample_id]
+                for k, ts in enumerate(sensitive_t):
+                    if ts == t:
+                        x_stat += alphas[k] * mu_vals[k]
+                    if ts + 1 == t:
+                        x_stat += betas[k] * mu_vals[k]
+                    if ts + 2 == t:
+                        x_stat += gammas[k] * mu_vals[k]
                 obj_dual += abs(x_stat)
 
             # -- coc[t] 驻点条件（与dual block一致）--
