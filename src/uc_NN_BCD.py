@@ -2476,8 +2476,8 @@ class Agent_NN_BCD:
                     dcpf_lower_viol = max(0, -flow[l] - branch_limit[l])
                     obj_primal += dcpf_upper_viol + dcpf_lower_viol
                     
-                    abs_dcpf_upper_viol = abs(dcpf_upper_viol)
-                    abs_dcpf_lower_viol = abs(dcpf_lower_viol)
+                    abs_dcpf_upper_viol = abs(flow[l] - branch_limit[l])
+                    abs_dcpf_lower_viol = abs(-flow[l] - branch_limit[l])
                     if sample_id < len(self.lambda_) and 'lambda_dcpf_upper' in self.lambda_[sample_id]:
                         obj_opt += abs_dcpf_upper_viol * abs(self.lambda_[sample_id]['lambda_dcpf_upper'][l, t])
                     if sample_id < len(self.lambda_) and 'lambda_dcpf_lower' in self.lambda_[sample_id]:
@@ -2500,9 +2500,9 @@ class Agent_NN_BCD:
                     
                     theta_rhs_name = f'theta_rhs_branch_{branch_id}_time_{time_slot}'
                     theta_rhs = sample_theta.get(theta_rhs_name, 1.0)
-                    violation = max(0, lhs_expr - theta_rhs)
+                    violation = lhs_expr - theta_rhs
+                    obj_primal += max(0, violation)
                     abs_violation = abs(violation)
-                    obj_primal += violation
                     if branch_id < self.nl and sample_id < len(self.mu):
                         obj_opt += abs_violation * abs(self.mu[sample_id, branch_id, time_slot])
             
@@ -2518,9 +2518,9 @@ class Agent_NN_BCD:
                     
                     zeta_rhs_name = f'zeta_rhs_unit_{unit_id}_time_{time_slot}'
                     zeta_rhs = sample_zeta.get(zeta_rhs_name, 1.0)
-                    violation = max(0, lhs_expr - zeta_rhs)
+                    violation = lhs_expr - zeta_rhs
+                    obj_primal += max(0, violation)
                     abs_violation = abs(violation)
-                    obj_primal += violation
                     if sample_id < len(self.ita):
                         obj_opt += abs_violation * abs(self.ita[sample_id, unit_id, time_slot])
             
@@ -2618,6 +2618,15 @@ class Agent_NN_BCD:
                             dual_expr += _zeta_val * self.ita[sample_id, g, t]
 
                         # 对偶约束：梯度 = 0
+                        obj_dual += abs(dual_expr)
+
+                # coc 变量的对偶约束
+                for g in range(self.ng):
+                    for t in range(self.T - 1):
+                        dual_expr = 1
+                        dual_expr -= self.lambda_[sample_id]['lambda_start_cost'][g, t]
+                        dual_expr -= self.lambda_[sample_id]['lambda_shut_cost'][g, t]
+                        dual_expr -= self.lambda_[sample_id]['lambda_coc_nonneg'][g, t]
                         obj_dual += abs(dual_expr)
 
         return obj_primal, obj_dual, obj_opt
@@ -2747,11 +2756,6 @@ class Agent_NN_BCD:
             else:
                 obj_opt = obj_opt + torch.abs(violation) * _default_mu
 
-            # lhs_expr_x_LP == lhs_expr（x_LP = x，冗余循环已消除）
-            d_value = theta_rhs
-            constraint_violation = torch.relu(d_value + epsilon - lhs_expr)
-            obj_constraint_violation = obj_constraint_violation + lambda_weight * constraint_violation
-
         # 计算zeta相关的参数化约束损失（使用预处理缓存）
         for unit_id, time_slot, zeta_idx, rhs_idx in self._cached_zeta_constraints:
             zeta = zeta_tensor[zeta_idx]
@@ -2762,11 +2766,6 @@ class Agent_NN_BCD:
             violation = lhs_expr - zeta_rhs
             obj_primal = obj_primal + torch.relu(violation)
             obj_opt = obj_opt + torch.abs(violation) * ita[unit_id, time_slot]
-
-            # lhs_expr_x_LP == lhs_expr（x_LP = x，冗余赋值已消除）
-            d_value = zeta_rhs
-            constraint_violation = torch.relu(d_value + epsilon - lhs_expr)
-            obj_constraint_violation = obj_constraint_violation + lambda_weight * constraint_violation
 
         # 计算对偶约束损失
         for g in range(self.ng):

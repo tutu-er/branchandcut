@@ -68,3 +68,4 @@ coverage.xml
 # Experiment results and outputs
 result/
 logs/
+*.log
