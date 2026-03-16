@@ -507,52 +507,83 @@ class DualVariablePredictorTrainer:
 
 # ========================== 第二部分：子问题代理约束训练（BCD方式） ==========================
 
+class ResBlock(nn.Module):
+    """残差块：Linear → BN → LeakyReLU → Dropout → Linear → BN + skip"""
+
+    def __init__(self, in_dim: int, out_dim: int, dropout: float = 0.1):
+        super().__init__()
+        self.fc1 = nn.Linear(in_dim, out_dim)
+        self.bn1 = nn.BatchNorm1d(out_dim)
+        self.fc2 = nn.Linear(out_dim, out_dim)
+        self.bn2 = nn.BatchNorm1d(out_dim)
+        self.act = nn.LeakyReLU(0.01)
+        self.drop = nn.Dropout(dropout)
+        self.skip = nn.Linear(in_dim, out_dim) if in_dim != out_dim else nn.Identity()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        identity = self.skip(x)
+        out = self.drop(self.act(self.bn1(self.fc1(x))))
+        out = self.bn2(self.fc2(out))
+        return self.act(out + identity)
+
+
 class SubproblemSurrogateNet(nn.Module):
     """
     单机组子问题的代理约束网络 - V3三时段耦合版本
-    
-    输入: Pd数据 + 对偶变量λ (pd_dim + T)
+
+    输入: Pd数据 + 对偶变量λ + 机组静态参数 (pd_dim + T + 6)
     输出: 三时段耦合约束参数 (alphas, betas, gammas, deltas)
           约束形式: alpha_t * x_t + beta_t * x_{t+1} + gamma_t * x_{t+2} <= delta_t
-          
+
     改进点：
-    - 三时段约束捕捉更长时间窗口
-    - 敏感时段动态选择（只对整数性差的时段生成约束）
-    - 最大约束数量max_constraints（而非固定T-1）
+    - 残差连接 + BatchNorm 稳定训练
+    - 低 Dropout (0.1) 避免小样本欠拟合
+    - 输出头增加隐层增强表达力
+    - 机组静态参数作为额外特征
     """
-    
+
     def __init__(self, input_dim: int, T: int, max_constraints: int = 20, hidden_dims: List[int] = None):
         super(SubproblemSurrogateNet, self).__init__()
-        
-        self.T = T
-        self.max_constraints = max_constraints  # 最大约束数量
-        
-        if hidden_dims is None:
-            hidden_dims = [128, 128]
 
-        # 统一的特征提取网络
-        feature_layers = []
-        prev_dim = input_dim
-        for hidden_dim in hidden_dims:
-            feature_layers.append(nn.Linear(prev_dim, hidden_dim))
-            feature_layers.append(nn.LeakyReLU(0.01))
-            feature_layers.append(nn.Dropout(0.3))
-            prev_dim = hidden_dim
-        self.feature_extractor = nn.Sequential(*feature_layers)
-        
-        # 四个参数网络: alpha(t), beta(t+1), gamma(t+2), delta(RHS)
-        self.alpha_net = nn.Linear(prev_dim, self.max_constraints)
-        self.beta_net = nn.Linear(prev_dim, self.max_constraints)
-        self.gamma_net = nn.Linear(prev_dim, self.max_constraints)
-        
-        # delta网络：右端项，使用Softplus确保非负
+        self.T = T
+        self.max_constraints = max_constraints
+
+        if hidden_dims is None:
+            hidden_dims = [256, 256]
+
+        # 输入投影 + 残差块
+        self.input_proj = nn.Linear(input_dim, hidden_dims[0])
+        res_blocks = []
+        prev_dim = hidden_dims[0]
+        for hd in hidden_dims:
+            res_blocks.append(ResBlock(prev_dim, hd))
+            prev_dim = hd
+        self.res_blocks = nn.ModuleList(res_blocks)
+
+        feat_dim = prev_dim
+        head_hidden = max(feat_dim // 2, 64)
+
+        # 四个参数头（每个带一个隐层）
+        self.alpha_net = nn.Sequential(
+            nn.Linear(feat_dim, head_hidden), nn.LeakyReLU(0.01),
+            nn.Linear(head_hidden, self.max_constraints)
+        )
+        self.beta_net = nn.Sequential(
+            nn.Linear(feat_dim, head_hidden), nn.LeakyReLU(0.01),
+            nn.Linear(head_hidden, self.max_constraints)
+        )
+        self.gamma_net = nn.Sequential(
+            nn.Linear(feat_dim, head_hidden), nn.LeakyReLU(0.01),
+            nn.Linear(head_hidden, self.max_constraints)
+        )
         self.delta_net = nn.Sequential(
-            nn.Linear(prev_dim, self.max_constraints),
+            nn.Linear(feat_dim, head_hidden), nn.LeakyReLU(0.01),
+            nn.Linear(head_hidden, self.max_constraints),
             nn.Softplus()
         )
-        
+
         self._init_weights()
-    
+
     def _init_weights(self):
         for module in self.modules():
             if isinstance(module, nn.Linear):
@@ -560,24 +591,29 @@ class SubproblemSurrogateNet(nn.Module):
                 if module.bias is not None:
                     nn.init.zeros_(module.bias)
 
-        # delta网络的偏置初始化为正值
-        if hasattr(self.delta_net[0], 'bias') and self.delta_net[0].bias is not None:
-            nn.init.constant_(self.delta_net[0].bias, 1.0)
-    
+        # delta头最后一个Linear的偏置初始化为正值（Softplus前）
+        delta_linears = [m for m in self.delta_net if isinstance(m, nn.Linear)]
+        if delta_linears:
+            last_linear = delta_linears[-1]
+            if last_linear.bias is not None:
+                nn.init.constant_(last_linear.bias, 1.0)
+
     def forward(self, x):
         """
         前向传播
-        
+
         Args:
             x: 输入特征 (batch_size, input_dim)
-        
+
         Returns:
             alphas: t时段系数 (batch_size, max_constraints)
             betas: t+1时段系数 (batch_size, max_constraints)
             gammas: t+2时段系数 (batch_size, max_constraints)
             deltas: 右端项 (batch_size, max_constraints)
         """
-        features = self.feature_extractor(x)
+        features = self.input_proj(x)
+        for block in self.res_blocks:
+            features = block(features)
         alphas = self.alpha_net(features)
         betas = self.beta_net(features)
         gammas = self.gamma_net(features)
@@ -832,18 +868,17 @@ class SubproblemSurrogateTrainer:
     
     def _init_neural_network(self):
         """初始化代理约束神经网络 - V3版本"""
-        # 使用实际pd_data的维度而不是总节点数
-        input_dim = self.n_load * self.T + self.T  # Pd + λ
-        
+        input_dim = self.n_load * self.T + self.T + 6  # Pd + λ + unit_params
+
         self.surrogate_net = SubproblemSurrogateNet(
             input_dim=input_dim,
             T=self.T,
-            max_constraints=self.max_constraints,  # V3新增
-            hidden_dims=[256, 512, 256]  # V3: 更大网络
+            max_constraints=self.max_constraints,
+            hidden_dims=[256, 256]  # 两层残差块
         ).to(self.device)
-        
-        self.optimizer = optim.Adam(self.surrogate_net.parameters(), lr=5e-5)  # V3: 降低学习率
-        
+
+        self.optimizer = optim.Adam(self.surrogate_net.parameters(), lr=1e-4)
+
         print(f"  - 代理约束网络输入维度: {input_dim}", flush=True)
         print(f"  - 最大约束数量: {self.max_constraints}", flush=True)
     
@@ -1474,11 +1509,24 @@ class SubproblemSurrogateTrainer:
             return None, None
     
     def _extract_features(self, sample_id: int) -> np.ndarray:
-        """提取特征: [Pd, λ]"""
+        """提取特征: [Pd, λ, unit_params]"""
         pd_data = self.active_set_data[sample_id]['pd_data']
         pd_flat = pd_data.flatten()
         lambda_val = self.lambda_vals[sample_id]
-        return np.concatenate([pd_flat, lambda_val])
+
+        # 机组静态参数（归一化，训练和推理都一致可用）
+        g = self.unit_id
+        Pmax = self.gen[g, PMAX]
+        unit_params = np.array([
+            self.gen[g, PMIN] / (Pmax + 1e-8),                    # Pmin/Pmax ratio
+            self.gencost[g, -2] / self.T_delta,                    # 边际成本 a
+            self.gencost[g, -1] / self.T_delta / (Pmax + 1e-8),   # 归一化无负荷成本 b
+            0.4 * Pmax / self.T_delta / (Pmax + 1e-8),            # 归一化爬坡率 Ru
+            self.gencost[g, 1] / (Pmax + 1e-8),                   # 归一化启动成本
+            self.gencost[g, 2] / (Pmax + 1e-8),                   # 归一化停机成本
+        ])
+
+        return np.concatenate([pd_flat, lambda_val, unit_params])
     
     def loss_function_differentiable(self, sample_id: int, alphas_tensor: torch.Tensor, 
                                      betas_tensor: torch.Tensor, gammas_tensor: torch.Tensor, 
@@ -1942,9 +1990,20 @@ class SubproblemSurrogateTrainer:
             raise RuntimeError("PyTorch不可用")
         
         self.surrogate_net.eval()
-        
+
         pd_flat = pd_data.flatten()
-        features = np.concatenate([pd_flat, lambda_val])
+        # 机组静态参数（与 _extract_features 保持一致）
+        g = self.unit_id
+        Pmax = self.gen[g, PMAX]
+        unit_params = np.array([
+            self.gen[g, PMIN] / (Pmax + 1e-8),
+            self.gencost[g, -2] / self.T_delta,
+            self.gencost[g, -1] / self.T_delta / (Pmax + 1e-8),
+            0.4 * Pmax / self.T_delta / (Pmax + 1e-8),
+            self.gencost[g, 1] / (Pmax + 1e-8),
+            self.gencost[g, 2] / (Pmax + 1e-8),
+        ])
+        features = np.concatenate([pd_flat, lambda_val, unit_params])
         features_tensor = torch.tensor(features, dtype=torch.float32, device=self.device).unsqueeze(0)
         
         with torch.no_grad():
