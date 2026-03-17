@@ -508,21 +508,20 @@ class DualVariablePredictorTrainer:
 # ========================== 第二部分：子问题代理约束训练（BCD方式） ==========================
 
 class ResBlock(nn.Module):
-    """残差块：Linear → LN → LeakyReLU → Dropout → Linear → LN + skip"""
+    """残差块：Linear → LN → LeakyReLU → Linear → LN + skip"""
 
-    def __init__(self, in_dim: int, out_dim: int, dropout: float = 0.1):
+    def __init__(self, in_dim: int, out_dim: int):
         super().__init__()
         self.fc1 = nn.Linear(in_dim, out_dim)
         self.ln1 = nn.LayerNorm(out_dim)
         self.fc2 = nn.Linear(out_dim, out_dim)
         self.ln2 = nn.LayerNorm(out_dim)
         self.act = nn.LeakyReLU(0.01)
-        self.drop = nn.Dropout(dropout)
         self.skip = nn.Linear(in_dim, out_dim) if in_dim != out_dim else nn.Identity()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         identity = self.skip(x)
-        out = self.drop(self.act(self.ln1(self.fc1(x))))
+        out = self.act(self.ln1(self.fc1(x)))
         out = self.ln2(self.fc2(out))
         return self.act(out + identity)
 
@@ -536,8 +535,7 @@ class SubproblemSurrogateNet(nn.Module):
           约束形式: alpha_t * x_t + beta_t * x_{t+1} + gamma_t * x_{t+2} <= delta_t
 
     改进点：
-    - 残差连接 + BatchNorm 稳定训练
-    - 低 Dropout (0.1) 避免小样本欠拟合
+    - 残差连接 + LayerNorm 稳定训练
     - 输出头增加隐层增强表达力
     - 机组静态参数作为额外特征
     """
@@ -1702,25 +1700,31 @@ class SubproblemSurrogateTrainer:
 
         return loss
     
-    def iter_with_surrogate_nn(self, num_epochs: int = 10):
+    def iter_with_surrogate_nn(self, num_epochs: int = 10, batch_size: int = 4):
         """
         BCD迭代：神经网络更新三时段耦合代理约束参数
-        使用loss_function_differentiable进行训练
+        使用loss_function_differentiable进行训练，mini-batch梯度累积模式
         """
         if not TORCH_AVAILABLE:
             return
 
-        self.optimizer = optim.Adam(self.surrogate_net.parameters(), lr=5e-5)
+        self.optimizer = optim.Adam(self.surrogate_net.parameters(), lr=5e-5, weight_decay=1e-4)
         self.surrogate_net.train()
-        
+
         for epoch in range(num_epochs):
             epoch_loss = 0.0
-            
+            self.optimizer.zero_grad()
+            batch_count = 0
+
             for sample_id in range(self.n_samples):
+                # 计算当前 batch 的实际大小（最后一个 batch 可能不满）
+                batch_start = (sample_id // batch_size) * batch_size
+                actual_batch_size = min(batch_size, self.n_samples - batch_start)
+
                 # 提取特征: [Pd, λ]
                 features = self._extract_features(sample_id)
                 features_tensor = torch.tensor(features, dtype=torch.float32, device=self.device).unsqueeze(0)
-                
+
                 # V3前向传播：输出 (alphas, betas, gammas, deltas)
                 alphas_out, betas_out, gammas_out, deltas_out = self.surrogate_net(features_tensor)
                 nc = self.num_coupling_constraints
@@ -1728,26 +1732,28 @@ class SubproblemSurrogateTrainer:
                 betas_tensor = betas_out.squeeze(0)[:nc]
                 gammas_tensor = gammas_out.squeeze(0)[:nc]
                 deltas_tensor = deltas_out.squeeze(0)[:nc]   # Softplus保证非负
-                
-                # 计算loss（V3版本，传入4个参数）
-                self.optimizer.zero_grad()
+
+                # 计算loss（V3版本，传入4个参数）+ scaled backward
                 loss = self.loss_function_differentiable(
                     sample_id, alphas_tensor, betas_tensor, gammas_tensor, deltas_tensor, self.device
                 )
-                
-                # 反向传播
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.surrogate_net.parameters(), max_norm=1.0)
-                self.optimizer.step()
-                
-                epoch_loss += loss.item()
-                
+                (loss / actual_batch_size).backward()
+                epoch_loss += loss.detach().cpu().item()
+                batch_count += 1
+
                 # 更新参数值（V3：4个参数）
                 self.alpha_values[sample_id] = alphas_tensor.detach().cpu().numpy()
                 self.beta_values[sample_id] = betas_tensor.detach().cpu().numpy()
                 self.gamma_values[sample_id] = gammas_tensor.detach().cpu().numpy()
                 self.delta_values[sample_id] = deltas_tensor.detach().cpu().numpy()
-            
+
+                # batch 满或 epoch 结束：clip + step
+                if batch_count == batch_size or sample_id == self.n_samples - 1:
+                    torch.nn.utils.clip_grad_norm_(self.surrogate_net.parameters(), max_norm=1.0)
+                    self.optimizer.step()
+                    self.optimizer.zero_grad()
+                    batch_count = 0
+
             if epoch == 0 or epoch == num_epochs - 1:
                 print(f"  [NN] epoch {epoch+1}/{num_epochs}, avg_loss = {epoch_loss/self.n_samples:.6f}", flush=True)
     
