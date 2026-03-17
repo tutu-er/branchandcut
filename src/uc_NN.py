@@ -327,10 +327,24 @@ class Agent_NN:
         # 初始化神经网络
         if TORCH_AVAILABLE:
             self._init_neural_network()
+            self._generate_initial_values_from_nn()
         else:
             self.theta_net = None
             self.zeta_net = None
             self.device = None
+            # 回退：用随机初始化填充占位值
+            np.random.seed(42)
+            for key in self.theta_values:
+                if key.startswith('theta_rhs_'):
+                    self.theta_values[key] = np.random.normal(1.0, 0.01)
+                else:
+                    self.theta_values[key] = np.random.normal(0.0, 0.01)
+            np.random.seed(43)
+            for key in self.zeta_values:
+                if key.startswith('zeta_rhs_'):
+                    self.zeta_values[key] = np.random.normal(1.0, 0.01)
+                else:
+                    self.zeta_values[key] = np.random.normal(0.0, 0.01)
     
     def _initialize_solve(self):
         """初始化求解，获得初始x和lambda"""
@@ -709,42 +723,37 @@ class Agent_NN:
         }
     
     def _compute_dcpf_constraints_for_fractional_times(self, fractional_variables, lambda_init) -> List:
-        """计算DCPF约束"""
+        """计算DCPF约束：per (branch, fractional_time) 构建，每条约束包含多个 generator。"""
         union_constraints = []
         nb = self.bus.shape[0]
-        G = np.zeros((nb, self.ng))
-        for g in range(self.ng):
-            bus_idx = int(self.gen[g, GEN_BUS])
-            if 0 <= bus_idx < nb:
-                G[bus_idx, g] = 1
-        
         PTDF = makePTDF(self.baseMVA, self.bus, self.branch)
-        
-        for var in fractional_variables:
-            unit_id = var['unit_id']
-            time_slot = var['time_slot']
-            bus_idx = int(self.gen[unit_id, GEN_BUS])
-            
-            if 0 <= bus_idx < nb:
+
+        # 收集所有分数时段（去重）
+        fractional_times = sorted(set(var['time_slot'] for var in fractional_variables))
+
+        # 对每个 (branch, fractional_time) 构建约束
+        for time_slot in fractional_times:
+            for branch_id in range(self.nl):
                 nonzero_coefficients = []
-                for branch_id in range(self.nl):
-                    coeff = PTDF[branch_id, bus_idx]
-                    if abs(coeff) > 1e-6:
-                        nonzero_coefficients.append({
-                            'unit_id': unit_id,
-                            'branch_id': branch_id,
-                            'coefficient': coeff
-                        })
-                
+                for g in range(self.ng):
+                    bus_idx = int(self.gen[g, GEN_BUS])
+                    if 0 <= bus_idx < nb:
+                        coeff = PTDF[branch_id, bus_idx]
+                        if abs(coeff) > 1e-6:
+                            nonzero_coefficients.append({
+                                'unit_id': g,
+                                'branch_id': branch_id,
+                                'coefficient': coeff,
+                            })
                 if nonzero_coefficients:
                     union_constraints.append({
                         'branch_id': branch_id,
                         'time_slot': time_slot,
                         'constraint_type': 'dcpf_upper',
                         'nonzero_pg_coefficients': nonzero_coefficients,
-                        'constraint_name': f'dcpf_upper_{branch_id}_{time_slot}'
+                        'constraint_name': f'dcpf_upper_{branch_id}_{time_slot}',
                     })
-        
+
         return union_constraints
     
     def _add_manual_constraints_all_units(self, M=4) -> List:
@@ -806,19 +815,18 @@ class Agent_NN:
             return {}, np.zeros((self.n_samples, self.nl, self.T))
         
         theta_values = {}
-        np.random.seed(42)
-        
+
         for constraint in union_analysis['union_constraints']:
             branch_id = constraint['branch_id']
             time_slot = constraint['time_slot']
-            
+
             for coeff_info in constraint.get('nonzero_pg_coefficients', []):
                 unit_id = coeff_info['unit_id']
                 var_name = f'theta_branch_{branch_id}_unit_{unit_id}_time_{time_slot}'
-                theta_values[var_name] = np.random.normal(0.0, 0.01)
-            
+                theta_values[var_name] = 0.0
+
             theta_rhs_name = f'theta_rhs_branch_{branch_id}_time_{time_slot}'
-            theta_values[theta_rhs_name] = np.random.normal(1.0, 0.01)
+            theta_values[theta_rhs_name] = 0.0
         
         mu_init = np.zeros((self.n_samples, self.nl, self.T), dtype=float)
         return theta_values, mu_init
@@ -833,17 +841,16 @@ class Agent_NN:
             return {}, np.zeros((self.n_samples, self.ng, self.T))
         
         zeta_values = {}
-        np.random.seed(43)
-        
+
         for constraint in union_analysis['union_zeta_constraints']:
             unit_id = constraint["unit_id"]
             time_slot = constraint["time_slot"]
-            
+
             var_name = f'zeta_unit_{unit_id}_time_{time_slot}'
-            zeta_values[var_name] = np.random.normal(0.0, 0.01)
-            
+            zeta_values[var_name] = 0.0
+
             zeta_rhs_name = f'zeta_rhs_unit_{unit_id}_time_{time_slot}'
-            zeta_values[zeta_rhs_name] = np.random.normal(1.0, 0.01)
+            zeta_values[zeta_rhs_name] = 0.0
         
         ita_init = np.zeros((self.n_samples, self.ng, self.T), dtype=float)
         return zeta_values, ita_init
@@ -948,7 +955,35 @@ class Agent_NN:
         
         print(f"✓ 初始化神经网络: 设备={self.device}, 输入维度={input_dim}, "
               f"theta输出={self.theta_output_dim}, zeta输出={self.zeta_output_dim}", flush=True)
-    
+
+    def _generate_initial_values_from_nn(self):
+        """用未训练的神经网络 forward pass 生成 theta/zeta 初值。
+
+        使第一个 sample 的特征通过随机权重网络，输出值替换占位零值，
+        确保初始参数在 NN 输出空间内，BCD 迭代更平滑。
+        """
+        self.theta_net.eval()
+        self.zeta_net.eval()
+
+        features = self._extract_features(0)
+        feat_tensor = torch.tensor(features, dtype=torch.float32).unsqueeze(0).to(self.device)
+
+        with torch.no_grad():
+            theta_out = self.theta_net(feat_tensor).squeeze(0)
+            zeta_out = self.zeta_net(feat_tensor).squeeze(0)
+
+        self.theta_values = self._tensor_to_theta_dict(theta_out)
+        self.zeta_values = self._tensor_to_zeta_dict(zeta_out)
+
+        self.theta_net.train()
+        self.zeta_net.train()
+
+        print(f"✓ 用NN forward pass生成theta/zeta初值 "
+              f"(theta: mean={np.mean(list(self.theta_values.values())):.4f}, "
+              f"std={np.std(list(self.theta_values.values())):.4f}; "
+              f"zeta: mean={np.mean(list(self.zeta_values.values())):.4f}, "
+              f"std={np.std(list(self.zeta_values.values())):.4f})", flush=True)
+
     def _extract_features(self, sample_id) -> np.ndarray:
         """从样本中提取特征"""
         pd_data = self.active_set_data[sample_id]['pd_data']

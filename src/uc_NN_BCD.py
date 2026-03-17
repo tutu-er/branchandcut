@@ -403,10 +403,28 @@ class Agent_NN_BCD:
         # 初始化神经网络模型（用于更新theta和zeta）
         if TORCH_AVAILABLE:
             self._init_neural_network()
+            self._generate_initial_values_from_nn()
         else:
             self.theta_net = None
             self.zeta_net = None
             self.device = None
+            # 回退：用随机初始化填充占位值
+            np.random.seed(42)
+            for i in range(self.n_samples):
+                for key in self.theta_values_list[i]:
+                    if key.startswith('theta_rhs_'):
+                        self.theta_values_list[i][key] = np.random.normal(1.0, 0.01)
+                    else:
+                        self.theta_values_list[i][key] = np.random.normal(0.0, 0.01)
+            np.random.seed(43)
+            for i in range(self.n_samples):
+                for key in self.zeta_values_list[i]:
+                    if key.startswith('zeta_rhs_'):
+                        self.zeta_values_list[i][key] = np.random.normal(1.0, 0.01)
+                    else:
+                        self.zeta_values_list[i][key] = np.random.normal(0.0, 0.01)
+            self.theta_values = self.theta_values_list[0]
+            self.zeta_values = self.zeta_values_list[0]
 
     def _solve_lp_with_fixed_x(self, Pd: np.ndarray, x_vals: np.ndarray):
         """以固定 x 矩阵构建纯 LP，求解后返回连续变量解和对偶变量字典。
@@ -1172,8 +1190,7 @@ class Agent_NN_BCD:
                         })
         
         print(f"发现 {len(fractional_variables)} 个非整数/非正确变量")
-        
-        # 计算DCPF约束系数
+
         union_constraints = []
         union_zeta_constraints = []
         
@@ -1208,49 +1225,37 @@ class Agent_NN_BCD:
         }
     
     def _compute_dcpf_constraints_for_fractional_times(self, fractional_variables, lambda_init):
-        """计算DCPF约束（参考uc_NN.py）"""
-        # 简化实现：为每个非整数变量创建约束
+        """计算DCPF约束：per (branch, fractional_time) 构建，每条约束包含多个 generator。"""
         union_constraints = []
-        
-        # 计算PTDF
         nb = self.bus.shape[0]
-        G = np.zeros((nb, self.ng))
-        for g in range(self.ng):
-            bus_idx = int(self.gen[g, GEN_BUS])
-            if 0 <= bus_idx < nb:
-                G[bus_idx, g] = 1
-        
         PTDF = makePTDF(self.baseMVA, self.bus, self.branch)
-        branch_limit = self.branch[:, RATE_A]
-        
-        # 为每个非整数变量创建约束
-        for var in fractional_variables:
-            unit_id = var['unit_id']
-            time_slot = var['time_slot']
-            
-            # 找到该机组连接的节点
-            bus_idx = int(self.gen[unit_id, GEN_BUS])
-            if 0 <= bus_idx < nb:
-                # 计算该机组对每条支路的贡献
+
+        # 收集所有分数时段（去重）
+        fractional_times = sorted(set(var['time_slot'] for var in fractional_variables))
+
+        # 对每个 (branch, fractional_time) 构建约束
+        for time_slot in fractional_times:
+            for branch_id in range(self.nl):
                 nonzero_coefficients = []
-                for branch_id in range(self.nl):
-                    coeff = PTDF[branch_id, bus_idx]
-                    if abs(coeff) > 1e-6:
-                        nonzero_coefficients.append({
-                            'unit_id': unit_id,
-                            'branch_id': branch_id,
-                            'coefficient': coeff
-                        })
-                
+                for g in range(self.ng):
+                    bus_idx = int(self.gen[g, GEN_BUS])
+                    if 0 <= bus_idx < nb:
+                        coeff = PTDF[branch_id, bus_idx]
+                        if abs(coeff) > 1e-3:
+                            nonzero_coefficients.append({
+                                'unit_id': g,
+                                'branch_id': branch_id,
+                                'coefficient': coeff,
+                            })
                 if nonzero_coefficients:
                     union_constraints.append({
                         'branch_id': branch_id,
                         'time_slot': time_slot,
-                        'constraint_type': 'dcpf_upper',
+                        'constraint_type': 'dcpf',
                         'nonzero_pg_coefficients': nonzero_coefficients,
-                        'constraint_name': f'dcpf_upper_{branch_id}_{time_slot}'
+                        'constraint_name': f'dcpf_{branch_id}_{time_slot}',
                     })
-        
+
         return union_constraints
     
     def _add_manual_constraints_all_units(self, M=4):
@@ -1322,25 +1327,22 @@ class Agent_NN_BCD:
         union_constraints = union_analysis['union_constraints']
         
         initialization_values = {'theta_values': {}}
-        
-        # 使用随机初始化
-        np.random.seed(42)
+
         for constraint in union_constraints:
             branch_id = constraint['branch_id']
             time_slot = constraint['time_slot']
             nonzero_coefficients = constraint.get('nonzero_pg_coefficients', [])
-            
+
             for coeff_info in nonzero_coefficients:
                 unit_id = coeff_info['unit_id']
                 var_name = f'theta_branch_{branch_id}_unit_{unit_id}_time_{time_slot}'
-                initialization_values['theta_values'][var_name] = np.random.normal(0.0, 0.01)
-            
-            # 创建右端项变量
+                initialization_values['theta_values'][var_name] = 0.0
+
             theta_rhs_name = f'theta_rhs_branch_{branch_id}_time_{time_slot}'
-            initialization_values['theta_values'][theta_rhs_name] = np.random.normal(1.0, 0.01)
+            initialization_values['theta_values'][theta_rhs_name] = 0.0
         
         # 初始化mu
-        mu_init = np.zeros((self.n_samples, self.nl, self.T), dtype=float)
+        mu_init = np.ones((self.n_samples, self.nl, self.T), dtype=float) * 0.1
         
         base_dict = initialization_values['theta_values']
         return [base_dict.copy() for _ in range(self.n_samples)], mu_init
@@ -1357,22 +1359,19 @@ class Agent_NN_BCD:
         union_constraints = union_analysis['union_zeta_constraints']
         
         initialization_values = {'zeta_values': {}}
-        
-        # 使用随机初始化
-        np.random.seed(43)
+
         for constraint in union_constraints:
             unit_id = constraint["unit_id"]
             time_slot = constraint["time_slot"]
-            
+
             var_name = f'zeta_unit_{unit_id}_time_{time_slot}'
-            initialization_values['zeta_values'][var_name] = np.random.normal(0.0, 0.01)
-            
-            # 创建右端项变量
+            initialization_values['zeta_values'][var_name] = 0.0
+
             zeta_rhs_name = f'zeta_rhs_unit_{unit_id}_time_{time_slot}'
-            initialization_values['zeta_values'][zeta_rhs_name] = np.random.normal(1.0, 0.01)
+            initialization_values['zeta_values'][zeta_rhs_name] = 0.0
         
         # 初始化ita
-        ita_init = np.zeros((self.n_samples, self.ng, self.T), dtype=float)
+        ita_init = np.ones((self.n_samples, self.ng, self.T), dtype=float) * 0.1
         
         base_dict = initialization_values['zeta_values']
         return [base_dict.copy() for _ in range(self.n_samples)], ita_init
@@ -1525,6 +1524,32 @@ class Agent_NN_BCD:
             for s in range(self.n_samples)
         ]).to(self.device)  # shape: (n_samples, input_dim)
 
+    def _generate_initial_values_from_nn(self):
+        """用未训练的神经网络 forward pass 生成每个 sample 的 theta/zeta 初值。"""
+        self.theta_net.eval()
+        self.zeta_net.eval()
+
+        with torch.no_grad():
+            # 批量推理所有 sample
+            theta_out = self.theta_net(self._features_cache)  # (n_samples, theta_dim)
+            zeta_out = self.zeta_net(self._features_cache)    # (n_samples, zeta_dim)
+
+        for i in range(self.n_samples):
+            self.theta_values_list[i] = self._tensor_to_theta_dict(theta_out[i])
+            self.zeta_values_list[i] = self._tensor_to_zeta_dict(zeta_out[i])
+
+        self.theta_values = self.theta_values_list[0]
+        self.zeta_values = self.zeta_values_list[0]
+
+        self.theta_net.train()
+        self.zeta_net.train()
+
+        vals = list(self.theta_values.values())
+        zvals = list(self.zeta_values.values())
+        print(f"✓ 用NN forward pass生成theta/zeta初值 "
+              f"(theta: mean={np.mean(vals):.4f}, std={np.std(vals):.4f}; "
+              f"zeta: mean={np.mean(zvals):.4f}, std={np.std(zvals):.4f})", flush=True)
+
     def _precompute_constant_tensors(self):
         """预计算训练全程不变的常量张量，避免每次 loss 调用时重建（Tier 1）。"""
         dev = self.device
@@ -1559,12 +1584,19 @@ class Agent_NN_BCD:
         """
         cached_theta: list = []
         dual_theta_lookup: dict = defaultdict(list)
+        seen_branch_time: set = set()
 
         if self.enable_theta_constraints and union_analysis and 'union_constraints' in union_analysis:
             for constraint_info in union_analysis['union_constraints']:
                 branch_id = constraint_info['branch_id']
                 time_slot = constraint_info['time_slot']
-                constraint_type = constraint_info.get('constraint_type', 'dcpf_upper')
+
+                key = (branch_id, time_slot)
+                if key in seen_branch_time:
+                    continue
+                seen_branch_time.add(key)
+
+                constraint_type = constraint_info.get('constraint_type', 'dcpf')
                 nonzero_coefficients = constraint_info['nonzero_pg_coefficients']
 
                 coeff_list: list = []
@@ -2151,7 +2183,7 @@ class Agent_NN_BCD:
             
             if sample_id <= 2:
                 print(
-                    f"dual_block, sample_id: {sample_id}, sample_obj_dual: {obj_dual.getValue()}, sample_obj_opt: {obj_opt.getValue()}",
+                    f"dual_block, sample_id: {sample_id}, obj_dual: {obj_dual.getValue()}, obj_opt: {obj_opt.getValue()}",
                     flush=True,
                 )
             
@@ -2880,7 +2912,7 @@ class Agent_NN_BCD:
             for constraint_info in union_constraints:
                 branch_id = constraint_info['branch_id']
                 time_slot = constraint_info['time_slot']
-                constraint_type = constraint_info.get('constraint_type', 'dcpf_upper')
+                constraint_type = constraint_info.get('constraint_type', 'dcpf')
                 nonzero_coefficients = constraint_info['nonzero_pg_coefficients']
                 constraint_name = constraint_info['constraint_name']
 
@@ -3033,7 +3065,7 @@ class Agent_NN_BCD:
             for constraint_info in union_constraints:
                 branch_id = constraint_info['branch_id']
                 time_slot = constraint_info['time_slot']
-                constraint_type = constraint_info.get('constraint_type', 'dcpf_upper')
+                constraint_type = constraint_info.get('constraint_type', 'dcpf')
                 nonzero_coefficients = constraint_info['nonzero_pg_coefficients']
                 constraint_name = constraint_info['constraint_name']
 
@@ -3139,7 +3171,7 @@ class Agent_NN_BCD:
                 time_slot = constraint_info['time_slot']
                 if time_slot != t_id:
                     continue
-                constraint_type = constraint_info.get('constraint_type', 'dcpf_upper')
+                constraint_type = constraint_info.get('constraint_type', 'dcpf')
                 nonzero_coefficients = constraint_info['nonzero_pg_coefficients']
                 constraint_name = constraint_info['constraint_name']
 
@@ -3244,7 +3276,7 @@ class Agent_NN_BCD:
             for constraint_info in union_constraints:
                 branch_id = constraint_info['branch_id']
                 time_slot = constraint_info['time_slot']
-                constraint_type = constraint_info.get('constraint_type', 'dcpf_upper')
+                constraint_type = constraint_info.get('constraint_type', 'dcpf')
                 nonzero_coefficients = constraint_info['nonzero_pg_coefficients']
                 
                 # 构建左端项表达式 - 直接使用theta值

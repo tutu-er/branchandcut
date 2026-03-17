@@ -508,22 +508,22 @@ class DualVariablePredictorTrainer:
 # ========================== 第二部分：子问题代理约束训练（BCD方式） ==========================
 
 class ResBlock(nn.Module):
-    """残差块：Linear → BN → LeakyReLU → Dropout → Linear → BN + skip"""
+    """残差块：Linear → LN → LeakyReLU → Dropout → Linear → LN + skip"""
 
     def __init__(self, in_dim: int, out_dim: int, dropout: float = 0.1):
         super().__init__()
         self.fc1 = nn.Linear(in_dim, out_dim)
-        self.bn1 = nn.BatchNorm1d(out_dim)
+        self.ln1 = nn.LayerNorm(out_dim)
         self.fc2 = nn.Linear(out_dim, out_dim)
-        self.bn2 = nn.BatchNorm1d(out_dim)
+        self.ln2 = nn.LayerNorm(out_dim)
         self.act = nn.LeakyReLU(0.01)
         self.drop = nn.Dropout(dropout)
         self.skip = nn.Linear(in_dim, out_dim) if in_dim != out_dim else nn.Identity()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         identity = self.skip(x)
-        out = self.drop(self.act(self.bn1(self.fc1(x))))
-        out = self.bn2(self.fc2(out))
+        out = self.drop(self.act(self.ln1(self.fc1(x))))
+        out = self.ln2(self.fc2(out))
         return self.act(out + identity)
 
 
@@ -773,19 +773,19 @@ class SubproblemSurrogateTrainer:
         # 获取对偶变量λ
         self.lambda_vals = self._get_lambda_values()
         
-        # V3: 初始化三时段耦合代理约束参数
-        # alphas: (n_samples, max_constraints) - t时段系数
-        # betas: (n_samples, max_constraints) - t+1时段系数
-        # gammas: (n_samples, max_constraints) - t+2时段系数
-        # deltas: (n_samples, max_constraints) - 右端项
+        # V3: 初始化三时段耦合代理约束参数（占位，后续由NN填充）
         self.alpha_values = np.zeros((self.n_samples, self.num_coupling_constraints))
         self.beta_values = np.zeros((self.n_samples, self.num_coupling_constraints))
         self.gamma_values = np.zeros((self.n_samples, self.num_coupling_constraints))
         self.delta_values = np.ones((self.n_samples, self.num_coupling_constraints))
-        
-        # 初始化神经网络
+
+        # 初始化神经网络，并用forward pass生成初值
         if TORCH_AVAILABLE:
             self._init_neural_network()
+            self._generate_initial_values_from_nn()
+        else:
+            # 回退：保持zeros/ones默认值
+            pass
         
         # 初始化求解
         self._initialize_solve()
@@ -881,7 +881,29 @@ class SubproblemSurrogateTrainer:
 
         print(f"  - 代理约束网络输入维度: {input_dim}", flush=True)
         print(f"  - 最大约束数量: {self.max_constraints}", flush=True)
-    
+
+    def _generate_initial_values_from_nn(self):
+        """用未训练的 SubproblemSurrogateNet forward pass 生成 alpha/beta/gamma/delta 初值。"""
+        self.surrogate_net.eval()
+
+        # 批量提取所有 sample 的特征
+        features_list = [self._extract_features(s) for s in range(self.n_samples)]
+        feat_tensor = torch.tensor(np.array(features_list), dtype=torch.float32).to(self.device)
+
+        with torch.no_grad():
+            alphas, betas, gammas, deltas = self.surrogate_net(feat_tensor)
+
+        self.alpha_values = alphas.cpu().numpy()
+        self.beta_values = betas.cpu().numpy()
+        self.gamma_values = gammas.cpu().numpy()
+        self.delta_values = deltas.cpu().numpy()
+
+        self.surrogate_net.train()
+
+        print(f"  ✓ 用NN forward pass生成代理约束初值 "
+              f"(alpha: mean={self.alpha_values.mean():.4f}; "
+              f"delta: mean={self.delta_values.mean():.4f})", flush=True)
+
     def _initialize_solve(self):
         """初始化求解：从active_set提取x，求解LP获取初始原始解和对偶变量（lambda_inherent）。
 
