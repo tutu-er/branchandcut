@@ -937,8 +937,8 @@ class Agent_NN:
         # 创建网络
         def create_net(output_dim):
             return nn.Sequential(
-                nn.Linear(input_dim, 64), nn.LeakyReLU(0.01), nn.Dropout(0.3),
-                nn.Linear(64, 128), nn.LeakyReLU(0.01), nn.Dropout(0.3),
+                nn.Linear(input_dim, 64), nn.LeakyReLU(0.01), nn.Dropout(0.1),
+                nn.Linear(64, 128), nn.LeakyReLU(0.01), nn.Dropout(0.1),
                 nn.Linear(128, output_dim)
             )
         
@@ -947,8 +947,8 @@ class Agent_NN:
         
         # 创建优化器
         all_params = list(self.theta_net.parameters()) + list(self.zeta_net.parameters())
-        self.optimizer = optim.Adam(all_params, lr=1e-4)
-        
+        self.optimizer = optim.Adam(all_params, lr=1e-4, weight_decay=1e-4)
+
         # 保存变量名列表
         self.theta_var_names = list(self.theta_values.keys())
         self.zeta_var_names = list(self.zeta_values.keys())
@@ -1423,8 +1423,8 @@ class Agent_NN:
             print(f"❌ 对偶块模型求解失败，状态: {model.status}", flush=True)
             return None, None, None
     
-    def iter_with_theta_zeta_neural_network(self, union_analysis=None, num_epochs=1):
-        """使用神经网络更新theta和zeta"""
+    def iter_with_theta_zeta_neural_network(self, union_analysis=None, num_epochs=1, batch_size: int = 4):
+        """使用神经网络更新theta和zeta，mini-batch梯度累积模式"""
         if not TORCH_AVAILABLE or self.theta_net is None or self.zeta_net is None:
             print("警告: 神经网络不可用，跳过theta/zeta更新", flush=True)
             return self.theta_values, self.zeta_values
@@ -1433,35 +1433,41 @@ class Agent_NN:
             union_analysis = self._current_union_analysis
 
         all_params = list(self.theta_net.parameters()) + list(self.zeta_net.parameters())
-        self.optimizer = optim.Adam(all_params, lr=1e-4)
+        self.optimizer = optim.Adam(all_params, lr=1e-4, weight_decay=1e-4)
         self.theta_net.train()
         self.zeta_net.train()
-        
+
         for epoch in range(num_epochs):
             epoch_total_loss = 0.0
-            
+            self.optimizer.zero_grad()
+            batch_count = 0
+
             for sample_id in range(self.n_samples):
+                batch_start = (sample_id // batch_size) * batch_size
+                actual_batch_size = min(batch_size, self.n_samples - batch_start)
+
                 features = self._extract_features(sample_id)
                 features_tensor = torch.tensor(np.array(features), dtype=torch.float32).unsqueeze(0)
                 if self.device:
                     features_tensor = features_tensor.to(self.device)
-                
+
                 theta_output = self.theta_net(features_tensor)
                 zeta_output = self.zeta_net(features_tensor)
-                
-                self.optimizer.zero_grad()
-                
+
                 differentiable_loss = self.loss_function_differentiable(
                     sample_id, theta_output[0], zeta_output[0], union_analysis, device=self.device
                 )
-                
-                differentiable_loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.theta_net.parameters(), max_norm=1.0)
-                torch.nn.utils.clip_grad_norm_(self.zeta_net.parameters(), max_norm=1.0)
-                self.optimizer.step()
-                
+                (differentiable_loss / actual_batch_size).backward()
                 epoch_total_loss += differentiable_loss.detach().cpu().item()
-            
+                batch_count += 1
+
+                if batch_count == batch_size or sample_id == self.n_samples - 1:
+                    torch.nn.utils.clip_grad_norm_(self.theta_net.parameters(), max_norm=1.0)
+                    torch.nn.utils.clip_grad_norm_(self.zeta_net.parameters(), max_norm=1.0)
+                    self.optimizer.step()
+                    self.optimizer.zero_grad()
+                    batch_count = 0
+
             if epoch == 0 or epoch == num_epochs - 1:
                 avg_loss = epoch_total_loss / self.n_samples
                 print(f"[NN-theta/zeta] epoch {epoch+1}/{num_epochs}, avg_loss = {avg_loss:.6f}", flush=True)

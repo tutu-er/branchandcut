@@ -1475,10 +1475,10 @@ class Agent_NN_BCD:
         self.theta_net = nn.Sequential(
             nn.Linear(input_dim, 64),
             nn.LeakyReLU(0.01),
-            nn.Dropout(0.3),
+            nn.Dropout(0.1),
             nn.Linear(64, 128),
             nn.LeakyReLU(0.01),
-            nn.Dropout(0.3),
+            nn.Dropout(0.1),
             nn.Linear(128, self.theta_output_dim)
         )
 
@@ -1486,10 +1486,10 @@ class Agent_NN_BCD:
         self.zeta_net = nn.Sequential(
             nn.Linear(input_dim, 64),
             nn.LeakyReLU(0.01),
-            nn.Dropout(0.3),
+            nn.Dropout(0.1),
             nn.Linear(64, 128),
             nn.LeakyReLU(0.01),
-            nn.Dropout(0.3),
+            nn.Dropout(0.1),
             nn.Linear(128, self.zeta_output_dim)
         )
         # 移动到设备
@@ -1499,7 +1499,7 @@ class Agent_NN_BCD:
         
         # 创建优化器（只优化theta和zeta网络，mu和ita在loss中通过Gurobi优化）
         all_params = list(self.theta_net.parameters()) + list(self.zeta_net.parameters())
-        self.optimizer = optim.Adam(all_params, lr=1e-4)
+        self.optimizer = optim.Adam(all_params, lr=1e-4, weight_decay=1e-4)
         
         # 保存变量名列表
         self.theta_var_names = list(self.theta_values.keys())
@@ -2192,10 +2192,10 @@ class Agent_NN_BCD:
             print(f"❌ 对偶块模型求解失败，状态: {model.status}", flush=True)
             return None, None, None
     
-    def iter_with_theta_zeta_neural_network(self, union_analysis=None, num_epochs=1):
+    def iter_with_theta_zeta_neural_network(self, union_analysis=None, num_epochs=1, batch_size: int = 4):
         """
         使用神经网络更新theta和zeta（参考uc_NN.py的train方法）
-        使用loss_function_differentiable进行训练
+        使用loss_function_differentiable进行训练，mini-batch梯度累积模式
         """
         if not TORCH_AVAILABLE or self.theta_net is None or self.zeta_net is None:
             print("警告: 神经网络不可用，跳过theta/zeta更新", flush=True)
@@ -2205,31 +2205,29 @@ class Agent_NN_BCD:
             union_analysis = self._current_union_analysis
 
         all_params = list(self.theta_net.parameters()) + list(self.zeta_net.parameters())
-        self.optimizer = optim.Adam(all_params, lr=1e-4)
-        # 训练神经网络（num_epochs个epoch）
+        self.optimizer = optim.Adam(all_params, lr=1e-4, weight_decay=1e-4)
         self.theta_net.train()
         self.zeta_net.train()
-        
+
         for epoch in range(num_epochs):
             epoch_total_loss = 0.0
-            epoch_sample_count = 0
-            
-            # 对每个样本单独进行训练
+            self.optimizer.zero_grad()
+            batch_count = 0
+
             for sample_id in range(self.n_samples):
+                batch_start = (sample_id // batch_size) * batch_size
+                actual_batch_size = min(batch_size, self.n_samples - batch_start)
+
                 # 从缓存取特征（view，无拷贝）
                 features_tensor = self._features_cache[sample_id:sample_id+1]
-                
+
                 # 前向传播
                 theta_output = self.theta_net(features_tensor)
                 zeta_output = self.zeta_net(features_tensor)
-                
-                # 使用可微分的loss函数进行训练
                 theta_tensor = theta_output[0]
                 zeta_tensor = zeta_output[0]
-                
-                # 计算可微分的loss
-                self.optimizer.zero_grad()
-                
+
+                # 计算可微分的loss + scaled backward
                 differentiable_loss = self.loss_function_differentiable(
                     sample_id,
                     theta_tensor,
@@ -2237,24 +2235,20 @@ class Agent_NN_BCD:
                     union_analysis,
                     device=self.device
                 )
-                
-                # 反向传播
-                differentiable_loss.backward()
-                
-                # 梯度裁剪
-                torch.nn.utils.clip_grad_norm_(self.theta_net.parameters(), max_norm=1.0)
-                torch.nn.utils.clip_grad_norm_(self.zeta_net.parameters(), max_norm=1.0)
-                
-                self.optimizer.step()
-                
-                # 记录loss值
-                loss_value = differentiable_loss.detach().cpu().item()
-                epoch_total_loss += loss_value
-                epoch_sample_count += 1
-            
-            # 每次BCD迭代中，只打印两次平均loss：第一个epoch和最后一个epoch
-            if epoch_sample_count > 0 and (epoch == 0 or epoch == num_epochs - 1):
-                avg_loss = epoch_total_loss / epoch_sample_count
+                (differentiable_loss / actual_batch_size).backward()
+                epoch_total_loss += differentiable_loss.detach().cpu().item()
+                batch_count += 1
+
+                # batch 满或 epoch 结束：clip + step
+                if batch_count == batch_size or sample_id == self.n_samples - 1:
+                    torch.nn.utils.clip_grad_norm_(self.theta_net.parameters(), max_norm=1.0)
+                    torch.nn.utils.clip_grad_norm_(self.zeta_net.parameters(), max_norm=1.0)
+                    self.optimizer.step()
+                    self.optimizer.zero_grad()
+                    batch_count = 0
+
+            if self.n_samples > 0 and (epoch == 0 or epoch == num_epochs - 1):
+                avg_loss = epoch_total_loss / self.n_samples
                 print(f"[NN-theta/zeta] epoch {epoch+1}/{num_epochs}, avg_loss = {avg_loss:.6f}", flush=True)
         
         # 更新theta和zeta值（per-sample 生成）
@@ -2669,6 +2663,7 @@ class Agent_NN_BCD:
                         dual_expr = 1
                         dual_expr -= self.lambda_[sample_id]['lambda_start_cost'][g, t]
                         dual_expr -= self.lambda_[sample_id]['lambda_shut_cost'][g, t]
+                        dual_expr -= self.lambda_[sample_id]['lambda_coc_nonneg'][g, t]
                         obj_dual += abs(dual_expr)
 
         return obj_primal, obj_dual, obj_opt
