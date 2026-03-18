@@ -4,7 +4,7 @@
 训练脚本（多模式）
 - surrogate: V3 三时段代理约束训练（uc_NN_subproblem_v3）
 - bcd:       BCD 主代理训练（uc_NN_BCD，Agent_NN_BCD）
-- both:      BCD 训练 → 提取功率平衡对偶变量注入样本 → surrogate 训练
+- both:      BCD 训练 → surrogate 训练 → 联合 BCD 训练
 
 可选标志 RUN_FP=True：训练后运行 feasibility_pump 可行性泵测试
 （bcd 模式不支持 RUN_FP，请改用 both 模式）
@@ -57,7 +57,7 @@ if not check_and_install_dependencies():
 #
 #   'surrogate' - V3 三时段代理约束训练
 #   'bcd'       - BCD 主代理训练（Agent_NN_BCD）
-#   'both'      - BCD 训练 → lambda 注入 → surrogate 训练
+#   'both'      - BCD 训练 → surrogate 训练 → 联合 BCD 训练
 #
 MODE   = 'both'
 RUN_FP = True        # True → 训练后运行 feasibility_pump 测试（bcd 模式不支持）
@@ -464,7 +464,7 @@ def main():
                 agent = run_bcd(ppc, all_samples_bcd, T_DELTA, MAX_ITER, bcd_model_dir,
                                 case_name=CASE_NAME, timestamp=timestamp, n_workers=N_WORKERS_BCD, NN_EPOCHS=NN_EPOCHS, DUAL_DECAY_ROUND=DUAL_DECAY_ROUND)
 
-            # Step 2: 加载 v3 格式样本
+            # Step 2: 加载 v3 格式样本（subproblem 独立训练，不注入 BCD 对偶变量）
             all_samples = load_json_data(data_file)
             if MAX_SAMPLES and len(all_samples) > MAX_SAMPLES:
                 log(f"  截取前 {MAX_SAMPLES} 个样本（共 {len(all_samples)}）")
@@ -472,14 +472,8 @@ def main():
             T_from_data = all_samples[0]['pd_data'].shape[1]
             log(f"  样本 T={T_from_data}，使用 {len(all_samples)} 个样本")
 
-            # Step 3: 注入 BCD 求解的功率平衡对偶变量
-            if hasattr(agent, 'lambda_') and agent.lambda_:
-                log(f"注入 BCD lambda（{len(agent.lambda_)} 条）→ 样本 'lambda' 字段")
-                inject_bcd_lambda(all_samples, agent.lambda_, T_from_data)
-            else:
-                log("警告: agent.lambda_ 为空，surrogate 训练将自行求解 LP 获取对偶变量")
-
-            # Step 4: surrogate 训练（使用 BCD 的 lambda 初始化）
+            # Step 3: surrogate 训练（与 surrogate 模式一致，自行 LP 求解对偶变量）
+            # BCD 的对偶变量仅在后续联合训练中使用，不注入 subproblem 训练
             dual_predictor, trainers = run_surrogate(
                 ppc, all_samples, T_DELTA, UNIT_IDS,
                 DUAL_EPOCHS, DUAL_BATCH_SIZE, MAX_ITER, NN_EPOCHS, save_dir,
@@ -487,7 +481,8 @@ def main():
             )
             print_surrogate_results(trainers, all_samples)
 
-            # Step 5: 联合BCD训练（theta/zeta + surrogate 约束，BCD迭代）
+            # Step 4: 联合BCD训练（theta/zeta + surrogate 约束，BCD迭代）
+            # BCD 的对偶变量（agent.lambda_/mu/ita）在此阶段被联合训练器使用
             from joint_trainer import JointLPTrainer
             log("联合BCD训练: pg块→dual块→theta/zeta NN→surrogate NN→cal_viol")
             joint_trainer = JointLPTrainer(agent, trainers)
@@ -498,7 +493,7 @@ def main():
                 surr_nn_epochs=JOINT_SURR_NN_EPOCHS,
             )
 
-            # Step 6: 可选 FP 测试
+            # Step 5: 可选 FP 测试
             if RUN_FP:
                 run_feasibility_pump_test(
                     ppc, all_samples, dual_predictor, trainers,
