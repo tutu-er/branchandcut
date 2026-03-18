@@ -472,14 +472,8 @@ def main():
             T_from_data = all_samples[0]['pd_data'].shape[1]
             log(f"  样本 T={T_from_data}，使用 {len(all_samples)} 个样本")
 
-            # Step 3: 注入 BCD 求解的功率平衡对偶变量
-            if hasattr(agent, 'lambda_') and agent.lambda_:
-                log(f"注入 BCD lambda（{len(agent.lambda_)} 条）→ 样本 'lambda' 字段")
-                inject_bcd_lambda(all_samples, agent.lambda_, T_from_data)
-            else:
-                log("警告: agent.lambda_ 为空，surrogate 训练将自行求解 LP 获取对偶变量")
-
-            # Step 4: surrogate 训练（使用 BCD 的 lambda 初始化）
+            # Step 3: surrogate 训练（与 surrogate 模式一致，自行 LP 求解对偶变量）
+            # BCD 的对偶变量仅在后续联合训练中使用，不注入 subproblem 训练
             dual_predictor, trainers = run_surrogate(
                 ppc, all_samples, T_DELTA, UNIT_IDS,
                 DUAL_EPOCHS, DUAL_BATCH_SIZE, MAX_ITER, NN_EPOCHS, save_dir,
