@@ -358,7 +358,7 @@ def main():
     JOINT_SURR_NN_EPOCHS = 5        # 联合BCD训练每轮surrogate NN训练epoch数
     JOINT_DUAL_DECAY_ROUND = 0     # 联合BCD训练dual_para_bound衰减轮次
     ACTIVE_SETS_FILE = None          # 指定 active_sets JSON 文件路径（None=自动查找最新）
-    BCD_MODEL_FILE   = None          # 指定已有 BCD 模型 .pth 文件路径（None=从头训练；both 模式下可跳过 BCD 训练）
+    BCD_MODEL_FILE   = "result/bcd_models/bcd_model_case30_20260318_000506.pth"           # 指定已有 BCD 模型 .pth 文件路径（None=从头训练；both 模式下可跳过 BCD 训练）
 
     data_dir = Path(__file__).parent / 'result' / 'active_set'
     bcd_model_dir = Path(__file__).parent / 'result' / 'bcd_models'

@@ -761,13 +761,14 @@ class SubproblemSurrogateTrainer:
             self.device = device
         
         # BCD迭代参数
-        self.rho_primal = 1e-2
-        self.rho_dual = 1e-2
-        self.rho_opt = 1e-2
+        self.rho_primal = 1e-3
+        self.rho_dual = 1e-3
+        self.rho_opt = 1e-3
         self.gamma = 1e-3
         self.rho_max = 10.0
         self.reg_weight = 1e-4   # alpha/beta/gamma L2 正则化权重
         self.mu_lower_bound = 0.1
+        self.cost_ema_alpha = 0.3  # cost_values EMA平滑系数，越小越平滑
         self.iter_number = 0
         
         # 初始化原始变量和对偶变量存储
@@ -895,7 +896,12 @@ class SubproblemSurrogateTrainer:
             hidden_dims=[256, 256]  # 两层残差块
         ).to(self.device)
 
-        self.optimizer = optim.Adam(self.surrogate_net.parameters(), lr=1e-4)
+        # 分离参数组：主优化器管理 backbone + alpha/beta/gamma/delta 头
+        cost_net_params = set(self.surrogate_net.cost_net.parameters())
+        main_params = [p for p in self.surrogate_net.parameters() if p not in cost_net_params]
+        self.optimizer = optim.Adam(main_params, lr=1e-4)
+        # cost_net 单独优化器，学习率更低以稳定 cost_values
+        self.cost_optimizer = optim.Adam(self.surrogate_net.cost_net.parameters(), lr=1e-5)
 
         print(f"  - 代理约束网络输入维度: {input_dim}", flush=True)
         print(f"  - 最大约束数量: {self.max_constraints}", flush=True)
@@ -915,13 +921,14 @@ class SubproblemSurrogateTrainer:
         self.beta_values = betas.cpu().numpy()
         self.gamma_values = gammas.cpu().numpy()
         self.delta_values = deltas.cpu().numpy()
-        self.cost_values = costs.cpu().numpy()
+        self.cost_values = np.zeros((self.n_samples, self.T))  # 强制初值为零，避免未训练NN的随机输出干扰
 
         self.surrogate_net.train()
 
         print(f"  ✓ 用NN forward pass生成代理约束初值 "
               f"(alpha: mean={self.alpha_values.mean():.4f}; "
-              f"delta: mean={self.delta_values.mean():.4f})", flush=True)
+              f"delta: mean={self.delta_values.mean():.4f}; "
+              f"cost: forced to 0)", flush=True)
 
     def _initialize_solve(self):
         """初始化求解：从active_set提取x，求解LP获取初始原始解和对偶变量（lambda_inherent）。
@@ -1738,8 +1745,13 @@ class SubproblemSurrogateTrainer:
         optimizer_persist_after = 5
         rebuild = (self.iter_number < optimizer_persist_after)
         if rebuild or not hasattr(self, '_surr_optimizer') or self._surr_optimizer is None:
+            # 分离 cost_net 参数，主优化器不管理 cost_net
+            cost_net_params = set(self.surrogate_net.cost_net.parameters())
+            main_params = [p for p in self.surrogate_net.parameters() if p not in cost_net_params]
             self._surr_optimizer = optim.Adam(
-                self.surrogate_net.parameters(), lr=3e-4, weight_decay=1e-4)
+                main_params, lr=3e-4, weight_decay=1e-4)
+            self._surr_cost_optimizer = optim.Adam(
+                self.surrogate_net.cost_net.parameters(), lr=3e-5, weight_decay=1e-4)
             self._surr_scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
                 self._surr_optimizer, T_0=max(num_epochs, 1), T_mult=1)
 
@@ -1748,6 +1760,7 @@ class SubproblemSurrogateTrainer:
         for epoch in range(num_epochs):
             epoch_loss = 0.0
             self._surr_optimizer.zero_grad()
+            self._surr_cost_optimizer.zero_grad()
             batch_count = 0
 
             for sample_id in range(self.n_samples):
@@ -1782,13 +1795,20 @@ class SubproblemSurrogateTrainer:
                 self.beta_values[sample_id] = betas_tensor.detach().cpu().numpy()
                 self.gamma_values[sample_id] = gammas_tensor.detach().cpu().numpy()
                 self.delta_values[sample_id] = deltas_tensor.detach().cpu().numpy()
-                self.cost_values[sample_id] = costs_tensor.detach().cpu().numpy()
+                # cost_values 使用 EMA 平滑，避免迭代间剧烈变化
+                new_costs = costs_tensor.detach().cpu().numpy()
+                self.cost_values[sample_id] = (
+                    (1 - self.cost_ema_alpha) * self.cost_values[sample_id]
+                    + self.cost_ema_alpha * new_costs
+                )
 
                 # batch 满或 epoch 结束：clip + step
                 if batch_count == batch_size or sample_id == self.n_samples - 1:
                     torch.nn.utils.clip_grad_norm_(self.surrogate_net.parameters(), max_norm=1.0)
                     self._surr_optimizer.step()
+                    self._surr_cost_optimizer.step()
                     self._surr_optimizer.zero_grad()
+                    self._surr_cost_optimizer.zero_grad()
                     batch_count = 0
 
             self._surr_scheduler.step()
