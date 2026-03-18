@@ -764,7 +764,7 @@ class SubproblemSurrogateTrainer:
         self.rho_primal = 1e-2
         self.rho_dual = 1e-2
         self.rho_opt = 1e-2
-        self.gamma = 1e-2
+        self.gamma = 1e-3
         self.rho_max = 10.0
         self.reg_weight = 1e-4   # alpha/beta/gamma L2 正则化权重
         self.mu_lower_bound = 0.1
