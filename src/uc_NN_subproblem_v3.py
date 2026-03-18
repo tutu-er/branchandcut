@@ -589,6 +589,13 @@ class SubproblemSurrogateNet(nn.Module):
             nn.Softplus()
         )
 
+        # 目标成本系数头：输出 T 个值，无激活（允许正负）
+        self.cost_net = nn.Sequential(
+            nn.Linear(feat_dim, head_hidden), nn.LayerNorm(head_hidden), nn.LeakyReLU(0.01),
+            nn.Linear(head_hidden, head_mid), nn.LayerNorm(head_mid), nn.LeakyReLU(0.01),
+            nn.Linear(head_mid, self.T)
+        )
+
         self._init_weights()
 
     def _init_weights(self):
@@ -617,6 +624,7 @@ class SubproblemSurrogateNet(nn.Module):
             betas: t+1时段系数 (batch_size, max_constraints)
             gammas: t+2时段系数 (batch_size, max_constraints)
             deltas: 右端项 (batch_size, max_constraints)
+            costs: 目标成本系数 (batch_size, T)
         """
         features = self.input_proj(x)
         for block in self.res_blocks:
@@ -625,7 +633,8 @@ class SubproblemSurrogateNet(nn.Module):
         betas = self.beta_net(features)
         gammas = self.gamma_net(features)
         deltas = self.delta_net(features)
-        return alphas, betas, gammas, deltas
+        costs = self.cost_net(features)
+        return alphas, betas, gammas, deltas, costs
 
 
 def identify_sensitive_timesteps(x_vals, threshold_low=0.1, threshold_high=0.9, max_constraints=20):
@@ -756,6 +765,7 @@ class SubproblemSurrogateTrainer:
         self.rho_dual = 1e-2
         self.rho_opt = 1e-2
         self.gamma = 1e-2
+        self.rho_max = 10.0
         self.reg_weight = 1e-4   # alpha/beta/gamma L2 正则化权重
         self.mu_lower_bound = 0.1
         self.iter_number = 0
@@ -785,6 +795,7 @@ class SubproblemSurrogateTrainer:
         self.beta_values = np.zeros((self.n_samples, self.num_coupling_constraints))
         self.gamma_values = np.zeros((self.n_samples, self.num_coupling_constraints))
         self.delta_values = np.ones((self.n_samples, self.num_coupling_constraints))
+        self.cost_values = np.zeros((self.n_samples, self.T))
 
         # 初始化神经网络，并用forward pass生成初值
         if TORCH_AVAILABLE:
@@ -898,12 +909,13 @@ class SubproblemSurrogateTrainer:
         feat_tensor = torch.tensor(np.array(features_list), dtype=torch.float32).to(self.device)
 
         with torch.no_grad():
-            alphas, betas, gammas, deltas = self.surrogate_net(feat_tensor)
+            alphas, betas, gammas, deltas, costs = self.surrogate_net(feat_tensor)
 
         self.alpha_values = alphas.cpu().numpy()
         self.beta_values = betas.cpu().numpy()
         self.gamma_values = gammas.cpu().numpy()
         self.delta_values = deltas.cpu().numpy()
+        self.cost_values = costs.cpu().numpy()
 
         self.surrogate_net.train()
 
@@ -1060,7 +1072,7 @@ class SubproblemSurrogateTrainer:
                     'lambda_x_lower':    np.zeros(self.T),
                 }
     
-    def iter_with_primal_block(self, sample_id: int, alphas: np.ndarray, betas: np.ndarray, gammas: np.ndarray, deltas: np.ndarray):
+    def iter_with_primal_block(self, sample_id: int, alphas: np.ndarray, betas: np.ndarray, gammas: np.ndarray, deltas: np.ndarray, costs: np.ndarray = None):
         """
         BCD迭代：原始块 - V3三时段耦合约束版本
         固定代理约束参数(alphas, betas, gammas, deltas)和对偶变量(mu)，更新原始变量(pg, x)
@@ -1228,11 +1240,15 @@ class SubproblemSurrogateTrainer:
         obj_opt    += gp.quicksum(surrogate_abs_vals[k] * mu_vals[k]
                                   for k in range(len(sensitive_t)))
 
-        # --- 目标函数（参考BCD：无显式cost项，经济方向由对偶变量通过obj_opt传递）---
+        # --- 目标函数 ---
+        obj_cost = 0
+        if costs is not None:
+            obj_cost = gp.quicksum(costs[t] * x[t] for t in range(self.T))
         model.setObjective(
             self.rho_primal * obj_primal
             + self.rho_opt  * obj_opt
-            + obj_binary,
+            + obj_binary
+            + obj_cost,
             GRB.MINIMIZE
         )
         model.optimize()
@@ -1254,7 +1270,7 @@ class SubproblemSurrogateTrainer:
             return None, None, None, None
     
     def iter_with_dual_block(self, sample_id: int, alphas: np.ndarray, betas: np.ndarray,
-                             gammas: np.ndarray, deltas: np.ndarray):
+                             gammas: np.ndarray, deltas: np.ndarray, costs: np.ndarray = None):
         """
         BCD迭代：对偶块 - V3三时段耦合约束完整版本
         固定原始变量(pg, x, coc)和代理约束参数，联合更新所有对偶变量：
@@ -1354,7 +1370,7 @@ class SubproblemSurrogateTrainer:
         
         obj_dual_test = 0
         for t in range(self.T):
-            expr = b
+            expr = b + (costs[t] if costs is not None else 0)
             expr += Pmin * lam_pg_lower[t]
             expr -= Pmax * lam_pg_upper[t]
 
@@ -1559,9 +1575,9 @@ class SubproblemSurrogateTrainer:
 
         return np.concatenate([pd_flat, lambda_val, unit_params])
     
-    def loss_function_differentiable(self, sample_id: int, alphas_tensor: torch.Tensor, 
-                                     betas_tensor: torch.Tensor, gammas_tensor: torch.Tensor, 
-                                     deltas_tensor: torch.Tensor,
+    def loss_function_differentiable(self, sample_id: int, alphas_tensor: torch.Tensor,
+                                     betas_tensor: torch.Tensor, gammas_tensor: torch.Tensor,
+                                     deltas_tensor: torch.Tensor, costs_tensor: torch.Tensor,
                                      device) -> torch.Tensor:
         """
         可微分的loss函数 - V3三时段耦合约束版本
@@ -1685,7 +1701,7 @@ class SubproblemSurrogateTrainer:
                 inherent_const += float(lam_xu[t]) - float(lam_xl[t])
 
             # 代理耦合约束贡献（含NN参数，可微分；按 sensitive_timesteps 索引）
-            dual_expr = torch.tensor(inherent_const, dtype=torch.float32, device=device)
+            dual_expr = torch.tensor(inherent_const, dtype=torch.float32, device=device) + costs_tensor[t]
             for k, ts in enumerate(sensitive_t):
                 if ts == t:
                     dual_expr = dual_expr + alphas_tensor[k] * mu_vals[k]
@@ -1696,10 +1712,11 @@ class SubproblemSurrogateTrainer:
 
             obj_dual = obj_dual + torch.abs(dual_expr)
         
-        # L2 正则化：控制 alpha/beta/gamma 参数大小
+        # L2 正则化：控制 alpha/beta/gamma/cost 参数大小
         reg_loss = self.reg_weight * (torch.sum(alphas_tensor ** 2)
                                       + torch.sum(betas_tensor ** 2)
-                                      + torch.sum(gammas_tensor ** 2))
+                                      + torch.sum(gammas_tensor ** 2)
+                                      + torch.sum(costs_tensor ** 2))
 
         # 总损失：三项BCD目标 + 正则化
         loss = (self.rho_primal * obj_primal +
@@ -1742,27 +1759,30 @@ class SubproblemSurrogateTrainer:
                 features = self._extract_features(sample_id)
                 features_tensor = torch.tensor(features, dtype=torch.float32, device=self.device).unsqueeze(0)
 
-                # V3前向传播：输出 (alphas, betas, gammas, deltas)
-                alphas_out, betas_out, gammas_out, deltas_out = self.surrogate_net(features_tensor)
+                # V3前向传播：输出 (alphas, betas, gammas, deltas, costs)
+                alphas_out, betas_out, gammas_out, deltas_out, costs_out = self.surrogate_net(features_tensor)
                 nc = self.num_coupling_constraints
                 alphas_tensor = alphas_out.squeeze(0)[:nc]   # (num_coupling_constraints,)
                 betas_tensor = betas_out.squeeze(0)[:nc]
                 gammas_tensor = gammas_out.squeeze(0)[:nc]
                 deltas_tensor = deltas_out.squeeze(0)[:nc]   # Softplus保证非负
+                costs_tensor = costs_out.squeeze(0)[:self.T]  # (T,)
 
-                # 计算loss（V3版本，传入4个参数）+ scaled backward
+                # 计算loss（V3版本，传入5个参数）+ scaled backward
                 loss = self.loss_function_differentiable(
-                    sample_id, alphas_tensor, betas_tensor, gammas_tensor, deltas_tensor, self.device
+                    sample_id, alphas_tensor, betas_tensor, gammas_tensor, deltas_tensor,
+                    costs_tensor, self.device
                 )
                 (loss / actual_batch_size).backward()
                 epoch_loss += loss.detach().cpu().item()
                 batch_count += 1
 
-                # 更新参数值（V3：4个参数）
+                # 更新参数值（V3：5个参数）
                 self.alpha_values[sample_id] = alphas_tensor.detach().cpu().numpy()
                 self.beta_values[sample_id] = betas_tensor.detach().cpu().numpy()
                 self.gamma_values[sample_id] = gammas_tensor.detach().cpu().numpy()
                 self.delta_values[sample_id] = deltas_tensor.detach().cpu().numpy()
+                self.cost_values[sample_id] = costs_tensor.detach().cpu().numpy()
 
                 # batch 满或 epoch 结束：clip + step
                 if batch_count == batch_size or sample_id == self.n_samples - 1:
@@ -1903,9 +1923,9 @@ class SubproblemSurrogateTrainer:
                         pg_stat += float(lam_rd[t])
                     obj_dual += abs(pg_stat)
 
-            # -- x[t] 驻点条件（含固有约束项和代理耦合项）--
+            # -- x[t] 驻点条件（含固有约束项、代理耦合项和cost项）--
             for t in range(self.T):
-                x_stat = b_v
+                x_stat = b_v + self.cost_values[sample_id][t]
                 if lam_inh is not None:
                     x_stat += Pmin_v * float(lam_inh['lambda_pg_lower'][t])
                     x_stat -= Pmax_v * float(lam_inh['lambda_pg_upper'][t])
@@ -1972,15 +1992,16 @@ class SubproblemSurrogateTrainer:
             
             EPS = 1e-10
             
-            # 1. 原始块迭代（V3：传入4个参数）
+            # 1. 原始块迭代（V3：传入5个参数）
             for sample_id in range(self.n_samples):
                 alphas = self.alpha_values[sample_id]
                 betas = self.beta_values[sample_id]
                 gammas = self.gamma_values[sample_id]
                 deltas = self.delta_values[sample_id]
-                
+                costs = self.cost_values[sample_id]
+
                 pg_sol, x_sol, coc_sol, cpower_sol = self.iter_with_primal_block(
-                    sample_id, alphas, betas, gammas, deltas
+                    sample_id, alphas, betas, gammas, deltas, costs
                 )
                 
                 if pg_sol is not None:
@@ -1997,9 +2018,10 @@ class SubproblemSurrogateTrainer:
                 betas  = self.beta_values[sample_id]
                 gammas = self.gamma_values[sample_id]
                 deltas = self.delta_values[sample_id]
+                costs  = self.cost_values[sample_id]
 
                 lambda_inherent_sol, mu_sol = self.iter_with_dual_block(
-                    sample_id, alphas, betas, gammas, deltas
+                    sample_id, alphas, betas, gammas, deltas, costs
                 )
                 if lambda_inherent_sol is not None:
                     self.lambda_inherent[sample_id] = lambda_inherent_sol
@@ -2017,28 +2039,29 @@ class SubproblemSurrogateTrainer:
             print(f"  obj_primal: {obj_primal:.6f}, obj_dual: {obj_dual:.6f}, obj_opt: {obj_opt:.6f}", flush=True)
 
             # 更新惩罚参数（累加式，与BCD标准一致）
-            self.rho_primal += self.gamma * obj_primal
-            self.rho_dual   += self.gamma * obj_dual
-            self.rho_opt    += self.gamma * obj_opt
+            self.rho_primal = min(self.rho_primal + self.gamma * obj_primal, self.rho_max)
+            self.rho_dual   = min(self.rho_dual   + self.gamma * obj_dual,   self.rho_max)
+            self.rho_opt    = min(self.rho_opt    + self.gamma * obj_opt,    self.rho_max)
 
             print(f"  ρ_primal={self.rho_primal:.4f}, ρ_dual={self.rho_dual:.4f}, ρ_opt={self.rho_opt:.4f}", flush=True)
             print("  " + "-" * 40, flush=True)
         
         print(f"✓ 机组{self.unit_id} V3三时段耦合代理约束训练完成", flush=True)
     
-    def get_surrogate_params(self, pd_data: np.ndarray, lambda_val: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    def get_surrogate_params(self, pd_data: np.ndarray, lambda_val: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         """
         获取V3三时段耦合代理约束参数
-        
+
         Returns:
             alphas: (max_constraints,) 第一时段系数
             betas: (max_constraints,) 第二时段系数
             gammas: (max_constraints,) 第三时段系数
             deltas: (max_constraints,) 右端项
+            costs: (T,) 目标成本系数
         """
         if not TORCH_AVAILABLE:
             raise RuntimeError("PyTorch不可用")
-        
+
         self.surrogate_net.eval()
 
         pd_flat = pd_data.flatten()
@@ -2055,14 +2078,15 @@ class SubproblemSurrogateTrainer:
         ])
         features = np.concatenate([pd_flat, lambda_val, unit_params])
         features_tensor = torch.tensor(features, dtype=torch.float32, device=self.device).unsqueeze(0)
-        
+
         with torch.no_grad():
-            alphas, betas, gammas, deltas = self.surrogate_net(features_tensor)
-        
-        return (alphas.squeeze(0).cpu().numpy(), 
-                betas.squeeze(0).cpu().numpy(), 
+            alphas, betas, gammas, deltas, costs = self.surrogate_net(features_tensor)
+
+        return (alphas.squeeze(0).cpu().numpy(),
+                betas.squeeze(0).cpu().numpy(),
                 gammas.squeeze(0).cpu().numpy(),
-                deltas.squeeze(0).cpu().numpy())
+                deltas.squeeze(0).cpu().numpy(),
+                costs.squeeze(0).cpu().numpy())
     
     def save(self, filepath: str):
         """保存V3模型"""
@@ -2073,12 +2097,14 @@ class SubproblemSurrogateTrainer:
                 'alpha_values': self.alpha_values,
                 'beta_values': self.beta_values,
                 'gamma_values': self.gamma_values,
-                'delta_values': self.delta_values,  # V3新增
+                'delta_values': self.delta_values,
+                'cost_values': self.cost_values,
                 'mu': self.mu,
                 'rho_primal': self.rho_primal,
                 'rho_dual': self.rho_dual,
                 'rho_opt': self.rho_opt,
-                'num_coupling_constraints': self.num_coupling_constraints
+                'num_coupling_constraints': self.num_coupling_constraints,
+                'lambda_inherent': self.lambda_inherent,
             }
             
             dirpath = os.path.dirname(os.path.abspath(filepath))
@@ -2092,16 +2118,19 @@ class SubproblemSurrogateTrainer:
         """加载V3模型"""
         if TORCH_AVAILABLE:
             state = torch.load(filepath, map_location=self.device, weights_only=False)
-            self.surrogate_net.load_state_dict(state['surrogate_net_state_dict'])
+            self.surrogate_net.load_state_dict(state['surrogate_net_state_dict'], strict=False)
             self.optimizer.load_state_dict(state['optimizer_state_dict'])
             self.alpha_values = state['alpha_values']
             self.beta_values = state['beta_values']
             self.gamma_values = state['gamma_values']
-            self.delta_values = state.get('delta_values', np.ones_like(self.gamma_values))  # V3新增，兼容旧模型
+            self.delta_values = state.get('delta_values', np.ones_like(self.gamma_values))
+            self.cost_values = state.get('cost_values', np.zeros((self.n_samples, self.T)))
             self.mu = state['mu']
             self.rho_primal = state['rho_primal']
             self.rho_dual = state['rho_dual']
             self.rho_opt = state['rho_opt']
+            if 'lambda_inherent' in state:
+                self.lambda_inherent = state['lambda_inherent']
             print(f"✓ V3三时段耦合代理约束模型已加载: {filepath}", flush=True)
 
 

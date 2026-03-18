@@ -115,6 +115,7 @@ class ParallelSubproblemSurrogateTrainer(SubproblemSurrogateTrainer):
                     self.beta_values[s].copy(),
                     self.gamma_values[s].copy(),
                     self.delta_values[s].copy(),
+                    self.cost_values[s].copy(),
                 )
                 for s in range(self.n_samples)
             ]
@@ -124,9 +125,9 @@ class ParallelSubproblemSurrogateTrainer(SubproblemSurrogateTrainer):
                 future_to_sid = {
                     executor.submit(
                         self.iter_with_primal_block,
-                        s, alphas, betas, gammas, deltas,
+                        s, alphas, betas, gammas, deltas, costs,
                     ): s
-                    for s, alphas, betas, gammas, deltas in primal_args
+                    for s, alphas, betas, gammas, deltas, costs in primal_args
                 }
                 for future in as_completed(future_to_sid):
                     s = future_to_sid[future]
@@ -156,6 +157,7 @@ class ParallelSubproblemSurrogateTrainer(SubproblemSurrogateTrainer):
                     self.beta_values[s].copy(),
                     self.gamma_values[s].copy(),
                     self.delta_values[s].copy(),
+                    self.cost_values[s].copy(),
                 )
                 for s in range(self.n_samples)
             ]
@@ -165,9 +167,9 @@ class ParallelSubproblemSurrogateTrainer(SubproblemSurrogateTrainer):
                 future_to_sid = {
                     executor.submit(
                         self.iter_with_dual_block,
-                        s, alphas, betas, gammas, deltas,
+                        s, alphas, betas, gammas, deltas, costs,
                     ): s
-                    for s, alphas, betas, gammas, deltas in dual_args
+                    for s, alphas, betas, gammas, deltas, costs in dual_args
                 }
                 for future in as_completed(future_to_sid):
                     s = future_to_sid[future]
@@ -199,9 +201,11 @@ class ParallelSubproblemSurrogateTrainer(SubproblemSurrogateTrainer):
                 flush=True,
             )
 
-            self.rho_primal += self.gamma * obj_primal
-            self.rho_dual   += self.gamma * obj_dual
-            self.rho_opt    += self.gamma * obj_opt
+            self.rho_primal = min(self.rho_primal + self.gamma * obj_primal, self.rho_max)
+            self.rho_dual   = min(self.rho_dual   + self.gamma * obj_dual,   self.rho_max)
+            self.rho_opt    = min(self.rho_opt    + self.gamma * obj_opt,    self.rho_max)
+            
+            print(f"{prefix}   ρ_primal={self.rho_primal:.4f}, ρ_dual={self.rho_dual:.4f}, ρ_opt={self.rho_opt:.4f}", flush=True)
 
         print(f"{prefix} ✓ 样本级并行训练完成", flush=True)
 

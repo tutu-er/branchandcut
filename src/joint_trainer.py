@@ -77,10 +77,11 @@ class JointLPTrainer:
         self.branch_limit = self.branch[:, RATE_A]
 
         # surrogate 对偶变量: {sample_id: {unit_id: ndarray(nc,)}}
+        # 从各trainer的mu继承，而非硬编码0.1
         self.lambda_surr: Dict[int, Dict[int, np.ndarray]] = {}
         for s in range(self.n_samples):
             self.lambda_surr[s] = {
-                g: np.ones(trainer.num_coupling_constraints) * 0.1
+                g: trainer.mu[s].copy()
                 for g, trainer in self.trainers.items()
             }
 
@@ -288,7 +289,7 @@ class JointLPTrainer:
         # --- surrogate 罚项（新增） ---
         surr_params = self._get_surrogate_params(sample_id)
         for g, trainer in self.trainers.items():
-            a, b, c, d = surr_params[g]
+            a, b, c, d, *_ = surr_params[g]
             sensitive_t = trainer.sensitive_timesteps[sample_id]
             for k, t_k in enumerate(sensitive_t):
                 if t_k + 2 >= self.T:
@@ -447,7 +448,7 @@ class JointLPTrainer:
         # 预构建surrogate对x[g,t]的贡献查找表
         surr_x_contrib: Dict[Tuple[int, int], list] = {}
         for g_s, trainer in self.trainers.items():
-            a, b, c, d = surr_params[g_s]
+            a, b, c, d, *_ = surr_params[g_s]
             sensitive_t = trainer.sensitive_timesteps[sample_id]
             for k, t_k in enumerate(sensitive_t):
                 if t_k + 2 >= self.T:
@@ -631,7 +632,7 @@ class JointLPTrainer:
 
         # surrogate obj_opt
         for g_s, trainer in self.trainers.items():
-            a, b, c, d = surr_params[g_s]
+            a, b, c, d, *_ = surr_params[g_s]
             sensitive_t = trainer.sensitive_timesteps[sample_id]
             for k, t_k in enumerate(sensitive_t):
                 if t_k + 2 >= self.T:
@@ -817,7 +818,7 @@ class JointLPTrainer:
             x_arr = agent.x[s]
 
             for g, trainer in self.trainers.items():
-                a, b, c, d = surr_params[g]
+                a, b, c, d, *_ = surr_params[g]
                 sensitive_t = trainer.sensitive_timesteps[s]
                 for k, t_k in enumerate(sensitive_t):
                     if t_k + 2 >= self.T:
@@ -867,7 +868,7 @@ class JointLPTrainer:
         """从各trainer的NN获取surrogate参数（detach）。
 
         Returns:
-            dict[unit_id -> (alphas, betas, gammas, deltas)] 各为numpy数组
+            dict[unit_id -> (alphas, betas, gammas, deltas, costs)] 各为numpy数组
         """
         params = {}
         for g, trainer in self.trainers.items():
@@ -876,13 +877,14 @@ class JointLPTrainer:
                                   device=trainer.device).unsqueeze(0)
             trainer.surrogate_net.eval()
             with torch.no_grad():
-                a, b, c, d = trainer.surrogate_net(feat_t)
+                a, b, c, d, e = trainer.surrogate_net(feat_t)
             trainer.surrogate_net.train()
             nc = trainer.num_coupling_constraints
             params[g] = (a.cpu().numpy().flatten()[:nc],
                          b.cpu().numpy().flatten()[:nc],
                          c.cpu().numpy().flatten()[:nc],
-                         d.cpu().numpy().flatten()[:nc])
+                         d.cpu().numpy().flatten()[:nc],
+                         e.cpu().numpy().flatten()[:trainer.T])
         return params
 
     def _compute_avg_integrality(self) -> float:

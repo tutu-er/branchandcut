@@ -232,7 +232,7 @@ def collect_integer_solutions(
 
     for g in unit_ids:
         trainer = trainers[g]
-        alphas, betas, gammas, deltas = trainer.get_surrogate_params(pd_data, lambda_val)
+        alphas, betas, gammas, deltas, *_ = trainer.get_surrogate_params(pd_data, lambda_val)
 
         # 原始子问题 LP
         x_LP_k = _solve_unit_LP_with_surrogate(trainer, lambda_val, alphas, betas, gammas, deltas)
@@ -242,7 +242,7 @@ def collect_integer_solutions(
         for m in range(n_perturbations):
             noise = perturb_std * rng.standard_normal(pd_data.shape) * pd_data
             pd_perturbed = pd_data + noise
-            alphas_m, betas_m, gammas_m, deltas_m = trainer.get_surrogate_params(
+            alphas_m, betas_m, gammas_m, deltas_m, *_ = trainer.get_surrogate_params(
                 pd_perturbed, lambda_val
             )
             x_LP_m = _solve_unit_LP_with_surrogate(
@@ -403,7 +403,7 @@ def solve_global_LP_relaxation(
         # 参考 BCD 中对原始约束的处理：slack_k >= lhs - delta; obj += M * slack_k
         # 这样即使代理约束紧张时 LP 仍可行，违背量以大 M 惩罚
         if g in trainers:
-            alphas, betas, gammas, deltas = trainers[g].get_surrogate_params(
+            alphas, betas, gammas, deltas, *_ = trainers[g].get_surrogate_params(
                 pd_data, lambda_val
             )
             for k in range(len(alphas)):

@@ -3853,6 +3853,9 @@ class Agent_NN_BCD:
             "theta_var_names": getattr(self, "theta_var_names", None),
             "zeta_var_names": getattr(self, "zeta_var_names", None),
             "device": str(self.device) if hasattr(self, "device") and self.device is not None else "cpu",
+            "lambda_": self.lambda_,
+            "mu": self.mu,
+            "ita": self.ita,
         }
         
         torch.save(state, filepath)
@@ -3908,7 +3911,7 @@ class Agent_NN_BCD:
         if not os.path.exists(filepath):
             raise FileNotFoundError(f"模型参数文件不存在: {filepath}")
 
-        state = torch.load(filepath, map_location=map_location, weights_only=True)
+        state = torch.load(filepath, map_location=map_location, weights_only=False)
 
         # 从 state_dict 重建网络结构（而非调用 _init_neural_network）
         self.theta_net = self._rebuild_sequential_from_state_dict(
@@ -3944,6 +3947,14 @@ class Agent_NN_BCD:
             self.theta_var_names = state["theta_var_names"]
         if state.get("zeta_var_names") is not None:
             self.zeta_var_names = state["zeta_var_names"]
+
+        # 恢复对偶变量（向后兼容旧checkpoint）
+        if "lambda_" in state:
+            self.lambda_ = state["lambda_"]
+        if "mu" in state:
+            self.mu = state["mu"]
+        if "ita" in state:
+            self.ita = state["ita"]
 
         print(f"✓ 模型参数已从文件加载: {filepath}", flush=True)
 
