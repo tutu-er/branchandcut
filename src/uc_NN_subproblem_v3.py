@@ -258,15 +258,16 @@ class DualVariablePredictorNet(nn.Module):
         super(DualVariablePredictorNet, self).__init__()
         
         if hidden_dims is None:
-            hidden_dims = [64, 64]
+            hidden_dims = [256, 128]
 
         layers = []
         prev_dim = input_dim
 
         for hidden_dim in hidden_dims:
             layers.append(nn.Linear(prev_dim, hidden_dim))
+            layers.append(nn.LayerNorm(hidden_dim))
             layers.append(nn.LeakyReLU(0.01))
-            layers.append(nn.Dropout(0.3))
+            layers.append(nn.Dropout(0.1))
             prev_dim = hidden_dim
 
         layers.append(nn.Linear(prev_dim, output_dim))
@@ -442,8 +443,10 @@ class DualVariablePredictorTrainer:
         dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
         
         criterion = nn.MSELoss()
+        scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+            self.optimizer, patience=10, factor=0.5)
         self.network.train()
-        
+
         for epoch in range(num_epochs):
             epoch_loss = 0.0
             for batch_X, batch_Y in dataloader:
@@ -453,9 +456,10 @@ class DualVariablePredictorTrainer:
                 loss.backward()
                 self.optimizer.step()
                 epoch_loss += loss.item() * batch_X.size(0)
-            
+
             epoch_loss /= len(dataset)
-            
+            scheduler.step(epoch_loss)
+
             if (epoch + 1) % 20 == 0:
                 print(f"  Epoch {epoch+1}/{num_epochs}, Loss: {epoch_loss:.6f}", flush=True)
         
@@ -547,7 +551,7 @@ class SubproblemSurrogateNet(nn.Module):
         self.max_constraints = max_constraints
 
         if hidden_dims is None:
-            hidden_dims = [256, 256]
+            hidden_dims = [512, 256, 256]
 
         # 输入投影 + 残差块
         self.input_proj = nn.Linear(input_dim, hidden_dims[0])
@@ -560,23 +564,28 @@ class SubproblemSurrogateNet(nn.Module):
 
         feat_dim = prev_dim
         head_hidden = max(feat_dim // 2, 64)
+        head_mid = max(head_hidden // 2, 32)
 
-        # 四个参数头（每个带一个隐层）
+        # 四个参数头（每个带两个隐层 + LayerNorm）
         self.alpha_net = nn.Sequential(
-            nn.Linear(feat_dim, head_hidden), nn.LeakyReLU(0.01),
-            nn.Linear(head_hidden, self.max_constraints)
+            nn.Linear(feat_dim, head_hidden), nn.LayerNorm(head_hidden), nn.LeakyReLU(0.01),
+            nn.Linear(head_hidden, head_mid), nn.LayerNorm(head_mid), nn.LeakyReLU(0.01),
+            nn.Linear(head_mid, self.max_constraints)
         )
         self.beta_net = nn.Sequential(
-            nn.Linear(feat_dim, head_hidden), nn.LeakyReLU(0.01),
-            nn.Linear(head_hidden, self.max_constraints)
+            nn.Linear(feat_dim, head_hidden), nn.LayerNorm(head_hidden), nn.LeakyReLU(0.01),
+            nn.Linear(head_hidden, head_mid), nn.LayerNorm(head_mid), nn.LeakyReLU(0.01),
+            nn.Linear(head_mid, self.max_constraints)
         )
         self.gamma_net = nn.Sequential(
-            nn.Linear(feat_dim, head_hidden), nn.LeakyReLU(0.01),
-            nn.Linear(head_hidden, self.max_constraints)
+            nn.Linear(feat_dim, head_hidden), nn.LayerNorm(head_hidden), nn.LeakyReLU(0.01),
+            nn.Linear(head_hidden, head_mid), nn.LayerNorm(head_mid), nn.LeakyReLU(0.01),
+            nn.Linear(head_mid, self.max_constraints)
         )
         self.delta_net = nn.Sequential(
-            nn.Linear(feat_dim, head_hidden), nn.LeakyReLU(0.01),
-            nn.Linear(head_hidden, self.max_constraints),
+            nn.Linear(feat_dim, head_hidden), nn.LayerNorm(head_hidden), nn.LeakyReLU(0.01),
+            nn.Linear(head_hidden, head_mid), nn.LayerNorm(head_mid), nn.LeakyReLU(0.01),
+            nn.Linear(head_mid, self.max_constraints),
             nn.Softplus()
         )
 
@@ -1708,12 +1717,20 @@ class SubproblemSurrogateTrainer:
         if not TORCH_AVAILABLE:
             return
 
-        self.optimizer = optim.Adam(self.surrogate_net.parameters(), lr=5e-5, weight_decay=1e-4)
+        # 前N轮BCD重建optimizer（适应剧烈变化），之后保持动量
+        optimizer_persist_after = 5
+        rebuild = (self.iter_number < optimizer_persist_after)
+        if rebuild or not hasattr(self, '_surr_optimizer') or self._surr_optimizer is None:
+            self._surr_optimizer = optim.Adam(
+                self.surrogate_net.parameters(), lr=3e-4, weight_decay=1e-4)
+            self._surr_scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
+                self._surr_optimizer, T_0=max(num_epochs, 1), T_mult=1)
+
         self.surrogate_net.train()
 
         for epoch in range(num_epochs):
             epoch_loss = 0.0
-            self.optimizer.zero_grad()
+            self._surr_optimizer.zero_grad()
             batch_count = 0
 
             for sample_id in range(self.n_samples):
@@ -1750,9 +1767,11 @@ class SubproblemSurrogateTrainer:
                 # batch 满或 epoch 结束：clip + step
                 if batch_count == batch_size or sample_id == self.n_samples - 1:
                     torch.nn.utils.clip_grad_norm_(self.surrogate_net.parameters(), max_norm=1.0)
-                    self.optimizer.step()
-                    self.optimizer.zero_grad()
+                    self._surr_optimizer.step()
+                    self._surr_optimizer.zero_grad()
                     batch_count = 0
+
+            self._surr_scheduler.step()
 
             if epoch == 0 or epoch == num_epochs - 1:
                 print(f"  [NN] epoch {epoch+1}/{num_epochs}, avg_loss = {epoch_loss/self.n_samples:.6f}", flush=True)

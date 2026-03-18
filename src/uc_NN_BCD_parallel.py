@@ -82,7 +82,7 @@ class ParallelAgent_NN_BCD(Agent_NN_BCD):
         super().__init__(ppc, active_set_data, T_delta, union_analysis)
         self.n_workers = min(n_workers, self.n_samples)
 
-    def iter(self, max_iter: int = 20, nn_epochs: int = 10, union_analysis=None):
+    def iter(self, max_iter: int = 20, dual_decay_round: int = 10, nn_epochs: int = 10, union_analysis=None):
         """主 BCD 迭代循环（样本级线程并行版本）。
 
         PG 块和 Dual 块使用 ThreadPoolExecutor 并发提交各样本；
@@ -101,6 +101,8 @@ class ParallelAgent_NN_BCD(Agent_NN_BCD):
 
         EPS = 1e-10
         gamma = self.gamma_base / (self.n_samples * max_iter)
+        
+        self.dual_decay_round = dual_decay_round
 
         print(
             f"[ParallelBCD] 开始并行BCD迭代 "

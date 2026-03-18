@@ -1921,7 +1921,12 @@ class Agent_NN_BCD:
         
         # mu和ita变量（注意：ita的维度是(ng, T)）
         
-        if (self.iter_number < self.dual_para_bound_quit_iteration):
+        if self.dual_decay_round is not None:
+            dual_decay_round_ = self.dual_decay_round
+        else:
+            dual_decay_round_ = self.dual_para_bound_quit_iteration
+            
+        if (self.iter_number < dual_decay_round_):
             mu = model.addVars(self.nl, self.T, lb=self.dual_para_bound, name='mu')
             ita = model.addVars(self.ng, self.T, lb=self.dual_para_bound, name='ita')
         else:
@@ -2266,7 +2271,7 @@ class Agent_NN_BCD:
 
         return theta_values_new_list, zeta_values_new_list
     
-    def iter(self, max_iter=20, nn_epochs=10, union_analysis=None):
+    def iter(self, max_iter=20, dual_decay_round=10, nn_epochs=10, union_analysis=None):
         """
         主迭代循环（参考uc_dfsm_bcd.py）
         - 迭代PG块（更新x, pg）
@@ -2275,6 +2280,8 @@ class Agent_NN_BCD:
         """
         if union_analysis is None:
             union_analysis = self._current_union_analysis
+        
+        self.dual_decay_round = dual_decay_round
         
         gamma = self.gamma_base / (self.n_samples * max_iter)
 
@@ -3851,41 +3858,93 @@ class Agent_NN_BCD:
         torch.save(state, filepath)
         print(f"✓ 模型参数已保存到: {filepath}", flush=True)
     
-    def load_model_parameters(self, filepath: str, map_location: str = "cpu") -> None:
+    @staticmethod
+    def _rebuild_sequential_from_state_dict(sd: dict) -> 'nn.Sequential':
+        """从 state_dict 的 weight shape 推断 Linear 层结构，重建 nn.Sequential。
+
+        Args:
+            sd: 网络的 state_dict，键形如 '0.weight', '0.bias', '1.weight' 等。
+
+        Returns:
+            按保存时结构重建的 nn.Sequential（含 LeakyReLU + Dropout 中间层）。
         """
-        从文件加载神经网络模型参数（theta_net, zeta_net 和优化器状态）。
-        
+        import torch.nn as nn_local
+
+        # 收集所有 Linear 层的 (layer_idx, out_features, in_features)
+        linear_layers: list[tuple[int, int, int]] = []
+        for key, tensor in sd.items():
+            if key.endswith('.weight') and tensor.dim() == 2:
+                idx = int(key.split('.')[0])
+                out_f, in_f = tensor.shape
+                linear_layers.append((idx, out_f, in_f))
+        linear_layers.sort(key=lambda x: x[0])
+
+        # 重建与保存时相同的 Sequential 结构
+        layers: list[nn_local.Module] = []
+        for i, (idx, out_f, in_f) in enumerate(linear_layers):
+            layers.append(nn_local.Linear(in_f, out_f))
+            # 非最后一层：加 LeakyReLU + Dropout（与 _init_neural_network 一致）
+            if i < len(linear_layers) - 1:
+                layers.append(nn_local.LeakyReLU(0.01))
+                layers.append(nn_local.Dropout(0.1))
+        return nn_local.Sequential(*layers)
+
+    def load_model_parameters(self, filepath: str, map_location: str = "cpu") -> None:
+        """从文件加载神经网络模型参数（theta_net, zeta_net 和优化器状态）。
+
+        与 _init_neural_network 不同，此方法直接从 checkpoint 的 state_dict
+        推断网络结构并重建，避免因当前数据维度不同导致的 size mismatch。
+
         Args:
             filepath: 保存的 .pth 文件路径
             map_location: 加载到的设备（例如 'cpu' 或 'cuda:0'）
         """
         if not TORCH_AVAILABLE:
             raise RuntimeError("PyTorch未安装，无法加载模型参数。")
-        
+
         import os
         import torch
-        
+
         if not os.path.exists(filepath):
             raise FileNotFoundError(f"模型参数文件不存在: {filepath}")
-        
-        state = torch.load(filepath, map_location=map_location)
-        
-        if self.theta_net is None or self.zeta_net is None:
-            # 如尚未初始化网络，先初始化
-            self._init_neural_network()
-        
+
+        state = torch.load(filepath, map_location=map_location, weights_only=True)
+
+        # 从 state_dict 重建网络结构（而非调用 _init_neural_network）
+        self.theta_net = self._rebuild_sequential_from_state_dict(
+            state["theta_net_state_dict"]
+        )
+        self.zeta_net = self._rebuild_sequential_from_state_dict(
+            state["zeta_net_state_dict"]
+        )
+
         self.theta_net.load_state_dict(state["theta_net_state_dict"])
         self.zeta_net.load_state_dict(state["zeta_net_state_dict"])
-        
-        if state.get("optimizer_state_dict") is not None and hasattr(self, "optimizer"):
-            self.optimizer.load_state_dict(state["optimizer_state_dict"])
-        
-        # 同步变量名（一般不变，这里以防以后改动）
+
+        # 设备设置
+        device_str = state.get("device", "cpu")
+        if torch.cuda.is_available() and "cuda" in device_str:
+            self.device = torch.device(device_str)
+        else:
+            self.device = torch.device("cpu")
+        self.theta_net = self.theta_net.to(self.device)
+        self.zeta_net = self.zeta_net.to(self.device)
+
+        # 重建优化器
+        all_params = list(self.theta_net.parameters()) + list(self.zeta_net.parameters())
+        self.optimizer = optim.Adam(all_params, lr=1e-4, weight_decay=1e-4)
+        if state.get("optimizer_state_dict") is not None:
+            try:
+                self.optimizer.load_state_dict(state["optimizer_state_dict"])
+            except (ValueError, KeyError):
+                pass  # optimizer 结构变化时忽略
+
+        # 同步变量名
         if state.get("theta_var_names") is not None:
             self.theta_var_names = state["theta_var_names"]
         if state.get("zeta_var_names") is not None:
             self.zeta_var_names = state["zeta_var_names"]
-        
+
         print(f"✓ 模型参数已从文件加载: {filepath}", flush=True)
 
     def plot_sample0_binary_comparison(

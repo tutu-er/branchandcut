@@ -57,7 +57,7 @@ if not check_and_install_dependencies():
 #   'bcd'       - 加载 BCD 神经网络模型并报告参数统计
 #   'both'      - 联合加载 BCD + surrogate，以全体代理约束评估（需同时配置下面两个路径）
 #
-MODE      = 'BCD'
+MODE      = 'bcd'
 RUN_FP    = False       # surrogate / both 模式：是否运行可行性泵测试
 CASE_NAME = 'case30'   # 'case14' / 'case30' / 'case39'
 
@@ -65,9 +65,10 @@ CASE_NAME = 'case30'   # 'case14' / 'case30' / 'case39'
 MODEL_DIR = 'result/subproblem_models_case30_20260306_171140'
 
 # bcd / both 模式：已训练 BCD 模型 .pth 文件路径
-BCD_MODEL_PATH = 'result/bcd_model_case30_20260306_171140.pth'
+BCD_MODEL_PATH = 'result/bcd_models/bcd_model_case30_20260318_000506.pth'
 
 TEST_SAMPLES = 3   # 测试/评估样本数
+ACTIVE_SETS_FILE = 'result/active_set/active_sets_case30_T24_n340_20260317_152540.json'  # 指定 active_sets JSON 文件路径（None=自动查找最新）
 
 # ──────────────────────── 导入 ────────────────────────
 
@@ -1040,9 +1041,245 @@ def _load_bcd_agent(ppc, data_file: Path, bcd_model_path: str,
     return agent
 
 
+def plot_lp_surrogate_comparison(
+    x_opt: np.ndarray,
+    x_lp: np.ndarray,
+    x_surr: np.ndarray,
+    sample_id: int,
+    fig_dir: Path,
+    case_name: str,
+) -> None:
+    """绘制单样本 3×2 热图：x* / x_LP / x_LP_surrogate 的状态与误差。
+
+    左列：连续值热图 (0~1, Blues)；右列：|x - x*| 误差热图 (Reds)。
+
+    Args:
+        x_opt:     最优整数解 (ng, T)。
+        x_lp:      标准 LP 松弛解 (ng, T)。
+        x_surr:    含代理约束 LP 解 (ng, T)。
+        sample_id: 样本编号（仅用于标题/文件名）。
+        fig_dir:   图像输出目录。
+        case_name: 算例名。
+    """
+    if not MPL_AVAILABLE:
+        return
+
+    _apply_style()
+    ng, T = x_opt.shape
+    diff_lp = np.abs(x_lp - x_opt)
+    diff_surr = np.abs(x_surr - x_opt)
+
+    l1_lp = float(np.sum(diff_lp))
+    l1_surr = float(np.sum(diff_surr))
+
+    fig, axes = plt.subplots(
+        3, 2, figsize=(12, 9),
+        gridspec_kw={'width_ratios': [1, 1], 'hspace': 0.45, 'wspace': 0.15},
+    )
+    fig.suptitle(
+        f'LP Relaxation vs Surrogate LP  [Sample {sample_id}, {case_name}]',
+        fontsize=13, fontweight='bold', y=1.01,
+    )
+
+    data_left = [x_opt, x_lp, x_surr]
+    data_right = [np.zeros_like(x_opt), diff_lp, diff_surr]
+    row_titles = [
+        r'A. $x^*$ (True Optimum)',
+        f'B. $x_{{LP}}$  (L1 = {l1_lp:.2f})',
+        f'C. $x_{{LP,surr}}$  (L1 = {l1_surr:.2f})',
+    ]
+    right_titles = [
+        '(reference)',
+        f'|$x_{{LP}} - x^*$|',
+        f'|$x_{{LP,surr}} - x^*$|',
+    ]
+
+    yticks = list(range(ng))
+    ylabels = [f'G{g}' for g in yticks]
+
+    for i in range(3):
+        # 左列：状态热图
+        ax_l = axes[i, 0]
+        im_l = ax_l.imshow(data_left[i], aspect='auto', cmap='Blues', vmin=0, vmax=1)
+        ax_l.set_title(row_titles[i], loc='left', fontsize=11, fontweight='bold')
+        ax_l.set_yticks(yticks)
+        ax_l.set_yticklabels(ylabels)
+        ax_l.set_ylabel('Unit')
+        if i == 2:
+            ax_l.set_xlabel('Time Period')
+
+        # 右列：误差热图
+        ax_r = axes[i, 1]
+        if i == 0:
+            ax_r.axis('off')
+            ax_r.text(0.5, 0.5, 'No error\n(reference)', ha='center', va='center',
+                      fontsize=12, color='#888888', transform=ax_r.transAxes)
+        else:
+            im_r = ax_r.imshow(data_right[i], aspect='auto', cmap='Reds', vmin=0, vmax=1)
+            ax_r.set_title(right_titles[i], loc='left', fontsize=11)
+            ax_r.set_yticks(yticks)
+            ax_r.set_yticklabels(ylabels)
+            if i == 2:
+                ax_r.set_xlabel('Time Period')
+            fig.colorbar(im_r, ax=ax_r, fraction=0.045, pad=0.03)
+
+    # 给左列第一行加 colorbar
+    fig.colorbar(im_l, ax=axes[0, 0], fraction=0.045, pad=0.03)
+
+    path = fig_dir / f'lp_surrogate_heatmap_sample{sample_id}_{case_name}'
+    _save_fig(fig, path, f'LP vs Surrogate heatmap sample {sample_id}')
+
+
+def plot_lp_surrogate_bar(
+    dist_lp: np.ndarray,
+    dist_surr: np.ndarray,
+    hamming_lp: np.ndarray,
+    hamming_surr: np.ndarray,
+    fig_dir: Path,
+    case_name: str,
+) -> None:
+    """绘制逐样本 L1 距离与 Hamming 距离对比柱状图（LP vs Surrogate LP）。
+
+    Args:
+        dist_lp:      各样本 |x_LP - x*| 的 L1 距离。
+        dist_surr:    各样本 |x_LP_surr - x*| 的 L1 距离。
+        hamming_lp:   各样本舍入后 Hamming 距离。
+        hamming_surr: 各样本舍入后 Hamming 距离。
+        fig_dir:      图像输出目录。
+        case_name:    算例名。
+    """
+    if not MPL_AVAILABLE:
+        return
+
+    _apply_style()
+    n = len(dist_lp)
+    x_pos = np.arange(n)
+    bar_w = 0.35
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
+    fig.suptitle(
+        f'LP Distance Comparison  [{case_name}]',
+        fontsize=13, fontweight='bold', y=1.02,
+    )
+
+    # 左：L1 距离
+    ax1.bar(x_pos - bar_w / 2, dist_lp, bar_w, label='Standard LP', color='#2166AC')
+    ax1.bar(x_pos + bar_w / 2, dist_surr, bar_w, label='Surrogate LP', color='#D6604D')
+    ax1.set_xlabel('Sample')
+    ax1.set_ylabel(r'$\| x - x^* \|_1$')
+    ax1.set_title('L1 Distance to Optimum')
+    ax1.set_xticks(x_pos)
+    ax1.set_xticklabels([f'S{i}' for i in range(n)])
+    ax1.legend()
+
+    # 右：Hamming 距离
+    ax2.bar(x_pos - bar_w / 2, hamming_lp, bar_w, label='Standard LP', color='#2166AC')
+    ax2.bar(x_pos + bar_w / 2, hamming_surr, bar_w, label='Surrogate LP', color='#D6604D')
+    ax2.set_xlabel('Sample')
+    ax2.set_ylabel('Hamming Distance')
+    ax2.set_title('Hamming Distance (after rounding)')
+    ax2.set_xticks(x_pos)
+    ax2.set_xticklabels([f'S{i}' for i in range(n)])
+    ax2.legend()
+
+    fig.tight_layout()
+    path = fig_dir / f'lp_surrogate_distance_bar_{case_name}'
+    _save_fig(fig, path, 'LP vs Surrogate distance bar')
+
+
+def analyse_lp_distance(agent, test_n: int, fig_dir: Path,
+                        case_name: str) -> None:
+    """计算并对比标准 LP 松弛 vs 含代理约束 LP 与最优解的距离。
+
+    对每个样本求解两种 LP，计算 L1 距离和舍入 Hamming 距离，
+    打印汇总表格并绘制热图 + 柱状图。
+
+    Args:
+        agent:     已加载参数的 Agent_NN_BCD 实例。
+        test_n:    测试样本数。
+        fig_dir:   图像输出目录。
+        case_name: 算例名。
+    """
+    n = min(test_n, agent.n_samples)
+    print("\n" + "=" * 70)
+    log(f"LP 距离分析: {n} 个样本")
+    print("=" * 70)
+
+    dist_lp_arr = np.zeros(n)
+    dist_surr_arr = np.zeros(n)
+    hamming_lp_arr = np.zeros(n, dtype=int)
+    hamming_surr_arr = np.zeros(n, dtype=int)
+
+    x_lp_list: list[np.ndarray] = []
+    x_surr_list: list[np.ndarray] = []
+    x_opt_list: list[np.ndarray] = []
+    valid_ids: list[int] = []
+
+    for i in range(n):
+        sol_lp = agent.solve_LP_without_theta_constraints(i)
+        sol_surr = agent.solve_LP_with_theta_constraints(i)
+        if sol_lp is None or sol_surr is None:
+            log(f"  样本 {i}: LP 求解失败，跳过")
+            continue
+
+        x_lp = sol_lp[1]       # (ng, T)
+        x_surr = sol_surr[1]   # (ng, T)
+        x_opt = agent.x_opt[i] # (ng, T)
+
+        # L1 距离
+        d_lp = float(np.sum(np.abs(x_lp - x_opt)))
+        d_surr = float(np.sum(np.abs(x_surr - x_opt)))
+
+        # 舍入后 Hamming 距离
+        h_lp = int(np.sum(np.round(x_lp).astype(int) != x_opt.astype(int)))
+        h_surr = int(np.sum(np.round(x_surr).astype(int) != x_opt.astype(int)))
+
+        dist_lp_arr[i] = d_lp
+        dist_surr_arr[i] = d_surr
+        hamming_lp_arr[i] = h_lp
+        hamming_surr_arr[i] = h_surr
+
+        valid_ids.append(i)
+        x_lp_list.append(x_lp)
+        x_surr_list.append(x_surr)
+        x_opt_list.append(x_opt)
+
+        log(f"  样本 {i}: L1(LP)={d_lp:.2f}  L1(surr)={d_surr:.2f}  "
+            f"Hamming(LP)={h_lp}  Hamming(surr)={h_surr}")
+
+    if not valid_ids:
+        log("没有有效样本，跳过分析")
+        return
+
+    # 汇总
+    nv = len(valid_ids)
+    print("\n" + "-" * 60)
+    log(f"汇总 ({nv} 个有效样本):")
+    log(f"  平均 L1 距离:      LP={dist_lp_arr[:nv].mean():.2f}  "
+        f"Surrogate={dist_surr_arr[:nv].mean():.2f}")
+    log(f"  平均 Hamming 距离:  LP={hamming_lp_arr[:nv].mean():.1f}  "
+        f"Surrogate={hamming_surr_arr[:nv].mean():.1f}")
+    reduction = (1 - dist_surr_arr[:nv].mean() / max(dist_lp_arr[:nv].mean(), 1e-9)) * 100
+    log(f"  代理约束 L1 缩减率: {reduction:.1f}%")
+    print("-" * 60)
+
+    # 绘图：第一个有效样本的 3×2 热图
+    plot_lp_surrogate_comparison(
+        x_opt_list[0], x_lp_list[0], x_surr_list[0],
+        valid_ids[0], fig_dir, case_name,
+    )
+
+    # 绘图：逐样本距离柱状图
+    plot_lp_surrogate_bar(
+        dist_lp_arr[:nv], dist_surr_arr[:nv],
+        hamming_lp_arr[:nv], hamming_surr_arr[:nv],
+        fig_dir, case_name,
+    )
+
+
 def test_bcd(ppc, data_file: Path, bcd_model_path: str,
              MAX_SAMPLES, T_DELTA: float, fig_dir: Path) -> None:
-    """加载 BCD 模型，初始化 agent，报告参数统计，绘图。"""
+    """加载 BCD 模型，初始化 agent，报告参数统计，绘图，分析 LP 距离。"""
     print("\n" + "=" * 70)
     log(f"加载 BCD 模型: {bcd_model_path}")
     print("=" * 70)
@@ -1055,7 +1292,9 @@ def test_bcd(ppc, data_file: Path, bcd_model_path: str,
     print("=" * 70)
     plot_bcd_analysis(agent, fig_dir, CASE_NAME)
 
-    log("BCD 测试完成（如需评估解质量，请使用 MODE='both' + RUN_FP=True）")
+    analyse_lp_distance(agent, TEST_SAMPLES, fig_dir, CASE_NAME)
+
+    log("BCD 测试完成")
 
 
 def test_both(ppc, data_file: Path, all_samples: list, T_DELTA: float,
@@ -1151,8 +1390,8 @@ def main():
     T_DELTA     = 1.0
     UNIT_IDS    = None   # None = 所有机组；或如 [0, 1, 2]
 
-    result_dir = Path(__file__).parent / 'result'
-    fig_dir    = result_dir / 'figures'
+    result_dir = Path(__file__).parent / 'result' / 'active_set'
+    fig_dir    = Path(__file__).parent / 'result' / 'figures'
     fig_dir.mkdir(parents=True, exist_ok=True)
     log(f"图像输出目录: {fig_dir}")
 
@@ -1172,7 +1411,16 @@ def main():
     log(f"  {n_units} 机组，{n_buses} 节点")
 
     # ── 查找数据文件 ─────────────────────────────────────
-    data_file = pick_data_file(result_dir, CASE_NAME)
+    if ACTIVE_SETS_FILE is not None:
+        data_file = Path(ACTIVE_SETS_FILE)
+        if not data_file.is_absolute():
+            data_file = Path(__file__).parent / data_file
+        if not data_file.exists():
+            log(f"错误: 指定的文件不存在: {data_file}")
+            sys.exit(1)
+        log(f"使用指定文件: {data_file}")
+    else:
+        data_file = pick_data_file(result_dir, CASE_NAME)
     if data_file is None:
         log(f"错误: 在 {result_dir} 中未找到 {CASE_NAME} 的 JSON 数据文件。")
         log("请先运行 ActiveSetLearner 生成数据，或在 result/ 目录下放置")

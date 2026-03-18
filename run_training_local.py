@@ -257,8 +257,8 @@ def print_surrogate_results(trainers, all_samples):
         print(f"  整数性指标(样本0): {integrality:.6f}  (0=完全整数)")
 
 
-def run_bcd(ppc, all_samples: list, T_DELTA, MAX_ITER, result_dir,
-            case_name: str = 'case', timestamp: str = '', n_workers: int = 4, NN_EPOCHS: int = 10):
+def run_bcd(ppc, all_samples: list, T_DELTA, MAX_ITER, bcd_model_dir,
+            case_name: str = 'case', timestamp: str = '', n_workers: int = 4, NN_EPOCHS: int = 10, DUAL_DECAY_ROUND: int = 10):
     """BCD 主代理训练（样本级并行），返回 ParallelAgent_NN_BCD 实例。"""
     log("模式: BCD 主代理训练（Agent_NN_BCD）")
     log(f"使用 {len(all_samples)} 个样本")
@@ -281,11 +281,11 @@ def run_bcd(ppc, all_samples: list, T_DELTA, MAX_ITER, result_dir,
     log("开始 BCD 迭代训练")
     print("=" * 70)
 
-    agent.iter(max_iter=MAX_ITER, nn_epochs=NN_EPOCHS)
+    agent.iter(max_iter=MAX_ITER, dual_decay_round=DUAL_DECAY_ROUND, nn_epochs=NN_EPOCHS)
 
     # 保存模型（含算例名和时间戳）
     suffix = f'_{case_name}_{timestamp}' if timestamp else f'_{case_name}'
-    save_path = str(result_dir / f'bcd_model{suffix}.pth')
+    save_path = str(bcd_model_dir / f'bcd_model{suffix}.pth')
     try:
         agent.save_model_parameters(save_path)
         log(f"BCD 模型参数保存至: {save_path}")
@@ -347,17 +347,27 @@ def main():
     DUAL_EPOCHS     = 50
     DUAL_BATCH_SIZE = 8
     MAX_ITER        = 20            # 迭代次数（BCD / surrogate BCD 轮数）
+    DUAL_DECAY_ROUND= 10
     NN_EPOCHS       = 10            # surrogate 模式每次 BCD 迭代的 NN 训练轮数
     UNIT_IDS        = None          # None = 所有机组；或如 [0, 1, 2]
     FP_TEST_SAMPLES = 3             # feasibility_pump 模式：测试样本数
     N_WORKERS_BCD   = 2             # 样本级并行线程数；1 = 串行（BCD 建议先用串行），>1 = 线程并行
     N_WORKERS_SUBPROBLEM = 2             # 样本级并行线程数；1 = 串行（BCD 建议先用串行），>1 = 线程并行
+    JOINT_MAX_ITER  = 10            # 联合BCD训练外层迭代次数
+    JOINT_NN_EPOCHS = 5             # 联合BCD训练每轮theta/zeta NN训练epoch数
+    JOINT_SURR_NN_EPOCHS = 5        # 联合BCD训练每轮surrogate NN训练epoch数
+    JOINT_DUAL_DECAY_ROUND = 10     # 联合BCD训练dual_para_bound衰减轮次
     ACTIVE_SETS_FILE = None          # 指定 active_sets JSON 文件路径（None=自动查找最新）
+    BCD_MODEL_FILE   = None          # 指定已有 BCD 模型 .pth 文件路径（None=从头训练；both 模式下可跳过 BCD 训练）
 
-    result_dir = Path(__file__).parent / 'result' / 'active_set'
-    result_dir.mkdir(exist_ok=True)
+    data_dir = Path(__file__).parent / 'result' / 'active_set'
+    bcd_model_dir = Path(__file__).parent / 'result' / 'bcd_models'
+    surrogate_model_dir = Path(__file__).parent / 'result' / 'surrogate_models'
+    data_dir.mkdir(parents=True, exist_ok=True)
+    bcd_model_dir.mkdir(parents=True, exist_ok=True)
+    surrogate_model_dir.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    save_dir = str(result_dir / f'subproblem_models_{CASE_NAME}_{timestamp}')
+    save_dir = str(surrogate_model_dir / f'subproblem_models_{CASE_NAME}_{timestamp}')
 
     # ── 加载 PyPower 案例 ────────────────────────────────
     log(f"加载 PyPower 案例: {CASE_NAME}")
@@ -384,9 +394,9 @@ def main():
             sys.exit(1)
         log(f"使用指定文件: {data_file}")
     else:
-        data_file = pick_data_file(result_dir, CASE_NAME)
+        data_file = pick_data_file(data_dir, CASE_NAME)
     if data_file is None:
-        log(f"错误: 在 {result_dir} 中未找到 {CASE_NAME} 的 JSON 数据文件。")
+        log(f"错误: 在 {data_dir} 中未找到 {CASE_NAME} 的 JSON 数据文件。")
         log("请先运行 ActiveSetLearner 生成数据，或在 result/ 目录下放置")
         log(f"命名为 active_sets_{CASE_NAME}_*.json 的数据文件后重试。")
         sys.exit(1)
@@ -400,8 +410,8 @@ def main():
             if MAX_SAMPLES and len(all_samples_bcd) > MAX_SAMPLES:
                 log(f"  截取前 {MAX_SAMPLES} 个样本（共 {len(all_samples_bcd)}）")
                 all_samples_bcd = all_samples_bcd[:MAX_SAMPLES]
-            run_bcd(ppc, all_samples_bcd, T_DELTA, MAX_ITER, result_dir,
-                    case_name=CASE_NAME, timestamp=timestamp, n_workers=N_WORKERS_BCD, NN_EPOCHS=NN_EPOCHS)
+            run_bcd(ppc, all_samples_bcd, T_DELTA, MAX_ITER, bcd_model_dir,
+                    case_name=CASE_NAME, timestamp=timestamp, n_workers=N_WORKERS_BCD, NN_EPOCHS=NN_EPOCHS, DUAL_DECAY_ROUND=DUAL_DECAY_ROUND)
             if RUN_FP:
                 log("警告: bcd 模式不支持 RUN_FP（需要 trainers），请改用 both 模式")
 
@@ -428,14 +438,31 @@ def main():
                 )
 
         elif MODE == 'both':
-            # Step 1: BCD 训练
+            # Step 1: BCD 训练（或从已有模型加载跳过）
             log(f"通过 ActiveSetReader 加载数据: {data_file.name}")
             all_samples_bcd = load_active_set_from_json(str(data_file))
             if MAX_SAMPLES and len(all_samples_bcd) > MAX_SAMPLES:
                 log(f"  截取前 {MAX_SAMPLES} 个样本（共 {len(all_samples_bcd)}）")
                 all_samples_bcd = all_samples_bcd[:MAX_SAMPLES]
-            agent = run_bcd(ppc, all_samples_bcd, T_DELTA, MAX_ITER, result_dir,
-                            case_name=CASE_NAME, timestamp=timestamp, n_workers=N_WORKERS_BCD, NN_EPOCHS=NN_EPOCHS)
+
+            if BCD_MODEL_FILE is not None:
+                # 从已有模型加载，跳过 BCD 训练
+                bcd_path = Path(BCD_MODEL_FILE)
+                if not bcd_path.is_absolute():
+                    bcd_path = Path(__file__).parent / bcd_path
+                if not bcd_path.exists():
+                    log(f"错误: 指定的 BCD 模型文件不存在: {bcd_path}")
+                    sys.exit(1)
+                log(f"从已有模型加载 BCD，跳过 BCD 训练: {bcd_path}")
+                if N_WORKERS_BCD <= 1:
+                    agent = Agent_NN_BCD(ppc, all_samples_bcd, T_DELTA)
+                else:
+                    agent = ParallelAgent_NN_BCD(ppc, all_samples_bcd, T_DELTA, n_workers=N_WORKERS_BCD)
+                agent.load_model_parameters(str(bcd_path))
+                log("BCD 模型加载成功，跳过训练")
+            else:
+                agent = run_bcd(ppc, all_samples_bcd, T_DELTA, MAX_ITER, bcd_model_dir,
+                                case_name=CASE_NAME, timestamp=timestamp, n_workers=N_WORKERS_BCD, NN_EPOCHS=NN_EPOCHS, DUAL_DECAY_ROUND=DUAL_DECAY_ROUND)
 
             # Step 2: 加载 v3 格式样本
             all_samples = load_json_data(data_file)
@@ -460,7 +487,18 @@ def main():
             )
             print_surrogate_results(trainers, all_samples)
 
-            # Step 5: 可选 FP 测试
+            # Step 5: 联合BCD训练（theta/zeta + surrogate 约束，BCD迭代）
+            from joint_trainer import JointLPTrainer
+            log("联合BCD训练: pg块→dual块→theta/zeta NN→surrogate NN→cal_viol")
+            joint_trainer = JointLPTrainer(agent, trainers)
+            joint_trainer.iter(
+                max_iter=JOINT_MAX_ITER,
+                dual_decay_round=JOINT_DUAL_DECAY_ROUND,
+                nn_epochs=JOINT_NN_EPOCHS,
+                surr_nn_epochs=JOINT_SURR_NN_EPOCHS,
+            )
+
+            # Step 6: 可选 FP 测试
             if RUN_FP:
                 run_feasibility_pump_test(
                     ppc, all_samples, dual_predictor, trainers,
