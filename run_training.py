@@ -80,6 +80,8 @@ try:
         ActiveSetReader,
     )
     from uc_NN_subproblem_v3_parallel import ParallelSubproblemSurrogateTrainer
+    from training_logger import TrainingLogger
+    from training_visualizer import TrainingVisualizer
 except ImportError as e:
     print(f"模块导入失败: {e}")
     print("请确保在项目根目录运行此脚本，且 src/ 目录存在")
@@ -170,7 +172,7 @@ def pick_data_file(result_dir: Path, case_name: str) -> Path:
 
 def run_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS,
                   DUAL_EPOCHS, DUAL_BATCH_SIZE, MAX_ITER, NN_EPOCHS, save_dir,
-                  n_workers: int = 4):
+                  n_workers: int = 4, logger: 'TrainingLogger | None' = None):
     """V3 代理约束训练（样本级并行），返回 (dual_predictor, trainers)。"""
     import os
     from pypower.ext2int import ext2int
@@ -213,6 +215,8 @@ def run_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS,
                 lambda_predictor=dual_predictor,
                 n_workers=n_workers,
             )
+        if logger is not None:
+            trainer.logger = logger
         trainer.iter(max_iter=MAX_ITER, nn_epochs=NN_EPOCHS)
         trainers[g] = trainer
         if save_dir:
@@ -258,7 +262,8 @@ def print_surrogate_results(trainers, all_samples):
 
 
 def run_bcd(ppc, all_samples: list, T_DELTA, MAX_ITER, bcd_model_dir,
-            case_name: str = 'case', timestamp: str = '', n_workers: int = 4, NN_EPOCHS: int = 10, DUAL_DECAY_ROUND: int = 10):
+            case_name: str = 'case', timestamp: str = '', n_workers: int = 4, NN_EPOCHS: int = 10, DUAL_DECAY_ROUND: int = 10,
+            logger: 'TrainingLogger | None' = None):
     """BCD 主代理训练（样本级并行），返回 ParallelAgent_NN_BCD 实例。"""
     log("模式: BCD 主代理训练（Agent_NN_BCD）")
     log(f"使用 {len(all_samples)} 个样本")
@@ -281,6 +286,8 @@ def run_bcd(ppc, all_samples: list, T_DELTA, MAX_ITER, bcd_model_dir,
     log("开始 BCD 迭代训练")
     print("=" * 70)
 
+    if logger is not None:
+        agent.logger = logger
     agent.iter(max_iter=MAX_ITER, dual_decay_round=DUAL_DECAY_ROUND, nn_epochs=NN_EPOCHS)
 
     # 保存模型（含算例名和时间戳）
@@ -360,6 +367,9 @@ def main():
     ACTIVE_SETS_FILE = None          # 指定 active_sets JSON 文件路径（None=自动查找最新）
     BCD_MODEL_FILE   = "result/bcd_models/bcd_model_case30_20260318_000506.pth"           # 指定已有 BCD 模型 .pth 文件路径（None=从头训练；both 模式下可跳过 BCD 训练）
 
+    # 创建训练指标收集器
+    logger = TrainingLogger()
+
     data_dir = Path(__file__).parent / 'result' / 'active_set'
     bcd_model_dir = Path(__file__).parent / 'result' / 'bcd_models'
     surrogate_model_dir = Path(__file__).parent / 'result' / 'surrogate_models'
@@ -411,7 +421,8 @@ def main():
                 log(f"  截取前 {MAX_SAMPLES} 个样本（共 {len(all_samples_bcd)}）")
                 all_samples_bcd = all_samples_bcd[:MAX_SAMPLES]
             run_bcd(ppc, all_samples_bcd, T_DELTA, MAX_ITER, bcd_model_dir,
-                    case_name=CASE_NAME, timestamp=timestamp, n_workers=N_WORKERS_BCD, NN_EPOCHS=NN_EPOCHS, DUAL_DECAY_ROUND=DUAL_DECAY_ROUND)
+                    case_name=CASE_NAME, timestamp=timestamp, n_workers=N_WORKERS_BCD, NN_EPOCHS=NN_EPOCHS, DUAL_DECAY_ROUND=DUAL_DECAY_ROUND,
+                    logger=logger)
             if RUN_FP:
                 log("警告: bcd 模式不支持 RUN_FP（需要 trainers），请改用 both 模式")
 
@@ -427,7 +438,7 @@ def main():
             dual_predictor, trainers = run_surrogate(
                 ppc, all_samples, T_DELTA, UNIT_IDS,
                 DUAL_EPOCHS, DUAL_BATCH_SIZE, MAX_ITER, NN_EPOCHS, save_dir,
-                n_workers=N_WORKERS_SUBPROBLEM,
+                n_workers=N_WORKERS_SUBPROBLEM, logger=logger,
             )
             print_surrogate_results(trainers, all_samples)
 
@@ -462,7 +473,8 @@ def main():
                 log("BCD 模型加载成功，跳过训练")
             else:
                 agent = run_bcd(ppc, all_samples_bcd, T_DELTA, MAX_ITER, bcd_model_dir,
-                                case_name=CASE_NAME, timestamp=timestamp, n_workers=N_WORKERS_BCD, NN_EPOCHS=NN_EPOCHS, DUAL_DECAY_ROUND=DUAL_DECAY_ROUND)
+                                case_name=CASE_NAME, timestamp=timestamp, n_workers=N_WORKERS_BCD, NN_EPOCHS=NN_EPOCHS, DUAL_DECAY_ROUND=DUAL_DECAY_ROUND,
+                                logger=logger)
 
             # Step 2: 加载 v3 格式样本（subproblem 独立训练，不注入 BCD 对偶变量）
             all_samples = load_json_data(data_file)
@@ -477,7 +489,7 @@ def main():
             dual_predictor, trainers = run_surrogate(
                 ppc, all_samples, T_DELTA, UNIT_IDS,
                 DUAL_EPOCHS, DUAL_BATCH_SIZE, MAX_ITER, NN_EPOCHS, save_dir,
-                n_workers=N_WORKERS_SUBPROBLEM,
+                n_workers=N_WORKERS_SUBPROBLEM, logger=logger,
             )
             print_surrogate_results(trainers, all_samples)
 
@@ -486,6 +498,7 @@ def main():
             from joint_trainer import JointLPTrainer
             log("联合BCD训练: pg块→dual块→theta/zeta NN→surrogate NN→cal_viol")
             joint_trainer = JointLPTrainer(agent, trainers)
+            joint_trainer.logger = logger
             joint_trainer.iter(
                 max_iter=JOINT_MAX_ITER,
                 dual_decay_round=JOINT_DUAL_DECAY_ROUND,
@@ -509,6 +522,19 @@ def main():
         import traceback
         traceback.print_exc()
         sys.exit(1)
+
+    # ── 保存指标 & 生成图表 ────────────────────────────────
+    figures_dir = Path(__file__).parent / 'result' / 'figures'
+    metrics_path = Path(__file__).parent / 'result' / f'training_metrics_{CASE_NAME}_{timestamp}.json'
+    try:
+        logger.save(metrics_path)
+        log(f"训练指标已保存: {metrics_path}")
+        viz = TrainingVisualizer(logger)
+        viz.plot_all(figures_dir, trainers=locals().get('trainers'))
+    except Exception as e:
+        log(f"图表生成失败（非致命）: {e}")
+        import traceback
+        traceback.print_exc()
 
     # ── 汇总 ─────────────────────────────────────────────
     total_time = time.time() - start_time

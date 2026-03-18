@@ -795,6 +795,21 @@ class JointLPTrainer:
             print(f"  rho: primal={agent.rho_primal:.4f}, "
                   f"dual={agent.rho_dual:.4f}, opt={agent.rho_opt:.4f}", flush=True)
             print("  " + "-" * 40, flush=True)
+
+            # logger 钩子
+            if hasattr(self, 'logger') and self.logger is not None:
+                nn_loss = getattr(agent, '_last_nn_loss', None)
+                # 收集 surrogate NN 平均 loss
+                surr_losses = [getattr(t, '_last_surr_nn_loss', None) for t in self.trainers.values()]
+                surr_losses = [v for v in surr_losses if v is not None]
+                surr_nn_loss = float(np.mean(surr_losses)) if surr_losses else None
+                self.logger.log_joint_iter(
+                    iter=i, obj_primal=obj_primal, obj_dual=obj_dual, obj_opt=obj_opt,
+                    rho_primal=agent.rho_primal, rho_dual=agent.rho_dual, rho_opt=agent.rho_opt,
+                    integrality=integrality, nn_loss=nn_loss, surr_nn_loss=surr_nn_loss,
+                )
+                self.logger.snapshot('joint', i, x=agent.x[0], pg=agent.pg[0], lambda_=agent.lambda_[0])
+
             time.sleep(1)
 
         print("\n联合BCD训练完成", flush=True)

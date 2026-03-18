@@ -1815,7 +1815,11 @@ class SubproblemSurrogateTrainer:
 
             if epoch == 0 or epoch == num_epochs - 1:
                 print(f"  [NN] epoch {epoch+1}/{num_epochs}, avg_loss = {epoch_loss/self.n_samples:.6f}", flush=True)
-    
+
+        # 记录最终 epoch loss 供 logger 使用
+        if self.n_samples > 0:
+            self._last_surr_nn_loss = epoch_loss / self.n_samples
+
     def cal_viol(self) -> Tuple[float, float, float]:
         """
         计算完整KKT违反量（与primal/dual block的目标函数完全对应）
@@ -2004,6 +2008,8 @@ class SubproblemSurrogateTrainer:
         """
         主BCD迭代循环 - V3三时段耦合约束版本
         """
+        if not hasattr(self, 'logger'):
+            self.logger = None
         print(f"开始BCD迭代训练 (机组{self.unit_id}, V3三时段耦合约束)...", flush=True)
         
         for i in range(max_iter):
@@ -2065,7 +2071,22 @@ class SubproblemSurrogateTrainer:
 
             print(f"  ρ_primal={self.rho_primal:.4f}, ρ_dual={self.rho_dual:.4f}, ρ_opt={self.rho_opt:.4f}", flush=True)
             print("  " + "-" * 40, flush=True)
-        
+
+            # logger 钩子
+            if self.logger is not None:
+                nn_loss = getattr(self, '_last_surr_nn_loss', None)
+                self.logger.log_surrogate_iter(
+                    unit_id=self.unit_id, iter=i,
+                    obj_primal=obj_primal, obj_dual=obj_dual, obj_opt=obj_opt,
+                    rho_primal=self.rho_primal, rho_dual=self.rho_dual, rho_opt=self.rho_opt,
+                    alpha_mean=float(np.mean(self.alpha_values)),
+                    beta_mean=float(np.mean(self.beta_values)),
+                    gamma_mean=float(np.mean(self.gamma_values)),
+                    delta_mean=float(np.mean(self.delta_values)),
+                    mu_mean=float(np.mean(self.mu)),
+                    nn_loss=nn_loss,
+                )
+
         print(f"✓ 机组{self.unit_id} V3三时段耦合代理约束训练完成", flush=True)
     
     def get_surrogate_params(self, pd_data: np.ndarray, lambda_val: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:

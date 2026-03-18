@@ -2255,7 +2255,11 @@ class Agent_NN_BCD:
             if self.n_samples > 0 and (epoch == 0 or epoch == num_epochs - 1):
                 avg_loss = epoch_total_loss / self.n_samples
                 print(f"[NN-theta/zeta] epoch {epoch+1}/{num_epochs}, avg_loss = {avg_loss:.6f}", flush=True)
-        
+
+        # 记录最终 epoch loss 供 logger 使用
+        if self.n_samples > 0:
+            self._last_nn_loss = epoch_total_loss / self.n_samples
+
         # 更新theta和zeta值（per-sample 生成）
         self.theta_net.eval()
         self.zeta_net.eval()
@@ -2278,11 +2282,13 @@ class Agent_NN_BCD:
         - 迭代对偶块（更新lambda, mu, ita）
         - 使用神经网络更新theta和zeta
         """
+        if not hasattr(self, 'logger'):
+            self.logger = None
         if union_analysis is None:
             union_analysis = self._current_union_analysis
-        
+
         self.dual_decay_round = dual_decay_round
-        
+
         gamma = self.gamma_base / (self.n_samples * max_iter)
 
         for i in range(max_iter):
@@ -2359,6 +2365,17 @@ class Agent_NN_BCD:
             self.rho_opt = min(self.rho_opt + gamma * obj_opt, self.rho_max)
             print(f"当前惩罚参数: ρ_primal={self.rho_primal}, ρ_dual={self.rho_dual}, ρ_opt={self.rho_opt}", flush=True)
             print("--------------------------------", flush=True)
+
+            # logger 钩子
+            if self.logger is not None:
+                nn_loss = getattr(self, '_last_nn_loss', None)
+                self.logger.log_bcd_iter(
+                    iter=i, obj_primal=obj_primal, obj_dual=obj_dual, obj_opt=obj_opt,
+                    rho_primal=self.rho_primal, rho_dual=self.rho_dual, rho_opt=self.rho_opt,
+                    nn_loss=nn_loss,
+                )
+                self.logger.snapshot('bcd', i, x=self.x[0], pg=self.pg[0], lambda_=self.lambda_[0])
+
             time.sleep(1)
         
         return self.theta_values_list, self.zeta_values_list
