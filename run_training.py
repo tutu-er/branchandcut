@@ -346,7 +346,7 @@ def main():
     T_DELTA         = 1.0
     DUAL_EPOCHS     = 50
     DUAL_BATCH_SIZE = 8
-    MAX_ITER        = 20            # 迭代次数（BCD / surrogate BCD 轮数）
+    MAX_ITER        = 50            # 迭代次数（BCD / surrogate BCD 轮数）
     DUAL_DECAY_ROUND= 10
     NN_EPOCHS       = 10            # surrogate 模式每次 BCD 迭代的 NN 训练轮数
     UNIT_IDS        = None          # None = 所有机组；或如 [0, 1, 2]
@@ -356,7 +356,7 @@ def main():
     JOINT_MAX_ITER  = 10            # 联合BCD训练外层迭代次数
     JOINT_NN_EPOCHS = 5             # 联合BCD训练每轮theta/zeta NN训练epoch数
     JOINT_SURR_NN_EPOCHS = 5        # 联合BCD训练每轮surrogate NN训练epoch数
-    JOINT_DUAL_DECAY_ROUND = 10     # 联合BCD训练dual_para_bound衰减轮次
+    JOINT_DUAL_DECAY_ROUND = 0     # 联合BCD训练dual_para_bound衰减轮次
     ACTIVE_SETS_FILE = None          # 指定 active_sets JSON 文件路径（None=自动查找最新）
     BCD_MODEL_FILE   = None          # 指定已有 BCD 模型 .pth 文件路径（None=从头训练；both 模式下可跳过 BCD 训练）
 
