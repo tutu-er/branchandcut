@@ -5,7 +5,7 @@ uc_NN_BCD_parallel.py
 
 并行层级
 --------
-BCD 的 Agent_NN_BCD 是全机组联合求解（区别于 subproblem_v3 的 per-unit 分离），
+BCD 的 Agent_NN_BCD 是全机组联合求解（区别于 subproblem 的 per-unit 分离），
 因此只有 **样本级线程并行**（无进程级机组并行）：
 
 - PG 块：用 ThreadPoolExecutor 并发提交各样本的 Gurobi 求解；
@@ -265,8 +265,8 @@ if __name__ == '__main__':
         print("错误: pypower 未安装", flush=True)
         sys.exit(1)
 
-    # 导入测试数据生成器（复用 subproblem_v3 的实现）
-    from uc_NN_subproblem_v3 import generate_test_data
+    # 导入测试数据生成器（复用 subproblem 的实现）
+    from uc_NN_subproblem import generate_test_data
 
     # ── 测试参数 ─────────────────────────────────────────────────────
     T         = 8

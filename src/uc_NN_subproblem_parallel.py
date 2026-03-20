@@ -1,5 +1,5 @@
 """
-uc_NN_subproblem_v3_parallel.py
+uc_NN_subproblem_parallel.py
 ================================
 并行版 subproblem_v3 训练，分两个并行层级：
 
@@ -15,7 +15,7 @@ Level 2（样本级，跨线程）
 
 用法
 ----
-    from uc_NN_subproblem_v3_parallel import (
+    from uc_NN_subproblem_parallel import (
         ParallelSubproblemSurrogateTrainer,
         train_all_surrogates_parallel,
     )
@@ -38,7 +38,7 @@ for _p in [str(_SRC_DIR), str(_ROOT_DIR)]:
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from uc_NN_subproblem_v3 import (
+from uc_NN_subproblem import (
     SubproblemSurrogateTrainer,
     _extract_lambda_power_balance,
     generate_test_data,
@@ -235,7 +235,7 @@ def _train_unit_worker(args: dict) -> dict:
         if _p not in sys.path:
             sys.path.insert(0, _p)
 
-    from uc_NN_subproblem_v3 import SubproblemSurrogateTrainer
+    from uc_NN_subproblem import SubproblemSurrogateTrainer
 
     unit_id             = args['unit_id']
     ppc                 = args['ppc']
@@ -259,7 +259,7 @@ def _train_unit_worker(args: dict) -> dict:
     # 构建 trainer
     if use_sample_parallel:
         # 导入并行 trainer（子进程中重新 import，无问题）
-        from uc_NN_subproblem_v3_parallel import ParallelSubproblemSurrogateTrainer
+        from uc_NN_subproblem_parallel import ParallelSubproblemSurrogateTrainer
         trainer = ParallelSubproblemSurrogateTrainer(
             ppc, active_set_data, T_delta, unit_id,
             lambda_predictor=None,

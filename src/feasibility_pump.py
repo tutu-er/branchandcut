@@ -19,7 +19,30 @@ from pypower.makePTDF import makePTDF
 from pypower.idx_gen import GEN_BUS, PMIN, PMAX
 from pypower.idx_brch import RATE_A, BR_STATUS
 
-from uc_NN_subproblem_v3 import SubproblemSurrogateTrainer
+try:
+    from uc_NN_subproblem import SubproblemSurrogateTrainer
+except ImportError:
+    from src.uc_NN_subproblem import SubproblemSurrogateTrainer
+try:
+    from sparse_surrogate_mining import (
+        SparseSurrogateLibrary,
+        add_sparse_parameterized_constraints,
+    )
+except ImportError:
+    from src.sparse_surrogate_mining import (
+        SparseSurrogateLibrary,
+        add_sparse_parameterized_constraints,
+    )
+try:
+    from sparse_constraint_templates import (
+        SparseConstraintTemplateLibrary,
+        add_sparse_x_templates_to_model,
+    )
+except ImportError:
+    from src.sparse_constraint_templates import (
+        SparseConstraintTemplateLibrary,
+        add_sparse_x_templates_to_model,
+    )
 
 
 # ========================== Step 1：整数恢复启发式 ==========================
@@ -36,6 +59,228 @@ def round_to_integer(x_LP: np.ndarray, threshold: float = 0.5) -> np.ndarray:
         整数解，shape 与输入相同，值为 0 或 1
     """
     return (x_LP >= threshold).astype(int)
+
+
+def _repair_min_up_down_heuristic(x_int: np.ndarray, T_delta: float) -> np.ndarray:
+    """对整数点做轻量最小开关机时间修复，提升热启动质量。"""
+    x_repaired = np.asarray(x_int, dtype=int).copy()
+    ng, T = x_repaired.shape
+    Ton = min(int(4 * T_delta), T - 1)
+    Toff = min(int(4 * T_delta), T - 1)
+
+    if T <= 1:
+        return x_repaired
+
+    for g in range(ng):
+        changed = True
+        while changed:
+            changed = False
+
+            # 启动后必须至少持续 Ton 个时段开机
+            for t in range(T - 1):
+                if x_repaired[g, t] == 0 and x_repaired[g, t + 1] == 1:
+                    end = min(T, t + 1 + Ton)
+                    if np.any(x_repaired[g, t + 1:end] == 0):
+                        x_repaired[g, t + 1:end] = 1
+                        changed = True
+
+            # 关机后必须至少持续 Toff 个时段停机
+            for t in range(T - 1):
+                if x_repaired[g, t] == 1 and x_repaired[g, t + 1] == 0:
+                    end = min(T, t + 1 + Toff)
+                    if np.any(x_repaired[g, t + 1:end] == 1):
+                        x_repaired[g, t + 1:end] = 0
+                        changed = True
+
+    return x_repaired
+
+
+def _temporal_neighbor_average(x: np.ndarray, radius: int = 1) -> np.ndarray:
+    """按时间维计算邻域平均，用于方向性热启动与周边平均约束。"""
+    x_arr = np.asarray(x, dtype=float)
+    if x_arr.ndim == 1:
+        x_arr = x_arr[np.newaxis, :]
+
+    ng, T = x_arr.shape
+    avg = np.zeros_like(x_arr, dtype=float)
+    for t in range(T):
+        lo = max(0, t - radius)
+        hi = min(T, t + radius + 1)
+        avg[:, t] = np.mean(x_arr[:, lo:hi], axis=1)
+    return avg if x.ndim == 2 else avg[0]
+
+
+def _build_directional_hot_start(
+    x_LP: np.ndarray,
+    x_surr_LP: np.ndarray,
+    trusted_mask: np.ndarray
+) -> np.ndarray:
+    """利用 surrogate 相对 LP 的方向性，生成非对称热启动点。"""
+    lp_round = round_to_integer(x_LP)
+    surr_round = round_to_integer(x_surr_LP)
+
+    direction = x_surr_LP - x_LP
+    lp_neighbor = _temporal_neighbor_average(x_LP, radius=1)
+    surr_neighbor = _temporal_neighbor_average(x_surr_LP, radius=1)
+    round_neighbor = 0.5 * _temporal_neighbor_average(lp_round, radius=1) \
+                     + 0.5 * _temporal_neighbor_average(surr_round, radius=1)
+
+    # surrogate 比全局 LP 更强调局部结构，因此给更高权重；
+    # direction 与邻域平均共同决定是否做“反四舍五入”。
+    directional_score = (
+        0.35 * x_LP
+        + 0.65 * x_surr_LP
+        + 2.20 * direction
+        + 0.60 * (0.5 * lp_neighbor + 0.5 * surr_neighbor - 0.5)
+        + 0.35 * (round_neighbor - 0.5)
+    )
+
+    x_directional = (directional_score >= 0.5).astype(int)
+
+    upward_mask = (
+        (~trusted_mask)
+        & (direction >= 0.05)
+        & ((surr_neighbor >= 0.55) | (round_neighbor >= 0.75))
+    )
+    downward_mask = (
+        (~trusted_mask)
+        & (direction <= -0.05)
+        & ((surr_neighbor <= 0.45) | (round_neighbor <= 0.25))
+    )
+
+    x_directional[upward_mask] = 1
+    x_directional[downward_mask] = 0
+    x_directional[trusted_mask] = lp_round[trusted_mask]
+    return x_directional
+
+
+def _neighbor_average_1d(arr: np.ndarray, radius: int = 1) -> np.ndarray:
+    """对 surrogate 约束参数做邻域平均平滑。"""
+    arr = np.asarray(arr, dtype=float)
+    out = np.zeros_like(arr, dtype=float)
+    n = len(arr)
+    for i in range(n):
+        lo = max(0, i - radius)
+        hi = min(n, i + radius + 1)
+        out[i] = np.mean(arr[lo:hi])
+    return out
+
+
+def _perturb_surrogate_outputs(
+    alphas: np.ndarray,
+    betas: np.ndarray,
+    gammas: np.ndarray,
+    deltas: np.ndarray,
+    rng: np.random.Generator,
+    perturb_std: float = 0.10,
+    neighborhood_weight: float = 0.35
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """对 surrogate 网络输出参数做扰动，并引入周边平均约束。"""
+    def _perturb_one(arr: np.ndarray, clip_nonnegative: bool = False) -> np.ndarray:
+        arr = np.asarray(arr, dtype=float)
+        scale = np.maximum(np.abs(arr), 1.0)
+        noisy = arr + perturb_std * scale * rng.standard_normal(arr.shape)
+        neighbor_avg = _neighbor_average_1d(noisy, radius=1)
+        mixed = (1.0 - neighborhood_weight) * noisy + neighborhood_weight * neighbor_avg
+        if clip_nonnegative:
+            mixed = np.maximum(mixed, 0.0)
+        return mixed
+
+    return (
+        _perturb_one(alphas, clip_nonnegative=False),
+        _perturb_one(betas, clip_nonnegative=False),
+        _perturb_one(gammas, clip_nonnegative=False),
+        _perturb_one(deltas, clip_nonnegative=True),
+    )
+
+
+def _build_hot_start_candidates(
+    x_LP: np.ndarray,
+    x_surr_LP: np.ndarray,
+    x_init_k: np.ndarray,
+    x_init_k_m: np.ndarray,
+    trusted_mask: np.ndarray,
+    T_delta: float
+) -> List[Tuple[str, np.ndarray]]:
+    """根据全局 LP 与 surrogate LP 解构造多组启发式热启动点。"""
+    lp_round = round_to_integer(x_LP)
+    surr_round = round_to_integer(x_surr_LP)
+    directional = _build_directional_hot_start(x_LP, x_surr_LP, trusted_mask)
+
+    lp_margin = np.abs(x_LP - 0.5)
+    surr_margin = np.abs(x_surr_LP - 0.5)
+    choose_lp = lp_margin >= surr_margin
+
+    blended = np.where(choose_lp, lp_round, surr_round)
+    agreement = np.where(lp_round == surr_round, lp_round, blended)
+
+    vote_sum = (
+        lp_round.astype(float)
+        + surr_round.astype(float)
+        + x_init_k.astype(float)
+        + np.sum(x_init_k_m.astype(float), axis=1)
+    )
+    n_votes = 3 + x_init_k_m.shape[1]
+    majority = (vote_sum / n_votes >= 0.5).astype(int)
+
+    trusted_ref = np.where(trusted_mask, lp_round, majority)
+    confidence_mix = np.where(trusted_mask, lp_round, agreement)
+
+    candidate_specs = [
+        ("lp_round", lp_round),
+        ("surrogate_lp_round", surr_round),
+        ("directional_surrogate_start", directional),
+        ("lp_surrogate_confidence_mix", blended),
+        ("lp_surrogate_agreement", agreement),
+        ("vote_majority", majority),
+        ("trusted_vote_mix", trusted_ref),
+        ("trusted_confidence_mix", confidence_mix),
+    ]
+
+    unique_candidates: List[Tuple[str, np.ndarray]] = []
+    seen = set()
+    for name, x_candidate in candidate_specs:
+        repaired = _repair_min_up_down_heuristic(x_candidate, T_delta)
+        key = tuple(repaired.flatten().tolist())
+        if key not in seen:
+            seen.add(key)
+            unique_candidates.append((name, repaired))
+
+    return unique_candidates
+
+
+def _rank_hot_start_candidates(
+    candidates: List[Tuple[str, np.ndarray]],
+    x_LP: np.ndarray,
+    x_surr_LP: np.ndarray,
+    x_init_k: np.ndarray,
+    x_init_k_m: np.ndarray,
+    trusted_mask: np.ndarray
+) -> List[Tuple[str, np.ndarray, float]]:
+    """按与 LP / surrogate LP / 投票参考的一致性对热启动候选排序。"""
+    lp_round = round_to_integer(x_LP)
+    surr_round = round_to_integer(x_surr_LP)
+    vote_sum = x_init_k.astype(float) + np.sum(x_init_k_m.astype(float), axis=1)
+    vote_majority = (vote_sum / (1 + x_init_k_m.shape[1]) >= 0.5).astype(int)
+
+    ranked: List[Tuple[str, np.ndarray, float]] = []
+    for name, x_candidate in candidates:
+        trusted_match = float(np.sum(x_candidate[trusted_mask] == lp_round[trusted_mask]))
+        vote_match = float(np.sum(x_candidate == vote_majority))
+        lp_dist = float(np.sum(np.abs(x_candidate - x_LP)))
+        surr_dist = float(np.sum(np.abs(x_candidate - x_surr_LP)))
+        surrogate_match = float(np.sum(x_candidate == surr_round))
+        score = (
+            3.0 * trusted_match
+            + 1.5 * vote_match
+            + 0.5 * surrogate_match
+            - 0.75 * lp_dist
+            - 0.50 * surr_dist
+        )
+        ranked.append((name, x_candidate, score))
+
+    ranked.sort(key=lambda item: item[2], reverse=True)
+    return ranked
 
 
 # ========================== 内部辅助：代理约束添加 ==========================
@@ -203,8 +448,9 @@ def collect_integer_solutions(
     trainers: Dict[int, 'SubproblemSurrogateTrainer'],
     n_perturbations: int = 5,
     perturb_std: float = 0.1,
+    neighborhood_weight: float = 0.35,
     rng: Optional[np.random.Generator] = None
-) -> Tuple[np.ndarray, np.ndarray]:
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     收集多组整数解（来自子问题 LP + 代理参数扰动）。
 
@@ -213,10 +459,12 @@ def collect_integer_solutions(
         lambda_val: (T,) 功率平衡对偶变量
         trainers: {unit_id: SubproblemSurrogateTrainer}
         n_perturbations: 扰动次数
-        perturb_std: 扰动标准差（相对值）
+        perturb_std: surrogate 网络输出参数扰动标准差（相对值）
+        neighborhood_weight: 周边平均约束权重，越大表示越强调相邻约束平滑
         rng: 随机数生成器
 
     Returns:
+        x_surr_lp:  (ng, T) surrogate 子问题 LP 连续解
         x_init_k:   (ng, T) 各机组子问题 LP 整数解
         x_init_k_m: (ng, n_perturbations, T) 扰动参数后的多组整数解
     """
@@ -227,6 +475,7 @@ def collect_integer_solutions(
     ng = max(unit_ids) + 1
     T = pd_data.shape[1]
 
+    x_surr_lp = np.zeros((ng, T))
     x_init_k = np.zeros((ng, T), dtype=int)
     x_init_k_m = np.zeros((ng, n_perturbations, T), dtype=int)
 
@@ -236,21 +485,23 @@ def collect_integer_solutions(
 
         # 原始子问题 LP
         x_LP_k = _solve_unit_LP_with_surrogate(trainer, lambda_val, alphas, betas, gammas, deltas)
+        x_surr_lp[g] = x_LP_k
         x_init_k[g] = round_to_integer(x_LP_k)
 
-        # 扰动 pd_data，重新查询代理参数，生成多组解
+        # 扰动 surrogate 网络输出参数，并用周边平均约束平滑，生成多组解
         for m in range(n_perturbations):
-            noise = perturb_std * rng.standard_normal(pd_data.shape) * pd_data
-            pd_perturbed = pd_data + noise
-            alphas_m, betas_m, gammas_m, deltas_m, *_ = trainer.get_surrogate_params(
-                pd_perturbed, lambda_val
+            alphas_m, betas_m, gammas_m, deltas_m = _perturb_surrogate_outputs(
+                alphas, betas, gammas, deltas,
+                rng=rng,
+                perturb_std=perturb_std,
+                neighborhood_weight=neighborhood_weight,
             )
             x_LP_m = _solve_unit_LP_with_surrogate(
                 trainer, lambda_val, alphas_m, betas_m, gammas_m, deltas_m
             )
             x_init_k_m[g, m] = round_to_integer(x_LP_m)
 
-    return x_init_k, x_init_k_m
+    return x_surr_lp, x_init_k, x_init_k_m
 
 
 # ========================== Step 3：识别高可信度变量 ==========================
@@ -303,6 +554,8 @@ def solve_global_LP_relaxation(
     trainers: Dict[int, 'SubproblemSurrogateTrainer'],
     lambda_val: np.ndarray,
     agent=None,
+    sparse_library: Optional[SparseSurrogateLibrary] = None,
+    sparse_x_template_library: Optional[SparseConstraintTemplateLibrary] = None,
 ) -> np.ndarray:
     """
     构建完整 UC LP 松弛（x ∈ [0,1]），加入 V3 代理约束 + BCD theta/zeta 代理约束，求解得 x_LP。
@@ -315,6 +568,10 @@ def solve_global_LP_relaxation(
         lambda_val: (T,) 功率平衡对偶变量（用于查询代理约束参数）
         agent: （可选）已训练的 Agent_NN_BCD 实例；若提供则额外加入其
             theta/zeta 参数化代理约束（M-penalty 软约束形式）
+        sparse_library: （可选）离线筛选出的稀疏参数化约束库。若提供则以
+            `lhs(x, pg) - rhs(Pd) <= slack` 的软约束形式加入全局 LP。
+        sparse_x_template_library: （可选）x[g,t] 稀疏支持集模板库，以
+            `sum x[g_k, t_k] <= rhs + slack` 的形式软注入。
 
     Returns:
         x_LP: (ng, T) LP 松弛解；若不可行返回零矩阵
@@ -482,6 +739,24 @@ def solve_global_LP_relaxation(
                     name=f'zeta_surr_{_uid}_{_ts}'
                 )
                 surr_slacks.append(_slack)
+
+    # 可选的稀疏参数化约束库（M-penalty 软约束）
+    add_sparse_parameterized_constraints(
+        model,
+        x,
+        pg,
+        pd_data,
+        sparse_library=sparse_library,
+        surr_slacks=surr_slacks,
+        name_prefix="sparse",
+    )
+    add_sparse_x_templates_to_model(
+        model,
+        x,
+        template_library=sparse_x_template_library,
+        surr_slacks=surr_slacks,
+        name_prefix="sparse_x",
+    )
 
     # 目标：发电成本 + 启停成本 + M × Σ 代理约束违背量（软约束惩罚）
     obj = (gp.quicksum(cpower[g, t] for g in range(ng) for t in range(T))
@@ -940,9 +1215,14 @@ def recover_integer_solution(
     ppc: dict,
     T_delta: float,
     manager=None,
+    sparse_library: Optional[SparseSurrogateLibrary] = None,
+    sparse_x_template_library: Optional[SparseConstraintTemplateLibrary] = None,
     n_perturbations: int = 5,
     conf_threshold: float = 0.15,
     max_fp_iter: int = 50,
+    perturb_std: float = 0.1,
+    neighborhood_weight: float = 0.35,
+    use_hot_start: bool = True,
     verbose: bool = True,
     rng: Optional[np.random.Generator] = None
 ) -> Tuple[Optional[np.ndarray], bool]:
@@ -953,9 +1233,10 @@ def recover_integer_solution(
       1. 通过 lambda_predictor 获取对偶变量
       2. 求解全局 UC LP 松弛（含代理约束）→ x_LP，启发式四舍五入 → x_init
          （若提供 manager，则使用 manager.solve_global 替代默认 LP 求解器）
-      3. 各机组子问题 LP（+ 参数扰动）收集多组整数解
+      3. 各机组子问题 LP（+ 参数扰动）收集 surrogate LP 连续解与多组整数解
       4. 识别高可信度变量（整数性强 + 多来源一致）
-      5. 可行性泵：从 x_init 出发；失败则从 x_init_k 再试
+      5. 基于全局 LP / surrogate LP 构造多组热启动候选
+      6. 可行性泵：按热启动候选优先级依次尝试
 
     Args:
         pd_data: (nb_load, T) 负荷数据
@@ -965,9 +1246,14 @@ def recover_integer_solution(
         T_delta: 时间间隔（小时）
         manager: （可选）UnifiedSurrogateManager 实例；若提供则使用其
             solve_global 方法求解全局 LP 松弛（同时包含 theta/zeta 和 V3 代理约束）
+        sparse_library: （可选）离线筛选出的稀疏参数化约束库，仅在显式提供时启用
+        sparse_x_template_library: （可选）稀疏 x 支持集模板库，仅在显式提供时启用
         n_perturbations: 参数扰动次数
         conf_threshold: LP 整数性置信阈值
         max_fp_iter: 可行性泵最大迭代次数
+        perturb_std: surrogate 网络输出参数扰动标准差
+        neighborhood_weight: 周边平均约束权重
+        use_hot_start: 是否启用基于 LP 与 surrogate LP 的热启动候选
         verbose: 是否打印进度
         rng: 随机数生成器（传 None 则使用固定种子 42）
 
@@ -986,9 +1272,22 @@ def recover_integer_solution(
     if verbose:
         print("Step 2: 求解全局 UC LP 松弛 ...", flush=True)
     if manager is not None:
-        x_LP = manager.solve_global(pd_data, lambda_val)
+        x_LP = manager.solve_global(
+            pd_data,
+            lambda_val,
+            sparse_library=sparse_library,
+            sparse_x_template_library=sparse_x_template_library,
+        )
     else:
-        x_LP = solve_global_LP_relaxation(ppc, pd_data, T_delta, trainers, lambda_val)
+        x_LP = solve_global_LP_relaxation(
+            ppc,
+            pd_data,
+            T_delta,
+            trainers,
+            lambda_val,
+            sparse_library=sparse_library,
+            sparse_x_template_library=sparse_x_template_library,
+        )
     x_init = round_to_integer(x_LP)
 
     integrality_gap = float(np.mean(np.minimum(x_LP, 1 - x_LP)))  # 平均到0或1的距离
@@ -998,8 +1297,12 @@ def recover_integer_solution(
     # Step 3：收集多组整数解
     if verbose:
         print("Step 3: 收集多组整数解（子问题 LP + 扰动）...", flush=True)
-    x_init_k, x_init_k_m = collect_integer_solutions(
-        pd_data, lambda_val, trainers, n_perturbations=n_perturbations, rng=rng
+    x_surr_lp, x_init_k, x_init_k_m = collect_integer_solutions(
+        pd_data, lambda_val, trainers,
+        n_perturbations=n_perturbations,
+        perturb_std=perturb_std,
+        neighborhood_weight=neighborhood_weight,
+        rng=rng
     )
 
     # Step 4：识别高可信度变量
@@ -1013,29 +1316,56 @@ def recover_integer_solution(
     if verbose:
         print(f"  可信变量: {n_trusted}/{ng*T} ({100*n_trusted/(ng*T):.1f}%)", flush=True)
 
-    # 构建整数解池：x_init_k (ng,T) + x_init_k_m (ng, n_perturb, T) → (n_pool, ng, T)
-    x_pool = np.concatenate(
-        [x_init_k[np.newaxis],               # (1, ng, T)
-         x_init_k_m.transpose(1, 0, 2)],     # (n_perturb, ng, T)
-        axis=0
-    )
+    # Step 5：基于全局 LP 与 surrogate LP 的启发式热启动候选
+    hot_start_candidates: List[Tuple[str, np.ndarray, float]] = []
+    if use_hot_start:
+        hot_start_candidates = _rank_hot_start_candidates(
+            _build_hot_start_candidates(x_LP, x_surr_lp, x_init_k, x_init_k_m, trusted_mask, T_delta),
+            x_LP, x_surr_lp, x_init_k, x_init_k_m, trusted_mask
+        )
+    else:
+        hot_start_candidates = [
+            ("lp_round", x_init, 0.0),
+            ("surrogate_lp_round", _repair_min_up_down_heuristic(x_init_k, T_delta), -1.0),
+        ]
 
-    # Step 5：可行性泵（第一轮：从全局 LP 整数化解出发）
+    # 构建整数解池：子问题整数解 + 扰动解 + 热启动候选，供 FP 投影阶段使用
+    x_pool_list = [x_init_k]
+    x_pool_list.extend(list(x_init_k_m.transpose(1, 0, 2)))
+    x_pool_list.extend([x_start for _, x_start, _ in hot_start_candidates])
+
+    x_pool_unique: List[np.ndarray] = []
+    x_pool_seen = set()
+    for x_candidate in x_pool_list:
+        key = tuple(np.asarray(x_candidate, dtype=int).flatten().tolist())
+        if key not in x_pool_seen:
+            x_pool_seen.add(key)
+            x_pool_unique.append(np.asarray(x_candidate, dtype=int))
+    x_pool = np.stack(x_pool_unique, axis=0)
+
     if verbose:
-        print("Step 5: 运行可行性泵（初始点：全局 LP 四舍五入解）...", flush=True)
-    x_result, success = run_feasibility_pump(
-        x_init, trusted_mask, ppc, pd_data, T_delta,
-        x_pool=x_pool, max_iter=max_fp_iter, rng=rng, verbose=verbose
-    )
+        print("Step 5: 运行可行性泵热启动 ...", flush=True)
+        for idx, (name, _x_start, score) in enumerate(hot_start_candidates, start=1):
+            print(f"  热启动候选 {idx}: {name}, score={score:.2f}", flush=True)
 
-    if not success:
-        # 第二轮：从子问题 LP 整数解出发重试
+    x_result = hot_start_candidates[0][1] if hot_start_candidates else x_init
+    success = False
+
+    for idx, (name, x_start, _score) in enumerate(hot_start_candidates, start=1):
+        start_feas, _reason = check_uc_feasibility(x_start, ppc, pd_data, T_delta)
+        if start_feas:
+            if verbose:
+                print(f"  热启动候选 {idx}（{name}）已直接可行，无需进入 FP", flush=True)
+            return x_start, True
+
         if verbose:
-            print("Step 5b: 可行性泵（初始点：子问题 LP 整数解）...", flush=True)
+            print(f"  运行 FP 热启动 {idx}/{len(hot_start_candidates)}: {name}", flush=True)
         x_result, success = run_feasibility_pump(
-            x_init_k, trusted_mask, ppc, pd_data, T_delta,
+            x_start, trusted_mask, ppc, pd_data, T_delta,
             x_pool=x_pool, max_iter=max_fp_iter, rng=rng, verbose=verbose
         )
+        if success:
+            break
 
     if verbose:
         status_str = "✓ 找到可行解" if success else "✗ 未找到可行解（返回最近整数点）"

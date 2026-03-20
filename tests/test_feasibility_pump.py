@@ -16,6 +16,7 @@
 import sys
 import os
 import time
+from pathlib import Path
 
 import numpy as np
 import gurobipy as gp
@@ -29,11 +30,13 @@ import pypower.case30
 from pypower.ext2int import ext2int
 from pypower.idx_gen import PMIN, PMAX
 
-from src.uc_NN_subproblem_v3 import (
+from src.uc_NN_subproblem import (
     ActiveSetReader,
     SubproblemSurrogateTrainer,
     DualVariablePredictorTrainer,
 )
+from src.uc_NN_BCD import Agent_NN_BCD, load_active_set_from_json
+from src.uc_unified_surrogate import UnifiedSurrogateManager
 from src.feasibility_pump import (
     round_to_integer,
     check_uc_feasibility,
@@ -42,20 +45,60 @@ from src.feasibility_pump import (
 
 # ── 路径常量 ────────────────────────────────────────────────────────────────
 DATA_JSON  = os.path.join(ROOT, 'result', 'active_sets_case30_20251223_002959.json')
-MODEL_DIR  = os.path.join(ROOT, 'result', 'subproblem_models')
+MODEL_DIR  = None   # None -> 自动选择最新 surrogate 模型目录
+BMODEL_DIR = os.path.join(ROOT, 'result', 'surrogate_models')
+BCD_MODEL_PATH = None   # None -> 自动选择最新 BCD 模型
 T_DELTA    = 1.0
+USE_BCD_SURROGATE = True
 
 
 # ============================================================
 # 辅助函数
 # ============================================================
 
+def _pick_latest_path(paths):
+    paths = [Path(p) for p in paths]
+    if not paths:
+        return None
+    return str(sorted(paths, key=lambda p: p.stat().st_mtime)[-1])
+
+
+def resolve_surrogate_model_dir():
+    """解析 surrogate 模型目录，优先显式配置，否则自动选最新目录。"""
+    if MODEL_DIR is not None:
+        return MODEL_DIR
+
+    candidates = list(Path(BMODEL_DIR).glob('subproblem_models_case30_*'))
+    resolved = _pick_latest_path(candidates)
+    if resolved is None:
+        raise FileNotFoundError(
+            f"未找到 surrogate 模型目录，请检查 {BMODEL_DIR} 或显式设置 MODEL_DIR"
+        )
+    return resolved
+
+
+def resolve_bcd_model_path():
+    """解析 BCD 模型文件，优先显式配置，否则自动选最新文件。"""
+    if BCD_MODEL_PATH is not None:
+        return BCD_MODEL_PATH
+
+    candidates = list((Path(ROOT) / 'result' / 'bcd_models').glob('bcd_model_case30_*.pth'))
+    resolved = _pick_latest_path(candidates)
+    if resolved is None:
+        raise FileNotFoundError(
+            "未找到 BCD 模型文件，请在 result/bcd_models 下提供模型或显式设置 BCD_MODEL_PATH"
+        )
+    return resolved
+
+
 def load_models(ppc, active_set_data):
     """加载预训练的 lambda 预测器和各机组代理约束训练器。"""
     print("加载预训练模型 ...")
+    model_dir = resolve_surrogate_model_dir()
+    print(f"  surrogate 模型目录: {model_dir}")
 
     lambda_predictor = DualVariablePredictorTrainer(ppc, active_set_data, T_DELTA)
-    pred_path = os.path.join(MODEL_DIR, 'dual_predictor.pth')
+    pred_path = os.path.join(model_dir, 'dual_predictor.pth')
     lambda_predictor.load(pred_path)
     print(f"  lambda 预测器: 已加载 ({pred_path})")
 
@@ -63,7 +106,7 @@ def load_models(ppc, active_set_data):
     ng = ppc_int['gen'].shape[0]
     trainers = {}
     for g in range(ng):
-        path = os.path.join(MODEL_DIR, f'surrogate_unit_{g}.pth')
+        path = os.path.join(model_dir, f'surrogate_unit_{g}.pth')
         if os.path.exists(path):
             trainer = SubproblemSurrogateTrainer(
                 ppc, active_set_data, T_DELTA, unit_id=g,
@@ -76,6 +119,24 @@ def load_models(ppc, active_set_data):
             print(f"  机组 {g}: 无模型文件，跳过")
 
     return lambda_predictor, trainers
+
+
+def load_bcd_manager(ppc, active_set_data, trainers):
+    """加载 BCD 模型并构造联合代理管理器（BCD 约束 + subproblem 约束）。"""
+    bcd_model_path = resolve_bcd_model_path()
+    print(f"加载 BCD 模型: {bcd_model_path}")
+
+    bcd_samples = load_active_set_from_json(DATA_JSON)
+    if len(bcd_samples) > len(active_set_data):
+        bcd_samples = bcd_samples[:len(active_set_data)]
+
+    agent = Agent_NN_BCD(ppc, bcd_samples, T_DELTA)
+    agent.load_model_parameters(bcd_model_path)
+    print("  BCD agent: 已加载")
+
+    manager = UnifiedSurrogateManager(agent, trainers, bcd_samples)
+    print("  UnifiedSurrogateManager: 已启用（BCD + subproblem 联合约束）")
+    return manager
 
 
 def solve_milp_basic(ppc, pd_data, T_delta=1.0, time_limit=120.0):
@@ -238,7 +299,7 @@ def test_feasibility_check_on_milp(ppc, active_set_data, n_test=3):
 # ============================================================
 
 def test_recover_integer_solution(ppc, active_set_data, trainers, lambda_predictor,
-                                   n_test=None, fp_iter=50):
+                                   manager=None, n_test=None, fp_iter=50):
     """
     对每个样本运行完整的 recover_integer_solution pipeline，
     并与 Gurobi MILP 目标函数值对比。
@@ -264,6 +325,7 @@ def test_recover_integer_solution(ppc, active_set_data, trainers, lambda_predict
         t0 = time.time()
         x_fp, fp_success = recover_integer_solution(
             pd_data, trainers, lambda_predictor, ppc, T_DELTA,
+            manager=manager,
             n_perturbations=5,
             conf_threshold=0.15,
             max_fp_iter=fp_iter,
@@ -338,12 +400,20 @@ if __name__ == '__main__':
     lambda_predictor, trainers = load_models(ppc, active_set_data)
     print(f"  已加载 {len(trainers)} 个机组的代理约束模型\n")
 
+    manager = None
+    if USE_BCD_SURROGATE:
+        manager = load_bcd_manager(ppc, active_set_data, trainers)
+        print("  测试模式: 联合代理模型（BCD 约束 + subproblem 约束）\n")
+    else:
+        print("  测试模式: 仅 subproblem surrogate 约束\n")
+
     # 测试 1
     test1_pass = test_feasibility_check_on_milp(ppc, active_set_data, n_test=3)
 
     # 测试 2（全部 12 样本）
     results = test_recover_integer_solution(
         ppc, active_set_data, trainers, lambda_predictor,
+        manager=manager,
         n_test=None, fp_iter=50
     )
 

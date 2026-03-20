@@ -21,6 +21,9 @@ src/
   uc_NN_subproblem_v3.py  V3 三时段代理约束训练（主推）
   uc_NN_BCD.py            BCD + 神经网络主代理训练
   feasibility_pump.py     整数可行解恢复（可行性泵）
+  sparse_surrogate_mining.py 稀疏参数化约束挖掘与可选软注入
+  sparse_support_discovery.py x[g,t] 级别的稀疏支持集发现
+  sparse_constraint_templates.py 支持集模板构造与软注入
 tests/
   run_uc_case39.py        端到端 UC 测试
 run_training.py           多模式训练入口
@@ -42,6 +45,42 @@ python run_training.py
 # 3. 运行基准测试
 python tests/run_uc_case39.py
 ```
+
+## 可选：稀疏参数化约束
+
+`src/sparse_surrogate_mining.py` 提供一个与现有 BCD 主流程解耦的可选模块，用于：
+
+- 从历史样本中的 `Pd`, `pg_lp`, `pg_true`, `x_lp`, `x_true` 挖掘候选约束；
+- 用简单的 `Pd` 非线性特征拟合右端项 `rhs(Pd)`；
+- 通过“真实解满足率 + LP 违反量 + greedy 去冗余”筛出少量高价值约束；
+- 在 `feasibility_pump` / `UnifiedSurrogateManager` 中以软约束形式可选注入。
+
+默认情况下该模块不会改变现有 `run_training.py`、`run_test.py` 等入口的行为，只有在显式传入稀疏约束库时才会启用。
+
+推荐验证顺序：
+
+1. 离线统计：先用 `mine_sparse_surrogate_library(...)` 或
+   `mine_sparse_surrogate_library_from_agent(...)` 从已有样本中挖掘约束库。
+2. 质量检查：用 `evaluate_library_on_samples(...)` 和 `summarize_library(...)`
+   查看真实解满足率、LP 违反量差异和最终保留数量。
+3. 在线注入：将得到的 `SparseSurrogateLibrary` 作为可选参数传入
+   `feasibility_pump.recover_integer_solution(...)`，或在
+   `UnifiedSurrogateManager(..., sparse_library=library)` 中启用软约束注入。
+
+## 可选：稀疏支持集发现
+
+如果目标不是直接学习完整约束参数，而是先找到高价值参与变量，
+可以使用新的两阶段路径：
+
+1. 用 `src/sparse_support_discovery.py` 从 `x_lp`, `x_true`, `Pd`
+   中筛选高价值 `x[g,t]` 变量，并组合成少量跨时段支持集。
+2. 用 `src/sparse_constraint_templates.py` 将支持集转成固定模板库。
+3. 先把模板库作为软约束注入 `feasibility_pump` 或
+   `UnifiedSurrogateManager` 做离线验证。
+4. 如效果稳定，再把模板库通过 `Agent_NN_BCD(..., external_sparse_templates=...)`
+   接回 BCD 参数学习阶段。
+
+这条路径默认也不会改变现有入口行为，只有显式提供模板库时才启用。
 
 ## 依赖
 

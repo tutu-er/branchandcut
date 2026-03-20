@@ -60,6 +60,11 @@ except ImportError:
     PYPOWER_AVAILABLE = False
     print("警告: pypower未安装，测试代码可能无法运行", flush=True)
 
+try:
+    from sparse_constraint_templates import template_library_to_bcd_union_constraints
+except ImportError:
+    from src.sparse_constraint_templates import template_library_to_bcd_union_constraints
+
 # 设置输出缓冲
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', line_buffering=True)
 
@@ -325,7 +330,7 @@ class Agent_NN_BCD:
     - 约束构建：直接优化系数（类似uc_NN.py）
     """
     
-    def __init__(self, ppc, active_set_data, T_delta, union_analysis=None):
+    def __init__(self, ppc, active_set_data, T_delta, union_analysis=None, external_sparse_templates=None):
         self.ppc = ppc
         ppc = ext2int(ppc)
         self.baseMVA = ppc['baseMVA']
@@ -375,6 +380,7 @@ class Agent_NN_BCD:
         self.nl = self.branch.shape[0]
         
         self.active_set_data = active_set_data
+        self.external_sparse_templates = external_sparse_templates
         
         # 初始化theta和zeta变量字典
         self.theta_vars = {}
@@ -1196,9 +1202,14 @@ class Agent_NN_BCD:
         
         enable_theta = getattr(self, 'enable_theta_constraints', True)
         if enable_theta:
-            union_constraints = self._compute_dcpf_constraints_for_fractional_times(
-                fractional_variables, lambda_init
-            )
+            if getattr(self, 'external_sparse_templates', None) is not None:
+                union_constraints = template_library_to_bcd_union_constraints(
+                    self.external_sparse_templates
+                )
+            else:
+                union_constraints = self._compute_dcpf_constraints_for_fractional_times(
+                    fractional_variables, lambda_init
+                )
             
             # 手动为每个时段添加M=4个包含所有机组的约束
             # M = 4
@@ -1223,6 +1234,16 @@ class Agent_NN_BCD:
             'union_constraints': union_constraints,
             'union_zeta_constraints': union_zeta_constraints,
         }
+
+    def _theta_member_time_index(self, constraint_info, coeff_info):
+        """theta 成员变量的显式时间索引；旧模板回退到 constraint 的 time_slot。"""
+        return int(coeff_info.get('time_index', constraint_info.get('time_slot', 0)))
+
+    def _theta_var_name(self, branch_id, unit_id, member_time):
+        return f'theta_branch_{branch_id}_unit_{unit_id}_time_{member_time}'
+
+    def _theta_rhs_name(self, branch_id, anchor_time):
+        return f'theta_rhs_branch_{branch_id}_time_{anchor_time}'
     
     def _compute_dcpf_constraints_for_fractional_times(self, fractional_variables, lambda_init):
         """计算DCPF约束：per (branch, fractional_time) 构建，每条约束包含多个 generator。"""
@@ -1335,11 +1356,12 @@ class Agent_NN_BCD:
 
             for coeff_info in nonzero_coefficients:
                 unit_id = coeff_info['unit_id']
-                var_name = f'theta_branch_{branch_id}_unit_{unit_id}_time_{time_slot}'
+                member_time = self._theta_member_time_index(constraint, coeff_info)
+                var_name = self._theta_var_name(branch_id, unit_id, member_time)
                 initialization_values['theta_values'][var_name] = 0.0
 
-            theta_rhs_name = f'theta_rhs_branch_{branch_id}_time_{time_slot}'
-            initialization_values['theta_values'][theta_rhs_name] = 0.0
+            theta_rhs_name = self._theta_rhs_name(branch_id, time_slot)
+            initialization_values['theta_values'][theta_rhs_name] = constraint.get('initial_rhs', 0.0)
         
         # 初始化mu
         mu_init = np.ones((self.n_samples, self.nl, self.T), dtype=float) * 0.1
@@ -1395,22 +1417,23 @@ class Agent_NN_BCD:
             
             for coeff_info in nonzero_coefficients:
                 unit_id = coeff_info['unit_id']
-                var_name = f'theta_branch_{branch_id}_unit_{unit_id}_time_{time_slot}'
+                member_time = self._theta_member_time_index(constraint, coeff_info)
+                var_name = self._theta_var_name(branch_id, unit_id, member_time)
                 self.theta_vars[var_name] = {
                     'branch_id': branch_id,
                     'unit_id': unit_id,
-                    'time_slot': time_slot,
+                    'time_slot': member_time,
                     'var_name': var_name,
                     'value': 0.0
                 }
             
             # 创建右端项变量
-            theta_rhs_name = f'theta_rhs_branch_{branch_id}_time_{time_slot}'
+            theta_rhs_name = self._theta_rhs_name(branch_id, time_slot)
             self.theta_vars[theta_rhs_name] = {
                 'branch_id': branch_id,
                 'time_slot': time_slot,
                 'var_name': theta_rhs_name,
-                'value': 1.0
+                'value': constraint.get('initial_rhs', 1.0)
             }
         
         print(f"✓ 创建了 {len(self.theta_vars)} 个theta变量")
@@ -1577,8 +1600,8 @@ class Agent_NN_BCD:
 
         结果写入:
             _cached_theta_constraints: list[(branch_id, time_slot, constraint_type,
-                                            coeff_list[(unit_id, theta_idx)], rhs_idx)]
-            _dual_theta_lookup: dict[(unit_id, time_slot)] -> list[(theta_idx, branch_id)]
+                                            coeff_list[(unit_id, member_time, theta_idx)], rhs_idx)]
+            _dual_theta_lookup: dict[(unit_id, member_time)] -> list[(theta_idx, branch_id)]
             _cached_zeta_constraints: list[(unit_id, time_slot, zeta_idx, rhs_idx)]
             _dual_zeta_lookup: dict[(unit_id, time_slot)] -> list[zeta_idx]
         """
@@ -1602,13 +1625,14 @@ class Agent_NN_BCD:
                 coeff_list: list = []
                 for coeff_info in nonzero_coefficients:
                     unit_id = coeff_info['unit_id']
-                    theta_name = f'theta_branch_{branch_id}_unit_{unit_id}_time_{time_slot}'
+                    member_time = self._theta_member_time_index(constraint_info, coeff_info)
+                    theta_name = self._theta_var_name(branch_id, unit_id, member_time)
                     theta_idx = self._theta_name_to_idx.get(theta_name, -1)
                     if theta_idx >= 0:
-                        coeff_list.append((unit_id, theta_idx))
-                        dual_theta_lookup[(unit_id, time_slot)].append((theta_idx, branch_id))
+                        coeff_list.append((unit_id, member_time, theta_idx))
+                        dual_theta_lookup[(unit_id, member_time)].append((theta_idx, branch_id))
 
-                theta_rhs_name = f'theta_rhs_branch_{branch_id}_time_{time_slot}'
+                theta_rhs_name = self._theta_rhs_name(branch_id, time_slot)
                 rhs_idx = self._theta_name_to_idx.get(theta_rhs_name, -1)
                 cached_theta.append((branch_id, time_slot, constraint_type, coeff_list, rhs_idx))
 
@@ -2429,9 +2453,10 @@ class Agent_NN_BCD:
                     _t_s = _c['time_slot']
                     for _coeff in _c['nonzero_pg_coefficients']:
                         _u_id = _coeff['unit_id']
-                        _name = f'theta_branch_{_b_id}_unit_{_u_id}_time_{_t_s}'
+                        _m_t = self._theta_member_time_index(_c, _coeff)
+                        _name = self._theta_var_name(_b_id, _u_id, _m_t)
                         _val = sample_theta.get(_name, 0.0)
-                        theta_lookup.setdefault((_t_s, _u_id), []).append((_b_id, _val))
+                        theta_lookup.setdefault((_m_t, _u_id), []).append((_b_id, _val))
 
             zeta_lookup: dict[tuple[int, int], float] = {}
             if (self.enable_zeta_constraints and union_analysis
@@ -2548,11 +2573,12 @@ class Agent_NN_BCD:
                     lhs_expr = 0.0
                     for coeff_info in nonzero_coefficients:
                         unit_id = coeff_info['unit_id']
-                        theta_name = f'theta_branch_{branch_id}_unit_{unit_id}_time_{time_slot}'
+                        member_time = self._theta_member_time_index(constraint_info, coeff_info)
+                        theta_name = self._theta_var_name(branch_id, unit_id, member_time)
                         theta = sample_theta.get(theta_name, 0.0)
-                        lhs_expr += theta * x[unit_id, time_slot]
+                        lhs_expr += theta * x[unit_id, member_time]
                     
-                    theta_rhs_name = f'theta_rhs_branch_{branch_id}_time_{time_slot}'
+                    theta_rhs_name = self._theta_rhs_name(branch_id, time_slot)
                     theta_rhs = sample_theta.get(theta_rhs_name, 1.0)
                     violation = lhs_expr - theta_rhs
                     abs_violation = abs(violation)
@@ -2800,8 +2826,8 @@ class Agent_NN_BCD:
         # 计算theta相关的参数化约束损失（使用预处理缓存，无字符串格式化）
         for branch_id, time_slot, _ctype, coeff_list, rhs_idx in self._cached_theta_constraints:
             lhs_expr = 0.0
-            for unit_id, theta_idx in coeff_list:
-                lhs_expr = lhs_expr + theta_tensor[theta_idx] * x[unit_id, time_slot]
+            for unit_id, member_time, theta_idx in coeff_list:
+                lhs_expr = lhs_expr + theta_tensor[theta_idx] * x[unit_id, member_time]
 
             theta_rhs = theta_tensor[rhs_idx] if rhs_idx >= 0 else _one
 
@@ -2940,20 +2966,21 @@ class Agent_NN_BCD:
                 
                 for coeff_info in nonzero_coefficients:
                     unit_id = coeff_info['unit_id']
+                    member_time = self._theta_member_time_index(constraint_info, coeff_info)
                     original_coeff = 0
                     
                     # 直接获取theta变量值
-                    theta_name = f'theta_branch_{branch_id}_unit_{unit_id}_time_{time_slot}'
+                    theta_name = self._theta_var_name(branch_id, unit_id, member_time)
                     theta = theta_values.get(theta_name, 0.0)
                     
                     # 直接使用theta值作为系数
                     parametric_coeff = original_coeff + theta
                     
                     # 添加到左端项
-                    lhs_expr += parametric_coeff * x[unit_id, time_slot]
+                    lhs_expr += parametric_coeff * x[unit_id, member_time]
                 
                 # 构建右端项 - 从theta_values字典中获取
-                theta_rhs_name = f'theta_rhs_branch_{branch_id}_time_{time_slot}'
+                theta_rhs_name = self._theta_rhs_name(branch_id, time_slot)
                 if theta_rhs_name in theta_values:
                     parametric_rhs = theta_values[theta_rhs_name]
                 else:
@@ -3093,20 +3120,21 @@ class Agent_NN_BCD:
                 
                 for coeff_info in nonzero_coefficients:
                     unit_id = coeff_info['unit_id']
+                    member_time = self._theta_member_time_index(constraint_info, coeff_info)
                     original_coeff = 0
                     
                     # 直接获取theta变量值（不再使用多项式）
-                    theta_name = f'theta_branch_{branch_id}_unit_{unit_id}_time_{time_slot}'
+                    theta_name = self._theta_var_name(branch_id, unit_id, member_time)
                     theta = theta_values.get(theta_name, 0.0)
                     
                     # 直接使用theta值作为系数
                     parametric_coeff = original_coeff + theta
                     
                     # 添加到左端项
-                    lhs_expr += parametric_coeff * x[unit_id, time_slot]
+                    lhs_expr += parametric_coeff * x[unit_id, member_time]
                 
                 # 构建右端项 - 从theta_values字典中获取
-                theta_rhs_name = f'theta_rhs_branch_{branch_id}_time_{time_slot}'
+                theta_rhs_name = self._theta_rhs_name(branch_id, time_slot)
                 if theta_values is not None and theta_rhs_name in theta_values:
                     parametric_rhs = theta_values[theta_rhs_name]
                 else:
@@ -3188,8 +3216,6 @@ class Agent_NN_BCD:
             for constraint_info in union_constraints:
                 branch_id = constraint_info['branch_id']
                 time_slot = constraint_info['time_slot']
-                if time_slot != t_id:
-                    continue
                 constraint_type = constraint_info.get('constraint_type', 'dcpf')
                 nonzero_coefficients = constraint_info['nonzero_pg_coefficients']
                 constraint_name = constraint_info['constraint_name']
@@ -3197,12 +3223,13 @@ class Agent_NN_BCD:
                 # 直接使用theta值，不再使用多项式参数化
                 for coeff_info in nonzero_coefficients:
                     unit_id = coeff_info['unit_id']
-                    if unit_id != g_id:
+                    member_time = self._theta_member_time_index(constraint_info, coeff_info)
+                    if unit_id != g_id or member_time != t_id:
                         continue
                     original_coeff = 0
                     
                     # 直接获取theta变量值（不再使用多项式）
-                    theta_name = f'theta_branch_{branch_id}_unit_{unit_id}_time_{time_slot}'
+                    theta_name = self._theta_var_name(branch_id, unit_id, member_time)
                     theta = theta_values.get(theta_name, 0.0)
                     
                     # 直接使用theta值作为系数
@@ -3303,20 +3330,21 @@ class Agent_NN_BCD:
                 
                 for coeff_info in nonzero_coefficients:
                     unit_id = coeff_info['unit_id']
+                    member_time = self._theta_member_time_index(constraint_info, coeff_info)
                     original_coeff = 0.0
                     
                     # 直接获取theta变量值
-                    theta_name = f'theta_branch_{branch_id}_unit_{unit_id}_time_{time_slot}'
+                    theta_name = self._theta_var_name(branch_id, unit_id, member_time)
                     theta = theta_values.get(theta_name, 0.0)
                     
                     # 直接使用theta值作为系数
                     parametric_coeff = original_coeff + theta
                     
                     # 添加到左端项（使用当前的x值，numpy数组）
-                    lhs_expr += parametric_coeff * x[unit_id, time_slot]
+                    lhs_expr += parametric_coeff * x[unit_id, member_time]
                 
                 # 构建右端项
-                theta_rhs_name = f'theta_rhs_branch_{branch_id}_time_{time_slot}'
+                theta_rhs_name = self._theta_rhs_name(branch_id, time_slot)
                 if theta_rhs_name in theta_values:
                     parametric_rhs = theta_values[theta_rhs_name]
                 else:

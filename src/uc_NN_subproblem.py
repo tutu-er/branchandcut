@@ -39,8 +39,9 @@ except ImportError:
     PYPOWER_AVAILABLE = False
     print("警告: pypower未安装，测试代码可能无法运行", flush=True)
 
-# 设置输出缓冲
-sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', line_buffering=True)
+# 设置输出缓冲（用 reconfigure 原地修改，避免替换 stdout 导致 buffer 被 GC 关闭）
+if hasattr(sys.stdout, 'reconfigure'):
+    sys.stdout.reconfigure(encoding='utf-8', line_buffering=True)
 
 
 # ========================== 数据加载工具 ==========================
@@ -150,10 +151,36 @@ class ActiveSetReader:
         return unit_commitment
 
 
+def _extract_lambda_power_balance(lambda_field, T: int) -> np.ndarray:
+    """从样本的 lambda 字段中提取功率平衡对偶变量 (T,) 数组。
+    支持三种格式：
+      - list/ndarray: 直接使用
+      - dict with 'lambda_power_balance' key: 提取该字段
+      - dict without that key: 取第一个 list 值
+    """
+    if isinstance(lambda_field, dict):
+        if 'lambda_power_balance' in lambda_field:
+            arr = np.array(lambda_field['lambda_power_balance'], dtype=float)
+        else:
+            # 取第一个 list 类型的值
+            for v in lambda_field.values():
+                if isinstance(v, list):
+                    arr = np.array(v, dtype=float)
+                    break
+            else:
+                return np.zeros(T)
+    else:
+        arr = np.array(lambda_field, dtype=float)
+    # 确保长度匹配 T
+    if arr.ndim != 1 or len(arr) != T:
+        return np.zeros(T)
+    return arr
+
+
 def load_active_set_from_json(json_filepath: str, sample_id: Optional[int] = None):
     """从JSON文件加载活动集数据"""
     reader = ActiveSetReader(json_filepath)
-
+    
     if sample_id is not None:
         active_constraints, active_variables, pd_data = reader.extract_active_constraints_and_variables(sample_id)
         unit_commitment = reader.get_unit_commitment_matrix(sample_id)
@@ -168,28 +195,53 @@ def load_active_set_from_json(json_filepath: str, sample_id: Optional[int] = Non
         return reader.load_all_samples()
 
 
-def _extract_lambda_power_balance(lambda_field, T: int) -> np.ndarray:
-    """从样本的 lambda 字段中提取功率平衡对偶变量 (T,) 数组。
-    支持三种格式：
-      - list/ndarray: 直接使用
-      - dict with 'lambda_power_balance' key: 提取该字段
-      - dict without that key: 取第一个 list 值
+def generate_test_data(ppc, T: int = 8, n_samples: int = 10, seed: int = 42) -> List[Dict]:
     """
-    if isinstance(lambda_field, dict):
-        if 'lambda_power_balance' in lambda_field:
-            arr = np.array(lambda_field['lambda_power_balance'], dtype=float)
-        else:
-            for v in lambda_field.values():
-                if isinstance(v, list):
-                    arr = np.array(v, dtype=float)
-                    break
-            else:
-                return np.zeros(T)
-    else:
-        arr = np.array(lambda_field, dtype=float)
-    if arr.ndim != 1 or len(arr) != T:
-        return np.zeros(T)
-    return arr
+    生成测试用的活动集数据
+
+    Args:
+        ppc: PyPower案例数据
+        T: 时段数
+        n_samples: 样本数量
+        seed: 随机种子
+
+    Returns:
+        活动集数据列表
+    """
+    ppc_int = ext2int(ppc)
+    nb = ppc_int['bus'].shape[0]
+    ng = ppc_int['gen'].shape[0]
+
+    active_set_data = []
+
+    for sample_id in range(n_samples):
+        np.random.seed(seed + sample_id)
+
+        # 生成随机负荷数据（带有日变化曲线）
+        base_load = np.random.uniform(50, 150, nb)
+        time_factor = 1 + 0.3 * np.sin(np.linspace(0, 2*np.pi, T)) + 0.1 * np.random.randn(T)
+        pd_data = np.outer(base_load, time_factor)
+        pd_data = np.maximum(pd_data, 10)  # 确保负荷为正
+
+        # 生成随机的机组启停状态（满足部分约束）
+        unit_commitment = np.zeros((ng, T), dtype=int)
+        for g in range(ng):
+            on_probability = 0.6 + 0.3 * np.random.rand()
+            for t in range(T):
+                if np.random.rand() < on_probability:
+                    unit_commitment[g, t] = 1
+
+        sample = {
+            'sample_id': sample_id,
+            'pd_data': pd_data,
+            'unit_commitment_matrix': unit_commitment,
+            'active_constraints': [],
+            'active_variables': []
+        }
+        active_set_data.append(sample)
+
+    print(f"✓ 生成了 {n_samples} 个测试样本 (T={T}, nb={nb}, ng={ng})", flush=True)
+    return active_set_data
 
 
 # ========================== 第一部分：对偶变量预测网络 ==========================
@@ -206,25 +258,26 @@ class DualVariablePredictorNet(nn.Module):
         super(DualVariablePredictorNet, self).__init__()
         
         if hidden_dims is None:
-            hidden_dims = [256, 512, 256]
-        
+            hidden_dims = [256, 128]
+
         layers = []
         prev_dim = input_dim
-        
+
         for hidden_dim in hidden_dims:
             layers.append(nn.Linear(prev_dim, hidden_dim))
-            layers.append(nn.ReLU())
+            layers.append(nn.LayerNorm(hidden_dim))
+            layers.append(nn.LeakyReLU(0.01))
             layers.append(nn.Dropout(0.1))
             prev_dim = hidden_dim
-        
+
         layers.append(nn.Linear(prev_dim, output_dim))
         self.network = nn.Sequential(*layers)
         self._init_weights()
-    
+
     def _init_weights(self):
         for module in self.modules():
             if isinstance(module, nn.Linear):
-                nn.init.kaiming_normal_(module.weight, mode='fan_in', nonlinearity='relu')
+                nn.init.kaiming_normal_(module.weight, mode='fan_in', nonlinearity='leaky_relu')
                 if module.bias is not None:
                     nn.init.zeros_(module.bias)
     
@@ -294,32 +347,35 @@ class DualVariablePredictorTrainer:
     
     def _solve_for_true_dual_variables(self) -> np.ndarray:
         """获取功率平衡约束的对偶变量真值λ
-
+        
         优化策略：
         1. 如果JSON有lambda → 直接读取（0次求解）
         2. 如果JSON没有lambda → 从active_set提取x，求解ED（LP）获取（不需要MILP）
         """
         lambda_true = []
         needs_solve = []
-
+        
         # 检查JSON中是否已有lambda
         for sample_id in range(self.n_samples):
             if 'lambda' in self.active_set_data[sample_id] and \
                self.active_set_data[sample_id]['lambda'] is not None:
                 lam = _extract_lambda_power_balance(
                     self.active_set_data[sample_id]['lambda'], self.T)
-                lambda_true.append(lam)
+                if np.any(lam != 0) or True:  # 即使全零也接受，避免重复求解
+                    lambda_true.append(lam)
+                else:
+                    needs_solve.append(sample_id)
             else:
                 needs_solve.append(sample_id)
-
+        
         # 如果所有样本都有lambda，直接返回
         if not needs_solve:
             print(f"✓ 从数据中读取了 {len(lambda_true)} 个样本的 lambda 真值", flush=True)
             return np.array(lambda_true)
-
+        
         # 否则通过求解LP获取缺失的lambda
         print(f"⚠ {len(needs_solve)} 个样本缺少 lambda，从 active_set 提取 x 并求解 LP...", flush=True)
-
+        
         # 构建完整的lambda_true字典（按sample_id索引）
         lambda_dict = {}
         already_loaded = [i for i in range(self.n_samples) if i not in needs_solve]
@@ -358,10 +414,7 @@ class DualVariablePredictorTrainer:
 
             lambda_dict[sample_id] = lambda_sample
 
-        n_loaded = len(already_loaded)
-        n_solved = len(needs_solve)
-        print(f"✓ 成功获取所有 {self.n_samples} 个样本的 lambda"
-              f"（{n_loaded} 个从JSON读取，{n_solved} 个求解LP获得）", flush=True)
+        print(f"✓ 成功获取所有 {self.n_samples} 个样本的 lambda（{len(already_loaded)} 个从JSON读取，{len(needs_solve)} 个求解LP获得）", flush=True)
 
         # 按sample_id顺序返回
         return np.array([lambda_dict[i] for i in range(self.n_samples)])
@@ -390,8 +443,10 @@ class DualVariablePredictorTrainer:
         dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
         
         criterion = nn.MSELoss()
+        scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+            self.optimizer, patience=10, factor=0.5)
         self.network.train()
-        
+
         for epoch in range(num_epochs):
             epoch_loss = 0.0
             for batch_X, batch_Y in dataloader:
@@ -401,9 +456,10 @@ class DualVariablePredictorTrainer:
                 loss.backward()
                 self.optimizer.step()
                 epoch_loss += loss.item() * batch_X.size(0)
-            
+
             epoch_loss /= len(dataset)
-            
+            scheduler.step(epoch_loss)
+
             if (epoch + 1) % 20 == 0:
                 print(f"  Epoch {epoch+1}/{num_epochs}, Loss: {epoch_loss:.6f}", flush=True)
         
@@ -455,82 +511,181 @@ class DualVariablePredictorTrainer:
 
 # ========================== 第二部分：子问题代理约束训练（BCD方式） ==========================
 
+class ResBlock(nn.Module):
+    """残差块：Linear → LN → LeakyReLU → Linear → LN + skip"""
+
+    def __init__(self, in_dim: int, out_dim: int):
+        super().__init__()
+        self.fc1 = nn.Linear(in_dim, out_dim)
+        self.ln1 = nn.LayerNorm(out_dim)
+        self.fc2 = nn.Linear(out_dim, out_dim)
+        self.ln2 = nn.LayerNorm(out_dim)
+        self.act = nn.LeakyReLU(0.01)
+        self.skip = nn.Linear(in_dim, out_dim) if in_dim != out_dim else nn.Identity()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        identity = self.skip(x)
+        out = self.act(self.ln1(self.fc1(x)))
+        out = self.ln2(self.fc2(out))
+        return self.act(out + identity)
+
+
 class SubproblemSurrogateNet(nn.Module):
     """
-    单机组子问题的代理约束网络 - 时间耦合版本
-    
-    输入: Pd数据 + 对偶变量λ (pd_dim + T)
-    输出: 时间耦合约束参数 (alphas, betas, gammas)
-          约束形式: alpha_t * x_t + beta_t * x_{t+1} <= gamma_t  (对于 t = 0..T-2)
-          
-    这种形式可以学习相邻时段的关系：
-    - 模拟最小运行/停机时间的软约束
-    - 限制开关机频率
-    - 在整数性差的时段附近加强约束
+    单机组子问题的代理约束网络 - V3三时段耦合版本
+
+    输入: Pd数据 + 对偶变量λ + 机组静态参数 (pd_dim + T + 6)
+    输出: 三时段耦合约束参数 (alphas, betas, gammas, deltas)
+          约束形式: alpha_t * x_t + beta_t * x_{t+1} + gamma_t * x_{t+2} <= delta_t
+
+    改进点：
+    - 残差连接 + LayerNorm 稳定训练
+    - 输出头增加隐层增强表达力
+    - 机组静态参数作为额外特征
     """
-    
-    def __init__(self, input_dim: int, T: int, hidden_dims: List[int] = None):
+
+    def __init__(self, input_dim: int, T: int, max_constraints: int = 20, hidden_dims: List[int] = None):
         super(SubproblemSurrogateNet, self).__init__()
-        
+
         self.T = T
-        self.num_coupling_constraints = T - 1  # T-1个时序耦合约束
-        
+        self.max_constraints = max_constraints
+
         if hidden_dims is None:
-            hidden_dims = [128, 256, 128]
-        
-        # 统一的特征提取网络
-        feature_layers = []
-        prev_dim = input_dim
-        for hidden_dim in hidden_dims:
-            feature_layers.append(nn.Linear(prev_dim, hidden_dim))
-            feature_layers.append(nn.ReLU())
-            feature_layers.append(nn.Dropout(0.1))
-            prev_dim = hidden_dim
-        self.feature_extractor = nn.Sequential(*feature_layers)
-        
-        # alpha网络：预测当前时段系数 (T-1个)
-        self.alpha_net = nn.Linear(prev_dim, self.num_coupling_constraints)
-        
-        # beta网络：预测下一时段系数 (T-1个)
-        self.beta_net = nn.Linear(prev_dim, self.num_coupling_constraints)
-        
-        # gamma网络：预测右端项 (T-1个)
-        # 使用Softplus确保非负，加上偏置使初始值接近1
+            hidden_dims = [512, 256, 256]
+
+        # 输入投影 + 残差块
+        self.input_proj = nn.Linear(input_dim, hidden_dims[0])
+        res_blocks = []
+        prev_dim = hidden_dims[0]
+        for hd in hidden_dims:
+            res_blocks.append(ResBlock(prev_dim, hd))
+            prev_dim = hd
+        self.res_blocks = nn.ModuleList(res_blocks)
+
+        feat_dim = prev_dim
+        head_hidden = max(feat_dim // 2, 64)
+        head_mid = max(head_hidden // 2, 32)
+
+        # 四个参数头（每个带两个隐层 + LayerNorm）
+        self.alpha_net = nn.Sequential(
+            nn.Linear(feat_dim, head_hidden), nn.LayerNorm(head_hidden), nn.LeakyReLU(0.01),
+            nn.Linear(head_hidden, head_mid), nn.LayerNorm(head_mid), nn.LeakyReLU(0.01),
+            nn.Linear(head_mid, self.max_constraints)
+        )
+        self.beta_net = nn.Sequential(
+            nn.Linear(feat_dim, head_hidden), nn.LayerNorm(head_hidden), nn.LeakyReLU(0.01),
+            nn.Linear(head_hidden, head_mid), nn.LayerNorm(head_mid), nn.LeakyReLU(0.01),
+            nn.Linear(head_mid, self.max_constraints)
+        )
         self.gamma_net = nn.Sequential(
-            nn.Linear(prev_dim, self.num_coupling_constraints),
+            nn.Linear(feat_dim, head_hidden), nn.LayerNorm(head_hidden), nn.LeakyReLU(0.01),
+            nn.Linear(head_hidden, head_mid), nn.LayerNorm(head_mid), nn.LeakyReLU(0.01),
+            nn.Linear(head_mid, self.max_constraints)
+        )
+        self.delta_net = nn.Sequential(
+            nn.Linear(feat_dim, head_hidden), nn.LayerNorm(head_hidden), nn.LeakyReLU(0.01),
+            nn.Linear(head_hidden, head_mid), nn.LayerNorm(head_mid), nn.LeakyReLU(0.01),
+            nn.Linear(head_mid, self.max_constraints),
             nn.Softplus()
         )
-        
+
+        # 目标成本系数头：输出 T 个值，无激活（允许正负）
+        self.cost_net = nn.Sequential(
+            nn.Linear(feat_dim, head_hidden), nn.LayerNorm(head_hidden), nn.LeakyReLU(0.01),
+            nn.Linear(head_hidden, head_mid), nn.LayerNorm(head_mid), nn.LeakyReLU(0.01),
+            nn.Linear(head_mid, self.T)
+        )
+
         self._init_weights()
-    
+
     def _init_weights(self):
         for module in self.modules():
             if isinstance(module, nn.Linear):
-                nn.init.kaiming_normal_(module.weight, mode='fan_in', nonlinearity='relu')
+                nn.init.kaiming_normal_(module.weight, mode='fan_in', nonlinearity='leaky_relu')
                 if module.bias is not None:
                     nn.init.zeros_(module.bias)
-        
-        # gamma网络的偏置初始化为正值，使初始gamma接近1
-        if hasattr(self.gamma_net[0], 'bias') and self.gamma_net[0].bias is not None:
-            nn.init.constant_(self.gamma_net[0].bias, 1.0)
-    
+
+        # delta头最后一个Linear的偏置初始化为正值（Softplus前）
+        delta_linears = [m for m in self.delta_net if isinstance(m, nn.Linear)]
+        if delta_linears:
+            last_linear = delta_linears[-1]
+            if last_linear.bias is not None:
+                nn.init.constant_(last_linear.bias, 1.0)
+
     def forward(self, x):
         """
         前向传播
-        
+
         Args:
             x: 输入特征 (batch_size, input_dim)
-        
+
         Returns:
-            alphas: 当前时段系数 (batch_size, T-1)
-            betas: 下一时段系数 (batch_size, T-1)
-            gammas: 右端项 (batch_size, T-1)
+            alphas: t时段系数 (batch_size, max_constraints)
+            betas: t+1时段系数 (batch_size, max_constraints)
+            gammas: t+2时段系数 (batch_size, max_constraints)
+            deltas: 右端项 (batch_size, max_constraints)
+            costs: 目标成本系数 (batch_size, T)
         """
-        features = self.feature_extractor(x)
+        features = self.input_proj(x)
+        for block in self.res_blocks:
+            features = block(features)
         alphas = self.alpha_net(features)
         betas = self.beta_net(features)
         gammas = self.gamma_net(features)
-        return alphas, betas, gammas
+        deltas = self.delta_net(features)
+        costs = self.cost_net(features)
+        return alphas, betas, gammas, deltas, costs
+
+
+def identify_sensitive_timesteps(x_vals, threshold_low=0.1, threshold_high=0.9, max_constraints=20):
+    """
+    识别整数性差的敏感时段（用于三时段约束）
+    
+    Args:
+        x_vals: (T,) 时段变量值
+        threshold_low: 下阈值，低于此值认为接近0
+        threshold_high: 上阈值，高于此值认为接近1
+        max_constraints: 最大约束数量
+    
+    Returns:
+        sensitive_timesteps: 需要生成约束的时段索引列表（长度≤max_constraints）
+    """
+    T = len(x_vals)
+    sensitive = []
+    
+    # 三时段约束需要t, t+1, t+2都存在
+    for t in range(T - 2):
+        # 检查三时段窗口是否有整数性问题
+        window = x_vals[t:t+3]
+        # 如果窗口内任意变量在(0.1, 0.9)区间，标记为敏感
+        if any(threshold_low < x < threshold_high for x in window):
+            sensitive.append(t)
+    
+    # 限制约束数量
+    if len(sensitive) > max_constraints:
+        # 按整数性从差到好排序，保留最差的max_constraints个
+        violations = []
+        for t in sensitive:
+            window = x_vals[t:t+3]
+            # 整数性：sum(x*(1-x))，越大越差
+            viol = sum(x * (1-x) for x in window)
+            violations.append((t, viol))
+
+        # 按违反程度排序
+        violations.sort(key=lambda item: item[1], reverse=True)
+        sensitive = [t for t, _ in violations[:max_constraints]]
+        sensitive.sort()  # 按时间顺序排列
+
+    # 全整数回退：若无分数时段，按 |x[t]-0.5| 升序选最多 max_constraints 个三时段起点
+    if len(sensitive) == 0:
+        n_pick = min(max_constraints, T - 2)
+        candidates = list(range(T - 2))
+        candidates.sort(key=lambda t: min(abs(x_vals[t] - 0.5),
+                                          abs(x_vals[t+1] - 0.5),
+                                          abs(x_vals[t+2] - 0.5)))
+        sensitive = sorted(candidates[:n_pick])
+
+    return sensitive
 
 
 class SubproblemSurrogateTrainer:
@@ -551,9 +706,10 @@ class SubproblemSurrogateTrainer:
     """
     
     def __init__(self, ppc, active_set_data, T_delta, unit_id: int, 
-                 lambda_predictor: DualVariablePredictorTrainer = None, device=None):
+                 lambda_predictor: DualVariablePredictorTrainer = None, 
+                 max_constraints: int = 20, device=None):
         """
-        初始化单机组子问题代理约束训练器
+        初始化单机组子问题代理约束训练器 - V3三时段版本
         
         Args:
             ppc: PyPower案例数据
@@ -561,6 +717,7 @@ class SubproblemSurrogateTrainer:
             T_delta: 时间间隔
             unit_id: 机组索引
             lambda_predictor: 已训练的对偶变量预测器（可选）
+            max_constraints: 最大约束数量（敏感时段）
             device: 计算设备
         """
         self.ppc = ppc
@@ -573,6 +730,7 @@ class SubproblemSurrogateTrainer:
         self.n_samples = len(active_set_data)
         self.T_delta = T_delta
         self.unit_id = unit_id
+        self.max_constraints = max_constraints  # V3新增
         
         if isinstance(active_set_data, list):
             self.T = active_set_data[0]['pd_data'].shape[1]
@@ -603,11 +761,14 @@ class SubproblemSurrogateTrainer:
             self.device = device
         
         # BCD迭代参数
-        self.rho_primal = 1e-2
-        self.rho_dual = 1e-2
-        self.rho_opt = 1e-2
-        self.gamma = 1e-1
+        self.rho_primal = 1e-3
+        self.rho_dual = 1e-3
+        self.rho_opt = 1e-3
+        self.gamma = 1e-3
+        self.rho_max = 10.0
+        self.reg_weight = 1e-4   # alpha/beta/gamma L2 正则化权重
         self.mu_lower_bound = 0.1
+        self.cost_ema_alpha = 0.3  # cost_values EMA平滑系数，越小越平滑
         self.iter_number = 0
         
         # 初始化原始变量和对偶变量存储
@@ -616,24 +777,34 @@ class SubproblemSurrogateTrainer:
         self.coc = np.zeros((self.n_samples, self.T-1))
         self.cpower = np.zeros((self.n_samples, self.T))
         
-        # 时序耦合约束：T-1个约束，每个约束一个对偶变量
-        self.num_coupling_constraints = self.T - 1
+        # 三时段耦合约束，每个样本可能有不同数量的约束（≤max_constraints）
+        # 初始化为max_constraints大小
+        self.num_coupling_constraints = self.max_constraints
         self.mu = np.ones((self.n_samples, self.num_coupling_constraints)) * self.mu_lower_bound
+
+        # 固有约束的对偶变量（由dual block更新，用于NN loss的完整KKT驻点条件）
+        self.lambda_inherent = [None] * self.n_samples
+
+        # 存储每个样本的敏感时段索引
+        self.sensitive_timesteps = [[] for _ in range(self.n_samples)]
         
         # 获取对偶变量λ
         self.lambda_vals = self._get_lambda_values()
         
-        # 初始化时序耦合代理约束参数
-        # alphas: (n_samples, T-1) - 当前时段系数
-        # betas: (n_samples, T-1) - 下一时段系数
-        # gammas: (n_samples, T-1) - 右端项
+        # 初始化三时段耦合代理约束参数（占位，后续由NN填充）
         self.alpha_values = np.zeros((self.n_samples, self.num_coupling_constraints))
         self.beta_values = np.zeros((self.n_samples, self.num_coupling_constraints))
-        self.gamma_values = np.ones((self.n_samples, self.num_coupling_constraints))
-        
-        # 初始化神经网络
+        self.gamma_values = np.zeros((self.n_samples, self.num_coupling_constraints))
+        self.delta_values = np.ones((self.n_samples, self.num_coupling_constraints))
+        self.cost_values = np.zeros((self.n_samples, self.T))
+
+        # 初始化神经网络，并用forward pass生成初值
         if TORCH_AVAILABLE:
             self._init_neural_network()
+            self._generate_initial_values_from_nn()
+        else:
+            # 回退：保持zeros/ones默认值
+            pass
         
         # 初始化求解
         self._initialize_solve()
@@ -655,515 +826,1191 @@ class SubproblemSurrogateTrainer:
             return self._solve_for_lambda()
     
     def _solve_for_lambda(self) -> np.ndarray:
-        """求解原问题获取λ"""
+        """获取对偶变量λ（优先从数据读取，否则从active_set提取x求解LP）"""
         lambda_vals = []
-        for sample_id in range(self.n_samples):
-            Pd = self.active_set_data[sample_id]['pd_data']
-            model = gp.Model('uc_for_lambda')
-            model.Params.OutputFlag = 0
-            
-            pg = model.addVars(self.ng, self.T, lb=0, name='pg')
-            x = model.addVars(self.ng, self.T, vtype=GRB.BINARY, name='x')
-            coc = model.addVars(self.ng, self.T-1, lb=0, name='coc')
-            cpower = model.addVars(self.ng, self.T, lb=0, name='cpower')
-            
-            # 功率平衡约束
-            for t in range(self.T):
-                model.addConstr(gp.quicksum(pg[g, t] for g in range(self.ng)) == np.sum(Pd[:, t]),
-                              name=f'power_balance_{t}')
-            
-            # 其他约束（简化）
-            for g in range(self.ng):
-                for t in range(self.T):
-                    model.addConstr(pg[g, t] >= self.gen[g, PMIN] * x[g, t])
-                    model.addConstr(pg[g, t] <= self.gen[g, PMAX] * x[g, t])
-            
-            Ru = 0.4 * self.gen[:, PMAX] / self.T_delta
-            Rd = 0.4 * self.gen[:, PMAX] / self.T_delta
-            for g in range(self.ng):
-                for t in range(1, self.T):
-                    model.addConstr(pg[g, t] - pg[g, t-1] <= Ru[g] * x[g, t-1] + self.gen[g, PMAX] * (1 - x[g, t-1]))
-                    model.addConstr(pg[g, t-1] - pg[g, t] <= Rd[g] * x[g, t] + self.gen[g, PMAX] * (1 - x[g, t]))
-            
-            Ton = min(4, self.T)
-            Toff = min(4, self.T)
-            for g in range(self.ng):
-                for tau in range(1, Ton+1):
-                    for t1 in range(self.T - tau):
-                        model.addConstr(x[g, t1+1] - x[g, t1] <= x[g, t1+tau])
-                for tau in range(1, Toff+1):
-                    for t1 in range(self.T - tau):
-                        model.addConstr(-x[g, t1+1] + x[g, t1] <= 1 - x[g, t1+tau])
-            
-            start_cost = self.gencost[:, 1]
-            shut_cost = self.gencost[:, 2]
-            for t in range(1, self.T):
-                for g in range(self.ng):
-                    model.addConstr(coc[g, t-1] >= start_cost[g] * (x[g, t] - x[g, t-1]))
-                    model.addConstr(coc[g, t-1] >= shut_cost[g] * (x[g, t-1] - x[g, t]))
-            
-            for t in range(self.T):
-                for g in range(self.ng):
-                    model.addConstr(cpower[g, t] >= self.gencost[g, -2]/self.T_delta * pg[g, t] + 
-                                  self.gencost[g, -1]/self.T_delta * x[g, t])
-            
-            obj = (gp.quicksum(cpower[g, t] for g in range(self.ng) for t in range(self.T)) +
-                   gp.quicksum(coc[g, t] for g in range(self.ng) for t in range(self.T-1)))
-            model.setObjective(obj, GRB.MINIMIZE)
-            model.optimize()
-            
-            if model.status == GRB.OPTIMAL:
-                lambda_sample = np.zeros(self.T)
-                for t in range(self.T):
-                    constr = model.getConstrByName(f'power_balance_{t}')
-                    if constr is not None:
-                        try:
-                            lambda_sample[t] = constr.Pi
-                        except:
-                            pass
-                lambda_vals.append(lambda_sample)
-            else:
-                lambda_vals.append(np.zeros(self.T))
+        needs_solve = []
         
-        return np.array(lambda_vals)
+        # 检查JSON中是否已有lambda
+        for sample_id in range(self.n_samples):
+            if 'lambda' in self.active_set_data[sample_id] and \
+               self.active_set_data[sample_id]['lambda'] is not None:
+                lambda_vals.append(_extract_lambda_power_balance(
+                    self.active_set_data[sample_id]['lambda'], self.T))
+            else:
+                needs_solve.append(sample_id)
+        
+        # 如果所有样本都有lambda，直接返回
+        if not needs_solve:
+            return np.array(lambda_vals)
+        
+        # 否则通过求解LP获取缺失的lambda
+        print(f"⚠ {len(needs_solve)} 个样本缺少 lambda，从 active_set 提取 x 并求解 LP...", flush=True)
+        
+        # 构建完整的lambda_vals字典（按sample_id索引）
+        already_loaded_ids = [i for i in range(self.n_samples) if i not in needs_solve]
+        lambda_dict = {sid: lambda_vals[idx] for idx, sid in enumerate(already_loaded_ids)}
+
+        for sample_id in needs_solve:
+            Pd = self.active_set_data[sample_id]['pd_data']
+
+            # 恢复x矩阵：优先用 active_set，否则用 unit_commitment_matrix
+            x_sol = np.zeros((self.ng, self.T))
+            if 'active_set' in self.active_set_data[sample_id]:
+                active_set = self.active_set_data[sample_id]['active_set']
+                for item in active_set:
+                    if isinstance(item, list) and len(item) == 2 and isinstance(item[0], list):
+                        g, t = item[0]
+                        value = item[1]
+                        x_sol[g, t] = value
+            elif 'unit_commitment_matrix' in self.active_set_data[sample_id]:
+                uc = self.active_set_data[sample_id]['unit_commitment_matrix']
+                x_sol[:uc.shape[0], :] = uc
+
+            # 用x求解ED（LP），获取对偶变量
+            from ed_cvxpy import EconomicDispatchCVXPY
+            ed = EconomicDispatchCVXPY(self.ppc, Pd, self.T_delta, x_sol)
+            pg_sol, total_cost = ed.solve()
+
+            # 提取功率平衡约束的对偶变量λ（前T个约束）
+            lambda_sample = np.zeros(self.T)
+            for t in range(self.T):
+                dual_val = ed.constraints[t].dual_value
+                if dual_val is None:
+                    lambda_sample[t] = 0.0
+                else:
+                    lambda_sample[t] = float(dual_val)
+
+            lambda_dict[sample_id] = lambda_sample
+
+        # 按sample_id顺序返回
+        return np.array([lambda_dict[i] for i in range(self.n_samples)])
     
     def _init_neural_network(self):
-        """初始化代理约束神经网络"""
-        # 使用实际pd_data的维度而不是总节点数
-        input_dim = self.n_load * self.T + self.T  # Pd + λ
-        
+        """初始化代理约束神经网络 - V3版本"""
+        input_dim = self.n_load * self.T + self.T + 6  # Pd + λ + unit_params
+
         self.surrogate_net = SubproblemSurrogateNet(
             input_dim=input_dim,
             T=self.T,
-            hidden_dims=[128, 256, 128]
+            max_constraints=self.max_constraints,
+            hidden_dims=[256, 256]  # 两层残差块
         ).to(self.device)
-        
-        self.optimizer = optim.Adam(self.surrogate_net.parameters(), lr=1e-4)
-        
+
+        # 分离参数组：主优化器管理 backbone + alpha/beta/gamma/delta 头
+        cost_net_params = set(self.surrogate_net.cost_net.parameters())
+        main_params = [p for p in self.surrogate_net.parameters() if p not in cost_net_params]
+        self.optimizer = optim.Adam(main_params, lr=1e-4)
+        # cost_net 单独优化器，学习率更低以稳定 cost_values
+        self.cost_optimizer = optim.Adam(self.surrogate_net.cost_net.parameters(), lr=1e-5)
+
         print(f"  - 代理约束网络输入维度: {input_dim}", flush=True)
-    
+        print(f"  - 最大约束数量: {self.max_constraints}", flush=True)
+
+    def _generate_initial_values_from_nn(self):
+        """用未训练的 SubproblemSurrogateNet forward pass 生成 alpha/beta/gamma/delta 初值。"""
+        self.surrogate_net.eval()
+
+        # 批量提取所有 sample 的特征
+        features_list = [self._extract_features(s) for s in range(self.n_samples)]
+        feat_tensor = torch.tensor(np.array(features_list), dtype=torch.float32).to(self.device)
+
+        with torch.no_grad():
+            alphas, betas, gammas, deltas, costs = self.surrogate_net(feat_tensor)
+
+        self.alpha_values = alphas.cpu().numpy()
+        self.beta_values = betas.cpu().numpy()
+        self.gamma_values = gammas.cpu().numpy()
+        self.delta_values = deltas.cpu().numpy()
+        self.cost_values = np.zeros((self.n_samples, self.T))  # 强制初值为零，避免未训练NN的随机输出干扰
+
+        self.surrogate_net.train()
+
+        print(f"  ✓ 用NN forward pass生成代理约束初值 "
+              f"(alpha: mean={self.alpha_values.mean():.4f}; "
+              f"delta: mean={self.delta_values.mean():.4f}; "
+              f"cost: forced to 0)", flush=True)
+
     def _initialize_solve(self):
-        """初始化求解，获取初始的pg, x, coc, cpower"""
-        g = self.unit_id
-        
+        """初始化求解：从active_set提取x，求解LP获取初始原始解和对偶变量（lambda_inherent）。
+
+        求解不含代理约束的单机组原问题LP，同时提取约束对偶变量作为 lambda_inherent 的初始值，
+        确保 BCD 第一次迭代时 obj_opt 已有有意义的对偶权重。
+        """
+        g    = self.unit_id
+        Pmin = self.gen[g, PMIN]
+        Pmax = self.gen[g, PMAX]
+        Ru    = 0.4 * Pmax / self.T_delta
+        Rd    = 0.4 * Pmax / self.T_delta
+        Ru_co = 0.3 * Pmax
+        Rd_co = 0.3 * Pmax
+        a     = self.gencost[g, -2] / self.T_delta
+        b     = self.gencost[g, -1] / self.T_delta
+        sc    = self.gencost[g, 1]
+        shc   = self.gencost[g, 2]
+        Ton   = min(4, self.T)
+        Toff  = min(4, self.T)
+
+        def _get_pi(m, name):
+            """安全获取约束对偶变量（负值截断为0）"""
+            try:
+                return max(0.0, m.getConstrByName(name).Pi)
+            except Exception:
+                return 0.0
+
         for sample_id in range(self.n_samples):
             lambda_val = self.lambda_vals[sample_id]
-            
-            model = gp.Model('init_subproblem')
+
+            # 恢复x：优先用 active_set，否则用 unit_commitment_matrix
+            x_init = np.zeros(self.T)
+            _x_source = 'none'
+            if 'active_set' in self.active_set_data[sample_id]:
+                active_set = self.active_set_data[sample_id]['active_set']
+                for item in active_set:
+                    if isinstance(item, list) and len(item) == 2 and isinstance(item[0], list):
+                        g_idx, t = item[0]
+                        value = item[1]
+                        if g_idx == g:
+                            x_init[t] = value
+                _x_source = 'active_set'
+            elif 'unit_commitment_matrix' in self.active_set_data[sample_id]:
+                uc = self.active_set_data[sample_id]['unit_commitment_matrix']
+                if isinstance(uc, np.ndarray) and uc.ndim == 2 and g < uc.shape[0]:
+                    x_init = uc[g].astype(float)
+                    _x_source = 'unit_commitment_matrix'
+
+            if np.all(x_init == 0) and _x_source != 'none':
+                print(f"  ⚠ 样本 {sample_id} 机组 {g}: x_init 全零（来源={_x_source}），"
+                      f"该机组在所有时段均关机或数据缺失", flush=True)
+            elif _x_source == 'none':
+                print(f"  ⚠ 样本 {sample_id} 机组 {g}: 数据中既无 active_set 也无 "
+                      f"unit_commitment_matrix，x_init 使用全零默认值", flush=True)
+
+            # 求解单机组LP松弛，目标: cost - λᵀpg
+            model = gp.Model('init_subproblem_LP')
             model.Params.OutputFlag = 0
-            
-            pg = model.addVars(self.T, lb=0, name='pg')
-            x = model.addVars(self.T, vtype=GRB.BINARY, name='x')
-            coc = model.addVars(self.T-1, lb=0, name='coc')
-            cpower = model.addVars(self.T, lb=0, name='cpower')
-            
-            # 发电上下限约束
+
+            pg     = model.addVars(self.T,   lb=0,       name='pg')
+            x      = model.addVars(self.T,   lb=0, ub=1, name='x')   # LP 松弛（连续）
+            coc    = model.addVars(self.T-1, lb=0,       name='coc')
+            cpower = model.addVars(self.T,   lb=0,       name='cpower')
+
+            # 发电上下限（x 为松弛变量）
             for t in range(self.T):
-                model.addConstr(pg[t] >= self.gen[g, PMIN] * x[t], name=f'pg_lower_{t}')
-                model.addConstr(pg[t] <= self.gen[g, PMAX] * x[t], name=f'pg_upper_{t}')
-            
-            # 爬坡约束
-            Ru = 0.4 * self.gen[g, PMAX] / self.T_delta
-            Rd = 0.4 * self.gen[g, PMAX] / self.T_delta
+                model.addConstr(pg[t] >= Pmin * x[t], name=f'pg_lower_{t}')
+                model.addConstr(pg[t] <= Pmax * x[t], name=f'pg_upper_{t}')
+
+            # 爬坡约束（与 dual block 一致：Ru_co=0.3*Pmax）
             for t in range(1, self.T):
-                model.addConstr(pg[t] - pg[t-1] <= Ru * x[t-1] + self.gen[g, PMAX] * (1 - x[t-1]), name=f'ramp_up_{t}')
-                model.addConstr(pg[t-1] - pg[t] <= Rd * x[t] + self.gen[g, PMAX] * (1 - x[t]), name=f'ramp_down_{t}')
-            
-            # 最小开关机时间约束
-            Ton = min(4, self.T)
-            Toff = min(4, self.T)
-            for tau in range(1, Ton+1):
+                model.addConstr(
+                    pg[t] - pg[t-1] <= Ru * x[t-1] + Ru_co * (1 - x[t-1]),
+                    name=f'ramp_up_{t}')
+                model.addConstr(
+                    pg[t-1] - pg[t] <= Rd * x[t] + Rd_co * (1 - x[t]),
+                    name=f'ramp_down_{t}')
+
+            # 最小开机时间（LP 松弛形式）
+            for tau in range(1, Ton + 1):
                 for t1 in range(self.T - tau):
-                    model.addConstr(x[t1+1] - x[t1] <= x[t1+tau], name=f'min_on_{tau}_{t1}')
-            for tau in range(1, Toff+1):
+                    model.addConstr(
+                        x[t1+1] - x[t1] <= x[t1+tau],
+                        name=f'min_on_{tau}_{t1}')
+            # 最小关机时间（LP 松弛形式）
+            for tau in range(1, Toff + 1):
                 for t1 in range(self.T - tau):
-                    model.addConstr(-x[t1+1] + x[t1] <= 1 - x[t1+tau], name=f'min_off_{tau}_{t1}')
-            
+                    model.addConstr(
+                        -x[t1+1] + x[t1] <= 1 - x[t1+tau],
+                        name=f'min_off_{tau}_{t1}')
+
             # 启停成本
-            start_cost = self.gencost[g, 1]
-            shut_cost = self.gencost[g, 2]
             for t in range(1, self.T):
-                model.addConstr(coc[t-1] >= start_cost * (x[t] - x[t-1]), name=f'start_cost_{t}')
-                model.addConstr(coc[t-1] >= shut_cost * (x[t-1] - x[t]), name=f'shut_cost_{t}')
-            
-            # 发电成本
+                model.addConstr(coc[t-1] >= sc  * (x[t] - x[t-1]), name=f'start_cost_{t}')
+                model.addConstr(coc[t-1] >= shc * (x[t-1] - x[t]), name=f'shut_cost_{t}')
+
+            # 发电成本（等式约束，与 dual block 假设 lambda_cpower=1 一致）
             for t in range(self.T):
-                model.addConstr(cpower[t] >= self.gencost[g, -2]/self.T_delta * pg[t] + 
-                              self.gencost[g, -1]/self.T_delta * x[t], name=f'cpower_{t}')
-            
-            # 目标函数: cost - λᵀ × pg
-            obj = gp.quicksum(cpower[t] for t in range(self.T))
-            obj += gp.quicksum(coc[t] for t in range(self.T-1))
-            obj -= gp.quicksum(lambda_val[t] * pg[t] for t in range(self.T))
-            
+                model.addConstr(cpower[t] == a * pg[t] + b * x[t], name=f'cpower_{t}')
+
+            # 目标: min cost - λᵀpg（用于提取有意义的对偶变量）
+            obj = (gp.quicksum(cpower[t] for t in range(self.T)) +
+                   gp.quicksum(coc[t]    for t in range(self.T-1)) -
+                   gp.quicksum(lambda_val[t] * pg[t] for t in range(self.T)))
             model.setObjective(obj, GRB.MINIMIZE)
             model.optimize()
-            
+
             if model.status == GRB.OPTIMAL:
-                self.pg[sample_id] = np.array([pg[t].X for t in range(self.T)])
-                self.x[sample_id] = np.array([x[t].X for t in range(self.T)])
-                self.coc[sample_id] = np.array([coc[t].X for t in range(self.T-1)])
+                x_lp = np.array([x[t].X for t in range(self.T)])    # LP 松弛解（连续）
+                self.pg[sample_id]     = np.array([pg[t].X     for t in range(self.T)])
+                self.x[sample_id]      = x_lp                        # ← 连续松弛解
+                # 将 JSON 整数解存入 sample，作为 iter_with_primal_block 的持久锚点
+                # （不随 BCD 迭代更新，确保 x_true 始终指向原始 MILP 最优解）
+                self.active_set_data[sample_id]['x_true'] = x_init.copy()
+
+                # 识别敏感时段（分数解 → 优先覆盖；全整数 → 按距0.5升序补齐）
+                self.sensitive_timesteps[sample_id] = identify_sensitive_timesteps(
+                    x_lp,
+                    threshold_low=0.1, threshold_high=0.9,
+                    max_constraints=self.max_constraints
+                )
+                self.coc[sample_id]    = np.array([coc[t].X    for t in range(self.T-1)])
                 self.cpower[sample_id] = np.array([cpower[t].X for t in range(self.T)])
+
+                # 提取约束对偶变量作为 lambda_inherent 初始值
+                self.lambda_inherent[sample_id] = {
+                    'lambda_pg_lower':   np.array([_get_pi(model, f'pg_lower_{t}')
+                                                   for t in range(self.T)]),
+                    'lambda_pg_upper':   np.array([_get_pi(model, f'pg_upper_{t}')
+                                                   for t in range(self.T)]),
+                    'lambda_ramp_up':    np.array([_get_pi(model, f'ramp_up_{t}')
+                                                   for t in range(1, self.T)]),
+                    'lambda_ramp_down':  np.array([_get_pi(model, f'ramp_down_{t}')
+                                                   for t in range(1, self.T)]),
+                    'lambda_min_on':     np.array([[_get_pi(model, f'min_on_{tau}_{t1}')
+                                                    for t1 in range(self.T - tau)]
+                                                   for tau in range(1, Ton+1)],  dtype=object),
+                    'lambda_min_off':    np.array([[_get_pi(model, f'min_off_{tau}_{t1}')
+                                                    for t1 in range(self.T - tau)]
+                                                   for tau in range(1, Toff+1)], dtype=object),
+                    'lambda_start_cost': np.array([_get_pi(model, f'start_cost_{t}')
+                                                   for t in range(1, self.T)]),
+                    'lambda_shut_cost':  np.array([_get_pi(model, f'shut_cost_{t}')
+                                                   for t in range(1, self.T)]),
+                    'lambda_coc_nonneg': np.zeros(self.T - 1),
+                    'lambda_x_upper':    np.zeros(self.T),
+                    'lambda_x_lower':    np.zeros(self.T),
+                }
     
-    def iter_with_primal_block(self, sample_id: int, alphas: np.ndarray, betas: np.ndarray, gammas: np.ndarray):
+    def iter_with_primal_block(self, sample_id: int, alphas: np.ndarray, betas: np.ndarray, gammas: np.ndarray, deltas: np.ndarray, costs: np.ndarray = None):
         """
-        BCD迭代：原始块 - 时序耦合约束版本
-        固定代理约束参数(alphas, betas, gammas)和对偶变量(mu)，更新原始变量(pg, x)
-        
-        时序耦合约束形式（T-1个）:
-            alpha_t * x_t + beta_t * x_{t+1} <= gamma_t  (对于 t = 0..T-2)
-        
-        目标函数:
-            min  cost - λᵀ × pg 
-                 + rho_primal * Σ_t max(0, alpha_t*x_t + beta_t*x_{t+1} - gamma_t)
-                 + rho_opt * Σ_t |alpha_t*x_t + beta_t*x_{t+1} - gamma_t| * mu_t
-        
-        Args:
-            sample_id: 样本索引
-            alphas: (T-1,) 当前时段系数
-            betas: (T-1,) 下一时段系数
-            gammas: (T-1,) 右端项
+        BCD迭代：原始块 - V3三时段耦合约束版本
+        固定代理约束参数(alphas, betas, gammas, deltas)和对偶变量(mu)，更新原始变量(pg, x)
+
+        时序耦合约束形式（T-2个）:
+            alpha_t * x_t + beta_t * x_{t+1} + gamma_t * x_{t+2} <= delta_t  (t = 0..T-3)
+
+        目标函数（参考BCD软约束形式）:
+            min  (cost - λᵀ × pg)
+                 + rho_primal * Σ_{all} max(0, violation)   [原问题约束 + 耦合约束]
+                 + rho_opt    * Σ_{all} |violation| * dual  [互补松弛]
+                 + obj_binary
+
+        原问题约束均以软约束形式处理（violation变量），与BCD一致。
+        lambda_inherent 由 _initialize_solve 在初始化阶段从单机组LP提取，保证非None。
+        cost-lambda项不入目标函数，经济方向由对偶变量通过obj_opt传递（与BCD一致）。
         """
         g = self.unit_id
-        lambda_val = self.lambda_vals[sample_id]
-        mu_vals = self.mu[sample_id]  # (T-1,) 每个时序约束的对偶变量
-        
+        mu_vals = self.mu[sample_id]           # (num_coupling_constraints,)
+        lam_inh = self.lambda_inherent[sample_id]  # dict，由 _initialize_solve 保证非None
+
+        Pmin    = self.gen[g, PMIN]
+        Pmax    = self.gen[g, PMAX]
+        a       = self.gencost[g, -2] / self.T_delta   # 线性发电成本系数
+        b       = self.gencost[g, -1] / self.T_delta   # 无负荷成本系数
+        Ru      = 0.4 * Pmax / self.T_delta
+        Rd      = 0.4 * Pmax / self.T_delta
+        Ru_co   = 0.3 * Pmax
+        Rd_co   = 0.3 * Pmax
+        sc      = self.gencost[g, 1]   # 启动成本
+        shc     = self.gencost[g, 2]   # 停机成本
+        Ton     = min(4, self.T)
+        Toff    = min(4, self.T)
+
         model = gp.Model('primal_block_temporal')
         model.Params.OutputFlag = 0
-        
-        # 变量（x为连续，LP松弛）
-        pg = model.addVars(self.T, lb=0, name='pg')
-        x = model.addVars(self.T, lb=0, ub=1, name='x')
-        coc = model.addVars(self.T-1, lb=0, name='coc')
-        cpower = model.addVars(self.T, lb=0, name='cpower')
-        
-        # 时序耦合约束违反量（每个时序约束一个）
-        surrogate_viols = model.addVars(self.num_coupling_constraints, lb=0, name='surrogate_viol')
+
+        # --- 决策变量 ---
+        pg     = model.addVars(self.T,   lb=0, name='pg')
+        x      = model.addVars(self.T,   lb=0, ub=1, name='x')
+        coc    = model.addVars(self.T-1, lb=0, name='coc')
+        cpower = model.addVars(self.T,   lb=0, name='cpower')
+
+        x_true = self.active_set_data[sample_id].get('x_true', None)
+        if x_true is None:
+            x_true = self.x[sample_id]
+        x_binary_dev = model.addVars(self.T, lb=0, name='x_binary_dev')
+
+        # 原问题约束违反量/绝对值辅助变量（软约束形式）
+        pg_lower_viol   = model.addVars(self.T,   lb=0, name='pg_lower_viol')
+        pg_upper_viol   = model.addVars(self.T,   lb=0, name='pg_upper_viol')
+        pg_lower_abs    = model.addVars(self.T,   lb=0, name='pg_lower_abs')
+        pg_upper_abs    = model.addVars(self.T,   lb=0, name='pg_upper_abs')
+        ramp_up_viol    = model.addVars(self.T-1, lb=0, name='ramp_up_viol')
+        ramp_down_viol  = model.addVars(self.T-1, lb=0, name='ramp_down_viol')
+        ramp_up_abs     = model.addVars(self.T-1, lb=0, name='ramp_up_abs')
+        ramp_down_abs   = model.addVars(self.T-1, lb=0, name='ramp_down_abs')
+        min_on_viol     = model.addVars(Ton,  self.T, lb=0, name='min_on_viol')
+        min_off_viol    = model.addVars(Toff, self.T, lb=0, name='min_off_viol')
+        min_on_abs      = model.addVars(Ton,  self.T, lb=0, name='min_on_abs')
+        min_off_abs     = model.addVars(Toff, self.T, lb=0, name='min_off_abs')
+        start_cost_viol = model.addVars(self.T-1, lb=0, name='start_cost_viol')
+        shut_cost_viol  = model.addVars(self.T-1, lb=0, name='shut_cost_viol')
+        start_cost_abs  = model.addVars(self.T-1, lb=0, name='start_cost_abs')
+        shut_cost_abs   = model.addVars(self.T-1, lb=0, name='shut_cost_abs')
+
+        # 代理耦合约束违反量/绝对值
+        surrogate_viols    = model.addVars(self.num_coupling_constraints, lb=0, name='surrogate_viol')
         surrogate_abs_vals = model.addVars(self.num_coupling_constraints, lb=0, name='surrogate_abs')
-        
-        # 发电上下限约束
+
+        obj_primal = gp.LinExpr()
+        obj_opt    = gp.LinExpr()
+        obj_binary = gp.LinExpr()
+
+        # --- x 偏差（硬约束，定义性）---
         for t in range(self.T):
-            model.addConstr(pg[t] >= self.gen[g, PMIN] * x[t], name=f'pg_lower_{t}')
-            model.addConstr(pg[t] <= self.gen[g, PMAX] * x[t], name=f'pg_upper_{t}')
-        
-        # 爬坡约束
-        Ru = 0.4 * self.gen[g, PMAX] / self.T_delta
-        Rd = 0.4 * self.gen[g, PMAX] / self.T_delta
+            model.addConstr(x_binary_dev[t] >= x[t] - x_true[t], name=f'x_binary_dev_pos_{t}')
+            model.addConstr(x_binary_dev[t] >= x_true[t] - x[t], name=f'x_binary_dev_neg_{t}')
+            obj_binary += x_binary_dev[t]
+
+        # --- 发电上下限（软约束）---
+        for t in range(self.T):
+            pg_lower_expr = Pmin * x[t] - pg[t]
+            model.addConstr(pg_lower_viol[t] >= pg_lower_expr, name=f'pg_lower_viol_{t}')
+            model.addConstr(pg_lower_abs[t]  >= pg_lower_expr, name=f'pg_lower_abs1_{t}')
+            model.addConstr(pg_lower_abs[t]  >= -pg_lower_expr, name=f'pg_lower_abs2_{t}')
+            obj_primal += pg_lower_viol[t]
+
+            pg_upper_expr = pg[t] - Pmax * x[t]
+            model.addConstr(pg_upper_viol[t] >= pg_upper_expr, name=f'pg_upper_viol_{t}')
+            model.addConstr(pg_upper_abs[t]  >= pg_upper_expr, name=f'pg_upper_abs1_{t}')
+            model.addConstr(pg_upper_abs[t]  >= -pg_upper_expr, name=f'pg_upper_abs2_{t}')
+            obj_primal += pg_upper_viol[t]
+
+            obj_opt += pg_lower_abs[t] * abs(float(lam_inh['lambda_pg_lower'][t]))
+            obj_opt += pg_upper_abs[t] * abs(float(lam_inh['lambda_pg_upper'][t]))
+            obj_opt += x[t]       * abs(float(lam_inh['lambda_x_lower'][t]))
+            obj_opt += (1 - x[t]) * abs(float(lam_inh['lambda_x_upper'][t]))
+
+        # --- 爬坡约束（软约束，Ru_co=0.3*Pmax 与 dual block 一致）---
         for t in range(1, self.T):
-            model.addConstr(pg[t] - pg[t-1] <= Ru * x[t-1] + self.gen[g, PMAX] * (1 - x[t-1]), name=f'ramp_up_{t}')
-            model.addConstr(pg[t-1] - pg[t] <= Rd * x[t] + self.gen[g, PMAX] * (1 - x[t]), name=f'ramp_down_{t}')
-        
-        # 最小开关机时间约束
-        Ton = min(4, self.T)
-        Toff = min(4, self.T)
+            ramp_up_expr = pg[t] - pg[t-1] - Ru * x[t-1] - Ru_co * (1 - x[t-1])
+            model.addConstr(ramp_up_viol[t-1] >= ramp_up_expr, name=f'ramp_up_viol_{t}')
+            model.addConstr(ramp_up_abs[t-1]  >= ramp_up_expr, name=f'ramp_up_abs1_{t}')
+            model.addConstr(ramp_up_abs[t-1]  >= -ramp_up_expr, name=f'ramp_up_abs2_{t}')
+            obj_primal += ramp_up_viol[t-1]
+            obj_opt += ramp_up_abs[t-1]   * abs(float(lam_inh['lambda_ramp_up'][t-1]))
+
+            ramp_down_expr = pg[t-1] - pg[t] - Rd * x[t] - Rd_co * (1 - x[t])
+            model.addConstr(ramp_down_viol[t-1] >= ramp_down_expr, name=f'ramp_down_viol_{t}')
+            model.addConstr(ramp_down_abs[t-1]  >= ramp_down_expr, name=f'ramp_down_abs1_{t}')
+            model.addConstr(ramp_down_abs[t-1]  >= -ramp_down_expr, name=f'ramp_down_abs2_{t}')
+            obj_primal += ramp_down_viol[t-1]
+            obj_opt += ramp_down_abs[t-1] * abs(float(lam_inh['lambda_ramp_down'][t-1]))
+
+        # --- 最小开关机时间（软约束）---
         for tau in range(1, Ton+1):
             for t1 in range(self.T - tau):
-                model.addConstr(x[t1+1] - x[t1] <= x[t1+tau], name=f'min_on_{tau}_{t1}')
+                min_on_expr = x[t1+1] - x[t1] - x[t1+tau]
+                model.addConstr(min_on_viol[tau-1, t1] >= min_on_expr, name=f'min_on_viol_{tau}_{t1}')
+                model.addConstr(min_on_abs[tau-1, t1]  >= min_on_expr, name=f'min_on_abs1_{tau}_{t1}')
+                model.addConstr(min_on_abs[tau-1, t1]  >= -min_on_expr, name=f'min_on_abs2_{tau}_{t1}')
+                obj_primal += min_on_viol[tau-1, t1]
+                obj_opt += min_on_abs[tau-1, t1] * abs(float(lam_inh['lambda_min_on'][tau-1][t1]))
+
         for tau in range(1, Toff+1):
             for t1 in range(self.T - tau):
-                model.addConstr(-x[t1+1] + x[t1] <= 1 - x[t1+tau], name=f'min_off_{tau}_{t1}')
-        
-        # 启停成本
-        start_cost = self.gencost[g, 1]
-        shut_cost = self.gencost[g, 2]
+                min_off_expr = -x[t1+1] + x[t1] - (1 - x[t1+tau])
+                model.addConstr(min_off_viol[tau-1, t1] >= min_off_expr, name=f'min_off_viol_{tau}_{t1}')
+                model.addConstr(min_off_abs[tau-1, t1]  >= min_off_expr, name=f'min_off_abs1_{tau}_{t1}')
+                model.addConstr(min_off_abs[tau-1, t1]  >= -min_off_expr, name=f'min_off_abs2_{tau}_{t1}')
+                obj_primal += min_off_viol[tau-1, t1]
+                obj_opt += min_off_abs[tau-1, t1] * abs(float(lam_inh['lambda_min_off'][tau-1][t1]))
+
+        # --- 启停成本（软约束）---
         for t in range(1, self.T):
-            model.addConstr(coc[t-1] >= start_cost * (x[t] - x[t-1]), name=f'start_cost_{t}')
-            model.addConstr(coc[t-1] >= shut_cost * (x[t-1] - x[t]), name=f'shut_cost_{t}')
-        
-        # 发电成本
+            start_expr = sc * (x[t] - x[t-1]) - coc[t-1]
+            model.addConstr(start_cost_viol[t-1] >= start_expr, name=f'start_cost_viol_{t}')
+            model.addConstr(start_cost_abs[t-1]  >= start_expr, name=f'start_cost_abs1_{t}')
+            model.addConstr(start_cost_abs[t-1]  >= -start_expr, name=f'start_cost_abs2_{t}')
+            obj_primal += start_cost_viol[t-1]
+            obj_opt += start_cost_abs[t-1] * abs(float(lam_inh['lambda_start_cost'][t-1]))
+
+            shut_expr = shc * (x[t-1] - x[t]) - coc[t-1]
+            model.addConstr(shut_cost_viol[t-1] >= shut_expr, name=f'shut_cost_viol_{t}')
+            model.addConstr(shut_cost_abs[t-1]  >= shut_expr, name=f'shut_cost_abs1_{t}')
+            model.addConstr(shut_cost_abs[t-1]  >= -shut_expr, name=f'shut_cost_abs2_{t}')
+            obj_primal += shut_cost_viol[t-1]
+            obj_opt += shut_cost_abs[t-1]  * abs(float(lam_inh['lambda_shut_cost'][t-1]))
+            obj_opt += coc[t-1]            * abs(float(lam_inh['lambda_coc_nonneg'][t-1]))
+
+        # --- 发电成本定义（等式约束，lambda_cpower=1；成本不显式入目标，与BCD一致）---
         for t in range(self.T):
-            model.addConstr(cpower[t] >= self.gencost[g, -2]/self.T_delta * pg[t] + 
-                          self.gencost[g, -1]/self.T_delta * x[t], name=f'cpower_{t}')
-        
-        # 时序耦合代理约束: alpha_t * x_t + beta_t * x_{t+1} <= gamma_t
-        for t in range(self.num_coupling_constraints):
-            coupling_lhs = alphas[t] * x[t] + betas[t] * x[t+1]
-            
-            # 违反量: max(0, lhs - gamma)
-            model.addConstr(surrogate_viols[t] >= coupling_lhs - gammas[t], 
-                          name=f'coupling_viol_{t}')
-            
-            # 绝对值: |lhs - gamma|
-            model.addConstr(surrogate_abs_vals[t] >= coupling_lhs - gammas[t], 
-                          name=f'coupling_abs_pos_{t}')
-            model.addConstr(surrogate_abs_vals[t] >= gammas[t] - coupling_lhs, 
-                          name=f'coupling_abs_neg_{t}')
-        
-        # 目标函数
-        obj_cost = gp.quicksum(cpower[t] for t in range(self.T))
-        obj_cost += gp.quicksum(coc[t] for t in range(self.T-1))
-        obj_lambda = -gp.quicksum(lambda_val[t] * pg[t] for t in range(self.T))
-        
-        # 代理约束惩罚项（所有时序约束的和）
-        obj_primal = self.rho_primal * gp.quicksum(surrogate_viols[t] for t in range(self.num_coupling_constraints))
-        obj_opt = self.rho_opt * gp.quicksum(surrogate_abs_vals[t] * mu_vals[t] 
-                                             for t in range(self.num_coupling_constraints))
-        
-        model.setObjective(obj_cost + obj_lambda + obj_primal + obj_opt, GRB.MINIMIZE)
+            model.addConstr(cpower[t] == a * pg[t] + b * x[t], name=f'cpower_{t}')
+
+        # --- 代理耦合约束（软约束，按 sensitive_timesteps 索引）---
+        sensitive_t = self.sensitive_timesteps[sample_id]
+        for k, t in enumerate(sensitive_t):
+            # sensitive_timesteps 已保证 t+2 < T
+            coupling_lhs = alphas[k] * x[t] + betas[k] * x[t+1] + gammas[k] * x[t+2]
+            model.addConstr(surrogate_viols[k]    >= coupling_lhs - deltas[k], name=f'coupling_viol_{k}')
+            model.addConstr(surrogate_abs_vals[k] >= coupling_lhs - deltas[k], name=f'coupling_abs_pos_{k}')
+            model.addConstr(surrogate_abs_vals[k] >= deltas[k] - coupling_lhs, name=f'coupling_abs_neg_{k}')
+        obj_primal += gp.quicksum(surrogate_viols[k]    for k in range(len(sensitive_t)))
+        obj_opt    += gp.quicksum(surrogate_abs_vals[k] * mu_vals[k]
+                                  for k in range(len(sensitive_t)))
+
+        # --- 目标函数 ---
+        obj_cost = 0
+        if costs is not None:
+            obj_cost = gp.quicksum(costs[t] * x[t] for t in range(self.T))
+        model.setObjective(
+            self.rho_primal * obj_primal
+            + self.rho_opt  * obj_opt
+            + obj_binary
+            + obj_cost,
+            GRB.MINIMIZE
+        )
         model.optimize()
-        
+
         if model.status == GRB.OPTIMAL:
-            pg_sol = np.array([pg[t].X for t in range(self.T)])
-            x_sol = np.array([x[t].X for t in range(self.T)])
-            coc_sol = np.array([coc[t].X for t in range(self.T-1)])
+            if sample_id <= 2:
+                print(f"primal_block, sample_id: {sample_id}, "
+                      f"obj_primal: {obj_primal.getValue():.4f}, "
+                      f"obj_opt: {obj_opt.getValue():.4f}, "
+                      f"obj_binary: {obj_binary.getValue():.4f}", flush=True)
+
+            pg_sol     = np.array([pg[t].X     for t in range(self.T)])
+            x_sol      = np.array([x[t].X      for t in range(self.T)])
+            coc_sol    = np.array([coc[t].X    for t in range(self.T-1)])
             cpower_sol = np.array([cpower[t].X for t in range(self.T)])
             return pg_sol, x_sol, coc_sol, cpower_sol
         else:
             print(f"警告: 原始块求解失败，状态: {model.status}", flush=True)
             return None, None, None, None
     
-    def iter_with_dual_block(self, sample_id: int, alphas: np.ndarray, betas: np.ndarray, gammas: np.ndarray):
+    def iter_with_dual_block(self, sample_id: int, alphas: np.ndarray, betas: np.ndarray,
+                             gammas: np.ndarray, deltas: np.ndarray, costs: np.ndarray = None):
         """
-        BCD迭代：对偶块 - 时序耦合约束版本
-        固定原始变量(pg, x)和代理约束参数(alphas, betas, gammas)，更新对偶变量(mu)
-        
-        对偶问题（每个时序约束独立求解）:
-            对于每个约束 t:
-                min  rho_opt * |alpha_t*x_t + beta_t*x_{t+1} - gamma_t| * mu_t
-                s.t. mu_t >= mu_lower_bound (前50次迭代) 或 mu_t >= 0
-        
-        Args:
-            sample_id: 样本索引
-            alphas: (T-1,) 当前时段系数
-            betas: (T-1,) 下一时段系数
-            gammas: (T-1,) 右端项
-        
+        BCD迭代：对偶块 - V3三时段耦合约束完整版本
+        固定原始变量(pg, x, coc)和代理约束参数，联合更新所有对偶变量：
+          - 固有约束对偶变量 (lambda_pg_lower/upper, lambda_ramp_up/down,
+            lambda_min_on/off, lambda_start/shut_cost, lambda_coc_nonneg,
+            lambda_x_upper/lower)
+          - 代理耦合约束对偶变量 (mu)
+
+        目标：
+            min  rho_dual * obj_dual + rho_opt * obj_opt
+
+        obj_dual = Σ KKT驻点条件违反量（对 pg, x, coc 变量）
+        obj_opt  = Σ 约束违反量 * 对应对偶变量（互补松弛条件）
+
         Returns:
-            mu_vals: (T-1,) 对偶变量数组
+            lambda_inherent_sol: dict，固有约束对偶变量
+            mu_sol: (num_coupling_constraints,) 代理耦合对偶变量
         """
         g = self.unit_id
-        x_val = self.x[sample_id]
+        pg_val  = self.pg[sample_id]    # (T,)
+        x_val   = self.x[sample_id]     # (T,)
+        coc_val = self.coc[sample_id]   # (T-1,)
+        lambda_val = self.lambda_vals[sample_id]  # (T,)  电价对偶变量（外部给定）
+
+        # 机组参数
+        a    = self.gencost[g, -2] / self.T_delta   # 线性发电成本系数
+        b    = self.gencost[g, -1] / self.T_delta   # 无负荷成本系数
+        Pmin = self.gen[g, PMIN]
+        Pmax = self.gen[g, PMAX]
+        Ru    = 0.4 * Pmax / self.T_delta
+        Rd    = 0.4 * Pmax / self.T_delta
+        Ru_co = 0.3 * Pmax
+        Rd_co = 0.3 * Pmax
+        start_cost = self.gencost[g, 1]
+        shut_cost  = self.gencost[g, 2]
+        Ton  = min(4, self.T)
+        Toff = min(4, self.T)
+
+        # 下界：前50次迭代保持正值，之后允许为0
+        lb = self.mu_lower_bound if self.iter_number < 50 else 0.0
+
+        model = gp.Model('dual_block_v3')
+        model.Params.OutputFlag = 0
+        model.Params.NumericFocus = 2
+        model.Params.MIPGap = 1e-6
+
+        # ===== 声明固有约束对偶变量 =====
+        lam_pg_lower    = model.addVars(self.T,      lb=0, name='lam_pg_lower')
+        lam_pg_upper    = model.addVars(self.T,      lb=0, name='lam_pg_upper')
+        lam_ramp_up     = model.addVars(self.T - 1,  lb=0, name='lam_ramp_up')
+        lam_ramp_down   = model.addVars(self.T - 1,  lb=0, name='lam_ramp_down')
+        lam_start_cost  = model.addVars(self.T - 1,  lb=0, name='lam_start_cost')
+        lam_shut_cost   = model.addVars(self.T - 1,  lb=0, name='lam_shut_cost')
+        lam_coc_nonneg  = model.addVars(self.T - 1,  lb=0, name='lam_coc_nonneg')
+        lam_x_upper     = model.addVars(self.T,      lb=0, name='lam_x_upper')
+        lam_x_lower     = model.addVars(self.T,      lb=0, name='lam_x_lower')
+
+        # min_on / min_off：只为有效约束索引创建变量
+        lam_min_on  = {}
+        lam_min_off = {}
+        for tau in range(1, Ton + 1):
+            for t1 in range(self.T - tau):
+                lam_min_on[tau - 1, t1]  = model.addVar(lb=0, name=f'lam_min_on_{tau-1}_{t1}')
+        for tau in range(1, Toff + 1):
+            for t1 in range(self.T - tau):
+                lam_min_off[tau - 1, t1] = model.addVar(lb=0, name=f'lam_min_off_{tau-1}_{t1}')
+
+        # 代理耦合约束对偶变量
+        mu = model.addVars(self.num_coupling_constraints, lb=lb, name='mu')
+
+        # lambda_cpower 由驻点条件固定为 1，不需要作为变量
+
+        obj_dual = 0
+        obj_opt  = 0
+
+        # ===== obj_dual：KKT 驻点条件 =====
+
+        # -- pg[t] 驻点：  a - lambda[t] - lam_pg_lower[t] + lam_pg_upper[t] + ramp_terms = 0
+        for t in range(self.T):
+            expr = a - lambda_val[t]
+            expr -= lam_pg_lower[t]
+            expr += lam_pg_upper[t]
+            if t > 0:
+                expr += lam_ramp_up[t - 1]
+                expr -= lam_ramp_down[t - 1]
+            if t < self.T - 1:
+                expr -= lam_ramp_up[t]
+                expr += lam_ramp_down[t]
+            abs_v = model.addVar(lb=0, name=f'abs_pg_{t}')
+            model.addConstr(abs_v >= expr,  name=f'abs_pg_pos_{t}')
+            model.addConstr(abs_v >= -expr, name=f'abs_pg_neg_{t}')
+            obj_dual += abs_v
+
+        # -- x[t] 驻点：  b + Pmin*lam_pg_lower[t] - Pmax*lam_pg_upper[t]
+        #                  + ramp_co_terms + min_on/off_terms + start/shut_terms
+        #                  + coupling_surrogate_terms + lam_x_upper[t] - lam_x_lower[t] = 0
         
-        mu_vals = np.zeros(self.num_coupling_constraints)
-        
-        # 为每个时序耦合约束独立求解对偶变量
-        for t in range(self.num_coupling_constraints):
-            model = gp.Model(f'dual_block_{t}')
-            model.Params.OutputFlag = 0
-            
-            # 对偶变量
-            if self.iter_number < 50:
-                mu = model.addVar(lb=self.mu_lower_bound, name='mu')
-            else:
-                mu = model.addVar(lb=0, name='mu')
-            
-            # 时序约束违反量: |alpha_t*x_t + beta_t*x_{t+1} - gamma_t|
-            coupling_expr = alphas[t] * x_val[t] + betas[t] * x_val[t+1] - gammas[t]
-            coupling_viol = abs(coupling_expr)
-            
-            # 目标函数：最小化违反量与对偶变量的乘积
-            obj_opt = self.rho_opt * coupling_viol * mu
-            
-            model.setObjective(obj_opt, GRB.MINIMIZE)
-            model.optimize()
-            
-            if model.status == GRB.OPTIMAL:
-                mu_vals[t] = mu.X
-            else:
-                mu_vals[t] = self.mu_lower_bound if self.iter_number < 50 else 0.0
-        
-        return mu_vals
+        obj_dual_test = 0
+        for t in range(self.T):
+            expr = b + (costs[t] if costs is not None else 0)
+            expr += Pmin * lam_pg_lower[t]
+            expr -= Pmax * lam_pg_upper[t]
+
+            # 爬坡约束对x[t]的贡献（x[t]作为t时段的"上一时刻"）
+            if t < self.T - 1:
+                expr += (Ru_co - Ru) * lam_ramp_up[t]
+            if t > 0:
+                expr += (Rd_co - Rd) * lam_ramp_down[t - 1]
+
+            # 最小开机时间约束
+            for tau in range(1, Ton + 1):
+                for t1 in range(self.T - tau):
+                    k = lam_min_on[tau - 1, t1]
+                    if t == t1 + 1:
+                        expr += k
+                    if t == t1:
+                        expr -= k
+                    if t == t1 + tau:
+                        expr -= k
+
+            # 最小停机时间约束
+            for tau in range(1, Toff + 1):
+                for t1 in range(self.T - tau):
+                    k = lam_min_off[tau - 1, t1]
+                    if t == t1 + 1:
+                        expr -= k
+                    if t == t1:
+                        expr += k
+                    if t == t1 + tau:
+                        expr += k
+
+            # 启停成本约束
+            if t > 0:
+                expr += start_cost * lam_start_cost[t - 1]
+                expr -= shut_cost  * lam_shut_cost[t - 1]
+            if t < self.T - 1:
+                expr -= start_cost * lam_start_cost[t]
+                expr += shut_cost  * lam_shut_cost[t]
+
+            # 代理耦合约束对 x[t] 的贡献（按 sensitive_timesteps 索引）
+            sensitive_t = self.sensitive_timesteps[sample_id]
+            for k, ts in enumerate(sensitive_t):
+                if ts == t:
+                    expr += alphas[k] * mu[k]
+                if ts + 1 == t:
+                    expr += betas[k] * mu[k]
+                if ts + 2 == t:
+                    expr += gammas[k] * mu[k]
+
+            # x 变量界约束（x ∈ [0,1]）
+            expr += lam_x_upper[t] - lam_x_lower[t]
+
+            abs_v = model.addVar(lb=0, name=f'abs_x_{t}')
+            model.addConstr(abs_v >= expr,  name=f'abs_x_pos_{t}')
+            model.addConstr(abs_v >= -expr, name=f'abs_x_neg_{t}')
+            obj_dual += abs_v
+            obj_dual_test += abs_v
+
+        # -- coc[t] 驻点：  1 - lam_start_cost[t] - lam_shut_cost[t] - lam_coc_nonneg[t] = 0
+        for t in range(self.T - 1):
+            expr = 1 - lam_start_cost[t] - lam_shut_cost[t] - lam_coc_nonneg[t]
+            abs_v = model.addVar(lb=0, name=f'abs_coc_{t}')
+            model.addConstr(abs_v >= expr,  name=f'abs_coc_pos_{t}')
+            model.addConstr(abs_v >= -expr, name=f'abs_coc_neg_{t}')
+            obj_dual += abs_v
+
+        # ===== obj_opt：互补松弛条件（约束违反量 × 对偶变量）=====
+
+        # pg_lower: pg[t] >= Pmin * x[t]
+        for t in range(self.T):
+            viol = abs(pg_val[t] - Pmin * x_val[t])
+            if viol > 1e-10:
+                obj_opt += viol * lam_pg_lower[t]
+
+        # pg_upper: pg[t] <= Pmax * x[t]
+        for t in range(self.T):
+            viol = abs(Pmax * x_val[t] - pg_val[t])
+            if viol > 1e-10:
+                obj_opt += viol * lam_pg_upper[t]
+
+        # ramp_up: pg[t] - pg[t-1] <= Ru*x[t-1] + Ru_co*(1-x[t-1])
+        for t in range(1, self.T):
+            limit = Ru * x_val[t - 1] + Ru_co * (1 - x_val[t - 1])
+            viol  = abs(pg_val[t] - pg_val[t - 1] - limit)
+            if viol > 1e-10:
+                obj_opt += viol * lam_ramp_up[t - 1]
+
+        # ramp_down: pg[t-1] - pg[t] <= Rd*x[t] + Rd_co*(1-x[t])
+        for t in range(1, self.T):
+            limit = Rd * x_val[t] + Rd_co * (1 - x_val[t])
+            viol  = abs(pg_val[t - 1] - pg_val[t] - limit)
+            if viol > 1e-10:
+                obj_opt += viol * lam_ramp_down[t - 1]
+
+        # min_on: x[t1+1] - x[t1] - x[t1+tau] <= 0
+        for tau in range(1, Ton + 1):
+            for t1 in range(self.T - tau):
+                viol = abs(x_val[t1 + 1] - x_val[t1] - x_val[t1 + tau])
+                if viol > 1e-10:
+                    obj_opt += viol * lam_min_on[tau - 1, t1]
+
+        # min_off: -x[t1+1] + x[t1] - 1 + x[t1+tau] <= 0
+        for tau in range(1, Toff + 1):
+            for t1 in range(self.T - tau):
+                viol = abs(-x_val[t1 + 1] + x_val[t1] - 1 + x_val[t1 + tau])
+                if viol > 1e-10:
+                    obj_opt += viol * lam_min_off[tau - 1, t1]
+
+        # start_cost: coc[t] >= start_cost*(x[t+1] - x[t])
+        for t in range(self.T - 1):
+            viol = abs(coc_val[t] - start_cost * (x_val[t + 1] - x_val[t]))
+            if viol > 1e-10:
+                obj_opt += viol * lam_start_cost[t]
+
+        # shut_cost: coc[t] >= shut_cost*(x[t] - x[t+1])
+        for t in range(self.T - 1):
+            viol = abs(coc_val[t] - shut_cost * (x_val[t] - x_val[t + 1]))
+            if viol > 1e-10:
+                obj_opt += viol * lam_shut_cost[t]
+
+        # coc_nonneg: coc[t] >= 0
+        for t in range(self.T - 1):
+            viol = abs(coc_val[t])
+            if viol > 1e-10:
+                obj_opt += viol * lam_coc_nonneg[t]
+
+        # x_lower: x[t] >= 0
+        for t in range(self.T):
+            viol = abs(x_val[t])
+            if viol > 1e-10:
+                obj_opt += viol * lam_x_lower[t]
+
+        # x_upper: x[t] <= 1
+        for t in range(self.T):
+            viol = abs(x_val[t] - 1)
+            if viol > 1e-10:
+                obj_opt += viol * lam_x_upper[t]
+
+        # 代理耦合约束（按 sensitive_timesteps 索引）
+        for k, t in enumerate(self.sensitive_timesteps[sample_id]):
+            lhs  = alphas[k] * x_val[t] + betas[k] * x_val[t + 1] + gammas[k] * x_val[t + 2]
+            viol = abs(lhs - deltas[k])
+            if viol > 1e-10:
+                obj_opt += viol * mu[k]
+
+        # ===== 设置目标函数并求解 =====
+        model.setObjective(
+            self.rho_dual * obj_dual + self.rho_opt * obj_opt,
+            GRB.MINIMIZE
+        )
+        model.optimize()
+
+        if model.status == GRB.OPTIMAL:
+            # 提取固有约束对偶变量
+            lambda_inherent_sol = {
+                'lambda_pg_lower':   np.array([lam_pg_lower[t].X   for t in range(self.T)]),
+                'lambda_pg_upper':   np.array([lam_pg_upper[t].X   for t in range(self.T)]),
+                'lambda_ramp_up':    np.array([lam_ramp_up[t].X    for t in range(self.T - 1)]),
+                'lambda_ramp_down':  np.array([lam_ramp_down[t].X  for t in range(self.T - 1)]),
+                'lambda_min_on':     np.array([[lam_min_on[tau - 1, t1].X
+                                                for t1 in range(self.T - tau)]
+                                               for tau in range(1, Ton + 1)], dtype=object),
+                'lambda_min_off':    np.array([[lam_min_off[tau - 1, t1].X
+                                                for t1 in range(self.T - tau)]
+                                               for tau in range(1, Toff + 1)], dtype=object),
+                'lambda_start_cost': np.array([lam_start_cost[t].X for t in range(self.T - 1)]),
+                'lambda_shut_cost':  np.array([lam_shut_cost[t].X  for t in range(self.T - 1)]),
+                'lambda_coc_nonneg': np.array([lam_coc_nonneg[t].X for t in range(self.T - 1)]),
+                'lambda_x_upper':    np.array([lam_x_upper[t].X    for t in range(self.T)]),
+                'lambda_x_lower':    np.array([lam_x_lower[t].X    for t in range(self.T)]),
+            }
+            mu_sol = np.array([mu[k].X for k in range(self.num_coupling_constraints)])
+
+            if sample_id <= 2:
+                print(f"  dual_block sample={sample_id}: "
+                      f"obj_dual={obj_dual.getValue():.4f}, "
+                      f"obj_opt={obj_opt.getValue() if hasattr(obj_opt, 'getValue') else obj_opt:.4f}",
+                      flush=True)
+
+            return lambda_inherent_sol, mu_sol
+        else:
+            print(f"警告: 对偶块求解失败 sample={sample_id}，状态: {model.status}", flush=True)
+            return None, None
     
     def _extract_features(self, sample_id: int) -> np.ndarray:
-        """提取特征: [Pd, λ]"""
+        """提取特征: [Pd, λ, unit_params]"""
         pd_data = self.active_set_data[sample_id]['pd_data']
         pd_flat = pd_data.flatten()
         lambda_val = self.lambda_vals[sample_id]
-        return np.concatenate([pd_flat, lambda_val])
+
+        # 机组静态参数（归一化，训练和推理都一致可用）
+        g = self.unit_id
+        Pmax = self.gen[g, PMAX]
+        unit_params = np.array([
+            self.gen[g, PMIN] / (Pmax + 1e-8),                    # Pmin/Pmax ratio
+            self.gencost[g, -2] / self.T_delta,                    # 边际成本 a
+            self.gencost[g, -1] / self.T_delta / (Pmax + 1e-8),   # 归一化无负荷成本 b
+            0.4 * Pmax / self.T_delta / (Pmax + 1e-8),            # 归一化爬坡率 Ru
+            self.gencost[g, 1] / (Pmax + 1e-8),                   # 归一化启动成本
+            self.gencost[g, 2] / (Pmax + 1e-8),                   # 归一化停机成本
+        ])
+
+        return np.concatenate([pd_flat, lambda_val, unit_params])
     
-    def loss_function_differentiable(self, sample_id: int, alphas_tensor: torch.Tensor, 
-                                     betas_tensor: torch.Tensor, gammas_tensor: torch.Tensor, 
+    def loss_function_differentiable(self, sample_id: int, alphas_tensor: torch.Tensor,
+                                     betas_tensor: torch.Tensor, gammas_tensor: torch.Tensor,
+                                     deltas_tensor: torch.Tensor, costs_tensor: torch.Tensor,
                                      device) -> torch.Tensor:
         """
-        可微分的loss函数 - 时序耦合约束版本
+        可微分的loss函数 - V3三时段耦合约束版本
         
         使用BCD迭代得到的变量值(x, mu)计算loss
         
         Loss = rho_primal * obj_primal + rho_dual * obj_dual + rho_opt * obj_opt
         
         其中:
-        - obj_primal: 时序约束违反量 Σ_t max(0, alpha_t*x_t + beta_t*x_{t+1} - gamma_t)
+        - obj_primal: 三时段约束违反量 Σ_t max(0, alpha_t*x_t + beta_t*x_{t+1} + gamma_t*x_{t+2} - delta_t)
         - obj_dual: 对偶约束违反量（简化）
-        - obj_opt: 互补松弛条件 Σ_t |alpha_t*x_t + beta_t*x_{t+1} - gamma_t| * mu_t
+        - obj_opt: 互补松弛条件 Σ_t |alpha_t*x_t + beta_t*x_{t+1} + gamma_t*x_{t+2} - delta_t| * mu_t
         
         Args:
             sample_id: 样本索引
-            alphas_tensor: (T-1,) 当前时段系数
-            betas_tensor: (T-1,) 下一时段系数
-            gammas_tensor: (T-1,) 右端项
+            alphas_tensor: (max_constraints,) 第一时段系数
+            betas_tensor: (max_constraints,) 第二时段系数
+            gammas_tensor: (max_constraints,) 第三时段系数
+            deltas_tensor: (max_constraints,) 右端项
             device: 计算设备
         """
         g = self.unit_id
         
         # 从BCD迭代得到的变量
-        x_val = torch.tensor(self.x[sample_id], dtype=torch.float32, device=device)  # (T,)
-        mu_vals = torch.tensor(self.mu[sample_id], dtype=torch.float32, device=device)  # (T-1,)
-        lambda_val = torch.tensor(self.lambda_vals[sample_id], dtype=torch.float32, device=device)
-        
-        # 机组参数
-        gencost_fixed = torch.tensor(self.gencost[g, -1] / self.T_delta, dtype=torch.float32, device=device)
-        
-        # 目标x（如果有的话）
-        unit_commitment = self.active_set_data[sample_id].get('unit_commitment_matrix', None)
-        if unit_commitment is not None and g < unit_commitment.shape[0]:
-            x_target = torch.tensor(unit_commitment[g], dtype=torch.float32, device=device)
-        else:
-            x_target = None
+        x_val   = torch.tensor(self.x[sample_id],   dtype=torch.float32, device=device)  # (T,)
+        mu_vals = torch.tensor(self.mu[sample_id],  dtype=torch.float32, device=device)  # (num_coupling_constraints,)
         
         # ========== 计算obj_primal ==========
-        # 时序约束违反量: Σ_t max(0, alpha_t*x_t + beta_t*x_{t+1} - gamma_t)
+        # V3三时段约束违反量（按 sensitive_timesteps 索引）
         obj_primal = torch.tensor(0.0, device=device, requires_grad=True)
-        for t in range(self.num_coupling_constraints):
-            coupling_lhs = alphas_tensor[t] * x_val[t] + betas_tensor[t] * x_val[t+1]
-            coupling_viol = torch.relu(coupling_lhs - gammas_tensor[t])
+        sensitive_t = self.sensitive_timesteps[sample_id]
+        for k, t in enumerate(sensitive_t):
+            coupling_lhs = (alphas_tensor[k] * x_val[t]
+                            + betas_tensor[k] * x_val[t+1]
+                            + gammas_tensor[k] * x_val[t+2])
+            coupling_viol = torch.relu(coupling_lhs - deltas_tensor[k])
             obj_primal = obj_primal + coupling_viol
-        
+
         # ========== 计算obj_opt ==========
-        # 互补松弛: Σ_t |alpha_t*x_t + beta_t*x_{t+1} - gamma_t| * mu_t
+        # V3互补松弛（按 sensitive_timesteps 索引）
         obj_opt = torch.tensor(0.0, device=device, requires_grad=True)
-        for t in range(self.num_coupling_constraints):
-            coupling_lhs = alphas_tensor[t] * x_val[t] + betas_tensor[t] * x_val[t+1]
-            coupling_abs = torch.abs(coupling_lhs - gammas_tensor[t])
-            obj_opt = obj_opt + coupling_abs * mu_vals[t]
+        for k, t in enumerate(sensitive_t):
+            coupling_lhs = (alphas_tensor[k] * x_val[t]
+                            + betas_tensor[k] * x_val[t+1]
+                            + gammas_tensor[k] * x_val[t+2])
+            coupling_abs = torch.abs(coupling_lhs - deltas_tensor[k])
+            obj_opt = obj_opt + coupling_abs * mu_vals[k]
         
-        # ========== 计算obj_dual（简化版本）==========
-        # x变量的对偶约束
-        # 对于时序约束 alpha_t*x_t + beta_t*x_{t+1} <= gamma_t
-        # x_t的对偶贡献: alpha_t * mu_t
-        # x_{t+1}的对偶贡献: beta_t * mu_t
+        # ========== 计算obj_dual：x[t] KKT驻点条件（完整版） ==========
+        # x[t]驻点：b + Pmin*lam_pg_lower[t] - Pmax*lam_pg_upper[t]
+        #           + ramp_co_terms + min_on/off_terms + start/shut_terms
+        #           + coupling_terms(alpha,beta,gamma,mu) + lam_x_upper[t] - lam_x_lower[t] = 0
+        #
+        # 固有项（常数，来自dual block存储的lambda_inherent）
+        # 代理耦合项（含alpha,beta,gamma张量，提供NN梯度）
+        g = self.unit_id
+        b_val   = float(self.gencost[g, -1] / self.T_delta)
+        Pmin_v  = float(self.gen[g, PMIN])
+        Pmax_v  = float(self.gen[g, PMAX])
+        Ru_v    = 0.4 * Pmax_v / self.T_delta
+        Rd_v    = 0.4 * Pmax_v / self.T_delta
+        Ru_co_v = 0.3 * Pmax_v
+        Rd_co_v = 0.3 * Pmax_v
+        start_c = float(self.gencost[g, 1])
+        shut_c  = float(self.gencost[g, 2])
+        Ton_l   = min(4, self.T)
+        Toff_l  = min(4, self.T)
+
+        lam_inh = self.lambda_inherent[sample_id]  # dict or None
+
         obj_dual = torch.tensor(0.0, device=device, requires_grad=True)
         for t in range(self.T):
-            dual_expr = gencost_fixed - lambda_val[t]
-            
-            # 如果t参与了时序约束（作为当前时段）
-            if t < self.num_coupling_constraints:
-                dual_expr = dual_expr + alphas_tensor[t] * mu_vals[t]
-            
-            # 如果t参与了时序约束（作为下一时段）
-            if t > 0 and t - 1 < self.num_coupling_constraints:
-                dual_expr = dual_expr + betas_tensor[t-1] * mu_vals[t-1]
-            
+            # 固有约束贡献（常数部分）
+            inherent_const = b_val
+            if lam_inh is not None:
+                lam_pgl = float(lam_inh['lambda_pg_lower'][t])
+                lam_pgu = float(lam_inh['lambda_pg_upper'][t])
+                inherent_const += Pmin_v * lam_pgl - Pmax_v * lam_pgu
+
+                lam_ru = lam_inh['lambda_ramp_up']    # (T-1,)
+                lam_rd = lam_inh['lambda_ramp_down']  # (T-1,)
+                if t < self.T - 1:
+                    inherent_const += (Ru_co_v - Ru_v) * float(lam_ru[t])
+                if t > 0:
+                    inherent_const += (Rd_co_v - Rd_v) * float(lam_rd[t - 1])
+
+                lam_mon  = lam_inh['lambda_min_on']   # ragged: list indexed [tau_idx][t1]
+                lam_moff = lam_inh['lambda_min_off']
+                for tau in range(1, Ton_l + 1):
+                    tau_row = lam_mon[tau - 1]  # (T-tau,)
+                    for t1 in range(self.T - tau):
+                        k = float(tau_row[t1])
+                        if t == t1 + 1:
+                            inherent_const += k
+                        if t == t1:
+                            inherent_const -= k
+                        if t == t1 + tau:
+                            inherent_const -= k
+                for tau in range(1, Toff_l + 1):
+                    tau_row = lam_moff[tau - 1]
+                    for t1 in range(self.T - tau):
+                        k = float(tau_row[t1])
+                        if t == t1 + 1:
+                            inherent_const -= k
+                        if t == t1:
+                            inherent_const += k
+                        if t == t1 + tau:
+                            inherent_const += k
+
+                lam_sc  = lam_inh['lambda_start_cost']  # (T-1,)
+                lam_shc = lam_inh['lambda_shut_cost']   # (T-1,)
+                if t > 0:
+                    inherent_const += start_c * float(lam_sc[t - 1])
+                    inherent_const -= shut_c  * float(lam_shc[t - 1])
+                if t < self.T - 1:
+                    inherent_const -= start_c * float(lam_sc[t])
+                    inherent_const += shut_c  * float(lam_shc[t])
+
+                lam_xu = lam_inh['lambda_x_upper']  # (T,)
+                lam_xl = lam_inh['lambda_x_lower']  # (T,)
+                inherent_const += float(lam_xu[t]) - float(lam_xl[t])
+
+            # 代理耦合约束贡献（含NN参数，可微分；按 sensitive_timesteps 索引）
+            dual_expr = torch.tensor(inherent_const, dtype=torch.float32, device=device) + costs_tensor[t]
+            for k, ts in enumerate(sensitive_t):
+                if ts == t:
+                    dual_expr = dual_expr + alphas_tensor[k] * mu_vals[k]
+                if ts + 1 == t:
+                    dual_expr = dual_expr + betas_tensor[k] * mu_vals[k]
+                if ts + 2 == t:
+                    dual_expr = dual_expr + gammas_tensor[k] * mu_vals[k]
+
             obj_dual = obj_dual + torch.abs(dual_expr)
         
-        # ========== 附加损失：确保代理约束有效 ==========
-        # 1. 真实解必须满足时序约束（大权重）
-        loss_target_feasibility = torch.tensor(0.0, device=device)
-        if x_target is not None:
-            for t in range(self.num_coupling_constraints):
-                target_lhs = alphas_tensor[t] * x_target[t] + betas_tensor[t] * x_target[t+1]
-                target_viol = torch.relu(target_lhs - gammas_tensor[t])
-                loss_target_feasibility = loss_target_feasibility + target_viol
-            loss_target_feasibility = loss_target_feasibility * 10.0
-        
-        # 2. 整数性损失：鼓励x接近0或1
-        loss_integrality = torch.sum(x_val * (1 - x_val))
-        
-        # 3. 与目标x的偏差
-        if x_target is not None:
-            loss_deviation = torch.sum((x_val - x_target) ** 2)
-        else:
-            loss_deviation = torch.tensor(0.0, device=device)
-        
-        # 总损失
-        loss = (self.rho_primal * obj_primal + 
-                self.rho_dual * obj_dual + 
-                self.rho_opt * obj_opt +
-                loss_target_feasibility +
-                0.1 * loss_integrality +
-                loss_deviation)
-        
+        # L2 正则化：控制 alpha/beta/gamma/cost 参数大小
+        reg_loss = self.reg_weight * (torch.sum(alphas_tensor ** 2)
+                                      + torch.sum(betas_tensor ** 2)
+                                      + torch.sum(gammas_tensor ** 2)
+                                      + torch.sum(costs_tensor ** 2))
+
+        # 总损失：三项BCD目标 + 正则化
+        loss = (self.rho_primal * obj_primal +
+                self.rho_dual   * obj_dual   +
+                self.rho_opt    * obj_opt    +
+                reg_loss)
+
         return loss
     
-    def iter_with_surrogate_nn(self, num_epochs: int = 10):
+    def iter_with_surrogate_nn(self, num_epochs: int = 10, batch_size: int = 4):
         """
-        BCD迭代：神经网络更新时序耦合代理约束参数
-        使用loss_function_differentiable进行训练
+        BCD迭代：神经网络更新三时段耦合代理约束参数
+        使用loss_function_differentiable进行训练，mini-batch梯度累积模式
         """
         if not TORCH_AVAILABLE:
             return
-        
+
+        # 前N轮BCD重建optimizer（适应剧烈变化），之后保持动量
+        optimizer_persist_after = 5
+        rebuild = (self.iter_number < optimizer_persist_after)
+        if rebuild or not hasattr(self, '_surr_optimizer') or self._surr_optimizer is None:
+            # 分离 cost_net 参数，主优化器不管理 cost_net
+            cost_net_params = set(self.surrogate_net.cost_net.parameters())
+            main_params = [p for p in self.surrogate_net.parameters() if p not in cost_net_params]
+            self._surr_optimizer = optim.Adam(
+                main_params, lr=3e-4, weight_decay=1e-4)
+            self._surr_cost_optimizer = optim.Adam(
+                self.surrogate_net.cost_net.parameters(), lr=3e-5, weight_decay=1e-4)
+            self._surr_scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
+                self._surr_optimizer, T_0=max(num_epochs, 1), T_mult=1)
+
         self.surrogate_net.train()
-        
+
         for epoch in range(num_epochs):
             epoch_loss = 0.0
-            
+            self._surr_optimizer.zero_grad()
+            self._surr_cost_optimizer.zero_grad()
+            batch_count = 0
+
             for sample_id in range(self.n_samples):
+                # 计算当前 batch 的实际大小（最后一个 batch 可能不满）
+                batch_start = (sample_id // batch_size) * batch_size
+                actual_batch_size = min(batch_size, self.n_samples - batch_start)
+
                 # 提取特征: [Pd, λ]
                 features = self._extract_features(sample_id)
                 features_tensor = torch.tensor(features, dtype=torch.float32, device=self.device).unsqueeze(0)
-                
-                # 前向传播：输出 (alphas, betas, gammas)
-                alphas_out, betas_out, gammas_out = self.surrogate_net(features_tensor)
-                alphas_tensor = alphas_out.squeeze(0)  # (T-1,)
-                betas_tensor = betas_out.squeeze(0)    # (T-1,)
-                gammas_tensor = gammas_out.squeeze(0)  # (T-1,)
-                
-                # 计算loss
-                self.optimizer.zero_grad()
+
+                # V3前向传播：输出 (alphas, betas, gammas, deltas, costs)
+                alphas_out, betas_out, gammas_out, deltas_out, costs_out = self.surrogate_net(features_tensor)
+                nc = self.num_coupling_constraints
+                alphas_tensor = alphas_out.squeeze(0)[:nc]   # (num_coupling_constraints,)
+                betas_tensor = betas_out.squeeze(0)[:nc]
+                gammas_tensor = gammas_out.squeeze(0)[:nc]
+                deltas_tensor = deltas_out.squeeze(0)[:nc]   # Softplus保证非负
+                costs_tensor = costs_out.squeeze(0)[:self.T]  # (T,)
+
+                # 计算loss（V3版本，传入5个参数）+ scaled backward
                 loss = self.loss_function_differentiable(
-                    sample_id, alphas_tensor, betas_tensor, gammas_tensor, self.device
+                    sample_id, alphas_tensor, betas_tensor, gammas_tensor, deltas_tensor,
+                    costs_tensor, self.device
                 )
-                
-                # 反向传播
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.surrogate_net.parameters(), max_norm=1.0)
-                self.optimizer.step()
-                
-                epoch_loss += loss.item()
-                
-                # 更新参数值
+                (loss / actual_batch_size).backward()
+                epoch_loss += loss.detach().cpu().item()
+                batch_count += 1
+
+                # 更新参数值（V3：5个参数）
                 self.alpha_values[sample_id] = alphas_tensor.detach().cpu().numpy()
                 self.beta_values[sample_id] = betas_tensor.detach().cpu().numpy()
                 self.gamma_values[sample_id] = gammas_tensor.detach().cpu().numpy()
-            
+                self.delta_values[sample_id] = deltas_tensor.detach().cpu().numpy()
+                # cost_values 使用 EMA 平滑，避免迭代间剧烈变化
+                new_costs = costs_tensor.detach().cpu().numpy()
+                self.cost_values[sample_id] = (
+                    (1 - self.cost_ema_alpha) * self.cost_values[sample_id]
+                    + self.cost_ema_alpha * new_costs
+                )
+
+                # batch 满或 epoch 结束：clip + step
+                if batch_count == batch_size or sample_id == self.n_samples - 1:
+                    torch.nn.utils.clip_grad_norm_(self.surrogate_net.parameters(), max_norm=1.0)
+                    self._surr_optimizer.step()
+                    self._surr_cost_optimizer.step()
+                    self._surr_optimizer.zero_grad()
+                    self._surr_cost_optimizer.zero_grad()
+                    batch_count = 0
+
+            self._surr_scheduler.step()
+
             if epoch == 0 or epoch == num_epochs - 1:
                 print(f"  [NN] epoch {epoch+1}/{num_epochs}, avg_loss = {epoch_loss/self.n_samples:.6f}", flush=True)
-    
+
+        # 记录最终 epoch loss 供 logger 使用
+        if self.n_samples > 0:
+            self._last_surr_nn_loss = epoch_loss / self.n_samples
+
     def cal_viol(self) -> Tuple[float, float, float]:
-        """计算时序耦合约束违反量"""
+        """
+        计算完整KKT违反量（与primal/dual block的目标函数完全对应）
+          obj_primal: 所有约束（原问题+代理）的原始可行性违反
+          obj_dual:   所有决策变量（pg, x, coc）的KKT驻点条件违反
+          obj_opt:    所有约束-对偶变量对的互补松弛违反
+        """
         obj_primal = 0.0
-        obj_dual = 0.0
-        obj_opt = 0.0
-        
+        obj_dual   = 0.0
+        obj_opt    = 0.0
+
         g = self.unit_id
-        
+
         for sample_id in range(self.n_samples):
-            x_val = self.x[sample_id]
-            alphas = self.alpha_values[sample_id]
-            betas = self.beta_values[sample_id]
-            gammas = self.gamma_values[sample_id]
+            x_val   = self.x[sample_id]
+            pg_val  = self.pg[sample_id]
+            coc_val = self.coc[sample_id]
+            alphas  = self.alpha_values[sample_id]
+            betas   = self.beta_values[sample_id]
+            gammas  = self.gamma_values[sample_id]
+            deltas  = self.delta_values[sample_id]
             mu_vals = self.mu[sample_id]
-            lambda_val = self.lambda_vals[sample_id]
-            
-            # 时序约束违反
-            for t in range(self.num_coupling_constraints):
-                coupling_lhs = alphas[t] * x_val[t] + betas[t] * x_val[t+1]
-                coupling_viol = max(0, coupling_lhs - gammas[t])
-                obj_primal += coupling_viol
-                
-                # 互补松弛
-                obj_opt += abs(coupling_lhs - gammas[t]) * mu_vals[t]
-            
-            # 对偶约束（简化）
-            gencost_fixed = self.gencost[g, -1] / self.T_delta
+            lam_inh = self.lambda_inherent[sample_id]
+            lambda_val = self.lambda_vals[sample_id]   # 电价对偶变量
+
+            a_v     = self.gencost[g, -2] / self.T_delta   # 线性发电成本系数
+            b_v     = self.gencost[g, -1] / self.T_delta   # 无负荷成本系数
+            Pmin_v  = float(self.gen[g, PMIN])
+            Pmax_v  = float(self.gen[g, PMAX])
+            Ru_v    = 0.4 * Pmax_v / self.T_delta
+            Rd_v    = 0.4 * Pmax_v / self.T_delta
+            Ru_co_v = 0.3 * Pmax_v
+            Rd_co_v = 0.3 * Pmax_v
+            sc_v    = self.gencost[g, 1]
+            shc_v   = self.gencost[g, 2]
+            Ton_v   = min(4, self.T)
+            Toff_v  = min(4, self.T)
+
+            # ================================================================
+            # obj_primal：所有原始可行性违反
+            # ================================================================
+
+            # -- 代理耦合约束违反（按 sensitive_timesteps 索引）--
+            sensitive_t = self.sensitive_timesteps[sample_id]
+            for k, ts in enumerate(sensitive_t):
+                coupling_lhs = alphas[k]*x_val[ts] + betas[k]*x_val[ts+1] + gammas[k]*x_val[ts+2]
+                obj_primal += max(0.0, coupling_lhs - deltas[k])
+
+            # -- 原问题固有约束违反（与primal block的obj_primal对应）--
             for t in range(self.T):
-                dual_expr = gencost_fixed - lambda_val[t]
-                
-                # 时序约束的对偶贡献
-                if t < self.num_coupling_constraints:
-                    dual_expr += alphas[t] * mu_vals[t]
-                if t > 0 and t - 1 < self.num_coupling_constraints:
-                    dual_expr += betas[t-1] * mu_vals[t-1]
-                
-                obj_dual += abs(dual_expr)
-        
+                obj_primal += max(0.0, Pmin_v * x_val[t] - pg_val[t])   # pg >= Pmin*x
+                obj_primal += max(0.0, pg_val[t] - Pmax_v * x_val[t])   # pg <= Pmax*x
+
+            for t in range(1, self.T):
+                obj_primal += max(0.0, pg_val[t] - pg_val[t-1]
+                                       - Ru_v*x_val[t-1] - Ru_co_v*(1-x_val[t-1]))  # ramp_up
+                obj_primal += max(0.0, pg_val[t-1] - pg_val[t]
+                                       - Rd_v*x_val[t] - Rd_co_v*(1-x_val[t]))       # ramp_down
+                obj_primal += max(0.0, sc_v  * (x_val[t] - x_val[t-1]) - coc_val[t-1])  # start_cost
+                obj_primal += max(0.0, shc_v * (x_val[t-1] - x_val[t]) - coc_val[t-1])  # shut_cost
+
+            for tau in range(1, Ton_v + 1):
+                for t1 in range(self.T - tau):
+                    obj_primal += max(0.0, x_val[t1+1] - x_val[t1] - x_val[t1+tau])   # min_on
+
+            for tau in range(1, Toff_v + 1):
+                for t1 in range(self.T - tau):
+                    obj_primal += max(0.0, -x_val[t1+1] + x_val[t1] - (1-x_val[t1+tau]))  # min_off
+
+            # ================================================================
+            # obj_opt：所有互补松弛违反（与primal block的obj_opt对应）
+            # ================================================================
+
+            # -- 代理耦合约束互补松弛（按 sensitive_timesteps 索引）--
+            for k, ts in enumerate(sensitive_t):
+                coupling_lhs = alphas[k]*x_val[ts] + betas[k]*x_val[ts+1] + gammas[k]*x_val[ts+2]
+                obj_opt += abs(coupling_lhs - deltas[k]) * mu_vals[k]
+
+            # -- 原问题固有约束互补松弛 --
+            if lam_inh is not None:
+                for t in range(self.T):
+                    obj_opt += abs(Pmin_v*x_val[t] - pg_val[t])   * abs(float(lam_inh['lambda_pg_lower'][t]))
+                    obj_opt += abs(pg_val[t] - Pmax_v*x_val[t])   * abs(float(lam_inh['lambda_pg_upper'][t]))
+                    obj_opt += x_val[t]       * abs(float(lam_inh['lambda_x_lower'][t]))
+                    obj_opt += (1-x_val[t])   * abs(float(lam_inh['lambda_x_upper'][t]))
+
+                for t in range(1, self.T):
+                    ru_expr    = pg_val[t] - pg_val[t-1] - Ru_v*x_val[t-1] - Ru_co_v*(1-x_val[t-1])
+                    rd_expr    = pg_val[t-1] - pg_val[t] - Rd_v*x_val[t]   - Rd_co_v*(1-x_val[t])
+                    start_expr = sc_v  * (x_val[t] - x_val[t-1]) - coc_val[t-1]
+                    shut_expr  = shc_v * (x_val[t-1] - x_val[t]) - coc_val[t-1]
+                    obj_opt += abs(ru_expr)    * abs(float(lam_inh['lambda_ramp_up'][t-1]))
+                    obj_opt += abs(rd_expr)    * abs(float(lam_inh['lambda_ramp_down'][t-1]))
+                    obj_opt += abs(start_expr) * abs(float(lam_inh['lambda_start_cost'][t-1]))
+                    obj_opt += abs(shut_expr)  * abs(float(lam_inh['lambda_shut_cost'][t-1]))
+                    obj_opt += coc_val[t-1]    * abs(float(lam_inh['lambda_coc_nonneg'][t-1]))
+
+                for tau in range(1, Ton_v + 1):
+                    for t1 in range(self.T - tau):
+                        expr = x_val[t1+1] - x_val[t1] - x_val[t1+tau]
+                        obj_opt += abs(expr) * abs(float(lam_inh['lambda_min_on'][tau-1][t1]))
+
+                for tau in range(1, Toff_v + 1):
+                    for t1 in range(self.T - tau):
+                        expr = -x_val[t1+1] + x_val[t1] - (1-x_val[t1+tau])
+                        obj_opt += abs(expr) * abs(float(lam_inh['lambda_min_off'][tau-1][t1]))
+
+            # ================================================================
+            # obj_dual：所有决策变量的KKT驻点条件违反
+            # ================================================================
+
+            # -- pg[t] 驻点条件（与dual block一致）--
+            if lam_inh is not None:
+                lam_ru = lam_inh['lambda_ramp_up']
+                lam_rd = lam_inh['lambda_ramp_down']
+                for t in range(self.T):
+                    pg_stat = a_v - lambda_val[t]
+                    pg_stat -= float(lam_inh['lambda_pg_lower'][t])
+                    pg_stat += float(lam_inh['lambda_pg_upper'][t])
+                    if t > 0:
+                        pg_stat += float(lam_ru[t-1])
+                        pg_stat -= float(lam_rd[t-1])
+                    if t < self.T - 1:
+                        pg_stat -= float(lam_ru[t])
+                        pg_stat += float(lam_rd[t])
+                    obj_dual += abs(pg_stat)
+
+            # -- x[t] 驻点条件（含固有约束项、代理耦合项和cost项）--
+            for t in range(self.T):
+                x_stat = b_v + self.cost_values[sample_id][t]
+                if lam_inh is not None:
+                    x_stat += Pmin_v * float(lam_inh['lambda_pg_lower'][t])
+                    x_stat -= Pmax_v * float(lam_inh['lambda_pg_upper'][t])
+                    lam_ru = lam_inh['lambda_ramp_up']
+                    lam_rd = lam_inh['lambda_ramp_down']
+                    if t < self.T - 1:
+                        x_stat += (Ru_co_v - Ru_v) * float(lam_ru[t])
+                    if t > 0:
+                        x_stat += (Rd_co_v - Rd_v) * float(lam_rd[t-1])
+                    lam_mon  = lam_inh['lambda_min_on']
+                    lam_moff = lam_inh['lambda_min_off']
+                    for tau in range(1, Ton_v + 1):
+                        for t1 in range(self.T - tau):
+                            k = float(lam_mon[tau-1][t1])
+                            if t == t1 + 1:   x_stat += k
+                            if t == t1:       x_stat -= k
+                            if t == t1 + tau: x_stat -= k
+                    for tau in range(1, Toff_v + 1):
+                        for t1 in range(self.T - tau):
+                            k = float(lam_moff[tau-1][t1])
+                            if t == t1 + 1:   x_stat -= k
+                            if t == t1:       x_stat += k
+                            if t == t1 + tau: x_stat += k
+                    lam_sc  = lam_inh['lambda_start_cost']
+                    lam_shc = lam_inh['lambda_shut_cost']
+                    if t > 0:
+                        x_stat += sc_v  * float(lam_sc[t-1])
+                        x_stat -= shc_v * float(lam_shc[t-1])
+                    if t < self.T - 1:
+                        x_stat -= sc_v  * float(lam_sc[t])
+                        x_stat += shc_v * float(lam_shc[t])
+                    x_stat += float(lam_inh['lambda_x_upper'][t]) - float(lam_inh['lambda_x_lower'][t])
+                # 代理耦合约束对偶贡献（按 sensitive_timesteps 索引）
+                sensitive_t = self.sensitive_timesteps[sample_id]
+                for k, ts in enumerate(sensitive_t):
+                    if ts == t:
+                        x_stat += alphas[k] * mu_vals[k]
+                    if ts + 1 == t:
+                        x_stat += betas[k] * mu_vals[k]
+                    if ts + 2 == t:
+                        x_stat += gammas[k] * mu_vals[k]
+                obj_dual += abs(x_stat)
+
+            # -- coc[t] 驻点条件（与dual block一致）--
+            if lam_inh is not None:
+                lam_sc  = lam_inh['lambda_start_cost']
+                lam_shc = lam_inh['lambda_shut_cost']
+                lam_cn  = lam_inh['lambda_coc_nonneg']
+                for t in range(self.T - 1):
+                    coc_stat = 1.0 - float(lam_sc[t]) - float(lam_shc[t]) - float(lam_cn[t])
+                    obj_dual += abs(coc_stat)
+
         return obj_primal, obj_dual, obj_opt
     
     def iter(self, max_iter: int = 20, nn_epochs: int = 10):
         """
-        主BCD迭代循环 - 时序耦合约束版本
+        主BCD迭代循环 - V3三时段耦合约束版本
         """
-        print(f"开始BCD迭代训练 (机组{self.unit_id}, 时序耦合约束)...", flush=True)
+        if not hasattr(self, 'logger'):
+            self.logger = None
+        print(f"开始BCD迭代训练 (机组{self.unit_id}, V3三时段耦合约束)...", flush=True)
         
         for i in range(max_iter):
             print(f"🔄 迭代 {i+1}/{max_iter}", flush=True)
@@ -1171,14 +2018,16 @@ class SubproblemSurrogateTrainer:
             
             EPS = 1e-10
             
-            # 1. 原始块迭代
+            # 1. 原始块迭代（V3：传入5个参数）
             for sample_id in range(self.n_samples):
-                alphas = self.alpha_values[sample_id]  # (T-1,)
-                betas = self.beta_values[sample_id]    # (T-1,)
-                gammas = self.gamma_values[sample_id]  # (T-1,)
-                
+                alphas = self.alpha_values[sample_id]
+                betas = self.beta_values[sample_id]
+                gammas = self.gamma_values[sample_id]
+                deltas = self.delta_values[sample_id]
+                costs = self.cost_values[sample_id]
+
                 pg_sol, x_sol, coc_sol, cpower_sol = self.iter_with_primal_block(
-                    sample_id, alphas, betas, gammas
+                    sample_id, alphas, betas, gammas, deltas, costs
                 )
                 
                 if pg_sol is not None:
@@ -1188,67 +2037,100 @@ class SubproblemSurrogateTrainer:
                     self.coc[sample_id] = np.where(np.abs(coc_sol) < EPS, 0, coc_sol)
                     self.cpower[sample_id] = np.where(np.abs(cpower_sol) < EPS, 0, cpower_sol)
             
-            # 2. 对偶块迭代
+            # 2. 对偶块迭代（V3：联合更新固有约束对偶变量和代理耦合对偶变量）
+            lb_mu = 0.0 if self.iter_number >= 50 else self.mu_lower_bound
             for sample_id in range(self.n_samples):
                 alphas = self.alpha_values[sample_id]
-                betas = self.beta_values[sample_id]
+                betas  = self.beta_values[sample_id]
                 gammas = self.gamma_values[sample_id]
-                
-                mu_sol = self.iter_with_dual_block(sample_id, alphas, betas, gammas)  # 返回(T-1,)数组
-                # 确保对偶变量非负
-                if self.iter_number >= 50:
-                    self.mu[sample_id] = np.maximum(mu_sol, 0)
-                else:
-                    self.mu[sample_id] = np.maximum(mu_sol, self.mu_lower_bound)
+                deltas = self.delta_values[sample_id]
+                costs  = self.cost_values[sample_id]
+
+                lambda_inherent_sol, mu_sol = self.iter_with_dual_block(
+                    sample_id, alphas, betas, gammas, deltas, costs
+                )
+                if lambda_inherent_sol is not None:
+                    self.lambda_inherent[sample_id] = lambda_inherent_sol
+                    self.mu[sample_id] = np.maximum(mu_sol, lb_mu)
             
-            # 3. 神经网络更新代理约束参数
+            # 3. 神经网络更新代理约束参数（V3：自动输出4个参数）
             self.iter_with_surrogate_nn(num_epochs=nn_epochs)
-            
-            # 计算违反量
+
+            # 计算违反量（NN更新后）
             obj_primal, obj_dual, obj_opt = self.cal_viol()
             obj_primal = obj_primal if abs(obj_primal) >= 1e-12 else 0.0
-            obj_dual = obj_dual if abs(obj_dual) >= 1e-12 else 0.0
-            obj_opt = obj_opt if abs(obj_opt) >= 1e-12 else 0.0
-            
+            obj_dual   = obj_dual   if abs(obj_dual)   >= 1e-12 else 0.0
+            obj_opt    = obj_opt    if abs(obj_opt)    >= 1e-12 else 0.0
+
             print(f"  obj_primal: {obj_primal:.6f}, obj_dual: {obj_dual:.6f}, obj_opt: {obj_opt:.6f}", flush=True)
-            
-            # 更新惩罚参数
-            self.rho_primal += self.gamma * obj_primal
-            self.rho_dual += self.gamma * obj_dual
-            self.rho_opt += self.gamma * obj_opt
-            
+
+            # 更新惩罚参数（累加式，与BCD标准一致）
+            self.rho_primal = min(self.rho_primal + self.gamma * obj_primal, self.rho_max)
+            self.rho_dual   = min(self.rho_dual   + self.gamma * obj_dual,   self.rho_max)
+            self.rho_opt    = min(self.rho_opt    + self.gamma * obj_opt,    self.rho_max)
+
             print(f"  ρ_primal={self.rho_primal:.4f}, ρ_dual={self.rho_dual:.4f}, ρ_opt={self.rho_opt:.4f}", flush=True)
             print("  " + "-" * 40, flush=True)
-        
-        print(f"✓ 机组{self.unit_id}时序耦合代理约束训练完成", flush=True)
+
+            # logger 钩子
+            if self.logger is not None:
+                nn_loss = getattr(self, '_last_surr_nn_loss', None)
+                self.logger.log_surrogate_iter(
+                    unit_id=self.unit_id, iter=i,
+                    obj_primal=obj_primal, obj_dual=obj_dual, obj_opt=obj_opt,
+                    rho_primal=self.rho_primal, rho_dual=self.rho_dual, rho_opt=self.rho_opt,
+                    alpha_mean=float(np.mean(self.alpha_values)),
+                    beta_mean=float(np.mean(self.beta_values)),
+                    gamma_mean=float(np.mean(self.gamma_values)),
+                    delta_mean=float(np.mean(self.delta_values)),
+                    mu_mean=float(np.mean(self.mu)),
+                    nn_loss=nn_loss,
+                )
+
+        print(f"✓ 机组{self.unit_id} V3三时段耦合代理约束训练完成", flush=True)
     
-    def get_surrogate_params(self, pd_data: np.ndarray, lambda_val: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    def get_surrogate_params(self, pd_data: np.ndarray, lambda_val: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         """
-        获取时序耦合代理约束参数
-        
+        获取V3三时段耦合代理约束参数
+
         Returns:
-            alphas: (T-1,) 当前时段系数
-            betas: (T-1,) 下一时段系数
-            gammas: (T-1,) 右端项
+            alphas: (max_constraints,) 第一时段系数
+            betas: (max_constraints,) 第二时段系数
+            gammas: (max_constraints,) 第三时段系数
+            deltas: (max_constraints,) 右端项
+            costs: (T,) 目标成本系数
         """
         if not TORCH_AVAILABLE:
             raise RuntimeError("PyTorch不可用")
-        
+
         self.surrogate_net.eval()
-        
+
         pd_flat = pd_data.flatten()
-        features = np.concatenate([pd_flat, lambda_val])
+        # 机组静态参数（与 _extract_features 保持一致）
+        g = self.unit_id
+        Pmax = self.gen[g, PMAX]
+        unit_params = np.array([
+            self.gen[g, PMIN] / (Pmax + 1e-8),
+            self.gencost[g, -2] / self.T_delta,
+            self.gencost[g, -1] / self.T_delta / (Pmax + 1e-8),
+            0.4 * Pmax / self.T_delta / (Pmax + 1e-8),
+            self.gencost[g, 1] / (Pmax + 1e-8),
+            self.gencost[g, 2] / (Pmax + 1e-8),
+        ])
+        features = np.concatenate([pd_flat, lambda_val, unit_params])
         features_tensor = torch.tensor(features, dtype=torch.float32, device=self.device).unsqueeze(0)
-        
+
         with torch.no_grad():
-            alphas, betas, gammas = self.surrogate_net(features_tensor)
-        
-        return (alphas.squeeze(0).cpu().numpy(), 
-                betas.squeeze(0).cpu().numpy(), 
-                gammas.squeeze(0).cpu().numpy())
+            alphas, betas, gammas, deltas, costs = self.surrogate_net(features_tensor)
+
+        return (alphas.squeeze(0).cpu().numpy(),
+                betas.squeeze(0).cpu().numpy(),
+                gammas.squeeze(0).cpu().numpy(),
+                deltas.squeeze(0).cpu().numpy(),
+                costs.squeeze(0).cpu().numpy())
     
     def save(self, filepath: str):
-        """保存模型"""
+        """保存V3模型"""
         if TORCH_AVAILABLE:
             state = {
                 'surrogate_net_state_dict': self.surrogate_net.state_dict(),
@@ -1256,11 +2138,14 @@ class SubproblemSurrogateTrainer:
                 'alpha_values': self.alpha_values,
                 'beta_values': self.beta_values,
                 'gamma_values': self.gamma_values,
+                'delta_values': self.delta_values,
+                'cost_values': self.cost_values,
                 'mu': self.mu,
                 'rho_primal': self.rho_primal,
                 'rho_dual': self.rho_dual,
                 'rho_opt': self.rho_opt,
-                'num_coupling_constraints': self.num_coupling_constraints
+                'num_coupling_constraints': self.num_coupling_constraints,
+                'lambda_inherent': self.lambda_inherent,
             }
             
             dirpath = os.path.dirname(os.path.abspath(filepath))
@@ -1268,29 +2153,26 @@ class SubproblemSurrogateTrainer:
                 os.makedirs(dirpath, exist_ok=True)
             
             torch.save(state, filepath)
-            print(f"✓ 时序耦合代理约束模型已保存: {filepath}", flush=True)
+            print(f"✓ V3三时段耦合代理约束模型已保存: {filepath}", flush=True)
     
     def load(self, filepath: str):
-        """加载模型"""
+        """加载V3模型"""
         if TORCH_AVAILABLE:
-            state = torch.load(filepath, map_location=self.device)
-            self.surrogate_net.load_state_dict(state['surrogate_net_state_dict'])
+            state = torch.load(filepath, map_location=self.device, weights_only=False)
+            self.surrogate_net.load_state_dict(state['surrogate_net_state_dict'], strict=False)
             self.optimizer.load_state_dict(state['optimizer_state_dict'])
             self.alpha_values = state['alpha_values']
             self.beta_values = state['beta_values']
             self.gamma_values = state['gamma_values']
+            self.delta_values = state.get('delta_values', np.ones_like(self.gamma_values))
+            self.cost_values = state.get('cost_values', np.zeros((self.n_samples, self.T)))
             self.mu = state['mu']
             self.rho_primal = state['rho_primal']
             self.rho_dual = state['rho_dual']
             self.rho_opt = state['rho_opt']
-            print(f"✓ 时序耦合代理约束模型已加载: {filepath}", flush=True)
-            self.alpha_values = state['alpha_values']
-            self.beta_values = state['beta_values']
-            self.mu = state['mu']
-            self.rho_primal = state['rho_primal']
-            self.rho_dual = state['rho_dual']
-            self.rho_opt = state['rho_opt']
-            print(f"✓ 代理约束模型已加载: {filepath}", flush=True)
+            if 'lambda_inherent' in state:
+                self.lambda_inherent = state['lambda_inherent']
+            print(f"✓ V3三时段耦合代理约束模型已加载: {filepath}", flush=True)
 
 
 # ========================== 训练代码 ==========================
@@ -1595,14 +2477,16 @@ def evaluate_trained_models(dual_predictor: DualVariablePredictorTrainer,
             alpha = trainer.alpha_values[sample_id]
             beta = trainer.beta_values[sample_id]
             
+            x_true = active_set_data[sample_id].get('x_true', None)
+            
             # 无代理约束
             x_without = solve_subproblem_LP_simple(trainer, sample_id, lambda_val, None, None)
-            gap_without = np.sum(x_without * (1 - x_without))
+            gap_without = np.sum(np.abs(x_without - x_true))
             total_gap_without += gap_without
             
             # 有代理约束
             x_with = solve_subproblem_LP_simple(trainer, sample_id, lambda_val, alpha, beta)
-            gap_with = np.sum(x_with * (1 - x_with))
+            gap_with = np.sum(np.abs(x_with - x_true))
             total_gap_with += gap_with
             
             # 真实解可行性
@@ -1615,13 +2499,11 @@ def evaluate_trained_models(dual_predictor: DualVariablePredictorTrainer,
         avg_gap_without = total_gap_without / n_eval
         avg_gap_with = total_gap_with / n_eval
         gap_reduction = (avg_gap_without - avg_gap_with) / max(avg_gap_without, 1e-6) * 100
-        feasibility_rate = feasible_count / n_eval * 100
         
         print(f"\n  机组 {g}:", flush=True)
-        print(f"    整数性间隙 (无代理): {avg_gap_without:.4f}", flush=True)
-        print(f"    整数性间隙 (有代理): {avg_gap_with:.4f}", flush=True)
+        print(f"    绝对间隙 (无代理): {avg_gap_without:.4f}", flush=True)
+        print(f"    绝对间隙 (有代理): {avg_gap_with:.4f}", flush=True)
         print(f"    间隙减少: {gap_reduction:.2f}%", flush=True)
-        print(f"    真实解可行率: {feasibility_rate:.1f}%", flush=True)
 
 
 def train_from_json_file(json_filepath: str, ppc, T_delta: float = 1.0,
@@ -1670,56 +2552,6 @@ def train_from_json_file(json_filepath: str, ppc, T_delta: float = 1.0,
 
 # ========================== 测试代码 ==========================
 
-def generate_test_data(ppc, T: int = 8, n_samples: int = 10, seed: int = 42) -> List[Dict]:
-    """
-    生成测试用的活动集数据
-    
-    Args:
-        ppc: PyPower案例数据
-        T: 时段数
-        n_samples: 样本数量
-        seed: 随机种子
-        
-    Returns:
-        活动集数据列表
-    """
-    ppc_int = ext2int(ppc)
-    nb = ppc_int['bus'].shape[0]
-    ng = ppc_int['gen'].shape[0]
-    
-    active_set_data = []
-    
-    for sample_id in range(n_samples):
-        np.random.seed(seed + sample_id)
-        
-        # 生成随机负荷数据（带有日变化曲线）
-        base_load = np.random.uniform(50, 150, nb)
-        time_factor = 1 + 0.3 * np.sin(np.linspace(0, 2*np.pi, T)) + 0.1 * np.random.randn(T)
-        pd_data = np.outer(base_load, time_factor)
-        pd_data = np.maximum(pd_data, 10)  # 确保负荷为正
-        
-        # 生成随机的机组启停状态（满足部分约束）
-        unit_commitment = np.zeros((ng, T), dtype=int)
-        for g in range(ng):
-            # 随机选择开机时段
-            on_probability = 0.6 + 0.3 * np.random.rand()
-            for t in range(T):
-                if np.random.rand() < on_probability:
-                    unit_commitment[g, t] = 1
-        
-        sample = {
-            'sample_id': sample_id,
-            'pd_data': pd_data,
-            'unit_commitment_matrix': unit_commitment,
-            'active_constraints': [],
-            'active_variables': []
-        }
-        active_set_data.append(sample)
-    
-    print(f"✓ 生成了 {n_samples} 个测试样本 (T={T}, nb={nb}, ng={ng})", flush=True)
-    return active_set_data
-
-
 def test_dual_predictor(ppc=None, active_set_data=None, save_path: str = None):
     """
     测试对偶变量预测器
@@ -1743,10 +2575,6 @@ def test_dual_predictor(ppc=None, active_set_data=None, save_path: str = None):
     # 准备数据
     if ppc is None:
         ppc = pypower.case30.case30()
-    
-    T = 8
-    if active_set_data is None:
-        active_set_data = generate_test_data(ppc, T=T, n_samples=20)
     
     # 创建并训练预测器
     print("\n--- 初始化预测器 ---", flush=True)
@@ -1871,45 +2699,36 @@ def evaluate_surrogate_effectiveness(trainer: SubproblemSurrogateTrainer, active
         else:
             x_target = None
         
+        x_true = active_set_data[sample_id].get('x_true', None)
         # 1. 无代理约束的LP松弛
         x_without = solve_subproblem_LP_simple(trainer, sample_id, lambda_val, None, None)
-        integrality_gap_without = np.sum(x_without * (1 - x_without))
+        integrality_gap_without = np.sum(np.abs(x_without - x_true))
         total_integrality_gap_without += integrality_gap_without
         
         # 2. 有代理约束的LP松弛
         x_with = solve_subproblem_LP_simple(trainer, sample_id, lambda_val, alpha, beta)
-        integrality_gap_with = np.sum(x_with * (1 - x_with))
+        integrality_gap_with = np.sum(np.abs(x_with - x_true))
         total_integrality_gap_with += integrality_gap_with
         
         # 3. 代理约束违反量
         constraint_viol = max(0, np.sum(alpha * x_with) - beta)
         total_constraint_violation += constraint_viol
         
-        # 4. 真实解的可行性（代理约束是否保留真实解）
-        if x_target is not None:
-            target_lhs = np.sum(alpha * x_target)
-            if target_lhs <= beta + 1e-6:
-                target_feasibility_rate += 1.0
-        
         if sample_id < 3:
             print(f"\n  样本 {sample_id}:", flush=True)
-            print(f"    无代理约束整数性间隙: {integrality_gap_without:.4f}", flush=True)
-            print(f"    有代理约束整数性间隙: {integrality_gap_with:.4f}", flush=True)
+            print(f"    无代理约束绝对间隙: {integrality_gap_without:.4f}", flush=True)
+            print(f"    有代理约束绝对间隙: {integrality_gap_with:.4f}", flush=True)
             print(f"    代理约束违反量: {constraint_viol:.6f}", flush=True)
-            if x_target is not None:
-                print(f"    真实解可行: {target_lhs <= beta + 1e-6}", flush=True)
     
     avg_gap_without = total_integrality_gap_without / n_test
     avg_gap_with = total_integrality_gap_with / n_test
     avg_violation = total_constraint_violation / n_test
-    feasibility_rate = target_feasibility_rate / n_test * 100
     
     print(f"\n  === 总体评估 ===", flush=True)
     print(f"  平均整数性间隙 (无代理约束): {avg_gap_without:.4f}", flush=True)
     print(f"  平均整数性间隙 (有代理约束): {avg_gap_with:.4f}", flush=True)
     print(f"  间隙减少: {(avg_gap_without - avg_gap_with) / max(avg_gap_without, 1e-6) * 100:.2f}%", flush=True)
     print(f"  平均代理约束违反量: {avg_violation:.6f}", flush=True)
-    print(f"  真实解可行率: {feasibility_rate:.1f}%", flush=True)
 
 
 def solve_subproblem_LP_simple(trainer: SubproblemSurrogateTrainer, sample_id: int,
@@ -2005,8 +2824,6 @@ def test_multi_unit_surrogate(ppc=None, active_set_data=None, lambda_predictor=N
     ng = ppc_int['gen'].shape[0]
     
     T = 8
-    if active_set_data is None:
-        active_set_data = generate_test_data(ppc, T=T, n_samples=15)
     
     if unit_ids is None:
         unit_ids = list(range(min(3, ng)))  # 默认训练前3个机组
@@ -2283,9 +3100,9 @@ def main():
         # 配置参数
         case_name = 'case30'  # 可选: 'case14', 'case30', 'case39'
         n_samples = 20
-        T = 8
+        T = 24
         T_delta = 1.0
-        unit_ids = None  # None表示所有机组，或指定如 [0, 1, 2]
+        unit_ids = [0]  # None表示所有机组，或指定如 [0, 1, 2]
         save_dir = result_dir  # 使用绝对路径
         
         # 训练参数

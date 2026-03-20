@@ -2,12 +2,13 @@
 # -*- coding: utf-8 -*-
 """
 训练脚本（多模式）
-- surrogate: V3 三时段代理约束训练（uc_NN_subproblem_v3）
+- surrogate: V3 三时段代理约束训练（uc_NN_subproblem）
 - bcd:       BCD 主代理训练（uc_NN_BCD，Agent_NN_BCD）
+- sparse:    稀疏支持集发现 → sparse BCD 主代理训练
 - both:      BCD 训练 → surrogate 训练 → 联合 BCD 训练
 
 可选标志 RUN_FP=True：训练后运行 feasibility_pump 可行性泵测试
-（bcd 模式不支持 RUN_FP，请改用 both 模式）
+（bcd / sparse 模式不支持 RUN_FP，请改用 both 模式）
 
 修改顶部的 MODE / RUN_FP 变量切换执行模式。
 """
@@ -57,10 +58,12 @@ if not check_and_install_dependencies():
 #
 #   'surrogate' - V3 三时段代理约束训练
 #   'bcd'       - BCD 主代理训练（Agent_NN_BCD）
+#   'sparse'    - 稀疏支持集发现 → sparse BCD 训练
 #   'both'      - BCD 训练 → surrogate 训练 → 联合 BCD 训练
 #
 MODE   = 'both'
-RUN_FP = True        # True → 训练后运行 feasibility_pump 测试（bcd 模式不支持）
+ENABLE_SPARSE_SUPPORTS = False
+RUN_FP = True        # True → 训练后运行 feasibility_pump 测试（bcd/sparse 模式不支持）
 
 # ──────────────────────── 导入 ────────────────────────
 
@@ -74,12 +77,12 @@ try:
     import pypower.case14
     import pypower.case30
     import pypower.case39
-    from uc_NN_subproblem_v3 import (
+    from uc_NN_subproblem import (
         train_dual_predictor_from_data,
         SubproblemSurrogateTrainer,
         ActiveSetReader,
     )
-    from uc_NN_subproblem_v3_parallel import ParallelSubproblemSurrogateTrainer
+    from uc_NN_subproblem_parallel import ParallelSubproblemSurrogateTrainer
     from training_logger import TrainingLogger
     from training_visualizer import TrainingVisualizer
 except ImportError as e:
@@ -88,7 +91,7 @@ except ImportError as e:
     sys.exit(1)
 
 # BCD 模式额外导入
-if MODE in ('bcd', 'both'):
+if MODE in ('bcd', 'sparse', 'both'):
     try:
         from uc_NN_BCD import load_active_set_from_json, Agent_NN_BCD
         from uc_NN_BCD_parallel import ParallelAgent_NN_BCD
@@ -263,7 +266,8 @@ def print_surrogate_results(trainers, all_samples):
 
 def run_bcd(ppc, all_samples: list, T_DELTA, MAX_ITER, bcd_model_dir,
             case_name: str = 'case', timestamp: str = '', n_workers: int = 4, NN_EPOCHS: int = 10, DUAL_DECAY_ROUND: int = 10,
-            logger: 'TrainingLogger | None' = None):
+            logger: 'TrainingLogger | None' = None,
+            external_sparse_templates=None):
     """BCD 主代理训练（样本级并行），返回 ParallelAgent_NN_BCD 实例。"""
     log("模式: BCD 主代理训练（Agent_NN_BCD）")
     log(f"使用 {len(all_samples)} 个样本")
@@ -275,9 +279,18 @@ def run_bcd(ppc, all_samples: list, T_DELTA, MAX_ITER, bcd_model_dir,
         log(f"初始化 ParallelAgent_NN_BCD，max_iter={MAX_ITER}，n_workers={n_workers}")
     print("=" * 70)
 
+    if external_sparse_templates is not None and n_workers > 1:
+        log("警告: external_sparse_templates 当前仅支持串行 Agent_NN_BCD，将忽略 n_workers > 1")
+        n_workers = 1
+
     if n_workers <= 1:
         log("使用串行 Agent_NN_BCD")
-        agent = Agent_NN_BCD(ppc, all_samples, T_DELTA)
+        agent = Agent_NN_BCD(
+            ppc,
+            all_samples,
+            T_DELTA,
+            external_sparse_templates=external_sparse_templates,
+        )
     else:
         log(f"使用并行 ParallelAgent_NN_BCD (n_workers={n_workers})")
         agent = ParallelAgent_NN_BCD(ppc, all_samples, T_DELTA, n_workers=n_workers)
@@ -300,6 +313,99 @@ def run_bcd(ppc, all_samples: list, T_DELTA, MAX_ITER, bcd_model_dir,
         log(f"模型保存失败（非致命）: {e}")
 
     return agent
+
+
+def build_sparse_template_library_from_bcd_agent(
+    agent,
+    top_k_variables: int,
+    max_groups: int,
+    group_size: int,
+    sparse_dir: Path,
+    case_name: str,
+    timestamp: str,
+):
+    """从 BCD 初始化结果中发现高价值 x[g,t] 变量，并构建 sparse 模板库。"""
+    from sparse_support_discovery import (
+        discover_sparse_supports,
+        extract_support_discovery_samples_from_agent,
+    )
+    from sparse_constraint_templates import build_sparse_template_library
+
+    log("开始 sparse 支持集发现")
+    sparse_samples = extract_support_discovery_samples_from_agent(agent)
+    discovery_result = discover_sparse_supports(
+        sparse_samples,
+        top_k_variables=top_k_variables,
+        max_groups=max_groups,
+        group_size=group_size,
+    )
+    template_library = build_sparse_template_library(
+        discovery_result,
+        sparse_samples,
+        max_templates=max_groups,
+    )
+
+    sparse_dir.mkdir(parents=True, exist_ok=True)
+    support_path = sparse_dir / f'sparse_supports_{case_name}_{timestamp}.json'
+    template_path = sparse_dir / f'sparse_templates_{case_name}_{timestamp}.json'
+    discovery_result.to_json(support_path)
+    template_library.to_json(template_path)
+
+    log(f"  已选变量数: {len(discovery_result.selected_variables)}")
+    log(f"  已构造模板数: {len(template_library.templates)}")
+    log(f"  sparse supports 保存至: {support_path}")
+    log(f"  sparse templates 保存至: {template_path}")
+    return discovery_result, template_library
+
+
+def run_sparse_bcd(ppc, all_samples: list, T_DELTA, MAX_ITER, bcd_model_dir,
+                   case_name: str = 'case', timestamp: str = '',
+                   NN_EPOCHS: int = 10, DUAL_DECAY_ROUND: int = 10,
+                   top_k_variables: int = 20, max_groups: int = 5, group_size: int = 3,
+                   logger: 'TrainingLogger | None' = None):
+    """
+    sparse 模式：
+    1. 用普通 Agent_NN_BCD 初始化，拿到 x_lp/x_true
+    2. 离线发现高价值 x[g,t] 变量并构建 sparse 模板
+    3. 用 external_sparse_templates 启动真正的 sparse-BCD 训练
+    """
+    log("模式: Sparse 支持集发现 → Sparse BCD 训练")
+    log(f"使用 {len(all_samples)} 个样本")
+    print("\n" + "=" * 70)
+    log("Step 1/3: 初始化 bootstrap Agent_NN_BCD 用于 sparse 变量发现")
+    print("=" * 70)
+
+    bootstrap_agent = Agent_NN_BCD(ppc, all_samples, T_DELTA)
+    sparse_dir = Path(__file__).parent / 'result' / 'sparse_templates'
+    discovery_result, template_library = build_sparse_template_library_from_bcd_agent(
+        bootstrap_agent,
+        top_k_variables=top_k_variables,
+        max_groups=max_groups,
+        group_size=group_size,
+        sparse_dir=sparse_dir,
+        case_name=case_name,
+        timestamp=timestamp,
+    )
+
+    print("\n" + "=" * 70)
+    log("Step 2/3: 使用 sparse 模板启动 BCD 训练")
+    print("=" * 70)
+    agent = run_bcd(
+        ppc,
+        all_samples,
+        T_DELTA,
+        MAX_ITER,
+        bcd_model_dir,
+        case_name=case_name,
+        timestamp=timestamp,
+        n_workers=1,
+        NN_EPOCHS=NN_EPOCHS,
+        DUAL_DECAY_ROUND=DUAL_DECAY_ROUND,
+        logger=logger,
+        external_sparse_templates=template_library,
+    )
+
+    return agent, discovery_result, template_library
 
 
 def run_feasibility_pump_test(ppc, all_samples, dual_predictor, trainers,
@@ -366,6 +472,9 @@ def main():
     JOINT_DUAL_DECAY_ROUND = 0     # 联合BCD训练dual_para_bound衰减轮次
     ACTIVE_SETS_FILE = None          # 指定 active_sets JSON 文件路径（None=自动查找最新）
     BCD_MODEL_FILE   = "result/bcd_models/bcd_model_case30_20260318_000506.pth"           # 指定已有 BCD 模型 .pth 文件路径（None=从头训练；both 模式下可跳过 BCD 训练）
+    SPARSE_TOP_K_VARIABLES = 20      # sparse 支持发现：保留的高价值 x[g,t] 变量数量
+    SPARSE_MAX_GROUPS = 5            # sparse 支持发现：构造的支持集模板数量上限
+    SPARSE_GROUP_SIZE = 3            # sparse 支持发现：每条模板最多包含多少个参与变量
 
     # 创建训练指标收集器
     logger = TrainingLogger()
@@ -426,6 +535,34 @@ def main():
             if RUN_FP:
                 log("警告: bcd 模式不支持 RUN_FP（需要 trainers），请改用 both 模式")
 
+        elif MODE == 'sparse':
+            log(f"通过 ActiveSetReader 加载数据: {data_file.name}")
+            all_samples_bcd = load_active_set_from_json(str(data_file))
+            if MAX_SAMPLES and len(all_samples_bcd) > MAX_SAMPLES:
+                log(f"  截取前 {MAX_SAMPLES} 个样本（共 {len(all_samples_bcd)}）")
+                all_samples_bcd = all_samples_bcd[:MAX_SAMPLES]
+
+            if N_WORKERS_BCD > 1:
+                log("警告: sparse 模式当前仅支持串行 Agent_NN_BCD，将忽略 N_WORKERS_BCD > 1")
+
+            run_sparse_bcd(
+                ppc,
+                all_samples_bcd,
+                T_DELTA,
+                MAX_ITER,
+                bcd_model_dir,
+                case_name=CASE_NAME,
+                timestamp=timestamp,
+                NN_EPOCHS=NN_EPOCHS,
+                DUAL_DECAY_ROUND=DUAL_DECAY_ROUND,
+                top_k_variables=SPARSE_TOP_K_VARIABLES,
+                max_groups=SPARSE_MAX_GROUPS,
+                group_size=SPARSE_GROUP_SIZE,
+                logger=logger,
+            )
+            if RUN_FP:
+                log("警告: sparse 模式暂不支持 RUN_FP（需要 trainers），请改用 both 模式或单独接入模板库")
+
         elif MODE == 'surrogate':
             # 加载并规范化样本（v3 格式）
             all_samples = load_json_data(data_file)
@@ -456,6 +593,22 @@ def main():
                 log(f"  截取前 {MAX_SAMPLES} 个样本（共 {len(all_samples_bcd)}）")
                 all_samples_bcd = all_samples_bcd[:MAX_SAMPLES]
 
+            sparse_template_library = None
+            if ENABLE_SPARSE_SUPPORTS:
+                log("both 模式: 启用 sparse 支持集发现")
+                if N_WORKERS_BCD > 1:
+                    log("警告: both + sparse 当前仅支持串行 Agent_NN_BCD，将忽略 N_WORKERS_BCD > 1")
+                _bootstrap_agent = Agent_NN_BCD(ppc, all_samples_bcd, T_DELTA)
+                _, sparse_template_library = build_sparse_template_library_from_bcd_agent(
+                    _bootstrap_agent,
+                    top_k_variables=SPARSE_TOP_K_VARIABLES,
+                    max_groups=SPARSE_MAX_GROUPS,
+                    group_size=SPARSE_GROUP_SIZE,
+                    sparse_dir=Path(__file__).parent / 'result' / 'sparse_templates',
+                    case_name=CASE_NAME,
+                    timestamp=timestamp,
+                )
+
             if BCD_MODEL_FILE is not None:
                 # 从已有模型加载，跳过 BCD 训练
                 bcd_path = Path(BCD_MODEL_FILE)
@@ -465,16 +618,34 @@ def main():
                     log(f"错误: 指定的 BCD 模型文件不存在: {bcd_path}")
                     sys.exit(1)
                 log(f"从已有模型加载 BCD，跳过 BCD 训练: {bcd_path}")
-                if N_WORKERS_BCD <= 1:
+                if ENABLE_SPARSE_SUPPORTS:
+                    agent = Agent_NN_BCD(
+                        ppc,
+                        all_samples_bcd,
+                        T_DELTA,
+                        external_sparse_templates=sparse_template_library,
+                    )
+                elif N_WORKERS_BCD <= 1:
                     agent = Agent_NN_BCD(ppc, all_samples_bcd, T_DELTA)
                 else:
                     agent = ParallelAgent_NN_BCD(ppc, all_samples_bcd, T_DELTA, n_workers=N_WORKERS_BCD)
                 agent.load_model_parameters(str(bcd_path))
                 log("BCD 模型加载成功，跳过训练")
             else:
-                agent = run_bcd(ppc, all_samples_bcd, T_DELTA, MAX_ITER, bcd_model_dir,
-                                case_name=CASE_NAME, timestamp=timestamp, n_workers=N_WORKERS_BCD, NN_EPOCHS=NN_EPOCHS, DUAL_DECAY_ROUND=DUAL_DECAY_ROUND,
-                                logger=logger)
+                agent = run_bcd(
+                    ppc,
+                    all_samples_bcd,
+                    T_DELTA,
+                    MAX_ITER,
+                    bcd_model_dir,
+                    case_name=CASE_NAME,
+                    timestamp=timestamp,
+                    n_workers=N_WORKERS_BCD if not ENABLE_SPARSE_SUPPORTS else 1,
+                    NN_EPOCHS=NN_EPOCHS,
+                    DUAL_DECAY_ROUND=DUAL_DECAY_ROUND,
+                    logger=logger,
+                    external_sparse_templates=sparse_template_library,
+                )
 
             # Step 2: 加载 v3 格式样本（subproblem 独立训练，不注入 BCD 对偶变量）
             all_samples = load_json_data(data_file)
@@ -514,7 +685,7 @@ def main():
                 )
 
         else:
-            log(f"未知模式: '{MODE}'，可选: 'surrogate' | 'bcd' | 'both'")
+            log(f"未知模式: '{MODE}'，可选: 'surrogate' | 'bcd' | 'sparse' | 'both'")
             sys.exit(1)
 
     except Exception as e:

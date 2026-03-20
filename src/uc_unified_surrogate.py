@@ -33,7 +33,30 @@ try:
 except ImportError:
     TORCH_AVAILABLE = False
 
-from feasibility_pump import _add_surrogate_constraints, _build_ptdf_data
+try:
+    from feasibility_pump import _add_surrogate_constraints, _build_ptdf_data
+except ImportError:
+    from src.feasibility_pump import _add_surrogate_constraints, _build_ptdf_data
+try:
+    from sparse_surrogate_mining import (
+        SparseSurrogateLibrary,
+        add_sparse_parameterized_constraints,
+    )
+except ImportError:
+    from src.sparse_surrogate_mining import (
+        SparseSurrogateLibrary,
+        add_sparse_parameterized_constraints,
+    )
+try:
+    from sparse_constraint_templates import (
+        SparseConstraintTemplateLibrary,
+        add_sparse_x_templates_to_model,
+    )
+except ImportError:
+    from src.sparse_constraint_templates import (
+        SparseConstraintTemplateLibrary,
+        add_sparse_x_templates_to_model,
+    )
 
 
 class UnifiedSurrogateManager:
@@ -50,7 +73,14 @@ class UnifiedSurrogateManager:
         nl: 线路数
     """
 
-    def __init__(self, agent, trainers: Dict, active_set_data: List[Dict]) -> None:
+    def __init__(
+        self,
+        agent,
+        trainers: Dict,
+        active_set_data: List[Dict],
+        sparse_library: Optional[SparseSurrogateLibrary] = None,
+        sparse_x_template_library: Optional[SparseConstraintTemplateLibrary] = None,
+    ) -> None:
         """
         初始化统一代理约束管理器。
 
@@ -58,10 +88,14 @@ class UnifiedSurrogateManager:
             agent: 已训练好的 Agent_NN 实例（含 theta_net/zeta_net）
             trainers: {unit_id: SubproblemSurrogateTrainer} 各机组已训练 V3 模型
             active_set_data: 样本数据列表，每项含 'pd_data', 'lambda' 等字段
+            sparse_library: （可选）离线筛选出的稀疏参数化约束库
+            sparse_x_template_library: （可选）x 稀疏支持集模板库
         """
         self.agent = agent
         self.trainers = trainers
         self.active_set_data = active_set_data
+        self.sparse_library = sparse_library
+        self.sparse_x_template_library = sparse_x_template_library
 
         # 从 agent 读取基本维度和参数
         self.ppc = agent.ppc
@@ -380,13 +414,21 @@ class UnifiedSurrogateManager:
     # 推理接口（供 feasibility_pump 调用）
     # =========================================================================
 
-    def solve_global(self, pd_data: np.ndarray, lambda_val: np.ndarray) -> np.ndarray:
+    def solve_global(
+        self,
+        pd_data: np.ndarray,
+        lambda_val: np.ndarray,
+        sparse_library: Optional[SparseSurrogateLibrary] = None,
+        sparse_x_template_library: Optional[SparseConstraintTemplateLibrary] = None,
+    ) -> np.ndarray:
         """
         给定新负荷，构建包含两类约束的全局 LP 松弛并求解。
 
         Args:
             pd_data: (nb_load, T) 负荷数据
             lambda_val: (T,) 功率平衡对偶变量
+            sparse_library: （可选）覆盖 manager 默认库的稀疏参数化约束库
+            sparse_x_template_library: （可选）覆盖 manager 默认库的 x 稀疏支持集模板库
 
         Returns:
             x_LP: (ng, T) LP 松弛解；不可行时返回零矩阵
@@ -508,6 +550,23 @@ class UnifiedSurrogateManager:
                         name=f'g{g}_surr_{k}'
                     )
                     surr_slacks.append(slack_k)
+
+        add_sparse_parameterized_constraints(
+            model,
+            x,
+            pg,
+            pd_data,
+            sparse_library=sparse_library or self.sparse_library,
+            surr_slacks=surr_slacks,
+            name_prefix="sparse",
+        )
+        add_sparse_x_templates_to_model(
+            model,
+            x,
+            template_library=sparse_x_template_library or self.sparse_x_template_library,
+            surr_slacks=surr_slacks,
+            name_prefix="sparse_x",
+        )
 
         # DC 线路潮流约束（硬约束）
         try:

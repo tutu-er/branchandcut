@@ -93,7 +93,7 @@ try:
     import pypower.case14
     import pypower.case30
     import pypower.case39
-    from uc_NN_subproblem_v3 import (
+    from uc_NN_subproblem import (
         load_trained_models,
         ActiveSetReader,
     )
