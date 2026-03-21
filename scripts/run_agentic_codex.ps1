@@ -6,6 +6,8 @@ param(
     [string[]]$TargetFiles = @("src/feasibility_pump.py"),
     [int]$MaxIters = 6,
     [int]$StagnationLimit = 3,
+    [int]$EvalTimeoutSec = 1800,
+    [int]$AgentTimeoutSec = 900,
     [string]$ResultsDir = "result/agentic_fp_optimizer",
     [string]$Goal = "",
     [switch]$NoBcdSurrogate,
@@ -17,13 +19,16 @@ $ErrorActionPreference = "Stop"
 
 $RepoRoot = Split-Path -Parent $PSScriptRoot
 $CodexWrapper = Join-Path $PSScriptRoot "codex_exec_prompt.ps1"
+$CodexCli = "C:\Users\Windows\AppData\Roaming\npm\codex.cmd"
 
 Push-Location $RepoRoot
 try {
     $null = Get-Command python -ErrorAction Stop
-    $null = Get-Command codex -ErrorAction Stop
     if (-not (Test-Path $CodexWrapper)) {
         throw "Missing wrapper script: $CodexWrapper"
+    }
+    if (-not (Test-Path $CodexCli)) {
+        throw "Missing Codex CLI: $CodexCli"
     }
 
     $evalParts = @(
@@ -47,6 +52,8 @@ try {
         "--eval-command", $evalCommand
         "--agent-kind", "command"
         "--agent-command-template", $agentTemplate
+        "--eval-timeout-sec", $EvalTimeoutSec.ToString()
+        "--agent-timeout-sec", $AgentTimeoutSec.ToString()
         "--max-iters", $MaxIters.ToString()
         "--stagnation-limit", $StagnationLimit.ToString()
     )
@@ -64,6 +71,8 @@ try {
     Write-Host "Target files: $($TargetFiles -join ', ')"
     Write-Host "Max iters: $MaxIters"
     Write-Host "Stagnation limit: $StagnationLimit"
+    Write-Host "Eval timeout sec: $EvalTimeoutSec"
+    Write-Host "Agent timeout sec: $AgentTimeoutSec"
     if ($NoBcdSurrogate) {
         Write-Host "Mode: subproblem surrogate only"
     } else {

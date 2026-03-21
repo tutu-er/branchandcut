@@ -116,6 +116,8 @@ class Config:
     api_key_env: Optional[str]
     api_temperature: float
     api_max_tokens: int
+    eval_timeout_sec: int
+    agent_timeout_sec: int
     max_iters: int
     stagnation_limit: int
     min_score_improvement: float
@@ -207,6 +209,13 @@ def truncate(text: str, max_chars: int) -> str:
     return text[:max_chars] + "\n... [truncated]\n"
 
 
+def tail_text(text: str, max_chars: int = 4000) -> str:
+    text = text.strip()
+    if len(text) <= max_chars:
+        return text
+    return "[truncated]\n" + text[-max_chars:]
+
+
 def parse_metrics(output: str) -> Metrics:
     metrics = Metrics()
 
@@ -272,24 +281,43 @@ def score_metrics(metrics: Metrics, return_code: int) -> float:
     return score
 
 
-def run_command(command: str, cwd: Path) -> tuple[int, str, str, float]:
+def run_command(
+    command: str,
+    cwd: Path,
+    timeout_sec: Optional[int] = None,
+) -> tuple[int, str, str, float]:
     start = time.time()
-    proc = subprocess.run(
-        command,
-        cwd=str(cwd),
-        capture_output=True,
-        text=True,
-        shell=True,
-        encoding="utf-8",
-        errors="replace",
-    )
+    try:
+        proc = subprocess.run(
+            command,
+            cwd=str(cwd),
+            capture_output=True,
+            text=True,
+            shell=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout_sec,
+        )
+    except subprocess.TimeoutExpired as exc:
+        elapsed = time.time() - start
+        stdout = exc.stdout or ""
+        stderr = exc.stderr or ""
+        stderr = (
+            stderr
+            + f"\n[timeout]\nCommand exceeded timeout of {timeout_sec} seconds.\n"
+        )
+        return 124, stdout, stderr, elapsed
     elapsed = time.time() - start
     return proc.returncode, proc.stdout, proc.stderr, elapsed
 
 
 def evaluate(config: Config, iteration_dir: Path, label: str) -> EvalResult:
     log(f"运行评估: {label}")
-    rc, stdout, stderr, elapsed = run_command(config.eval_command, config.workspace)
+    rc, stdout, stderr, elapsed = run_command(
+        config.eval_command,
+        config.workspace,
+        timeout_sec=config.eval_timeout_sec,
+    )
     output = stdout + ("\n[stderr]\n" + stderr if stderr else "")
     metrics = parse_metrics(output)
     score = score_metrics(metrics, rc)
@@ -559,7 +587,11 @@ def run_command_agent(
         prompt_file=str(prompt_file),
         iteration=iteration,
     )
-    rc, stdout, stderr, _elapsed = run_command(command, config.workspace)
+    rc, stdout, stderr, _elapsed = run_command(
+        command,
+        config.workspace,
+        timeout_sec=config.agent_timeout_sec,
+    )
     return command, rc, stdout, stderr
 
 
@@ -615,6 +647,18 @@ def parse_args() -> Config:
     )
     parser.add_argument("--api-temperature", type=float, default=0.2)
     parser.add_argument("--api-max-tokens", type=int, default=4000)
+    parser.add_argument(
+        "--eval-timeout-sec",
+        type=int,
+        default=1800,
+        help="单次评估命令超时时间（秒）",
+    )
+    parser.add_argument(
+        "--agent-timeout-sec",
+        type=int,
+        default=900,
+        help="单次 agent 命令超时时间（秒）",
+    )
     parser.add_argument("--max-iters", type=int, default=8, help="最多优化轮数")
     parser.add_argument(
         "--stagnation-limit",
@@ -678,6 +722,8 @@ def parse_args() -> Config:
         api_key_env=args.api_key_env,
         api_temperature=args.api_temperature,
         api_max_tokens=args.api_max_tokens,
+        eval_timeout_sec=args.eval_timeout_sec,
+        agent_timeout_sec=args.agent_timeout_sec,
         max_iters=args.max_iters,
         stagnation_limit=args.stagnation_limit,
         min_score_improvement=args.min_score_improvement,
@@ -772,7 +818,14 @@ def main() -> int:
                 write_text(iter_dir / "agent_stderr.txt", stderr)
                 agent_output_path = iter_dir / "agent_stdout.txt"
                 if rc != 0:
-                    raise RuntimeError(f"agent 命令失败，exit_code={rc}")
+                    stderr_tail = tail_text(stderr, max_chars=2000)
+                    stdout_tail = tail_text(stdout, max_chars=1000)
+                    detail_parts = [f"exit_code={rc}"]
+                    if stderr_tail:
+                        detail_parts.append(f"stderr_tail=\n{stderr_tail}")
+                    elif stdout_tail:
+                        detail_parts.append(f"stdout_tail=\n{stdout_tail}")
+                    raise RuntimeError("agent 命令失败，" + "\n".join(detail_parts))
                 summary = stdout.strip().splitlines()[-1] if stdout.strip() else ""
             else:
                 raw_api = call_openai_compatible_api(config, prompt)
