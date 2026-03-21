@@ -27,6 +27,18 @@ except ImportError:
 # 导入必要的工具函数
 from pypower.ext2int import ext2int
 from pypower.idx_gen import GEN_BUS, PMIN, PMAX
+try:
+    from scenario_utils import (
+        get_feature_vector,
+        get_feature_vector_from_sample,
+        normalize_sample_arrays,
+    )
+except ImportError:
+    from src.scenario_utils import (
+        get_feature_vector,
+        get_feature_vector_from_sample,
+        normalize_sample_arrays,
+    )
 
 # 导入pypower用于测试
 try:
@@ -77,6 +89,7 @@ class ActiveSetReader:
         
         for sample_id in range(total_samples):
             try:
+                sample = self.get_sample_data(sample_id) or {}
                 active_constraints, active_variables, pd_data = self.extract_active_constraints_and_variables(sample_id)
                 unit_commitment = self.get_unit_commitment_matrix(sample_id)
                 
@@ -87,8 +100,12 @@ class ActiveSetReader:
                     'pd_data': pd_data,
                     'unit_commitment_matrix': unit_commitment
                 }
+
+                if 'load_data' in sample:
+                    sample_data['load_data'] = np.array(sample['load_data'], dtype=float)
+                if 'renewable_data' in sample:
+                    sample_data['renewable_data'] = np.array(sample['renewable_data'], dtype=float)
                 
-                sample = self.get_sample_data(sample_id)
                 if sample and 'lambda' in sample:
                     sample_data['lambda'] = sample['lambda']
                 
@@ -98,6 +115,9 @@ class ActiveSetReader:
                 print(f"加载样本 {sample_id} 时出错: {e}", flush=True)
                 all_samples_data.append({
                     'sample_id': sample_id,
+                    'pd_data': np.array([]),
+                    'load_data': np.array([]),
+                    'renewable_data': np.array([]),
                     'error': str(e)
                 })
         
@@ -108,8 +128,9 @@ class ActiveSetReader:
         if sample is None:
             return [], [], np.array([])
         
+        sample = normalize_sample_arrays(dict(sample))
         active_set = sample.get('active_set', [])
-        pd_data = np.array(sample.get('pd_data', []))
+        pd_data = sample.get('pd_data', np.array([]))
         
         active_constraints = []
         active_variables = []
@@ -323,12 +344,8 @@ class DualVariablePredictorTrainer:
             self.device = device
         
         # 输入输出维度
-        # 使用实际pd_data的第一维度而不是nb（可能只包含负荷节点）
-        if isinstance(active_set_data, list):
-            self.n_load = active_set_data[0]['pd_data'].shape[0]
-        else:
-            self.n_load = active_set_data['pd_data'].shape[0]
-        self.input_dim = self.n_load * self.T
+        first_sample = active_set_data[0] if isinstance(active_set_data, list) else active_set_data
+        self.input_dim = len(get_feature_vector_from_sample(dict(first_sample)))
         self.output_dim = self.T
         
         # 初始化网络
@@ -421,8 +438,7 @@ class DualVariablePredictorTrainer:
     
     def _extract_features(self, sample_id: int) -> np.ndarray:
         """提取Pd数据作为特征"""
-        pd_data = self.active_set_data[sample_id]['pd_data']
-        return pd_data.flatten()
+        return get_feature_vector_from_sample(dict(self.active_set_data[sample_id]))
     
     def train(self, num_epochs: int = 100, batch_size: int = 8):
         """训练对偶变量预测网络"""
@@ -465,14 +481,17 @@ class DualVariablePredictorTrainer:
         
         print(f"✓ 对偶变量预测网络训练完成", flush=True)
     
-    def predict(self, pd_data: np.ndarray) -> np.ndarray:
+    def predict(self, pd_data: np.ndarray | dict, renewable_data: np.ndarray | None = None) -> np.ndarray:
         """预测对偶变量"""
         if not TORCH_AVAILABLE:
             raise RuntimeError("PyTorch不可用")
         
         self.network.eval()
-        pd_flat = pd_data.flatten()
-        pd_tensor = torch.tensor(pd_flat, dtype=torch.float32, device=self.device)
+        if isinstance(pd_data, dict):
+            features = get_feature_vector_from_sample(dict(pd_data))
+        else:
+            features = get_feature_vector(pd_data, renewable_data=renewable_data)
+        pd_tensor = torch.tensor(features, dtype=torch.float32, device=self.device)
         
         with torch.no_grad():
             lambda_pred = self.network(pd_tensor.unsqueeze(0)).squeeze(0)
@@ -817,8 +836,8 @@ class SubproblemSurrogateTrainer:
             # 使用预测器
             lambda_vals = []
             for sample_id in range(self.n_samples):
-                pd_data = self.active_set_data[sample_id]['pd_data']
-                lambda_pred = self.lambda_predictor.predict(pd_data)
+                sample = self.active_set_data[sample_id]
+                lambda_pred = self.lambda_predictor.predict(sample)
                 lambda_vals.append(lambda_pred)
             return np.array(lambda_vals)
         else:
@@ -887,7 +906,7 @@ class SubproblemSurrogateTrainer:
     
     def _init_neural_network(self):
         """初始化代理约束神经网络 - V3版本"""
-        input_dim = self.n_load * self.T + self.T + 6  # Pd + λ + unit_params
+        input_dim = len(self._extract_features(0))
 
         self.surrogate_net = SubproblemSurrogateNet(
             input_dim=input_dim,
@@ -1564,8 +1583,7 @@ class SubproblemSurrogateTrainer:
     
     def _extract_features(self, sample_id: int) -> np.ndarray:
         """提取特征: [Pd, λ, unit_params]"""
-        pd_data = self.active_set_data[sample_id]['pd_data']
-        pd_flat = pd_data.flatten()
+        pd_flat = get_feature_vector_from_sample(dict(self.active_set_data[sample_id]))
         lambda_val = self.lambda_vals[sample_id]
 
         # 机组静态参数（归一化，训练和推理都一致可用）
@@ -2089,7 +2107,12 @@ class SubproblemSurrogateTrainer:
 
         print(f"✓ 机组{self.unit_id} V3三时段耦合代理约束训练完成", flush=True)
     
-    def get_surrogate_params(self, pd_data: np.ndarray, lambda_val: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    def get_surrogate_params(
+        self,
+        pd_data: np.ndarray | dict,
+        lambda_val: np.ndarray,
+        renewable_data: np.ndarray | None = None,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         """
         获取V3三时段耦合代理约束参数
 
@@ -2105,7 +2128,10 @@ class SubproblemSurrogateTrainer:
 
         self.surrogate_net.eval()
 
-        pd_flat = pd_data.flatten()
+        if isinstance(pd_data, dict):
+            pd_flat = get_feature_vector_from_sample(pd_data)
+        else:
+            pd_flat = get_feature_vector(pd_data, renewable_data=renewable_data)
         # 机组静态参数（与 _extract_features 保持一致）
         g = self.unit_id
         Pmax = self.gen[g, PMAX]
@@ -2452,8 +2478,8 @@ def evaluate_trained_models(dual_predictor: DualVariablePredictorTrainer,
     total_mae = 0.0
     
     for sample_id in range(n_eval):
-        pd_data = active_set_data[sample_id]['pd_data']
-        lambda_pred = dual_predictor.predict(pd_data)
+        sample = active_set_data[sample_id]
+        lambda_pred = dual_predictor.predict(sample)
         lambda_true = dual_predictor.lambda_true[sample_id]
         
         mse = np.mean((lambda_pred - lambda_true) ** 2)
@@ -2915,12 +2941,23 @@ def test_save_load(ppc=None, active_set_data=None):
         trainer2.load(surrogate_path)
         
         # 验证代理约束参数一致
-        alpha1, beta1 = trainer.get_surrogate_params(test_pd, trainer.lambda_vals[0])
-        alpha2, beta2 = trainer2.get_surrogate_params(test_pd, trainer2.lambda_vals[0])
+        alpha1, beta1, gamma1, delta1, costs1 = trainer.get_surrogate_params(test_pd, trainer.lambda_vals[0])
+        alpha2, beta2, gamma2, delta2, costs2 = trainer2.get_surrogate_params(test_pd, trainer2.lambda_vals[0])
         diff_alpha = np.max(np.abs(alpha1 - alpha2))
-        diff_beta = abs(beta1 - beta2)
-        print(f"  代理约束加载验证: alpha差异 = {diff_alpha:.8f}, beta差异 = {diff_beta:.8f}", flush=True)
-        assert diff_alpha < 1e-5 and diff_beta < 1e-5, "代理约束加载失败"
+        diff_beta = np.max(np.abs(beta1 - beta2))
+        diff_gamma = np.max(np.abs(gamma1 - gamma2))
+        diff_delta = np.max(np.abs(delta1 - delta2))
+        diff_costs = np.max(np.abs(costs1 - costs2))
+        print(
+            "  代理约束加载验证: "
+            f"alpha差异 = {diff_alpha:.8f}, "
+            f"beta差异 = {diff_beta:.8f}, "
+            f"gamma差异 = {diff_gamma:.8f}, "
+            f"delta差异 = {diff_delta:.8f}, "
+            f"cost差异 = {diff_costs:.8f}",
+            flush=True
+        )
+        assert max(diff_alpha, diff_beta, diff_gamma, diff_delta, diff_costs) < 1e-5, "代理约束加载失败"
         
         print("\n✓ 模型保存和加载测试通过", flush=True)
         

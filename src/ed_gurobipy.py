@@ -8,7 +8,7 @@ from pypower.idx_bus import BUS_I, BUS_TYPE, PD, QD, GS, BS, BUS_AREA, VM, VA, B
 from pypower.idx_brch import F_BUS, T_BUS, BR_R, BR_X, BR_B, RATE_A, RATE_B, RATE_C, TAP, SHIFT, BR_STATUS, ANGMIN, ANGMAX
 
 class EconomicDispatchGurobi:
-    def __init__(self, ppc, Pd, T_delta, x):
+    def __init__(self, ppc, Pd, T_delta, x, renewable_data=None):
         self.ppc = ppc
         ppc = ext2int(ppc)
         self.baseMVA = ppc['baseMVA']
@@ -16,24 +16,47 @@ class EconomicDispatchGurobi:
         self.gen = ppc['gen']
         self.branch = ppc['branch']
         self.gencost = ppc['gencost']
-        self.Pd = Pd
+        self.load_data = np.asarray(Pd, dtype=float)
+        self.renewable_data = None if renewable_data is None else np.asarray(renewable_data, dtype=float)
+        if self.renewable_data is not None and self.renewable_data.shape != self.load_data.shape:
+            raise ValueError(
+                f"renewable_data shape {self.renewable_data.shape} does not match load shape {self.load_data.shape}"
+            )
+        self.Pd = self.load_data
+        self.net_load = self.load_data if self.renewable_data is None else self.load_data - self.renewable_data
         self.T_delta = T_delta
-        self.T = Pd.shape[1]
+        self.T = self.load_data.shape[1]
         self.ng = self.gen.shape[0]
-        self.nb = self.branch.shape[0]
+        self.nb = self.load_data.shape[0]
+        if self.renewable_data is not None:
+            self.renewable_bus_ids = np.where(np.any(self.renewable_data > 1e-9, axis=1))[0]
+        else:
+            self.renewable_bus_ids = np.array([], dtype=int)
+        self.nr = len(self.renewable_bus_ids)
         self.x = x  # 二值变量由外部给定，shape=(ng, T)
         self.model = gp.Model('EconomicDispatch')
         self.model.Params.OutputFlag = 0
         self.pg = self.model.addVars(self.ng, self.T, lb=0, name='pg')
+        self.p_ren = self.model.addVars(self.nr, self.T, lb=0, name='p_ren') if self.nr > 0 else None
         self.cpower = self.model.addVars(self.ng, self.T, lb=0, name='cpower')
         self._build_model()
 
     def _build_model(self):
         for t in range(self.T):
-            self.model.addConstr(gp.quicksum(self.pg[g, t] for g in range(self.ng)) == np.sum(self.Pd[:, t]), name=f'power_balance_{t}')
+            renewable_supply = (
+                gp.quicksum(self.p_ren[r, t] for r in range(self.nr))
+                if self.nr > 0 else 0
+            )
+            self.model.addConstr(
+                gp.quicksum(self.pg[g, t] for g in range(self.ng)) + renewable_supply
+                == np.sum(self.load_data[:, t]),
+                name=f'power_balance_{t}'
+            )
             for g in range(self.ng):
                 self.model.addConstr(self.pg[g, t] >= self.gen[g, PMIN] * self.x[g, t])
                 self.model.addConstr(self.pg[g, t] <= self.gen[g, PMAX] * self.x[g, t])
+            for r, bus_idx in enumerate(self.renewable_bus_ids):
+                self.model.addConstr(self.p_ren[r, t] <= self.renewable_data[bus_idx, t], name=f'ren_upper_{r}_{t}')
         Ru = 0.4 * self.gen[:, PMAX] / self.T_delta
         Rd = 0.4 * self.gen[:, PMAX] / self.T_delta
         Ru_co = 0.3 * self.gen[:, PMAX]
@@ -46,15 +69,22 @@ class EconomicDispatchGurobi:
             for g in range(self.ng):
                 self.model.addConstr(self.cpower[g, t] >= self.gencost[g, -2]/self.T_delta * self.pg[g, t] + self.gencost[g, -1]/self.T_delta * self.x[g, t])
         try:
-            nb = self.Pd.shape[0]
-            G = np.zeros((nb, self.ng))
+            G = np.zeros((self.nb, self.ng))
             for g in range(self.ng):
                 bus_idx = int(self.gen[g, GEN_BUS])
                 G[bus_idx, g] = 1
+            R = np.zeros((self.nb, self.nr))
+            for r, bus_idx in enumerate(self.renewable_bus_ids):
+                R[bus_idx, r] = 1
             PTDF = makePTDF(self.baseMVA, self.bus, self.branch)
             branch_limit = self.branch[:, RATE_A]
             for t in range(self.T):
-                flow = PTDF @ (G @ np.array([self.pg[g, t] for g in range(self.ng)]) - self.Pd[:, t])
+                thermal_injection = G @ np.array([self.pg[g, t] for g in range(self.ng)])
+                renewable_injection = (
+                    R @ np.array([self.p_ren[r, t] for r in range(self.nr)])
+                    if self.nr > 0 else 0
+                )
+                flow = PTDF @ (thermal_injection + renewable_injection - self.load_data[:, t])
                 for l in range(self.branch.shape[0]):
                     self.model.addConstr(flow[l] <= branch_limit[l])
                     self.model.addConstr(flow[l] >= -branch_limit[l])

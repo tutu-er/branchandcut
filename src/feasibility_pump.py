@@ -43,6 +43,10 @@ except ImportError:
         SparseConstraintTemplateLibrary,
         add_sparse_x_templates_to_model,
     )
+try:
+    from scenario_utils import get_sample_net_load, normalize_sample_arrays
+except ImportError:
+    from src.scenario_utils import get_sample_net_load, normalize_sample_arrays
 
 
 # ========================== Step 1：整数恢复启发式 ==========================
@@ -443,7 +447,7 @@ def _solve_unit_LP_with_surrogate(
 # ========================== Step 2：收集多组整数解 ==========================
 
 def collect_integer_solutions(
-    pd_data: np.ndarray,
+    pd_data: np.ndarray | dict,
     lambda_val: np.ndarray,
     trainers: Dict[int, 'SubproblemSurrogateTrainer'],
     n_perturbations: int = 5,
@@ -471,9 +475,16 @@ def collect_integer_solutions(
     if rng is None:
         rng = np.random.default_rng()
 
+    sample = None
+    if isinstance(pd_data, dict):
+        sample = normalize_sample_arrays(dict(pd_data))
+        pd_matrix = get_sample_net_load(sample)
+    else:
+        pd_matrix = pd_data
+
     unit_ids = sorted(trainers.keys())
     ng = max(unit_ids) + 1
-    T = pd_data.shape[1]
+    T = pd_matrix.shape[1]
 
     x_surr_lp = np.zeros((ng, T))
     x_init_k = np.zeros((ng, T), dtype=int)
@@ -481,7 +492,7 @@ def collect_integer_solutions(
 
     for g in unit_ids:
         trainer = trainers[g]
-        alphas, betas, gammas, deltas, *_ = trainer.get_surrogate_params(pd_data, lambda_val)
+        alphas, betas, gammas, deltas, *_ = trainer.get_surrogate_params(sample if sample is not None else pd_matrix, lambda_val)
 
         # 原始子问题 LP
         x_LP_k = _solve_unit_LP_with_surrogate(trainer, lambda_val, alphas, betas, gammas, deltas)
@@ -549,7 +560,7 @@ def identify_trusted_mask(
 
 def solve_global_LP_relaxation(
     ppc: dict,
-    pd_data: np.ndarray,
+    pd_data: np.ndarray | dict,
     T_delta: float,
     trainers: Dict[int, 'SubproblemSurrogateTrainer'],
     lambda_val: np.ndarray,
@@ -576,12 +587,19 @@ def solve_global_LP_relaxation(
     Returns:
         x_LP: (ng, T) LP 松弛解；若不可行返回零矩阵
     """
+    sample = None
+    if isinstance(pd_data, dict):
+        sample = normalize_sample_arrays(dict(pd_data))
+        pd_matrix = get_sample_net_load(sample)
+    else:
+        pd_matrix = pd_data
+
     ppc_int = ext2int(ppc)
     gen = ppc_int['gen']
     gencost = ppc_int['gencost']
     ng = gen.shape[0]
-    T = pd_data.shape[1]
-    Pd_sum = np.sum(pd_data, axis=0)  # (T,)
+    T = pd_matrix.shape[1]
+    Pd_sum = np.sum(pd_matrix, axis=0)  # (T,)
 
     model = gp.Model('global_LP_relaxation')
     model.Params.OutputFlag = 0
@@ -661,7 +679,7 @@ def solve_global_LP_relaxation(
         # 这样即使代理约束紧张时 LP 仍可行，违背量以大 M 惩罚
         if g in trainers:
             alphas, betas, gammas, deltas, *_ = trainers[g].get_surrogate_params(
-                pd_data, lambda_val
+                sample if sample is not None else pd_matrix, lambda_val
             )
             for k in range(len(alphas)):
                 t_k  = k % T_triples
@@ -683,7 +701,7 @@ def solve_global_LP_relaxation(
     # 假设 pd_data 形状为 (nb, T)，行顺序与 ext2int 后的总线顺序一致
     try:
         _PTDF, ptdf_g, branch_limit, active_lines = _build_ptdf_data(ppc_int)
-        ptdf_Pd = _PTDF @ pd_data   # (nl, T)：负荷对各线路潮流的贡献
+        ptdf_Pd = _PTDF @ pd_matrix   # (nl, T)：负荷对各线路潮流的贡献
         for l in active_lines:
             limit = float(branch_limit[l])
             for t in range(T):
@@ -1209,7 +1227,7 @@ def run_feasibility_pump(
 # ========================== Step 6：顶层接口 ==========================
 
 def recover_integer_solution(
-    pd_data: np.ndarray,
+    pd_data: np.ndarray | dict,
     trainers: Dict[int, 'SubproblemSurrogateTrainer'],
     lambda_predictor,
     ppc: dict,
@@ -1260,20 +1278,28 @@ def recover_integer_solution(
     Returns:
         (x_feasible, success): 整数解矩阵 (ng, T)，以及是否为可行解
     """
+    sample = None
+    if isinstance(pd_data, dict):
+        sample = normalize_sample_arrays(dict(pd_data))
+        scenario_input = sample
+        pd_data = get_sample_net_load(sample)
+    else:
+        scenario_input = pd_data
+
     if rng is None:
         rng = np.random.default_rng(42)
 
     # Step 1：获取对偶变量
     if verbose:
         print("Step 1: 获取对偶变量 lambda ...", flush=True)
-    lambda_val = lambda_predictor.predict(pd_data)  # (T,)
+    lambda_val = lambda_predictor.predict(scenario_input)  # (T,)
 
     # Step 2：全局 LP 松弛 + 启发式四舍五入
     if verbose:
         print("Step 2: 求解全局 UC LP 松弛 ...", flush=True)
     if manager is not None:
         x_LP = manager.solve_global(
-            pd_data,
+            scenario_input,
             lambda_val,
             sparse_library=sparse_library,
             sparse_x_template_library=sparse_x_template_library,
@@ -1281,7 +1307,7 @@ def recover_integer_solution(
     else:
         x_LP = solve_global_LP_relaxation(
             ppc,
-            pd_data,
+            scenario_input,
             T_delta,
             trainers,
             lambda_val,
@@ -1298,7 +1324,7 @@ def recover_integer_solution(
     if verbose:
         print("Step 3: 收集多组整数解（子问题 LP + 扰动）...", flush=True)
     x_surr_lp, x_init_k, x_init_k_m = collect_integer_solutions(
-        pd_data, lambda_val, trainers,
+        scenario_input, lambda_val, trainers,
         n_perturbations=n_perturbations,
         perturb_std=perturb_std,
         neighborhood_weight=neighborhood_weight,

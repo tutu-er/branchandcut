@@ -77,12 +77,15 @@ try:
     import pypower.case14
     import pypower.case30
     import pypower.case39
+    import pypower.case118
     from uc_NN_subproblem import (
         train_dual_predictor_from_data,
         SubproblemSurrogateTrainer,
         ActiveSetReader,
     )
     from uc_NN_subproblem_parallel import ParallelSubproblemSurrogateTrainer
+    from mti118_data_loader import load_case118_ppc_with_mti_limits
+    from scenario_utils import normalize_sample_arrays
     from training_logger import TrainingLogger
     from training_visualizer import TrainingVisualizer
 except ImportError as e:
@@ -127,8 +130,7 @@ def load_json_data(data_file: Path) -> list:
     log(f"  原始样本数: {len(all_samples)}")
 
     for sample in all_samples:
-        if isinstance(sample.get('pd_data'), list):
-            sample['pd_data'] = np.array(sample['pd_data'], dtype=float)
+        normalize_sample_arrays(sample)
 
     return all_samples
 
@@ -419,11 +421,11 @@ def run_feasibility_pump_test(ppc, all_samples, dual_predictor, trainers,
     results = []
     for i in range(test_n):
         sample = all_samples[i]
-        pd_data = sample['pd_data']   # (nb, T)
+        pd_data = sample['pd_data']   # (nb, T) net load compatibility field
         log(f"  样本 {i + 1}/{test_n}，pd_data shape={pd_data.shape}")
         try:
             x_result, success = recover_integer_solution(
-                pd_data, trainers, dual_predictor, ppc, T_DELTA,
+                sample, trainers, dual_predictor, ppc, T_DELTA,
                 verbose=True,
             )
         except Exception as e:
@@ -454,7 +456,7 @@ def main():
     print("=" * 70)
 
     # ── 配置 ──────────────────────────────────────────────
-    CASE_NAME       = 'case30'      # 'case14' / 'case30' / 'case39'
+    CASE_NAME       = 'case30'      # 'case14' / 'case30' / 'case39' / 'case118'
     MAX_SAMPLES     = 20           # 最多使用多少个样本（None=全部）
     T_DELTA         = 1.0
     DUAL_EPOCHS     = 50
@@ -494,6 +496,7 @@ def main():
         'case14': pypower.case14.case14,
         'case30': pypower.case30.case30,
         'case39': pypower.case39.case39,
+        'case118': load_case118_ppc_with_mti_limits,
     }
     if CASE_NAME not in ppc_map:
         print(f"未知案例: {CASE_NAME}，可选: {list(ppc_map)}")

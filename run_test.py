@@ -59,7 +59,7 @@ if not check_and_install_dependencies():
 #
 MODE      = 'bcd'
 RUN_FP    = False       # surrogate / both 模式：是否运行可行性泵测试
-CASE_NAME = 'case30'   # 'case14' / 'case30' / 'case39'
+CASE_NAME = 'case30'   # 'case14' / 'case30' / 'case39' / 'case118'
 
 # surrogate / both 模式：已训练 surrogate 模型目录（训练时输出的带时间戳路径）
 MODEL_DIR = 'result/subproblem_models_case30_20260306_171140'
@@ -93,10 +93,13 @@ try:
     import pypower.case14
     import pypower.case30
     import pypower.case39
+    import pypower.case118
     from uc_NN_subproblem import (
         load_trained_models,
         ActiveSetReader,
     )
+    from mti118_data_loader import load_case118_ppc_with_mti_limits
+    from scenario_utils import normalize_sample_arrays
 except ImportError as e:
     print(f"模块导入失败: {e}")
     print("请确保在项目根目录运行此脚本，且 src/ 目录存在")
@@ -137,8 +140,7 @@ def load_json_data(data_file: Path) -> list:
     log(f"  原始样本数: {len(all_samples)}")
 
     for sample in all_samples:
-        if isinstance(sample.get('pd_data'), list):
-            sample['pd_data'] = np.array(sample['pd_data'], dtype=float)
+        normalize_sample_arrays(sample)
 
     return all_samples
 
@@ -931,7 +933,7 @@ def run_fp_test(ppc, all_samples: list, dual_predictor, trainers: dict,
         log(f"  样本 {i + 1}/{test_n}，pd_data shape={pd_data.shape}")
         try:
             x_result, success = recover_integer_solution(
-                pd_data, trainers, dual_predictor, ppc, T_DELTA,
+                sample, trainers, dual_predictor, ppc, T_DELTA,
                 verbose=True,
             )
         except Exception as e:
@@ -1401,6 +1403,7 @@ def main():
         'case14': pypower.case14.case14,
         'case30': pypower.case30.case30,
         'case39': pypower.case39.case39,
+        'case118': load_case118_ppc_with_mti_limits,
     }
     if CASE_NAME not in ppc_map:
         print(f"未知案例: {CASE_NAME}，可选: {list(ppc_map)}")

@@ -38,6 +38,10 @@ try:
 except ImportError:
     from src.feasibility_pump import _add_surrogate_constraints, _build_ptdf_data
 try:
+    from scenario_utils import get_feature_vector_from_sample, get_sample_net_load, normalize_sample_arrays
+except ImportError:
+    from src.scenario_utils import get_feature_vector_from_sample, get_sample_net_load, normalize_sample_arrays
+try:
     from sparse_surrogate_mining import (
         SparseSurrogateLibrary,
         add_sparse_parameterized_constraints,
@@ -105,11 +109,12 @@ class UnifiedSurrogateManager:
         self.T_delta = agent.T_delta
         self.n_samples = len(active_set_data)
 
-        # 惩罚参数（与 agent 保持同步）
+        # 惩罚参数（与 agent 保持同步）。
+        # 兼容旧版 Agent_NN_BCD 仅暴露 gamma_base 而未显式存储 gamma 的情况。
         self.rho_primal = agent.rho_primal
         self.rho_dual = agent.rho_dual
         self.rho_opt = agent.rho_opt
-        self.gamma = agent.gamma
+        self.gamma = getattr(agent, 'gamma', getattr(agent, 'gamma_base', 0.0))
 
         # 从 agent 复制原始变量和对偶变量
         self.pg = agent.pg.copy()      # (n_samples, ng, T)
@@ -139,12 +144,13 @@ class UnifiedSurrogateManager:
         Returns:
             (pg_sol, x_sol): 各 shape (ng, T)；求解失败时返回当前缓存值
         """
-        Pd = self.active_set_data[sample_id]['pd_data']
+        sample = normalize_sample_arrays(self.active_set_data[sample_id])
+        Pd = get_sample_net_load(sample)
         Pd_sum = np.sum(Pd, axis=0)  # (T,)
 
         # 推断当前 theta/zeta 参数
         lambda_val = self._get_lambda_val(sample_id)
-        theta_values, zeta_values = self.get_theta_zeta_params(Pd, lambda_val)
+        theta_values, zeta_values = self.get_theta_zeta_params(sample, lambda_val)
 
         gen = self._gen
         gencost = self._gencost
@@ -308,7 +314,7 @@ class UnifiedSurrogateManager:
         # --- 路径 1：全局 theta/zeta 对偶 ---
         lambda_val = self._get_lambda_val(sample_id)
         theta_values, zeta_values = self.get_theta_zeta_params(
-            self.active_set_data[sample_id]['pd_data'], lambda_val
+            normalize_sample_arrays(self.active_set_data[sample_id]), lambda_val
         )
         lambda_sol, mu_sol, ita_sol = self.agent.iter_with_dual_block(
             sample_id=sample_id,
@@ -338,10 +344,11 @@ class UnifiedSurrogateManager:
             betas = trainer.beta_values[sample_id]
             gammas = trainer.gamma_values[sample_id]
             deltas = trainer.delta_values[sample_id]
+            costs = trainer.cost_values[sample_id]
 
             try:
                 result = trainer.iter_with_dual_block(
-                    sample_id, alphas, betas, gammas, deltas
+                    sample_id, alphas, betas, gammas, deltas, costs
                 )
                 if result is not None:
                     _, mu_v3 = result
@@ -534,7 +541,7 @@ class UnifiedSurrogateManager:
         for g in range(ng):
             if g not in surrogate_params:
                 continue
-            alphas, betas, gammas, deltas = surrogate_params[g]
+            alphas, betas, gammas, deltas, *_ = surrogate_params[g]
             for k in range(len(alphas)):
                 t_k = k % T_triples
                 t_k1 = min(t_k + 1, T - 1)
@@ -598,8 +605,8 @@ class UnifiedSurrogateManager:
         return np.zeros((ng, T))
 
     def get_surrogate_params(
-        self, g: int, pd_data: np.ndarray, lambda_val: np.ndarray
-    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        self, g: int, pd_data: np.ndarray | dict, lambda_val: np.ndarray
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         """
         获取机组 g 的 V3 代理约束参数，委托给 trainers[g].get_surrogate_params。
 
@@ -609,7 +616,8 @@ class UnifiedSurrogateManager:
             lambda_val: (T,) 功率平衡对偶变量
 
         Returns:
-            (alphas, betas, gammas, deltas) 各 shape (max_constraints,)
+            (alphas, betas, gammas, deltas, costs)，其中前四项 shape 为
+            (max_constraints,)，costs shape 为 (T,)
 
         Raises:
             KeyError: 当 g 不在 trainers 中时
@@ -617,7 +625,7 @@ class UnifiedSurrogateManager:
         return self.trainers[g].get_surrogate_params(pd_data, lambda_val)
 
     def get_theta_zeta_params(
-        self, pd_data: np.ndarray, lambda_val: np.ndarray
+        self, pd_data: np.ndarray | dict, lambda_val: np.ndarray
     ) -> Tuple[Dict, Dict]:
         """
         通过 agent.theta_net / agent.zeta_net 前向推断，返回 (theta_values, zeta_values)。
@@ -638,7 +646,10 @@ class UnifiedSurrogateManager:
 
         try:
             import torch as _torch
-            features = pd_data.flatten()
+            if isinstance(pd_data, dict):
+                features = get_feature_vector_from_sample(pd_data)
+            else:
+                features = pd_data.flatten()
             features_tensor = _torch.tensor(features, dtype=_torch.float32).unsqueeze(0)
             if agent.device is not None:
                 features_tensor = features_tensor.to(agent.device)

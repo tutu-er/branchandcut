@@ -25,7 +25,7 @@ sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
 # 你需要自行实现数据加载部分
 
 class UnitCommitmentModel:
-    def __init__(self, ppc, Pd, T_delta):
+    def __init__(self, ppc, Pd, T_delta, renewable_data=None):
         self.ppc = ppc
         ppc = ext2int(ppc)
         self.baseMVA = ppc['baseMVA']
@@ -33,15 +33,29 @@ class UnitCommitmentModel:
         self.gen = ppc['gen']
         self.branch = ppc['branch']
         self.gencost = ppc['gencost']
-        self.Pd = Pd
+        self.load_data = np.asarray(Pd, dtype=float)
+        self.renewable_data = None if renewable_data is None else np.asarray(renewable_data, dtype=float)
+        if self.renewable_data is not None and self.renewable_data.shape != self.load_data.shape:
+            raise ValueError(
+                f"renewable_data shape {self.renewable_data.shape} does not match load shape {self.load_data.shape}"
+            )
+        self.Pd = self.load_data
+        self.net_load = self.load_data if self.renewable_data is None else self.load_data - self.renewable_data
         self.T_delta = T_delta
-        self.T = Pd.shape[1]
+        self.T = self.load_data.shape[1]
         self.ng = self.gen.shape[0]
         self.nl = self.branch.shape[0]
+        self.nb = self.load_data.shape[0]
+        if self.renewable_data is not None:
+            self.renewable_bus_ids = np.where(np.any(self.renewable_data > 1e-9, axis=1))[0]
+        else:
+            self.renewable_bus_ids = np.array([], dtype=int)
+        self.nr = len(self.renewable_bus_ids)
         self.model = gp.Model('UnitCommitment')
         self.model.Params.OutputFlag = 0
         self.pg = self.model.addVars(self.ng, self.T, lb=0, name='pg')
         self.x = self.model.addVars(self.ng, self.T, vtype=GRB.BINARY, name='x')
+        self.p_ren = self.model.addVars(self.nr, self.T, lb=0, name='p_ren') if self.nr > 0 else None
         self.coc = self.model.addVars(self.ng, self.T-1, lb=0, name='coc')
         self.cpower = self.model.addVars(self.ng, self.T, lb=0, name='cpower')
         self._build_model()
@@ -49,10 +63,20 @@ class UnitCommitmentModel:
     def _build_model(self):
         # 有功平衡
         for t in range(self.T):
-            self.model.addConstr(gp.quicksum(self.pg[g, t] for g in range(self.ng)) == np.sum(self.Pd[:, t]), name=f'power_balance_{t}')
+            renewable_supply = (
+                gp.quicksum(self.p_ren[r, t] for r in range(self.nr))
+                if self.nr > 0 else 0
+            )
+            self.model.addConstr(
+                gp.quicksum(self.pg[g, t] for g in range(self.ng)) + renewable_supply
+                == np.sum(self.load_data[:, t]),
+                name=f'power_balance_{t}'
+            )
             for g in range(self.ng):
                 self.model.addConstr(self.pg[g, t] >= self.gen[g, PMIN] * self.x[g, t])
                 self.model.addConstr(self.pg[g, t] <= self.gen[g, PMAX] * self.x[g, t])
+            for r, bus_idx in enumerate(self.renewable_bus_ids):
+                self.model.addConstr(self.p_ren[r, t] <= self.renewable_data[bus_idx, t], name=f'ren_upper_{r}_{t}')
         # 爬坡约束
         Ru = 0.4 * self.gen[:, PMAX] / self.T_delta
         Rd = 0.4 * self.gen[:, PMAX] / self.T_delta
@@ -91,16 +115,23 @@ class UnitCommitmentModel:
         try:
             # G: 机组-节点映射矩阵，需用户根据数据准备
             # 这里假设 G 为 (nb, ng) 的0-1矩阵，gen[:,0]为机组母线编号（1-based）
-            nb = self.Pd.shape[0]
-            G = np.zeros((nb, self.ng))
+            G = np.zeros((self.nb, self.ng))
             for g in range(self.ng):
                 bus_idx = int(self.gen[g, GEN_BUS])
                 G[bus_idx, g] = 1
+            R = np.zeros((self.nb, self.nr))
+            for r, bus_idx in enumerate(self.renewable_bus_ids):
+                R[bus_idx, r] = 1
             # 计算PTDF
             PTDF = makePTDF(self.baseMVA, self.bus, self.branch)
             branch_limit = self.branch[:, RATE_A]  # 线路容量
             for t in range(self.T):
-                flow = PTDF @ (G @ np.array([self.pg[g, t] for g in range(self.ng)]) - self.Pd[:, t])
+                thermal_injection = G @ np.array([self.pg[g, t] for g in range(self.ng)])
+                renewable_injection = (
+                    R @ np.array([self.p_ren[r, t] for r in range(self.nr)])
+                    if self.nr > 0 else 0
+                )
+                flow = PTDF @ (thermal_injection + renewable_injection - self.load_data[:, t])
                 for l in range(self.branch.shape[0]):
                     self.model.addConstr(flow[l] <= branch_limit[l])
                     self.model.addConstr(flow[l] >= -branch_limit[l])

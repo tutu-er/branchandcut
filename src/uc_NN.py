@@ -50,14 +50,22 @@ from pypower.ext2int import ext2int
 from pypower.idx_gen import GEN_BUS, PMIN, PMAX
 from pypower.idx_brch import RATE_A
 from pypower.makePTDF import makePTDF
+try:
+    from scenario_utils import get_feature_vector_from_sample, normalize_sample_arrays
+except ImportError:
+    from src.scenario_utils import get_feature_vector_from_sample, normalize_sample_arrays
 
 # ED求解器导入（可选）
 try:
     from ed_gurobipy import EconomicDispatchGurobi
     ED_GUROBI_AVAILABLE = True
 except ImportError:
-    ED_GUROBI_AVAILABLE = False
-    print("警告: ed_gurobipy未安装，将无法使用ED问题求解功能", flush=True)
+    try:
+        from src.ed_gurobipy import EconomicDispatchGurobi
+        ED_GUROBI_AVAILABLE = True
+    except ImportError:
+        ED_GUROBI_AVAILABLE = False
+        print("警告: ed_gurobipy未安装，将无法使用ED问题求解功能", flush=True)
 
 # PyPower测试用例（可选）
 try:
@@ -123,6 +131,8 @@ class ActiveSetReader:
                     'active_constraints': active_constraints,
                     'active_variables': active_variables,
                     'pd_data': pd_data,
+                    'load_data': np.array(sample.get('load_data', pd_data), dtype=float),
+                    'renewable_data': np.array(sample.get('renewable_data', np.zeros_like(pd_data)), dtype=float),
                     'unit_commitment_matrix': unit_commitment
                 }
                 
@@ -142,6 +152,8 @@ class ActiveSetReader:
                     'active_constraints': [],
                     'active_variables': [],
                     'pd_data': np.array([]),
+                    'load_data': np.array([]),
+                    'renewable_data': np.array([]),
                     'unit_commitment_matrix': np.array([]),
                     'error': str(e)
                 })
@@ -156,7 +168,8 @@ class ActiveSetReader:
             return [], [], np.array([])
         
         active_set = sample['active_set']
-        pd_data = np.array(sample['pd_data'])
+        sample = normalize_sample_arrays(sample)
+        pd_data = sample['pd_data']
         
         active_constraints = []
         active_variables = []
@@ -986,8 +999,7 @@ class Agent_NN:
 
     def _extract_features(self, sample_id) -> np.ndarray:
         """从样本中提取特征"""
-        pd_data = self.active_set_data[sample_id]['pd_data']
-        return pd_data.flatten()
+        return get_feature_vector_from_sample(self.active_set_data[sample_id])
     
     def _tensor_to_theta_dict(self, theta_tensor) -> Dict:
         """将theta张量转换为字典"""

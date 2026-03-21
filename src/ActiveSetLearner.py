@@ -22,9 +22,11 @@ sys.path.append(str(root_dir))
 from src.case39_pypower import get_case39_pypower
 from src.uc_gurobipy import UnitCommitmentModel
 from src.ed_gurobipy import EconomicDispatchGurobi
+from src.scenario_utils import normalize_sample_arrays
 
 class ActiveSetLearner:
-    def __init__(self, alpha=0.05, delta=0.01, epsilon=0.04, ppc=None, T_delta=4, Pd=None, case_name=None):
+    def __init__(self, alpha=0.05, delta=0.01, epsilon=0.04, ppc=None, T_delta=4, Pd=None,
+                 case_name=None, renewable_data=None):
         self.alpha = alpha
         self.delta = delta
         self.epsilon = epsilon
@@ -34,6 +36,7 @@ class ActiveSetLearner:
         self.ppc = ppc
         self.T_delta = T_delta
         self.Pd = Pd
+        self.renewable_data = renewable_data
         self.case_name = case_name
         self._cal_W()  # 计算初始窗口大小
 
@@ -54,17 +57,17 @@ class ActiveSetLearner:
         Pd_perturbed = self.Pd * perturb
         return Pd_perturbed
 
-    def _solve_optimization(self, Pd):
+    def _solve_optimization(self, Pd, renewable_data=None):
         """求解优化问题并返回活动集和对偶变量λ
 
         注意：求解MILP获取活动集（包含x），然后用x求解LP获取λ
         """
         # Step 1: 求解 UC (MILP) 获取机组状态 x
-        uc = UnitCommitmentModel(self.ppc, Pd, self.T_delta)
+        uc = UnitCommitmentModel(self.ppc, Pd, self.T_delta, renewable_data=renewable_data)
         pg_sol, x_sol, total_cost = uc.solve()
 
         # Step 2: 用 x 求解 ED (LP) 获取对偶变量 λ
-        ed = EconomicDispatchGurobi(self.ppc, Pd, self.T_delta, x_sol)
+        ed = EconomicDispatchGurobi(self.ppc, Pd, self.T_delta, x_sol, renewable_data=renewable_data)
         pg_sol, total_cost = ed.solve()
 
         # Step 3: 提取功率平衡约束的对偶变量 λ（前T个约束）
@@ -117,10 +120,23 @@ class ActiveSetLearner:
 
         # 直接保存所有样本的Pd数据、活动集和对偶变量（一一对应）
         all_samples = []
-        for i, (pd_data, active_set, lambda_vals) in enumerate(self.samples):
+        for i, sample in enumerate(self.samples):
+            if isinstance(sample, dict):
+                sample = normalize_sample_arrays(sample)
+                pd_data = sample['pd_data']
+                load_data = sample.get('load_data')
+                renewable_data = sample.get('renewable_data')
+                active_set = sample['active_set']
+                lambda_vals = sample['lambda']
+            else:
+                pd_data, active_set, lambda_vals = sample
+                load_data = pd_data
+                renewable_data = np.zeros_like(pd_data)
             all_samples.append({
                 'sample_id': i,
                 'pd_data': pd_data.tolist(),
+                'load_data': load_data.tolist() if load_data is not None else pd_data.tolist(),
+                'renewable_data': renewable_data.tolist() if renewable_data is not None else np.zeros_like(pd_data).tolist(),
                 'active_set': list(active_set),
                 'lambda': lambda_vals  # 新增：保存对偶变量λ
             })
@@ -168,7 +184,18 @@ class ActiveSetLearner:
         result_dir.mkdir(parents=True, exist_ok=True)
 
         # 生成映射关系
-        mapping = {f"样本{i+1}": {"Pd": sample[0].tolist(), "活动集": list(sample[1])} for i, sample in enumerate(self.samples)}
+        mapping = {}
+        for i, sample in enumerate(self.samples):
+            if isinstance(sample, dict):
+                sample = normalize_sample_arrays(sample)
+                mapping[f"样本{i+1}"] = {
+                    "Pd": sample['pd_data'].tolist(),
+                    "Load": sample['load_data'].tolist(),
+                    "Renewable": sample['renewable_data'].tolist(),
+                    "活动集": list(sample['active_set']),
+                }
+            else:
+                mapping[f"样本{i+1}"] = {"Pd": sample[0].tolist(), "活动集": list(sample[1])}
         
         # 保存为JSON文件
         filepath = result_dir / filename
@@ -199,11 +226,19 @@ class ActiveSetLearner:
                 if M >= M_max:
                     break
                 Pd = self._generate_random_Pd(rng=idx)
+                renewable_data = None if self.renewable_data is None else np.asarray(self.renewable_data, dtype=float)
                 try:
                     # 静默求解器输出，避免打断进度条
                     with contextlib.redirect_stdout(io.StringIO()):
-                        active_set, lambda_vals = self._solve_optimization(Pd)
-                    samples.append((Pd, active_set, lambda_vals))
+                        active_set, lambda_vals = self._solve_optimization(Pd, renewable_data=renewable_data)
+                    samples.append({
+                        'sample_id': len(samples),
+                        'load_data': Pd,
+                        'renewable_data': np.zeros_like(Pd) if renewable_data is None else renewable_data,
+                        'pd_data': Pd,
+                        'active_set': active_set,
+                        'lambda': lambda_vals,
+                    })
                 except Exception as e:
                     # 在终端显式打印失败样本，便于排查不可行或求解异常
                     print(f"  样本 idx={idx} 求解失败: {e}", flush=True)
@@ -218,7 +253,8 @@ class ActiveSetLearner:
             # 计算发现率
             window_samples = samples[-WM:]
             new_active_sets = set()
-            for _, active_set, _ in window_samples:
+            for sample in window_samples:
+                active_set = sample['active_set'] if isinstance(sample, dict) else sample[1]
                 if active_set not in O:
                     new_active_sets.add(active_set)
             O.update(new_active_sets)
@@ -234,26 +270,44 @@ class ActiveSetLearner:
         self.M = M
         return O
 
+    def run_on_precomputed_scenarios(self, scenarios, max_samples=None):
+        """对预先构造的场景列表逐个求解并收集 active sets。"""
+        samples = []
+        observed = set()
+        limit = len(scenarios) if max_samples is None else min(max_samples, len(scenarios))
+        for idx, sample in enumerate(scenarios[:limit]):
+            sample = normalize_sample_arrays(dict(sample))
+            with contextlib.redirect_stdout(io.StringIO()):
+                active_set, lambda_vals = self._solve_optimization(
+                    sample['load_data'],
+                    renewable_data=sample['renewable_data'],
+                )
+            sample['sample_id'] = idx
+            sample['active_set'] = active_set
+            sample['lambda'] = lambda_vals
+            samples.append(sample)
+            observed.add(active_set)
+
+        self.samples = samples
+        self.observed_active_sets = observed
+        self.M = len(samples)
+        return observed
+
 # 使用示例
 if __name__ == "__main__":
-    # ppc = get_case39_pypower()
+    from src.mti118_data_loader import (
+        build_case118_daily_samples,
+        load_case118_ppc_with_mti_limits,
+    )
+
+    ppc = load_case118_ppc_with_mti_limits()
+    scenarios = build_case118_daily_samples(max_days=5)
     
-    load_df = pd.read_csv('src/load.csv', header=None)
-    Pd_base = load_df.values
-    Pd_base = np.sum(Pd_base, axis=0)
-    group_size = 4
-    valid_steps = (Pd_base.size // group_size) * group_size
-    Pd_base = Pd_base[:valid_steps].reshape(-1, group_size).sum(axis=1)
-    
-    ppc = pypower.case30.case30()
-    
-    Pd = ppc['bus'][:, pypower.idx_bus.PD]  # 假设Pd为bus数据中的Pd列
-    Pd = Pd[:, None] * Pd_base[None, :] / np.max(Pd_base)  # 归一化负荷
-    
-    ppc['branch'][:, pypower.idx_brch.RATE_A] = ppc['branch'][:, pypower.idx_brch.RATE_A]
-    
-    learner = ActiveSetLearner(alpha=0.70, delta=0.05, epsilon=0.10, ppc=ppc, T_delta=1, Pd=Pd, case_name='case30')
-    active_sets = learner.run(max_samples=200)
+    learner = ActiveSetLearner(
+        alpha=0.70, delta=0.05, epsilon=0.10,
+        ppc=ppc, T_delta=1, Pd=None, case_name='case118'
+    )
+    active_sets = learner.run_on_precomputed_scenarios(scenarios, max_samples=5)
     
     print(f"发现的活动集数量: {len(active_sets)}", flush=True)
     print("示例活动集:", list(active_sets)[:3], flush=True)
@@ -267,8 +321,11 @@ if __name__ == "__main__":
     # print(f"映射关系JSON文件已保存: {mapping_filename}")
 
     # 验证新样本
-    Pd = learner._generate_random_Pd()
-    test_active_set, test_lambda = learner._solve_optimization(Pd)
+    sample0 = scenarios[0]
+    test_active_set, test_lambda = learner._solve_optimization(
+        sample0['load_data'],
+        renewable_data=sample0['renewable_data'],
+    )
     
     # 使用集合预测（简单示例）
     if test_active_set in learner.observed_active_sets:

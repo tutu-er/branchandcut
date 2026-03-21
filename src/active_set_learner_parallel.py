@@ -13,6 +13,7 @@ root_dir = Path(__file__).resolve().parent.parent
 sys.path.append(str(root_dir))
 
 from src.ActiveSetLearner import ActiveSetLearner
+from src.scenario_utils import normalize_sample_arrays
 
 from pypower.idx_brch import RATE_A
 
@@ -26,7 +27,7 @@ def _solve_single_sample(args: tuple) -> dict | None:
     Returns:
         包含 pd_data, active_set, lambda 的字典，求解失败返回 None。
     """
-    ppc, Pd, T_delta, gurobi_threads, sample_id = args
+    ppc, load_data, renewable_data, T_delta, gurobi_threads, sample_id = args
 
     # 延迟导入，避免主进程 fork 时的序列化问题
     from src.uc_gurobipy import UnitCommitmentModel
@@ -36,17 +37,17 @@ def _solve_single_sample(args: tuple) -> dict | None:
         # 静默求解器输出
         with contextlib.redirect_stdout(io.StringIO()):
             # Step 1: 求解 UC (MILP)
-            uc = UnitCommitmentModel(ppc, Pd, T_delta)
+            uc = UnitCommitmentModel(ppc, load_data, T_delta, renewable_data=renewable_data)
             uc.model.Params.Threads = gurobi_threads
             pg_sol, x_sol, total_cost = uc.solve()
 
             # Step 2: 用 x 求解 ED (LP)
-            ed = EconomicDispatchGurobi(ppc, Pd, T_delta, x_sol)
+            ed = EconomicDispatchGurobi(ppc, load_data, T_delta, x_sol, renewable_data=renewable_data)
             ed.model.Params.Threads = gurobi_threads
             pg_sol, total_cost = ed.solve()
 
         # Step 3: 提取 lambda
-        T = Pd.shape[1]
+        T = load_data.shape[1]
         lambda_vals = []
         for t in range(T):
             constr = ed.model.getConstrByName(f"power_balance_{t}")
@@ -67,7 +68,14 @@ def _solve_single_sample(args: tuple) -> dict | None:
 
         active_set = frozenset(make_hashable(item) for item in active)
 
-        return {"pd_data": Pd, "active_set": active_set, "lambda": lambda_vals}
+        renewable_arr = np.zeros_like(load_data) if renewable_data is None else renewable_data
+        return {
+            "load_data": load_data,
+            "renewable_data": renewable_arr,
+            "pd_data": load_data,
+            "active_set": active_set,
+            "lambda": lambda_vals,
+        }
 
     except Exception as e:
         # 在子进程中打印失败样本的标识，便于定位问题负荷
@@ -148,18 +156,25 @@ class ParallelActiveSetLearner(ActiveSetLearner):
                 if actual_wm <= 0:
                     break
 
-                pd_list = []
+                load_list = []
                 seeds = []
                 for i in range(actual_wm):
                     seed = global_seed_counter + i
                     seeds.append(seed)
-                    pd_list.append(self._generate_random_Pd(rng=seed))
+                    load_list.append(self._generate_random_Pd(rng=seed))
                 global_seed_counter += actual_wm
 
                 # 并行提交，附带 sample_id（这里用全局 seed 标识）
                 args_list = [
-                    (self.ppc, pd, self.T_delta, self.gurobi_threads, seed)
-                    for pd, seed in zip(pd_list, seeds)
+                    (
+                        self.ppc,
+                        load_data,
+                        None if self.renewable_data is None else np.asarray(self.renewable_data, dtype=float),
+                        self.T_delta,
+                        self.gurobi_threads,
+                        seed,
+                    )
+                    for load_data, seed in zip(load_list, seeds)
                 ]
                 futures = {
                     pool.submit(_solve_single_sample, a): i
@@ -203,7 +218,8 @@ class ParallelActiveSetLearner(ActiveSetLearner):
                             flush=True,
                         )
                         continue
-                    samples.append((r["pd_data"], r["active_set"], r["lambda"]))
+                    r["sample_id"] = len(samples)
+                    samples.append(r)
                     if r["active_set"] not in O:
                         new_active_sets.add(r["active_set"])
 
@@ -225,25 +241,48 @@ class ParallelActiveSetLearner(ActiveSetLearner):
         self.M = M
         return O
 
+    def run_on_precomputed_scenarios(self, scenarios: list[dict], max_samples: int | None = None) -> set:
+        limit = len(scenarios) if max_samples is None else min(max_samples, len(scenarios))
+        selected = [normalize_sample_arrays(dict(sample)) for sample in scenarios[:limit]]
+        args_list = [
+            (
+                self.ppc,
+                sample["load_data"],
+                sample["renewable_data"],
+                self.T_delta,
+                self.gurobi_threads,
+                sample.get("sample_id", idx),
+            )
+            for idx, sample in enumerate(selected)
+        ]
+
+        samples = []
+        observed = set()
+        with ProcessPoolExecutor(max_workers=self.n_workers) as pool:
+            futures = {pool.submit(_solve_single_sample, args): idx for idx, args in enumerate(args_list)}
+            for future in as_completed(futures):
+                idx = futures[future]
+                result = future.result()
+                if result is None:
+                    continue
+                result["sample_id"] = selected[idx].get("sample_id", idx)
+                samples.append(result)
+                observed.add(result["active_set"])
+
+        self.samples = samples
+        self.observed_active_sets = observed
+        self.M = len(samples)
+        return observed
+
 
 if __name__ == "__main__":
-    import pandas as pd
-    import pypower.case118
-    import pypower.idx_bus
+    from src.mti118_data_loader import (
+        build_case118_daily_samples,
+        load_case118_ppc_with_mti_limits,
+    )
 
-    load_df = pd.read_csv("src/load.csv", header=None)
-    Pd_base = load_df.values
-    Pd_base = np.sum(Pd_base, axis=0)
-    group_size = 4
-    valid_steps = (Pd_base.size // group_size) * group_size
-    Pd_base = Pd_base[:valid_steps].reshape(-1, group_size).sum(axis=1)
-
-    ppc = pypower.case118.case118()
-
-    Pd = ppc["bus"][:, pypower.idx_bus.PD]
-    Pd = Pd[:, None] * Pd_base[None, :] / np.max(Pd_base) * 2.2
-    
-    ppc["branch"][:, RATE_A] = ppc["branch"][:, RATE_A] * 0.12
+    ppc = load_case118_ppc_with_mti_limits()
+    scenarios = build_case118_daily_samples(max_days=30)
 
     learner = ParallelActiveSetLearner(
         alpha=0.75,
@@ -251,12 +290,12 @@ if __name__ == "__main__":
         epsilon=0.10,
         ppc=ppc,
         T_delta=1,
-        Pd=Pd,
+        Pd=None,
         case_name="case118",
         n_workers=4,
         gurobi_threads=4,
     )
-    active_sets = learner.run(max_samples=200)
+    active_sets = learner.run_on_precomputed_scenarios(scenarios, max_samples=30)
 
     print(f"发现的活动集数量: {len(active_sets)}", flush=True)
 

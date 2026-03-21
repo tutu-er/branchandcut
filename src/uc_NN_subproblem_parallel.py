@@ -30,6 +30,7 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 import numpy as np
+from scenario_utils import normalize_sample_arrays
 
 # ── 路径设置（worker 进程也需要能 import src.*）──────────────
 _SRC_DIR = Path(__file__).resolve().parent
@@ -396,7 +397,7 @@ def train_all_surrogates_parallel(
     if lambda_predictor is not None:
         n_samples = len(active_set_data)
         lambda_vals = np.array([
-            lambda_predictor.predict(active_set_data[i]['pd_data'])
+            lambda_predictor.predict(normalize_sample_arrays(active_set_data[i]))
             for i in range(n_samples)
         ])
         print(
