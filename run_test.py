@@ -76,6 +76,7 @@ MODEL_DIR = 'result/subproblem_models/subproblem_models_case30_20260318_201124'
 BCD_MODEL_PATH = 'result/bcd_models/bcd_model_case30_20260318_000506.pth'
 
 TEST_SAMPLES_DEFAULT = 3
+TEST_SAMPLES = TEST_SAMPLES_DEFAULT
 ACTIVE_SETS_FILE = 'result/active_set/active_sets_case30_T24_n340_20260317_152540.json'  # 指定 active_sets JSON 文件路径（None=自动查找最新）
 
 # ──────────────────────── 导入 ────────────────────────
