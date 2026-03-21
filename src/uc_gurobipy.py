@@ -27,6 +27,7 @@ sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
 class UnitCommitmentModel:
     def __init__(self, ppc, Pd, T_delta, renewable_data=None):
         self.ppc = ppc
+        self.ppc_raw = ppc
         ppc = ext2int(ppc)
         self.baseMVA = ppc['baseMVA']
         self.bus = ppc['bus']
@@ -60,6 +61,52 @@ class UnitCommitmentModel:
         self.cpower = self.model.addVars(self.ng, self.T, lb=0, name='cpower')
         self._build_model()
 
+    def _get_ramp_limits(self):
+        default_up = 0.4 * self.gen[:, PMAX] / self.T_delta
+        default_down = 0.4 * self.gen[:, PMAX] / self.T_delta
+        default_up_co = 0.3 * self.gen[:, PMAX]
+        default_down_co = 0.3 * self.gen[:, PMAX]
+
+        ramp_up_h = self._get_custom_generator_array('uc_ramp_up_mw_per_h')
+        ramp_down_h = self._get_custom_generator_array('uc_ramp_down_mw_per_h')
+        if ramp_up_h is None or ramp_down_h is None:
+            return default_up, default_down, default_up_co, default_down_co
+
+        Ru = np.asarray(ramp_up_h, dtype=float) * self.T_delta
+        Rd = np.asarray(ramp_down_h, dtype=float) * self.T_delta
+        Ru = np.maximum(Ru, default_up)
+        Rd = np.maximum(Rd, default_down)
+        Ru_co = np.maximum(Ru, self.gen[:, PMIN])
+        Rd_co = np.maximum(Rd, self.gen[:, PMIN])
+        return Ru, Rd, Ru_co, Rd_co
+
+    def _get_min_up_down_time_steps(self):
+        min_up_h = self._get_custom_generator_array('uc_min_up_time_h')
+        min_down_h = self._get_custom_generator_array('uc_min_down_time_h')
+        if min_up_h is None or min_down_h is None:
+            default_steps = max(int(4 * self.T_delta), 1)
+            return (
+                np.full(self.ng, default_steps, dtype=int),
+                np.full(self.ng, default_steps, dtype=int),
+            )
+
+        min_up = np.maximum(np.ceil(np.asarray(min_up_h, dtype=float) / self.T_delta).astype(int), 1)
+        min_down = np.maximum(np.ceil(np.asarray(min_down_h, dtype=float) / self.T_delta).astype(int), 1)
+        return min_up, min_down
+
+    def _get_custom_generator_array(self, key):
+        values = self.ppc_raw.get(key)
+        if values is None:
+            return None
+        values = np.asarray(values)
+        if values.shape[0] != self.ng:
+            return None
+        raw_gen = np.asarray(self.ppc_raw.get('gen'))
+        if raw_gen.shape[0] != self.ng:
+            return values
+        order = np.argsort(raw_gen[:, GEN_BUS], kind='stable')
+        return values[order]
+
     def _build_model(self):
         # 有功平衡
         for t in range(self.T):
@@ -78,25 +125,21 @@ class UnitCommitmentModel:
             for r, bus_idx in enumerate(self.renewable_bus_ids):
                 self.model.addConstr(self.p_ren[r, t] <= self.renewable_data[bus_idx, t], name=f'ren_upper_{r}_{t}')
         # 爬坡约束
-        Ru = 0.4 * self.gen[:, PMAX] / self.T_delta
-        Rd = 0.4 * self.gen[:, PMAX] / self.T_delta
-        Ru_co = 0.3 * self.gen[:, PMAX]
-        Rd_co = 0.3 * self.gen[:, PMAX]
+        Ru, Rd, Ru_co, Rd_co = self._get_ramp_limits()
         for t in range(1, self.T):
             for g in range(self.ng):
                 self.model.addConstr(self.pg[g, t] - self.pg[g, t-1] <= Ru[g] * self.x[g, t-1] + Ru_co[g] * (1 - self.x[g, t-1]))
                 self.model.addConstr(self.pg[g, t-1] - self.pg[g, t] <= Rd[g] * self.x[g, t] + Rd_co[g] * (1 - self.x[g, t]))
         # 最小开机时间和最小关机时间约束
-        Ton = int(4 * self.T_delta)  # 最小开机时间
-        Toff = int(4 * self.T_delta) # 最小关机时间
+        min_up_steps, min_down_steps = self._get_min_up_down_time_steps()
         # 最小开机时间约束（与matlab一致）
         for g in range(self.ng):
-            for t in range(1, Ton+1):
+            for t in range(1, min_up_steps[g] + 1):
                 for t1 in range(self.T - t):
                     self.model.addConstr(self.x[g, t1+1] - self.x[g, t1] <= self.x[g, t1+t])
         # 最小关机时间约束（与matlab一致）
         for g in range(self.ng):
-            for t in range(1, Toff+1):
+            for t in range(1, min_down_steps[g] + 1):
                 for t1 in range(self.T - t):
                     self.model.addConstr(-self.x[g, t1+1] + self.x[g, t1] <= 1 - self.x[g, t1+t])
         # 启停成本

@@ -65,10 +65,14 @@ class ActiveSetLearner:
         # Step 1: 求解 UC (MILP) 获取机组状态 x
         uc = UnitCommitmentModel(self.ppc, Pd, self.T_delta, renewable_data=renewable_data)
         pg_sol, x_sol, total_cost = uc.solve()
+        if x_sol is None:
+            raise RuntimeError(f"UC solve failed with status={uc.model.status}")
 
         # Step 2: 用 x 求解 ED (LP) 获取对偶变量 λ
         ed = EconomicDispatchGurobi(self.ppc, Pd, self.T_delta, x_sol, renewable_data=renewable_data)
         pg_sol, total_cost = ed.solve()
+        if pg_sol is None:
+            raise RuntimeError(f"ED solve failed with status={ed.model.status}")
 
         # Step 3: 提取功率平衡约束的对偶变量 λ（前T个约束）
         T = Pd.shape[1]

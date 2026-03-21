@@ -40,11 +40,15 @@ def _solve_single_sample(args: tuple) -> dict | None:
             uc = UnitCommitmentModel(ppc, load_data, T_delta, renewable_data=renewable_data)
             uc.model.Params.Threads = gurobi_threads
             pg_sol, x_sol, total_cost = uc.solve()
+            if x_sol is None:
+                raise RuntimeError(f"UC solve failed with status={uc.model.status}")
 
             # Step 2: 用 x 求解 ED (LP)
             ed = EconomicDispatchGurobi(ppc, load_data, T_delta, x_sol, renewable_data=renewable_data)
             ed.model.Params.Threads = gurobi_threads
             pg_sol, total_cost = ed.solve()
+            if pg_sol is None:
+                raise RuntimeError(f"ED solve failed with status={ed.model.status}")
 
         # Step 3: 提取 lambda
         T = load_data.shape[1]
