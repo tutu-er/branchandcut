@@ -4,6 +4,10 @@ from pathlib import Path
 import sys
 
 import numpy as np
+from src.numpy_compat import ensure_numpy_compat_for_pypower
+
+ensure_numpy_compat_for_pypower()
+
 import pypower.case30
 from pypower.idx_bus import PD
 
@@ -124,6 +128,7 @@ def run_case30(
 def run_case118(
     market: str = "DA",
     horizon: int = 24,
+    aggregate_thermal_by_bus: bool = True,
     max_days: int | None = None,
     max_samples: int | None = None,
     perturb_repeats: int = 0,
@@ -139,7 +144,9 @@ def run_case118(
     gurobi_threads: int = 2,
     output: str | None = None,
 ) -> str:
-    ppc = load_case118_ppc_with_mti_limits()
+    ppc = load_case118_ppc_with_mti_limits(
+        aggregate_thermal_by_bus=aggregate_thermal_by_bus,
+    )
     scenarios = build_case118_daily_samples(
         market=market,
         horizon=horizon,
@@ -194,6 +201,7 @@ def main() -> None:
         output_path = run_case118(
             market="DA",
             horizon=24,
+            aggregate_thermal_by_bus=True,
             max_days=None,
             max_samples=None,
             perturb_repeats=0,
@@ -204,7 +212,7 @@ def main() -> None:
             delta=0.05,
             epsilon=0.10,
             t_delta=1.0,
-            parallel=True,
+            parallel=False,
             n_workers=4,
             gurobi_threads=2,
             output=None,

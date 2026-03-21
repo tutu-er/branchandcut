@@ -2,6 +2,10 @@ import numpy as np
 import gurobipy as gp
 from gurobipy import GRB
 import pandas as pd
+from src.numpy_compat import ensure_numpy_compat_for_pypower
+
+ensure_numpy_compat_for_pypower()
+
 import pypower
 from pypower.makePTDF import makePTDF
 from pypower.ext2int import ext2int
@@ -187,7 +191,7 @@ class UnitCommitmentModel:
         self.model.setObjective(obj, GRB.MINIMIZE)
         
         # self.model.setParam("Presolve", 2)
-        self.model.setParam('MIPGap', 1e-10)
+        self.model.setParam('MIPGap', 1e-5)
 
     def solve(self):
         # self.cut_count_log = []  # 用于记录每次callback的割平面数

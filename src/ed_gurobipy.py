@@ -1,6 +1,10 @@
 import numpy as np
 import gurobipy as gp
 from gurobipy import GRB
+from src.numpy_compat import ensure_numpy_compat_for_pypower
+
+ensure_numpy_compat_for_pypower()
+
 from pypower.makePTDF import makePTDF
 from pypower.ext2int import ext2int
 from pypower.idx_gen import GEN_BUS, PMIN, PMAX, QMIN, QMAX, VG, MBASE, GEN_STATUS

@@ -1,6 +1,10 @@
 import numpy as np
 from collections import defaultdict
 import pandas as pd
+from src.numpy_compat import ensure_numpy_compat_for_pypower
+
+ensure_numpy_compat_for_pypower()
+
 import pypower
 import pypower.case39
 import pypower.case30

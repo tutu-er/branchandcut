@@ -6,6 +6,10 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+from src.numpy_compat import ensure_numpy_compat_for_pypower
+
+ensure_numpy_compat_for_pypower()
+
 from pypower.api import case118
 from pypower.idx_brch import F_BUS, RATE_A, T_BUS
 from pypower.idx_bus import BUS_I
@@ -111,15 +115,14 @@ def _infer_fuel_key(generator_name: str) -> str | None:
     return "natural gas"
 
 
-def _build_case118_thermal_generators(metadata: MTI118Metadata, data_root: Path, base_mva: float) -> tuple[np.ndarray, np.ndarray, dict]:
+def _build_case118_thermal_generators(
+    metadata: MTI118Metadata,
+    data_root: Path,
+    base_mva: float,
+    aggregate_by_bus: bool = True,
+) -> tuple[np.ndarray, np.ndarray, dict]:
     fuels = _load_fuel_prices(data_root)
-    thermal_rows = []
-    gencost_rows = []
-    ramp_up_mw_per_h: list[float] = []
-    ramp_down_mw_per_h: list[float] = []
-    min_up_time_h: list[int] = []
-    min_down_time_h: list[int] = []
-    generator_names: list[str] = []
+    grouped: dict[str, dict] = {}
 
     for _, row in metadata.generators.iterrows():
         generator_name = str(row["Generator Name"]).strip()
@@ -149,9 +152,54 @@ def _build_case118_thermal_generators(metadata: MTI118Metadata, data_root: Path,
 
         # Approximate no-load cost from base heat input at zero output plus VO&M at min stable level.
         no_load_cost = max(heat_rate_base * fuel_price + vom * pmin, 0.0)
+        group_key = bus_name if aggregate_by_bus else generator_name
+        item = grouped.setdefault(
+            group_key,
+            {
+                "bus_number": bus_number,
+                "bus_name": bus_name,
+                "pmax": 0.0,
+                "pmin": 0.0,
+                "startup_cost": 0.0,
+                "shutdown_cost": 0.0,
+                "no_load_cost": 0.0,
+                "weighted_linear_cost": 0.0,
+                "ramp_up": 0.0,
+                "ramp_down": 0.0,
+                "min_up": 1,
+                "min_down": 1,
+                "generator_names": [],
+            },
+        )
+        item["pmax"] += pmax
+        item["pmin"] += pmin
+        item["startup_cost"] += startup_cost
+        item["shutdown_cost"] += shutdown_cost
+        item["no_load_cost"] += no_load_cost
+        item["weighted_linear_cost"] += linear_cost * max(pmax, 0.0)
+        item["ramp_up"] += max(_safe_float(row["Max Ramp Up (MW/min)"]) * 60.0, 0.0)
+        item["ramp_down"] += max(_safe_float(row["Max Ramp Down (MW/min)"]) * 60.0, 0.0)
+        item["min_up"] = max(item["min_up"], max(int(round(_safe_float(row["Min Up Time (h)"], default=1.0))), 1))
+        item["min_down"] = max(item["min_down"], max(int(round(_safe_float(row["Min Down Time (h)"], default=1.0))), 1))
+        item["generator_names"].append(generator_name)
+
+    thermal_rows = []
+    gencost_rows = []
+    ramp_up_mw_per_h: list[float] = []
+    ramp_down_mw_per_h: list[float] = []
+    min_up_time_h: list[int] = []
+    min_down_time_h: list[int] = []
+    generator_names: list[str] = []
+    aggregated_unit_counts: list[int] = []
+
+    for group_key in sorted(grouped, key=lambda name: (grouped[name]["bus_number"], name)):
+        item = grouped[group_key]
+        pmax = item["pmax"]
+        pmin = min(item["pmin"], pmax)
+        linear_cost = item["weighted_linear_cost"] / max(pmax, 1e-9)
 
         gen_row = np.zeros(21, dtype=float)
-        gen_row[GEN_BUS] = bus_number
+        gen_row[GEN_BUS] = item["bus_number"]
         gen_row[PG] = 0.0
         gen_row[QG] = 0.0
         gen_row[QMAX] = 0.0
@@ -163,14 +211,29 @@ def _build_case118_thermal_generators(metadata: MTI118Metadata, data_root: Path,
         gen_row[PMIN] = pmin
         thermal_rows.append(gen_row)
 
-        ramp_up_mw_per_h.append(max(_safe_float(row["Max Ramp Up (MW/min)"]) * 60.0, 0.0))
-        ramp_down_mw_per_h.append(max(_safe_float(row["Max Ramp Down (MW/min)"]) * 60.0, 0.0))
-        min_up_time_h.append(max(int(round(_safe_float(row["Min Up Time (h)"], default=1.0))), 1))
-        min_down_time_h.append(max(int(round(_safe_float(row["Min Down Time (h)"], default=1.0))), 1))
-        generator_names.append(generator_name)
-
-        gencost_row = np.array([2.0, startup_cost, shutdown_cost, 3.0, 0.0, linear_cost, no_load_cost], dtype=float)
-        gencost_rows.append(gencost_row)
+        gencost_rows.append(
+            np.array(
+                [
+                    2.0,
+                    item["startup_cost"],
+                    item["shutdown_cost"],
+                    3.0,
+                    0.0,
+                    linear_cost,
+                    item["no_load_cost"],
+                ],
+                dtype=float,
+            )
+        )
+        ramp_up_mw_per_h.append(item["ramp_up"])
+        ramp_down_mw_per_h.append(item["ramp_down"])
+        min_up_time_h.append(item["min_up"])
+        min_down_time_h.append(item["min_down"])
+        aggregated_unit_counts.append(len(item["generator_names"]))
+        if aggregate_by_bus:
+            generator_names.append(f"{item['bus_name']}_thermal_agg[{len(item['generator_names'])}]")
+        else:
+            generator_names.append(item["generator_names"][0])
 
     gen = np.vstack(thermal_rows) if thermal_rows else np.zeros((0, 21), dtype=float)
     gencost = np.vstack(gencost_rows) if gencost_rows else np.zeros((0, 7), dtype=float)
@@ -180,6 +243,8 @@ def _build_case118_thermal_generators(metadata: MTI118Metadata, data_root: Path,
         "ramp_down_mw_per_h": np.asarray(ramp_down_mw_per_h, dtype=float),
         "min_up_time_h": np.asarray(min_up_time_h, dtype=int),
         "min_down_time_h": np.asarray(min_down_time_h, dtype=int),
+        "aggregated_unit_counts": np.asarray(aggregated_unit_counts, dtype=int),
+        "aggregate_by_bus": bool(aggregate_by_bus),
     }
     return gen, gencost, meta
 
@@ -206,12 +271,20 @@ def load_mti118_metadata(data_root: Path | None = None) -> MTI118Metadata:
     )
 
 
-def load_case118_ppc_with_mti_limits(data_root: Path | None = None) -> dict:
+def load_case118_ppc_with_mti_limits(
+    data_root: Path | None = None,
+    aggregate_thermal_by_bus: bool = True,
+) -> dict:
     data_root = Path(data_root) if data_root is not None else _default_data_root()
     metadata = load_mti118_metadata(data_root)
     ppc = case118()
     _apply_mti_branch_limits(ppc, metadata.lines)
-    gen, gencost, uc_meta = _build_case118_thermal_generators(metadata, data_root, float(ppc["baseMVA"]))
+    gen, gencost, uc_meta = _build_case118_thermal_generators(
+        metadata,
+        data_root,
+        float(ppc["baseMVA"]),
+        aggregate_by_bus=aggregate_thermal_by_bus,
+    )
     ppc["gen"] = gen
     ppc["gencost"] = gencost
     ppc["uc_ramp_up_mw_per_h"] = uc_meta["ramp_up_mw_per_h"]
@@ -219,6 +292,8 @@ def load_case118_ppc_with_mti_limits(data_root: Path | None = None) -> dict:
     ppc["uc_min_up_time_h"] = uc_meta["min_up_time_h"]
     ppc["uc_min_down_time_h"] = uc_meta["min_down_time_h"]
     ppc["uc_generator_names"] = uc_meta["generator_names"]
+    ppc["uc_aggregated_unit_counts"] = uc_meta["aggregated_unit_counts"]
+    ppc["uc_aggregate_by_bus"] = uc_meta["aggregate_by_bus"]
 
     return ppc
 
