@@ -48,7 +48,15 @@ def check_and_install_dependencies():
     return True
 
 
-if not check_and_install_dependencies():
+def check_and_install_dependencies_safe():
+    try:
+        return check_and_install_dependencies()
+    except EOFError:
+        print("Non-interactive session detected; please install the missing dependencies manually.")
+        return False
+
+
+if not check_and_install_dependencies_safe():
     sys.exit(1)
 
 # ──────────────────────── 模式配置 ────────────────────────
