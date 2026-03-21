@@ -10,6 +10,13 @@ def _to_float_array(value):
     return arr
 
 
+def has_meaningful_renewable_data(sample: dict, tol: float = 1e-9) -> bool:
+    renewable_data = _to_float_array(sample.get("renewable_data"))
+    if renewable_data is None:
+        return False
+    return bool(np.any(np.abs(renewable_data) > tol))
+
+
 def normalize_sample_arrays(sample: dict) -> dict:
     """Normalize legacy/new scenario fields in-place.
 
@@ -24,9 +31,6 @@ def normalize_sample_arrays(sample: dict) -> dict:
 
     if load_data is None and pd_data is not None:
         load_data = pd_data.copy()
-
-    if renewable_data is None and load_data is not None:
-        renewable_data = np.zeros_like(load_data)
 
     if pd_data is None and load_data is not None:
         pd_data = load_data.copy()
@@ -65,7 +69,6 @@ def get_sample_renewable_data(sample: dict) -> np.ndarray:
     if renewable_data is None:
         load_data = get_sample_load_data(sample)
         renewable_data = np.zeros_like(load_data)
-        sample["renewable_data"] = renewable_data
     return renewable_data
 
 

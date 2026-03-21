@@ -41,9 +41,17 @@ from pypower.idx_gen import GEN_BUS, PMIN, PMAX, RAMP_AGC, RAMP_10, RAMP_30, RAM
 from pypower.idx_brch import RATE_A
 from pypower.makePTDF import makePTDF
 try:
-    from scenario_utils import get_feature_vector_from_sample, normalize_sample_arrays
+    from scenario_utils import (
+        get_feature_vector_from_sample,
+        get_sample_net_load,
+        normalize_sample_arrays,
+    )
 except ImportError:
-    from src.scenario_utils import get_feature_vector_from_sample, normalize_sample_arrays
+    from src.scenario_utils import (
+        get_feature_vector_from_sample,
+        get_sample_net_load,
+        normalize_sample_arrays,
+    )
 
 # 导入ED求解器
 try:
@@ -138,11 +146,24 @@ class ActiveSetReader:
         """
         all_samples_data = []
         total_samples = self.get_total_samples_count()
+        raw_samples = self.data.get('all_samples', [])
+        has_dataset_renewable = any(
+            'renewable_data' in sample and np.any(np.abs(np.asarray(sample['renewable_data'], dtype=float)) > 1e-9)
+            for sample in raw_samples
+        )
         
         print(f"开始加载 {total_samples} 个样本的数据...", flush=True)
         
         for sample_id in range(total_samples):
             try:
+                sample = self.get_sample_data(sample_id)
+                if sample is None:
+                    raise ValueError(f"样本 {sample_id} 不存在")
+                if not has_dataset_renewable:
+                    sample = dict(sample)
+                    sample.pop('renewable_data', None)
+                sample = normalize_sample_arrays(dict(sample))
+
                 active_constraints, active_variables, pd_data = self.extract_active_constraints_and_variables(sample_id)
                 unit_commitment = self.get_unit_commitment_matrix(sample_id)
                 
@@ -152,12 +173,12 @@ class ActiveSetReader:
                     'active_variables': active_variables,
                     'pd_data': pd_data,
                     'load_data': np.array(sample.get('load_data', pd_data), dtype=float),
-                    'renewable_data': np.array(sample.get('renewable_data', np.zeros_like(pd_data)), dtype=float),
                     'unit_commitment_matrix': unit_commitment
                 }
+                if has_dataset_renewable and 'renewable_data' in sample:
+                    sample_data['renewable_data'] = np.array(sample['renewable_data'], dtype=float)
                 
                 # 读取对偶变量（如果存在）
-                sample = self.get_sample_data(sample_id)
                 if sample and 'lambda' in sample:
                     sample_data['lambda'] = sample['lambda']
                 
@@ -1686,8 +1707,41 @@ class Agent_NN_BCD:
             })
 
     def _extract_features(self, sample_id):
-        """从样本中提取特征（参考uc_NN.py）"""
-        return get_feature_vector_from_sample(dict(self.active_set_data[sample_id]))
+        """从样本中提取特征，并兼容旧 checkpoint 的输入维度。"""
+        sample = normalize_sample_arrays(dict(self.active_set_data[sample_id]))
+        features = np.asarray(get_feature_vector_from_sample(sample), dtype=np.float32)
+
+        expected_dim = self._get_expected_feature_dim()
+        if expected_dim is None or features.size == expected_dim:
+            return features
+
+        net_load_features = np.asarray(get_sample_net_load(sample), dtype=np.float32).flatten()
+        if net_load_features.size == expected_dim:
+            return net_load_features
+
+        raise ValueError(
+            f"Feature dimension mismatch for sample {sample_id}: "
+            f"got {features.size}, net_load={net_load_features.size}, expected={expected_dim}"
+        )
+
+    def _get_expected_feature_dim(self) -> Optional[int]:
+        """Infer the expected NN input dimension from the loaded networks."""
+        for net in (getattr(self, "theta_net", None), getattr(self, "zeta_net", None)):
+            if net is None:
+                continue
+            for module in net.modules():
+                if isinstance(module, nn.Linear):
+                    return int(module.in_features)
+        return None
+
+    def _refresh_feature_cache(self) -> None:
+        """Rebuild cached features to match the currently loaded network input dimension."""
+        if not TORCH_AVAILABLE or self.device is None:
+            return
+        self._features_cache = torch.stack([
+            torch.tensor(np.asarray(self._extract_features(s)), dtype=torch.float32)
+            for s in range(self.n_samples)
+        ]).to(self.device)
     
     def _tensor_to_theta_dict(self, theta_tensor):
         """将theta张量转换为字典（参考uc_NN.py）"""
@@ -3988,6 +4042,7 @@ class Agent_NN_BCD:
             self.device = torch.device("cpu")
         self.theta_net = self.theta_net.to(self.device)
         self.zeta_net = self.zeta_net.to(self.device)
+        self._refresh_feature_cache()
 
         # 重建优化器
         all_params = list(self.theta_net.parameters()) + list(self.zeta_net.parameters())

@@ -108,10 +108,21 @@ def _is_renewable_name(name: str) -> bool:
     return any(name.startswith(prefix) for prefix in ("Solar ", "Wind ", "Hydro ", "Geo "))
 
 
-def _build_renewable_matrix(metadata: MTI118Metadata, data_root: Path, market: str, horizon: int) -> np.ndarray:
+def _build_renewable_matrix(
+    metadata: MTI118Metadata,
+    data_root: Path,
+    market: str,
+    horizon: int,
+    missing_policy: str = "drop",
+) -> tuple[np.ndarray, dict]:
     input_dir = data_root / "input-files" / "Input files"
     nb = len(metadata.bus_name_to_row)
     renewable_matrix = np.zeros((nb, horizon), dtype=float)
+    used_generators: list[str] = []
+    skipped_generators: list[str] = []
+
+    if missing_policy != "drop":
+        raise ValueError(f"Unsupported missing_policy={missing_policy!r}; only 'drop' is currently supported")
 
     for _, row in metadata.generators.iterrows():
         generator_name = str(row["Generator Name"]).strip()
@@ -123,7 +134,6 @@ def _build_renewable_matrix(metadata: MTI118Metadata, data_root: Path, market: s
         if bus_idx is None:
             continue
 
-        max_capacity = float(row["Max Capacity (MW)"])
         series_path = _renewable_series_path(input_dir, generator_name, market)
 
         if series_path is not None and series_path.exists():
@@ -131,10 +141,17 @@ def _build_renewable_matrix(metadata: MTI118Metadata, data_root: Path, market: s
             if len(series) < horizon:
                 raise ValueError(f"Time series {series_path} shorter than expected horizon {horizon}")
             renewable_matrix[bus_idx, :] += series[:horizon]
+            used_generators.append(generator_name)
         else:
-            renewable_matrix[bus_idx, :] += max_capacity
+            skipped_generators.append(generator_name)
 
-    return renewable_matrix
+    summary = {
+        "used_generators": used_generators,
+        "skipped_generators": skipped_generators,
+        "used_count": len(used_generators),
+        "skipped_count": len(skipped_generators),
+    }
+    return renewable_matrix, summary
 
 
 def build_case118_daily_samples(
@@ -142,13 +159,20 @@ def build_case118_daily_samples(
     market: str = "DA",
     horizon: int = 24,
     max_days: int | None = None,
+    missing_policy: str = "drop",
 ) -> list[dict]:
     """Build day-level case118 scenarios from MTI118 data files."""
     data_root = Path(data_root) if data_root is not None else _default_data_root()
     metadata = load_mti118_metadata(data_root)
 
     load_matrix = _build_load_matrix(metadata, data_root, market)
-    renewable_matrix = _build_renewable_matrix(metadata, data_root, market, load_matrix.shape[1])
+    renewable_matrix, renewable_summary = _build_renewable_matrix(
+        metadata,
+        data_root,
+        market,
+        load_matrix.shape[1],
+        missing_policy=missing_policy,
+    )
 
     total_horizon = load_matrix.shape[1]
     n_days = total_horizon // horizon
@@ -167,6 +191,7 @@ def build_case118_daily_samples(
                 "load_data": load_day,
                 "renewable_data": renewable_day,
                 "pd_data": load_day,
+                "renewable_summary": renewable_summary,
                 "active_set": [],
             }
         )

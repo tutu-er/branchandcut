@@ -85,7 +85,7 @@ try:
     )
     from uc_NN_subproblem_parallel import ParallelSubproblemSurrogateTrainer
     from mti118_data_loader import load_case118_ppc_with_mti_limits
-    from scenario_utils import normalize_sample_arrays
+    from scenario_utils import has_meaningful_renewable_data, normalize_sample_arrays
     from training_logger import TrainingLogger
     from training_visualizer import TrainingVisualizer
 except ImportError as e:
@@ -129,7 +129,11 @@ def load_json_data(data_file: Path) -> list:
 
     log(f"  原始样本数: {len(all_samples)}")
 
+    has_dataset_renewable = any(has_meaningful_renewable_data(sample) for sample in all_samples)
+
     for sample in all_samples:
+        if not has_dataset_renewable:
+            sample.pop('renewable_data', None)
         normalize_sample_arrays(sample)
 
     return all_samples

@@ -86,10 +86,18 @@ class ActiveSetReader:
     def load_all_samples(self) -> List[Dict]:
         all_samples_data = []
         total_samples = self.get_total_samples_count()
-        
+        raw_samples = self.data.get('all_samples', [])
+        has_dataset_renewable = any(
+            'renewable_data' in sample and np.any(np.abs(np.asarray(sample['renewable_data'], dtype=float)) > 1e-9)
+            for sample in raw_samples
+        )
+
         for sample_id in range(total_samples):
             try:
                 sample = self.get_sample_data(sample_id) or {}
+                if not has_dataset_renewable:
+                    sample = dict(sample)
+                    sample.pop('renewable_data', None)
                 active_constraints, active_variables, pd_data = self.extract_active_constraints_and_variables(sample_id)
                 unit_commitment = self.get_unit_commitment_matrix(sample_id)
                 
@@ -103,7 +111,7 @@ class ActiveSetReader:
 
                 if 'load_data' in sample:
                     sample_data['load_data'] = np.array(sample['load_data'], dtype=float)
-                if 'renewable_data' in sample:
+                if has_dataset_renewable and 'renewable_data' in sample:
                     sample_data['renewable_data'] = np.array(sample['renewable_data'], dtype=float)
                 
                 if sample and 'lambda' in sample:

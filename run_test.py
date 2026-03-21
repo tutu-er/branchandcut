@@ -57,22 +57,30 @@ if not check_and_install_dependencies():
 #   'bcd'       - 加载 BCD 神经网络模型并报告参数统计
 #   'both'      - 联合加载 BCD + surrogate，以全体代理约束评估（需同时配置下面两个路径）
 #
-MODE      = 'bcd'
-RUN_FP    = False       # surrogate / both 模式：是否运行可行性泵测试
+MODE      = 'both'
+RUN_FP    = True       # surrogate / both 模式：是否运行可行性泵测试
 CASE_NAME = 'case30'   # 'case14' / 'case30' / 'case39' / 'case118'
 
 # surrogate / both 模式：已训练 surrogate 模型目录（训练时输出的带时间戳路径）
-MODEL_DIR = 'result/subproblem_models_case30_20260306_171140'
+MODEL_DIR = 'result/subproblem_models/subproblem_models_case30_20260318_201124'
 
 # bcd / both 模式：已训练 BCD 模型 .pth 文件路径
 BCD_MODEL_PATH = 'result/bcd_models/bcd_model_case30_20260318_000506.pth'
 
-TEST_SAMPLES = 3   # 测试/评估样本数
+TEST_SAMPLES_DEFAULT = 3
 ACTIVE_SETS_FILE = 'result/active_set/active_sets_case30_T24_n340_20260317_152540.json'  # 指定 active_sets JSON 文件路径（None=自动查找最新）
 
 # ──────────────────────── 导入 ────────────────────────
 
 import numpy as np
+
+# NumPy 2.x 移除了顶层 np.in1d，一些旧依赖（例如部分电力系统相关包）仍会导入它。
+# 这里补一个兼容别名，避免在导入第三方模块时直接失败。
+if not hasattr(np, "in1d"):
+    def _compat_in1d(ar1, ar2, assume_unique=False, invert=False):
+        return np.isin(ar1, ar2, assume_unique=assume_unique, invert=invert)
+
+    np.in1d = _compat_in1d
 
 # matplotlib 为可选依赖，绘图功能在不可用时自动跳过
 try:
@@ -145,6 +153,44 @@ def load_json_data(data_file: Path) -> list:
     return all_samples
 
 
+def parse_sample_range(sample_range: str | tuple[int, int] | None) -> tuple[int, int] | None:
+    """Parse a half-open sample range like '210:220' or (210, 220)."""
+    if sample_range is None:
+        return None
+
+    if isinstance(sample_range, tuple):
+        if len(sample_range) != 2:
+            raise ValueError("SAMPLE_RANGE 元组必须恰好包含两个整数")
+        start, end = int(sample_range[0]), int(sample_range[1])
+        if start < 0 or end <= start:
+            raise ValueError("SAMPLE_RANGE 要求 0 <= start < end")
+        return start, end
+
+    parts = sample_range.split(':', maxsplit=1)
+    if len(parts) != 2 or not parts[0].strip() or not parts[1].strip():
+        raise ValueError("--sample-range 格式必须为 start:end，例如 210:220")
+
+    start = int(parts[0])
+    end = int(parts[1])
+    if start < 0 or end <= start:
+        raise ValueError("--sample-range 要求 0 <= start < end")
+    return start, end
+
+
+def apply_sample_range(all_samples: list, sample_range: tuple[int, int] | None) -> list:
+    """Apply a half-open slice to the loaded samples."""
+    if sample_range is None:
+        return all_samples
+
+    start, end = sample_range
+    total = len(all_samples)
+    if start >= total:
+        raise ValueError(f"--sample-range 起点 {start} 超出样本总数 {total}")
+
+    actual_end = min(end, total)
+    selected = all_samples[start:actual_end]
+    log(f"  使用样本范围 [{start}:{actual_end})，共 {len(selected)} 个样本")
+    return selected
 def pick_data_file(result_dir: Path, case_name: str) -> Path:
     """按优先级查找最合适的数据文件。"""
     specific = sorted(result_dir.glob(f'active_sets_{case_name}_*.json'))
@@ -272,12 +318,20 @@ def plot_surrogate_analysis(trainers: dict, all_samples: list,
     # 取所有单元中最小的 nc 作为公共时间轴
     nc_list = [trainers[uid].num_coupling_constraints for uid in unit_ids]
     nc_common = min(nc_list)
-    n_samples_plot = len(all_samples)
+    n_samples_plot = min(
+        len(all_samples),
+        *[
+            min(trainers[uid].alpha_values.shape[0], len(trainers[uid].x))
+            for uid in unit_ids
+        ],
+    )
 
     viol_matrix = np.zeros((n_units, nc_common))   # (ng, nc)
     for gi, uid in enumerate(unit_ids):
         tr = trainers[uid]
-        ns = min(n_samples_plot, tr.alpha_values.shape[0])
+        ns = min(n_samples_plot, tr.alpha_values.shape[0], len(tr.x))
+        if ns == 0:
+            continue
         for s in range(ns):
             x_s = np.asarray(tr.x[s], dtype=float)   # (T,)
             for t in range(nc_common):
@@ -324,13 +378,17 @@ def plot_surrogate_analysis(trainers: dict, all_samples: list,
     integ_means, integ_stds = [], []
     for uid in unit_ids:
         tr = trainers[uid]
-        ns = tr.alpha_values.shape[0]
+        ns = min(tr.alpha_values.shape[0], len(tr.x))
         scores = []
         for s in range(ns):
             x_s = np.asarray(tr.x[s], dtype=float)
             scores.append(float(np.sum(x_s * (1.0 - x_s))))
-        integ_means.append(np.mean(scores))
-        integ_stds.append(np.std(scores))
+        if scores:
+            integ_means.append(np.mean(scores))
+            integ_stds.append(np.std(scores))
+        else:
+            integ_means.append(0.0)
+            integ_stds.append(0.0)
 
     fig3, ax3 = plt.subplots(figsize=(max(5, n_units * 0.65 + 1.5), 4))
     xpos = np.arange(n_units)
@@ -347,7 +405,7 @@ def plot_surrogate_analysis(trainers: dict, all_samples: list,
     ax3.set_ylabel(r'Integrality Score  $\sum x_i(1-x_i)$')
     ax3.set_title(
         f'Per-Unit Integrality Score  [{case_name}]  '
-        f'(mean ± std over {trainers[unit_ids[0]].alpha_values.shape[0]} samples)',
+        f'(mean ± std over {n_samples_plot} samples)',
         fontweight='bold'
     )
     # 在每根柱子顶部标注均值
@@ -1023,7 +1081,7 @@ def _print_bcd_stats(agent) -> None:
 
 
 def _load_bcd_agent(ppc, data_file: Path, bcd_model_path: str,
-                    MAX_SAMPLES, T_DELTA: float):
+                    MAX_SAMPLES, T_DELTA: float, sample_range: tuple[int, int] | None = None):
     """加载 BCD 数据并恢复 Agent_NN_BCD 模型参数，返回 agent。"""
     model_path = Path(bcd_model_path)
     if not model_path.exists():
@@ -1033,6 +1091,7 @@ def _load_bcd_agent(ppc, data_file: Path, bcd_model_path: str,
 
     log(f"通过 load_active_set_from_json 加载数据: {data_file.name}")
     all_samples_bcd = load_active_set_from_json(str(data_file))
+    all_samples_bcd = apply_sample_range(all_samples_bcd, sample_range)
     if MAX_SAMPLES and len(all_samples_bcd) > MAX_SAMPLES:
         all_samples_bcd = all_samples_bcd[:MAX_SAMPLES]
     log(f"  使用 {len(all_samples_bcd)} 个 BCD 样本")
@@ -1280,13 +1339,22 @@ def analyse_lp_distance(agent, test_n: int, fig_dir: Path,
 
 
 def test_bcd(ppc, data_file: Path, bcd_model_path: str,
-             MAX_SAMPLES, T_DELTA: float, fig_dir: Path) -> None:
+             MAX_SAMPLES, T_DELTA: float, fig_dir: Path,
+             sample_range: tuple[int, int] | None = None,
+             test_samples: int = TEST_SAMPLES_DEFAULT) -> None:
     """加载 BCD 模型，初始化 agent，报告参数统计，绘图，分析 LP 距离。"""
     print("\n" + "=" * 70)
     log(f"加载 BCD 模型: {bcd_model_path}")
     print("=" * 70)
 
-    agent = _load_bcd_agent(ppc, data_file, bcd_model_path, MAX_SAMPLES, T_DELTA)
+    agent = _load_bcd_agent(
+        ppc,
+        data_file,
+        bcd_model_path,
+        MAX_SAMPLES,
+        T_DELTA,
+        sample_range=sample_range,
+    )
     _print_bcd_stats(agent)
 
     print("\n" + "=" * 70)
@@ -1294,14 +1362,16 @@ def test_bcd(ppc, data_file: Path, bcd_model_path: str,
     print("=" * 70)
     plot_bcd_analysis(agent, fig_dir, CASE_NAME)
 
-    analyse_lp_distance(agent, TEST_SAMPLES, fig_dir, CASE_NAME)
+    analyse_lp_distance(agent, test_samples, fig_dir, CASE_NAME)
 
     log("BCD 测试完成")
 
 
 def test_both(ppc, data_file: Path, all_samples: list, T_DELTA: float,
               model_dir: str, bcd_model_path: str,
-              MAX_SAMPLES, unit_ids, fig_dir: Path) -> None:
+              MAX_SAMPLES, unit_ids, fig_dir: Path,
+              sample_range: tuple[int, int] | None = None,
+              test_samples: int = TEST_SAMPLES_DEFAULT) -> None:
     """联合加载 BCD + surrogate 模型，以全体代理约束评估解质量，可选运行 FP。
 
     流程：
@@ -1327,7 +1397,14 @@ def test_both(ppc, data_file: Path, all_samples: list, T_DELTA: float,
 
     # ── Step 1: 加载 BCD 模型 ──────────────────────────────
     log("── Step 1/4  加载 BCD 模型")
-    agent = _load_bcd_agent(ppc, data_file, bcd_model_path, MAX_SAMPLES, T_DELTA)
+    agent = _load_bcd_agent(
+        ppc,
+        data_file,
+        bcd_model_path,
+        MAX_SAMPLES,
+        T_DELTA,
+        sample_range=sample_range,
+    )
     _print_bcd_stats(agent)
 
     # ── Step 2: 加载 surrogate 全体代理约束模型 ───────────
@@ -1343,7 +1420,7 @@ def test_both(ppc, data_file: Path, all_samples: list, T_DELTA: float,
         unit_ids=unit_ids,
     )
     log(f"已加载 {len(trainers)} 个机组的代理约束模型（全体约束）")
-    print_surrogate_results(trainers, all_samples[:TEST_SAMPLES])
+    print_surrogate_results(trainers, all_samples[:test_samples])
 
     # ── Step 3: 绘图 ───────────────────────────────────────
     log("── Step 3/4  生成分析图表")
@@ -1365,12 +1442,13 @@ def test_both(ppc, data_file: Path, all_samples: list, T_DELTA: float,
     # ── Step 4: LP 评估 + 可行性泵（全体代理约束） ────────
     log("── Step 4/4  LP 松弛解质量评估（FP 前置分析）")
     run_lp_compare_test(ppc, all_samples, dual_predictor, trainers,
-                        T_DELTA, TEST_SAMPLES, fig_dir, agent=agent)
+                        T_DELTA, test_samples, fig_dir, agent=agent)
+    analyse_lp_distance(agent, test_samples, fig_dir, CASE_NAME)
 
     if RUN_FP:
         log("── Step 4/4  以全体代理约束运行可行性泵")
         fp_results = run_fp_test(
-            ppc, all_samples, dual_predictor, trainers, T_DELTA, TEST_SAMPLES
+            ppc, all_samples, dual_predictor, trainers, T_DELTA, test_samples
         )
         plot_fp_results(fp_results, fig_dir, CASE_NAME)
     else:
@@ -1388,9 +1466,13 @@ def main():
     print("=" * 70)
 
     # ── 配置 ──────────────────────────────────────────────
-    MAX_SAMPLES = None   # 最多使用多少个样本（None=全部）
-    T_DELTA     = 1.0
-    UNIT_IDS    = None   # None = 所有机组；或如 [0, 1, 2]
+    MAX_SAMPLES  = None         # 最多使用多少个样本（None=全部）
+    SAMPLE_RANGE = "230:240"         # 指定样本区间，左闭右开；例如 (210, 220) 或 "210:220"
+    T_DELTA      = 1.0
+    UNIT_IDS     = None         # None = 所有机组；或如 [0, 1, 2]
+    TEST_SAMPLES = 10  # 测试/评估样本数
+    test_samples = TEST_SAMPLES
+    sample_range = parse_sample_range(SAMPLE_RANGE)
 
     result_dir = Path(__file__).parent / 'result' / 'active_set'
     fig_dir    = Path(__file__).parent / 'result' / 'figures'
@@ -1434,6 +1516,7 @@ def main():
     try:
         if MODE == 'surrogate':
             all_samples = load_json_data(data_file)
+            all_samples = apply_sample_range(all_samples, sample_range)
             if MAX_SAMPLES and len(all_samples) > MAX_SAMPLES:
                 log(f"  截取前 {MAX_SAMPLES} 个样本（共 {len(all_samples)}）")
                 all_samples = all_samples[:MAX_SAMPLES]
@@ -1446,11 +1529,21 @@ def main():
 
         elif MODE == 'bcd':
             bcd_path = str((Path(__file__).parent / BCD_MODEL_PATH).resolve())
-            test_bcd(ppc, data_file, bcd_path, MAX_SAMPLES, T_DELTA, fig_dir)
+            test_bcd(
+                ppc,
+                data_file,
+                bcd_path,
+                MAX_SAMPLES,
+                T_DELTA,
+                fig_dir,
+                sample_range=sample_range,
+                test_samples=test_samples,
+            )
 
         elif MODE == 'both':
             # both 模式需要同时加载 v3 格式样本（供 surrogate 用）
             all_samples = load_json_data(data_file)
+            all_samples = apply_sample_range(all_samples, sample_range)
             if MAX_SAMPLES and len(all_samples) > MAX_SAMPLES:
                 log(f"  截取前 {MAX_SAMPLES} 个样本（共 {len(all_samples)}）")
                 all_samples = all_samples[:MAX_SAMPLES]
@@ -1460,7 +1553,8 @@ def main():
             model_dir  = str((Path(__file__).parent / MODEL_DIR).resolve())
             bcd_path   = str((Path(__file__).parent / BCD_MODEL_PATH).resolve())
             test_both(ppc, data_file, all_samples, T_DELTA,
-                      model_dir, bcd_path, MAX_SAMPLES, UNIT_IDS, fig_dir)
+                      model_dir, bcd_path, MAX_SAMPLES, UNIT_IDS, fig_dir,
+                      sample_range=sample_range, test_samples=test_samples)
 
         else:
             log(f"未知模式: '{MODE}'，可选: 'surrogate' | 'bcd' | 'both'")

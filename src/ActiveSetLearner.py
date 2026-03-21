@@ -131,15 +131,16 @@ class ActiveSetLearner:
             else:
                 pd_data, active_set, lambda_vals = sample
                 load_data = pd_data
-                renewable_data = np.zeros_like(pd_data)
+                renewable_data = None
             all_samples.append({
                 'sample_id': i,
                 'pd_data': pd_data.tolist(),
                 'load_data': load_data.tolist() if load_data is not None else pd_data.tolist(),
-                'renewable_data': renewable_data.tolist() if renewable_data is not None else np.zeros_like(pd_data).tolist(),
                 'active_set': list(active_set),
                 'lambda': lambda_vals  # 新增：保存对偶变量λ
             })
+            if renewable_data is not None:
+                all_samples[-1]['renewable_data'] = renewable_data.tolist()
 
         data = {
             'metadata': {
@@ -191,9 +192,10 @@ class ActiveSetLearner:
                 mapping[f"样本{i+1}"] = {
                     "Pd": sample['pd_data'].tolist(),
                     "Load": sample['load_data'].tolist(),
-                    "Renewable": sample['renewable_data'].tolist(),
                     "活动集": list(sample['active_set']),
                 }
+                if 'renewable_data' in sample:
+                    mapping[f"鏍锋湰{i+1}"]["Renewable"] = sample['renewable_data'].tolist()
             else:
                 mapping[f"样本{i+1}"] = {"Pd": sample[0].tolist(), "活动集": list(sample[1])}
         
@@ -234,11 +236,12 @@ class ActiveSetLearner:
                     samples.append({
                         'sample_id': len(samples),
                         'load_data': Pd,
-                        'renewable_data': np.zeros_like(Pd) if renewable_data is None else renewable_data,
                         'pd_data': Pd,
                         'active_set': active_set,
                         'lambda': lambda_vals,
                     })
+                    if renewable_data is not None:
+                        samples[-1]['renewable_data'] = renewable_data
                 except Exception as e:
                     # 在终端显式打印失败样本，便于排查不可行或求解异常
                     print(f"  样本 idx={idx} 求解失败: {e}", flush=True)

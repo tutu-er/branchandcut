@@ -44,9 +44,21 @@ except ImportError:
         add_sparse_x_templates_to_model,
     )
 try:
-    from scenario_utils import get_sample_net_load, normalize_sample_arrays
+    from scenario_utils import (
+        get_feature_vector_from_sample,
+        get_sample_load_data,
+        get_sample_net_load,
+        get_sample_renewable_data,
+        normalize_sample_arrays,
+    )
 except ImportError:
-    from src.scenario_utils import get_sample_net_load, normalize_sample_arrays
+    from src.scenario_utils import (
+        get_feature_vector_from_sample,
+        get_sample_load_data,
+        get_sample_net_load,
+        get_sample_renewable_data,
+        normalize_sample_arrays,
+    )
 
 
 # ========================== Step 1：整数恢复启发式 ==========================
@@ -196,6 +208,213 @@ def _perturb_surrogate_outputs(
         _perturb_one(gammas, clip_nonnegative=False),
         _perturb_one(deltas, clip_nonnegative=True),
     )
+
+
+def _coerce_scenario_sample(pd_data: np.ndarray | dict) -> dict:
+    """Convert array/dict input into a normalized scenario sample dict."""
+    if isinstance(pd_data, dict):
+        return normalize_sample_arrays(dict(pd_data))
+    pd_matrix = np.asarray(pd_data, dtype=float)
+    return normalize_sample_arrays({'pd_data': pd_matrix})
+
+
+def _predict_lambda_for_scenario(
+    lambda_predictor,
+    scenario_sample: dict,
+    fallback_lambda: np.ndarray,
+) -> np.ndarray:
+    """Predict lambda for a scenario when possible, otherwise reuse the current lambda."""
+    if lambda_predictor is None:
+        return np.asarray(fallback_lambda, dtype=float)
+    try:
+        lambda_pred = lambda_predictor.predict(scenario_sample)
+        lambda_pred = np.asarray(lambda_pred, dtype=float)
+        if lambda_pred.shape == np.asarray(fallback_lambda, dtype=float).shape:
+            return lambda_pred
+    except Exception:
+        pass
+    return np.asarray(fallback_lambda, dtype=float)
+
+
+def _get_scenario_bank(
+    trainers: Dict[int, 'SubproblemSurrogateTrainer']
+) -> List[dict]:
+    """Reuse the trainer dataset as a retrieval bank for scenario-based perturbations."""
+    for trainer in trainers.values():
+        active_set_data = getattr(trainer, 'active_set_data', None)
+        if isinstance(active_set_data, list) and active_set_data:
+            return [
+                normalize_sample_arrays(dict(sample))
+                for sample in active_set_data
+                if isinstance(sample, dict)
+            ]
+    return []
+
+
+def _feature_distance(lhs: np.ndarray, rhs: np.ndarray) -> float:
+    """Scaled L2 distance to reduce the effect of feature magnitude."""
+    scale = np.maximum(np.maximum(np.abs(lhs), np.abs(rhs)), 1.0)
+    return float(np.linalg.norm((lhs - rhs) / scale))
+
+
+def _find_similar_scenarios(
+    target_sample: dict,
+    scenario_bank: List[dict],
+    n_candidates: int,
+    top_k: int,
+    rng: np.random.Generator,
+) -> List[dict]:
+    """Retrieve similar historical scenarios based on load/renewable NN features."""
+    if n_candidates <= 0 or not scenario_bank:
+        return []
+
+    target_features = get_feature_vector_from_sample(dict(target_sample))
+    scored_candidates: List[Tuple[float, dict]] = []
+    for sample in scenario_bank:
+        try:
+            feature_vec = get_feature_vector_from_sample(dict(sample))
+        except Exception:
+            continue
+        if feature_vec.shape != target_features.shape:
+            continue
+        distance = _feature_distance(target_features, feature_vec)
+        if distance <= 1e-12:
+            continue
+        scored_candidates.append((distance, sample))
+
+    if not scored_candidates:
+        return []
+
+    scored_candidates.sort(key=lambda item: item[0])
+    shortlist = [sample for _, sample in scored_candidates[:max(1, top_k)]]
+    if len(shortlist) <= n_candidates:
+        return [normalize_sample_arrays(dict(sample)) for sample in shortlist]
+
+    chosen_idx = rng.choice(len(shortlist), size=n_candidates, replace=False)
+    return [normalize_sample_arrays(dict(shortlist[idx])) for idx in chosen_idx]
+
+
+def _generate_load_perturbed_scenarios(
+    base_sample: dict,
+    n_candidates: int,
+    perturb_scale: float,
+    rng: np.random.Generator,
+) -> List[dict]:
+    """Generate nearby scenarios by mildly perturbing load while preserving renewables."""
+    if n_candidates <= 0:
+        return []
+
+    base_sample = normalize_sample_arrays(dict(base_sample))
+    load_data = np.asarray(get_sample_load_data(base_sample), dtype=float)
+    renewable_data = np.asarray(get_sample_renewable_data(base_sample), dtype=float)
+    candidates: List[dict] = []
+
+    for _ in range(n_candidates):
+        global_scale = 1.0 + 0.35 * perturb_scale * rng.standard_normal()
+        time_scale = 1.0 + 0.50 * perturb_scale * rng.standard_normal((1, load_data.shape[1]))
+        bus_scale = 1.0 + 0.50 * perturb_scale * rng.standard_normal(load_data.shape)
+        perturbed_load = load_data * global_scale * time_scale * bus_scale
+        perturbed_load = np.maximum(perturbed_load, 0.0)
+
+        candidate = {
+            'load_data': perturbed_load,
+            'renewable_data': renewable_data.copy(),
+        }
+        candidates.append(normalize_sample_arrays(candidate))
+
+    return candidates
+
+
+def _build_surrogate_parameter_candidates(
+    base_sample: dict,
+    base_lambda: np.ndarray,
+    trainer: 'SubproblemSurrogateTrainer',
+    trainers: Dict[int, 'SubproblemSurrogateTrainer'],
+    rng: np.random.Generator,
+    lambda_predictor=None,
+    n_param_perturbations: int = 5,
+    perturb_std: float = 0.10,
+    neighborhood_weight: float = 0.35,
+    n_similar_scenarios: int = 0,
+    similar_scenario_pool_size: int = 10,
+    n_load_perturbations: int = 0,
+    load_perturbation_scale: float = 0.03,
+) -> List[Tuple[str, np.ndarray, np.ndarray, np.ndarray, np.ndarray]]:
+    """Build multiple surrogate parameter sets from direct/randomized and scenario-based strategies."""
+    parameter_sets: List[Tuple[str, np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = []
+
+    base_lambda_arr = np.asarray(base_lambda, dtype=float)
+    alphas, betas, gammas, deltas, *_ = trainer.get_surrogate_params(base_sample, base_lambda_arr)
+    parameter_sets.append(("base", alphas, betas, gammas, deltas))
+
+    for idx in range(n_param_perturbations):
+        alphas_m, betas_m, gammas_m, deltas_m = _perturb_surrogate_outputs(
+            alphas,
+            betas,
+            gammas,
+            deltas,
+            rng=rng,
+            perturb_std=perturb_std,
+            neighborhood_weight=neighborhood_weight,
+        )
+        parameter_sets.append((f"direct_randomized_{idx}", alphas_m, betas_m, gammas_m, deltas_m))
+
+    scenario_bank = _get_scenario_bank(trainers)
+    similar_scenarios = _find_similar_scenarios(
+        target_sample=base_sample,
+        scenario_bank=scenario_bank,
+        n_candidates=n_similar_scenarios,
+        top_k=similar_scenario_pool_size,
+        rng=rng,
+    )
+    for idx, scenario in enumerate(similar_scenarios):
+        lambda_sim = _predict_lambda_for_scenario(lambda_predictor, scenario, base_lambda_arr)
+        alpha_s, beta_s, gamma_s, delta_s, *_ = trainer.get_surrogate_params(scenario, lambda_sim)
+        parameter_sets.append((f"similar_scenario_{idx}", alpha_s, beta_s, gamma_s, delta_s))
+
+    perturbed_scenarios = _generate_load_perturbed_scenarios(
+        base_sample=base_sample,
+        n_candidates=n_load_perturbations,
+        perturb_scale=load_perturbation_scale,
+        rng=rng,
+    )
+    for idx, scenario in enumerate(perturbed_scenarios):
+        lambda_pert = _predict_lambda_for_scenario(lambda_predictor, scenario, base_lambda_arr)
+        alpha_p, beta_p, gamma_p, delta_p, *_ = trainer.get_surrogate_params(scenario, lambda_pert)
+        parameter_sets.append((f"load_perturbed_{idx}", alpha_p, beta_p, gamma_p, delta_p))
+
+    return parameter_sets
+
+
+def _select_pool_restart_candidate(
+    x_reference: np.ndarray,
+    x_pool: Optional[np.ndarray],
+    trusted_mask: np.ndarray,
+    rng: np.random.Generator,
+) -> Optional[np.ndarray]:
+    """Prefer a pool candidate that differs on free variables when FP stalls."""
+    if x_pool is None or len(x_pool) == 0:
+        return None
+
+    free_mask = ~trusted_mask
+    if not np.any(free_mask):
+        return None
+
+    scored: List[Tuple[float, np.ndarray]] = []
+    for candidate in x_pool:
+        candidate_int = np.asarray(candidate, dtype=int)
+        distance = float(np.sum(candidate_int[free_mask] != x_reference[free_mask]))
+        if distance > 0:
+            scored.append((distance, candidate_int))
+
+    if not scored:
+        return None
+
+    scored.sort(key=lambda item: item[0], reverse=True)
+    top_count = min(3, len(scored))
+    chosen = scored[int(rng.integers(0, top_count))][1].copy()
+    chosen[trusted_mask] = x_reference[trusted_mask]
+    return chosen
 
 
 def _build_hot_start_candidates(
@@ -451,8 +670,13 @@ def collect_integer_solutions(
     lambda_val: np.ndarray,
     trainers: Dict[int, 'SubproblemSurrogateTrainer'],
     n_perturbations: int = 5,
+    n_similar_scenarios: int = 0,
+    similar_scenario_pool_size: int = 10,
+    n_load_perturbations: int = 0,
+    load_perturbation_scale: float = 0.03,
     perturb_std: float = 0.1,
     neighborhood_weight: float = 0.35,
+    lambda_predictor=None,
     rng: Optional[np.random.Generator] = None
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
@@ -462,51 +686,62 @@ def collect_integer_solutions(
         pd_data: (nb_load, T) 负荷数据
         lambda_val: (T,) 功率平衡对偶变量
         trainers: {unit_id: SubproblemSurrogateTrainer}
-        n_perturbations: 扰动次数
+        n_perturbations: 直接随机化 surrogate 参数的扰动次数
+        n_similar_scenarios: 从历史场景库检索相似负荷/新能源样本的次数
+        similar_scenario_pool_size: 相似场景候选池大小
+        n_load_perturbations: 对当前负荷做小扰动后重新过 NN 的次数
+        load_perturbation_scale: 负荷小扰动幅度
         perturb_std: surrogate 网络输出参数扰动标准差（相对值）
         neighborhood_weight: 周边平均约束权重，越大表示越强调相邻约束平滑
+        lambda_predictor: 可选，对场景扰动后重新预测 lambda
         rng: 随机数生成器
 
     Returns:
         x_surr_lp:  (ng, T) surrogate 子问题 LP 连续解
         x_init_k:   (ng, T) 各机组子问题 LP 整数解
-        x_init_k_m: (ng, n_perturbations, T) 扰动参数后的多组整数解
+        x_init_k_m: (ng, n_candidates, T) 多策略扰动后的多组整数解
     """
     if rng is None:
         rng = np.random.default_rng()
 
-    sample = None
-    if isinstance(pd_data, dict):
-        sample = normalize_sample_arrays(dict(pd_data))
-        pd_matrix = get_sample_net_load(sample)
-    else:
-        pd_matrix = pd_data
+    sample = _coerce_scenario_sample(pd_data)
+    pd_matrix = get_sample_net_load(sample)
 
     unit_ids = sorted(trainers.keys())
     ng = max(unit_ids) + 1
     T = pd_matrix.shape[1]
+    n_candidates = n_perturbations + n_similar_scenarios + n_load_perturbations
 
     x_surr_lp = np.zeros((ng, T))
     x_init_k = np.zeros((ng, T), dtype=int)
-    x_init_k_m = np.zeros((ng, n_perturbations, T), dtype=int)
+    x_init_k_m = np.zeros((ng, n_candidates, T), dtype=int)
 
     for g in unit_ids:
         trainer = trainers[g]
-        alphas, betas, gammas, deltas, *_ = trainer.get_surrogate_params(sample if sample is not None else pd_matrix, lambda_val)
+        param_candidates = _build_surrogate_parameter_candidates(
+            base_sample=sample,
+            base_lambda=lambda_val,
+            trainer=trainer,
+            trainers=trainers,
+            rng=rng,
+            lambda_predictor=lambda_predictor,
+            n_param_perturbations=n_perturbations,
+            perturb_std=perturb_std,
+            neighborhood_weight=neighborhood_weight,
+            n_similar_scenarios=n_similar_scenarios,
+            similar_scenario_pool_size=similar_scenario_pool_size,
+            n_load_perturbations=n_load_perturbations,
+            load_perturbation_scale=load_perturbation_scale,
+        )
+        _base_name, alphas, betas, gammas, deltas = param_candidates[0]
 
         # 原始子问题 LP
         x_LP_k = _solve_unit_LP_with_surrogate(trainer, lambda_val, alphas, betas, gammas, deltas)
         x_surr_lp[g] = x_LP_k
         x_init_k[g] = round_to_integer(x_LP_k)
 
-        # 扰动 surrogate 网络输出参数，并用周边平均约束平滑，生成多组解
-        for m in range(n_perturbations):
-            alphas_m, betas_m, gammas_m, deltas_m = _perturb_surrogate_outputs(
-                alphas, betas, gammas, deltas,
-                rng=rng,
-                perturb_std=perturb_std,
-                neighborhood_weight=neighborhood_weight,
-            )
+        # 直接参数随机化 + 相似场景检索 + 小负荷扰动场景，共同生成多组解
+        for m, (_name, alphas_m, betas_m, gammas_m, deltas_m) in enumerate(param_candidates[1:]):
             x_LP_m = _solve_unit_LP_with_surrogate(
                 trainer, lambda_val, alphas_m, betas_m, gammas_m, deltas_m
             )
@@ -1029,6 +1264,8 @@ def run_feasibility_pump(
     T_delta: float,
     x_pool: Optional[np.ndarray] = None,
     max_iter: int = 50,
+    stall_perturbation_mode: str = 'pool_then_flip',
+    stall_flip_fraction: float = 0.10,
     rng: Optional[np.random.Generator] = None,
     verbose: bool = False
 ) -> Tuple[np.ndarray, bool]:
@@ -1046,6 +1283,8 @@ def run_feasibility_pump(
         T_delta: 时间间隔
         x_pool: (n_pool, ng, T) 整数解池，iteration >= 1 时用于凸组合约束（可选）
         max_iter: 最大迭代次数
+        stall_perturbation_mode: 停滞时的扰动策略：`flip`/`pool_restart`/`pool_then_flip`
+        stall_flip_fraction: 停滞时随机翻转的非可信变量比例
         rng: 随机数生成器（用于振荡扰动）
         verbose: 是否打印迭代信息
 
@@ -1201,14 +1440,21 @@ def run_feasibility_pump(
             no_improve_count += 1
             if no_improve_count >= 3:
                 if verbose:
-                    print(f"  FP: 检测到振荡，随机扰动低置信度变量", flush=True)
-                # 随机翻转少量非可信变量
-                free_idx = np.argwhere(~trusted_mask)
-                n_flip = max(1, len(free_idx) // 10)
-                chosen = rng.choice(len(free_idx), size=n_flip, replace=False)
-                for idx in chosen:
-                    g_f, t_f = free_idx[idx]
-                    x_next[g_f, t_f] = 1 - x_next[g_f, t_f]
+                    print(f"  FP: 检测到振荡，触发停滞扰动策略 {stall_perturbation_mode}", flush=True)
+
+                if stall_perturbation_mode in ('pool_restart', 'pool_then_flip'):
+                    pool_candidate = _select_pool_restart_candidate(x_next, x_pool, trusted_mask, rng)
+                    if pool_candidate is not None:
+                        x_next = pool_candidate
+
+                if stall_perturbation_mode in ('flip', 'pool_then_flip'):
+                    free_idx = np.argwhere(~trusted_mask)
+                    if len(free_idx) > 0:
+                        n_flip = max(1, int(np.ceil(len(free_idx) * stall_flip_fraction)))
+                        chosen = rng.choice(len(free_idx), size=min(n_flip, len(free_idx)), replace=False)
+                        for idx in chosen:
+                            g_f, t_f = free_idx[idx]
+                            x_next[g_f, t_f] = 1 - x_next[g_f, t_f]
                 no_improve_count = 0
         else:
             no_improve_count = 0
@@ -1236,11 +1482,17 @@ def recover_integer_solution(
     sparse_library: Optional[SparseSurrogateLibrary] = None,
     sparse_x_template_library: Optional[SparseConstraintTemplateLibrary] = None,
     n_perturbations: int = 5,
+    n_similar_scenarios: int = 0,
+    similar_scenario_pool_size: int = 10,
+    n_load_perturbations: int = 0,
+    load_perturbation_scale: float = 0.03,
     conf_threshold: float = 0.15,
     max_fp_iter: int = 50,
     perturb_std: float = 0.1,
     neighborhood_weight: float = 0.35,
     use_hot_start: bool = True,
+    stall_perturbation_mode: str = 'pool_then_flip',
+    stall_flip_fraction: float = 0.10,
     verbose: bool = True,
     rng: Optional[np.random.Generator] = None
 ) -> Tuple[Optional[np.ndarray], bool]:
@@ -1266,12 +1518,18 @@ def recover_integer_solution(
             solve_global 方法求解全局 LP 松弛（同时包含 theta/zeta 和 V3 代理约束）
         sparse_library: （可选）离线筛选出的稀疏参数化约束库，仅在显式提供时启用
         sparse_x_template_library: （可选）稀疏 x 支持集模板库，仅在显式提供时启用
-        n_perturbations: 参数扰动次数
+        n_perturbations: 直接随机化 surrogate 参数的次数
+        n_similar_scenarios: 检索相似负荷/新能源场景并重过 NN 的次数
+        similar_scenario_pool_size: 相似场景检索的候选池大小
+        n_load_perturbations: 小负荷扰动后重过 NN 的次数
+        load_perturbation_scale: 小负荷扰动幅度
         conf_threshold: LP 整数性置信阈值
         max_fp_iter: 可行性泵最大迭代次数
         perturb_std: surrogate 网络输出参数扰动标准差
         neighborhood_weight: 周边平均约束权重
         use_hot_start: 是否启用基于 LP 与 surrogate LP 的热启动候选
+        stall_perturbation_mode: FP 停滞时的扰动策略
+        stall_flip_fraction: FP 停滞时随机翻转比例
         verbose: 是否打印进度
         rng: 随机数生成器（传 None 则使用固定种子 42）
 
@@ -1326,8 +1584,13 @@ def recover_integer_solution(
     x_surr_lp, x_init_k, x_init_k_m = collect_integer_solutions(
         scenario_input, lambda_val, trainers,
         n_perturbations=n_perturbations,
+        n_similar_scenarios=n_similar_scenarios,
+        similar_scenario_pool_size=similar_scenario_pool_size,
+        n_load_perturbations=n_load_perturbations,
+        load_perturbation_scale=load_perturbation_scale,
         perturb_std=perturb_std,
         neighborhood_weight=neighborhood_weight,
+        lambda_predictor=lambda_predictor,
         rng=rng
     )
 
@@ -1388,7 +1651,12 @@ def recover_integer_solution(
             print(f"  运行 FP 热启动 {idx}/{len(hot_start_candidates)}: {name}", flush=True)
         x_result, success = run_feasibility_pump(
             x_start, trusted_mask, ppc, pd_data, T_delta,
-            x_pool=x_pool, max_iter=max_fp_iter, rng=rng, verbose=verbose
+            x_pool=x_pool,
+            max_iter=max_fp_iter,
+            stall_perturbation_mode=stall_perturbation_mode,
+            stall_flip_fraction=stall_flip_fraction,
+            rng=rng,
+            verbose=verbose,
         )
         if success:
             break

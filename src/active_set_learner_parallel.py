@@ -68,14 +68,15 @@ def _solve_single_sample(args: tuple) -> dict | None:
 
         active_set = frozenset(make_hashable(item) for item in active)
 
-        renewable_arr = np.zeros_like(load_data) if renewable_data is None else renewable_data
-        return {
+        sample_record = {
             "load_data": load_data,
-            "renewable_data": renewable_arr,
             "pd_data": load_data,
             "active_set": active_set,
             "lambda": lambda_vals,
         }
+        if renewable_data is not None:
+            sample_record["renewable_data"] = renewable_data
+        return sample_record
 
     except Exception as e:
         # 在子进程中打印失败样本的标识，便于定位问题负荷
