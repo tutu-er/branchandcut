@@ -29,9 +29,10 @@ sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
 # 你需要自行实现数据加载部分
 
 class UnitCommitmentModel:
-    def __init__(self, ppc, Pd, T_delta, renewable_data=None):
+    def __init__(self, ppc, Pd, T_delta, renewable_data=None, verbose=False):
         self.ppc = ppc
         self.ppc_raw = ppc
+        self.verbose = verbose
         ppc = ext2int(ppc)
         self.baseMVA = ppc['baseMVA']
         self.bus = ppc['bus']
@@ -57,7 +58,8 @@ class UnitCommitmentModel:
             self.renewable_bus_ids = np.array([], dtype=int)
         self.nr = len(self.renewable_bus_ids)
         self.model = gp.Model('UnitCommitment')
-        self.model.Params.OutputFlag = 0
+        self.model.Params.OutputFlag = 1 if self.verbose else 0
+        self.model.Params.LogToConsole = 1 if self.verbose else 0
         self.pg = self.model.addVars(self.ng, self.T, lb=0, name='pg')
         self.x = self.model.addVars(self.ng, self.T, vtype=GRB.BINARY, name='x')
         self.p_ren = self.model.addVars(self.nr, self.T, lb=0, name='p_ren') if self.nr > 0 else None

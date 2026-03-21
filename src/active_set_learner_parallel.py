@@ -37,14 +37,14 @@ def _solve_single_sample(args: tuple) -> dict | None:
         # 静默求解器输出
         with contextlib.redirect_stdout(io.StringIO()):
             # Step 1: 求解 UC (MILP)
-            uc = UnitCommitmentModel(ppc, load_data, T_delta, renewable_data=renewable_data)
+            uc = UnitCommitmentModel(ppc, load_data, T_delta, renewable_data=renewable_data, verbose=False)
             uc.model.Params.Threads = gurobi_threads
             pg_sol, x_sol, total_cost = uc.solve()
             if x_sol is None:
                 raise RuntimeError(f"UC solve failed with status={uc.model.status}")
 
             # Step 2: 用 x 求解 ED (LP)
-            ed = EconomicDispatchGurobi(ppc, load_data, T_delta, x_sol, renewable_data=renewable_data)
+            ed = EconomicDispatchGurobi(ppc, load_data, T_delta, x_sol, renewable_data=renewable_data, verbose=False)
             ed.model.Params.Threads = gurobi_threads
             pg_sol, total_cost = ed.solve()
             if pg_sol is None:
@@ -108,6 +108,7 @@ class ParallelActiveSetLearner(ActiveSetLearner):
         case_name: str | None = None,
         n_workers: int | None = None,
         gurobi_threads: int = 4,
+        verbose_solver: bool = False,
     ):
         super().__init__(
             alpha=alpha,
@@ -117,6 +118,7 @@ class ParallelActiveSetLearner(ActiveSetLearner):
             T_delta=T_delta,
             Pd=Pd,
             case_name=case_name,
+            verbose_solver=verbose_solver,
         )
         self.gurobi_threads = gurobi_threads
         if n_workers is None:
@@ -265,14 +267,30 @@ class ParallelActiveSetLearner(ActiveSetLearner):
         observed = set()
         with ProcessPoolExecutor(max_workers=self.n_workers) as pool:
             futures = {pool.submit(_solve_single_sample, args): idx for idx, args in enumerate(args_list)}
+            done_count = 0
+            t_start = time.time()
             for future in as_completed(futures):
                 idx = futures[future]
                 result = future.result()
+                done_count += 1
+                bar_len = 30
+                percent = done_count / max(limit, 1)
+                filled_len = int(bar_len * percent)
+                bar = "█" * filled_len + "-" * (bar_len - filled_len)
+                elapsed = time.time() - t_start
+                eta = elapsed / done_count * (limit - done_count) if done_count > 0 else 0.0
+                print(
+                    f"\r  场景求解进度: |{bar}| {done_count}/{limit} ({percent:.0%}) ETA: {eta:.0f}s",
+                    end="",
+                    flush=True,
+                )
                 if result is None:
                     continue
                 result["sample_id"] = selected[idx].get("sample_id", idx)
                 samples.append(result)
                 observed.add(result["active_set"])
+        if limit > 0:
+            print(flush=True)
 
         self.samples = samples
         self.observed_active_sets = observed

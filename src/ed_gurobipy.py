@@ -12,9 +12,10 @@ from pypower.idx_bus import BUS_I, BUS_TYPE, PD, QD, GS, BS, BUS_AREA, VM, VA, B
 from pypower.idx_brch import F_BUS, T_BUS, BR_R, BR_X, BR_B, RATE_A, RATE_B, RATE_C, TAP, SHIFT, BR_STATUS, ANGMIN, ANGMAX
 
 class EconomicDispatchGurobi:
-    def __init__(self, ppc, Pd, T_delta, x, renewable_data=None):
+    def __init__(self, ppc, Pd, T_delta, x, renewable_data=None, verbose=False):
         self.ppc = ppc
         self.ppc_raw = ppc
+        self.verbose = verbose
         ppc = ext2int(ppc)
         self.baseMVA = ppc['baseMVA']
         self.bus = ppc['bus']
@@ -40,7 +41,8 @@ class EconomicDispatchGurobi:
         self.nr = len(self.renewable_bus_ids)
         self.x = x  # 二值变量由外部给定，shape=(ng, T)
         self.model = gp.Model('EconomicDispatch')
-        self.model.Params.OutputFlag = 0
+        self.model.Params.OutputFlag = 1 if self.verbose else 0
+        self.model.Params.LogToConsole = 1 if self.verbose else 0
         self.pg = self.model.addVars(self.ng, self.T, lb=0, name='pg')
         self.p_ren = self.model.addVars(self.nr, self.T, lb=0, name='p_ren') if self.nr > 0 else None
         self.cpower = self.model.addVars(self.ng, self.T, lb=0, name='cpower')

@@ -30,7 +30,7 @@ from src.scenario_utils import normalize_sample_arrays
 
 class ActiveSetLearner:
     def __init__(self, alpha=0.05, delta=0.01, epsilon=0.04, ppc=None, T_delta=4, Pd=None,
-                 case_name=None, renewable_data=None):
+                 case_name=None, renewable_data=None, verbose_solver=False):
         self.alpha = alpha
         self.delta = delta
         self.epsilon = epsilon
@@ -42,6 +42,7 @@ class ActiveSetLearner:
         self.Pd = Pd
         self.renewable_data = renewable_data
         self.case_name = case_name
+        self.verbose_solver = verbose_solver
         self._cal_W()  # 计算初始窗口大小
 
     def _cal_W(self):
@@ -67,13 +68,26 @@ class ActiveSetLearner:
         注意：求解MILP获取活动集（包含x），然后用x求解LP获取λ
         """
         # Step 1: 求解 UC (MILP) 获取机组状态 x
-        uc = UnitCommitmentModel(self.ppc, Pd, self.T_delta, renewable_data=renewable_data)
+        uc = UnitCommitmentModel(
+            self.ppc,
+            Pd,
+            self.T_delta,
+            renewable_data=renewable_data,
+            verbose=self.verbose_solver,
+        )
         pg_sol, x_sol, total_cost = uc.solve()
         if x_sol is None:
             raise RuntimeError(f"UC solve failed with status={uc.model.status}")
 
         # Step 2: 用 x 求解 ED (LP) 获取对偶变量 λ
-        ed = EconomicDispatchGurobi(self.ppc, Pd, self.T_delta, x_sol, renewable_data=renewable_data)
+        ed = EconomicDispatchGurobi(
+            self.ppc,
+            Pd,
+            self.T_delta,
+            x_sol,
+            renewable_data=renewable_data,
+            verbose=self.verbose_solver,
+        )
         pg_sol, total_cost = ed.solve()
         if pg_sol is None:
             raise RuntimeError(f"ED solve failed with status={ed.model.status}")
@@ -238,9 +252,12 @@ class ActiveSetLearner:
                 Pd = self._generate_random_Pd(rng=idx)
                 renewable_data = None if self.renewable_data is None else np.asarray(self.renewable_data, dtype=float)
                 try:
-                    # 静默求解器输出，避免打断进度条
-                    with contextlib.redirect_stdout(io.StringIO()):
+                    # 调试时允许显示 Gurobi 日志；默认静默避免打断进度条
+                    if self.verbose_solver:
                         active_set, lambda_vals = self._solve_optimization(Pd, renewable_data=renewable_data)
+                    else:
+                        with contextlib.redirect_stdout(io.StringIO()):
+                            active_set, lambda_vals = self._solve_optimization(Pd, renewable_data=renewable_data)
                     samples.append({
                         'sample_id': len(samples),
                         'load_data': Pd,
@@ -286,18 +303,40 @@ class ActiveSetLearner:
         samples = []
         observed = set()
         limit = len(scenarios) if max_samples is None else min(max_samples, len(scenarios))
+        t_start = time.time()
         for idx, sample in enumerate(scenarios[:limit]):
             sample = normalize_sample_arrays(dict(sample))
-            with contextlib.redirect_stdout(io.StringIO()):
+            if self.verbose_solver:
                 active_set, lambda_vals = self._solve_optimization(
                     sample['load_data'],
                     renewable_data=sample['renewable_data'],
                 )
+            else:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    active_set, lambda_vals = self._solve_optimization(
+                        sample['load_data'],
+                        renewable_data=sample['renewable_data'],
+                    )
             sample['sample_id'] = idx
             sample['active_set'] = active_set
             sample['lambda'] = lambda_vals
             samples.append(sample)
             observed.add(active_set)
+            done_count = idx + 1
+            bar_len = 30
+            percent = done_count / max(limit, 1)
+            filled_len = int(bar_len * percent)
+            bar = '█' * filled_len + '-' * (bar_len - filled_len)
+            elapsed = time.time() - t_start
+            eta = elapsed / done_count * (limit - done_count) if done_count > 0 else 0.0
+            print(
+                f"\r  场景求解进度: |{bar}| {done_count}/{limit} ({percent:.0%}) ETA: {eta:.0f}s",
+                end='',
+                flush=True,
+            )
+
+        if limit > 0:
+            print(flush=True)
 
         self.samples = samples
         self.observed_active_sets = observed

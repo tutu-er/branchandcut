@@ -78,6 +78,7 @@ def build_learner(
     case_name: str,
     n_workers: int,
     gurobi_threads: int,
+    verbose_solver: bool,
 ):
     learner_cls = ParallelActiveSetLearner if parallel else ActiveSetLearner
     kwargs = {
@@ -88,6 +89,7 @@ def build_learner(
         "T_delta": t_delta,
         "Pd": pd_data,
         "case_name": case_name,
+        "verbose_solver": verbose_solver,
     }
     if parallel:
         kwargs["n_workers"] = n_workers
@@ -105,6 +107,7 @@ def run_case30(
     parallel: bool = False,
     n_workers: int = 4,
     gurobi_threads: int = 2,
+    verbose_solver: bool = False,
     output: str | None = None,
 ) -> str:
     ppc, base_load = build_case30_base_load(horizon)
@@ -119,6 +122,7 @@ def run_case30(
         case_name="case30",
         n_workers=n_workers,
         gurobi_threads=gurobi_threads,
+        verbose_solver=verbose_solver,
     )
     active_sets = learner.run(max_samples=max_samples)
     print(f"case30 active sets: {len(active_sets)}", flush=True)
@@ -142,6 +146,7 @@ def run_case118(
     parallel: bool = True,
     n_workers: int = 4,
     gurobi_threads: int = 2,
+    verbose_solver: bool = False,
     output: str | None = None,
 ) -> str:
     ppc = load_case118_ppc_with_mti_limits(
@@ -171,6 +176,7 @@ def run_case118(
         case_name="case118",
         n_workers=n_workers,
         gurobi_threads=gurobi_threads,
+        verbose_solver=verbose_solver,
     )
     active_sets = learner.run_on_precomputed_scenarios(
         scenarios,
@@ -195,6 +201,7 @@ def main() -> None:
             parallel=False,
             n_workers=4,
             gurobi_threads=2,
+            verbose_solver=True,
             output=None,
         )
     elif case_name == "case118":
@@ -208,13 +215,14 @@ def main() -> None:
             scale_low=0.95,
             scale_high=1.05,
             seed=42,
-            alpha=0.70,
-            delta=0.05,
-            epsilon=0.10,
+            alpha=0.75,
+            delta=0.15,
+            epsilon=0.15,
             t_delta=1.0,
             parallel=False,
             n_workers=4,
             gurobi_threads=2,
+            verbose_solver=False,
             output=None,
         )
     else:
