@@ -100,9 +100,9 @@ def build_learner(
 def run_case30(
     horizon: int = 24,
     max_samples: int = 200,
-    alpha: float = 0.70,
-    delta: float = 0.05,
-    epsilon: float = 0.10,
+    alpha: float = 0.75,
+    delta: float = 0.15,
+    epsilon: float = 0.15,
     t_delta: float = 1.0,
     parallel: bool = False,
     n_workers: int = 4,

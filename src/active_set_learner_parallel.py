@@ -12,7 +12,7 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 root_dir = Path(__file__).resolve().parent.parent
 sys.path.append(str(root_dir))
 
-from src.ActiveSetLearner import ActiveSetLearner
+from src.ActiveSetLearner import ActiveSetLearner, extract_ed_dual_bundle
 from src.scenario_utils import normalize_sample_arrays
 
 from pypower.idx_brch import RATE_A
@@ -52,10 +52,7 @@ def _solve_single_sample(args: tuple) -> dict | None:
 
         # Step 3: 提取 lambda
         T = load_data.shape[1]
-        lambda_vals = []
-        for t in range(T):
-            constr = ed.model.getConstrByName(f"power_balance_{t}")
-            lambda_vals.append(float(constr.Pi) if constr is not None else 0.0)
+        lambda_vals = extract_ed_dual_bundle(ppc, ed, T)
 
         # Step 4: 构建活动集（只用二进制变量 x，不含 LP 活跃约束索引）
         x_sol_list = [

@@ -11,6 +11,9 @@ import pypower.case30
 import pypower.case14
 import pypower.case9
 import pypower.idx_bus
+from pypower.ext2int import ext2int
+from pypower.makePTDF import makePTDF
+from pypower.idx_gen import GEN_BUS
 import json
 from datetime import datetime
 import time
@@ -28,6 +31,50 @@ from src.case39_pypower import get_case39_pypower
 from src.uc_gurobipy import UnitCommitmentModel
 from src.ed_gurobipy import EconomicDispatchGurobi
 from src.scenario_utils import normalize_sample_arrays
+
+
+def extract_ed_dual_bundle(ppc, ed_model, T: int) -> dict:
+    ppc_int = ext2int(ppc)
+    gen = ppc_int['gen']
+    bus = ppc_int['bus']
+    branch = ppc_int['branch']
+    nl = branch.shape[0]
+    ng = gen.shape[0]
+    nb = bus.shape[0]
+
+    lambda_power_balance = np.zeros(T, dtype=float)
+    lambda_dcpf_upper = np.zeros((nl, T), dtype=float)
+    lambda_dcpf_lower = np.zeros((nl, T), dtype=float)
+
+    for t in range(T):
+        constr = ed_model.model.getConstrByName(f'power_balance_{t}')
+        lambda_power_balance[t] = float(constr.Pi) if constr is not None else 0.0
+        for l in range(nl):
+            cu = ed_model.model.getConstrByName(f'flow_upper_{l}_{t}')
+            cl = ed_model.model.getConstrByName(f'flow_lower_{l}_{t}')
+            lambda_dcpf_upper[l, t] = float(cu.Pi) if cu is not None else 0.0
+            lambda_dcpf_lower[l, t] = max(0.0, -(float(cl.Pi) if cl is not None else 0.0))
+
+    G = np.zeros((nb, ng), dtype=float)
+    for g in range(ng):
+        bus_idx = int(gen[g, GEN_BUS])
+        if 0 <= bus_idx < nb:
+            G[bus_idx, g] = 1.0
+    ptdf_g = makePTDF(ppc_int['baseMVA'], bus, branch) @ G
+    lambda_pg_effective = np.zeros((ng, T), dtype=float)
+    congestion = lambda_dcpf_upper - lambda_dcpf_lower
+    for t in range(T):
+        lambda_pg_effective[:, t] = (
+            lambda_power_balance[t] - ptdf_g.T @ congestion[:, t]
+        )
+
+    return {
+        'lambda_power_balance': lambda_power_balance.tolist(),
+        'lambda_dcpf_upper': lambda_dcpf_upper.tolist(),
+        'lambda_dcpf_lower': lambda_dcpf_lower.tolist(),
+        'lambda_pg_effective': lambda_pg_effective.tolist(),
+    }
+
 
 class ActiveSetLearner:
     def __init__(self, alpha=0.05, delta=0.01, epsilon=0.04, ppc=None, T_delta=4, Pd=None,
@@ -95,10 +142,7 @@ class ActiveSetLearner:
 
         # Step 3: 提取功率平衡约束的对偶变量 λ（前T个约束）
         T = Pd.shape[1]
-        lambda_vals = []
-        for t in range(T):
-            constr = ed.model.getConstrByName(f'power_balance_{t}')
-            lambda_vals.append(float(constr.Pi) if constr is not None else 0.0)
+        lambda_vals = extract_ed_dual_bundle(self.ppc, ed, T)
 
         # Step 4: 构建活动集（只用二进制变量 x，不含 LP 活跃约束索引）
         # 将x_sol转为[[g,t],value]的list（保持JSON格式一致）
@@ -186,7 +230,12 @@ class ActiveSetLearner:
         }
         
         # 使用Path对象构建完整路径，使用紧凑格式（无缩进，紧凑分隔符）
-        filepath = result_dir / filename
+        filename_path = Path(filename)
+        if filename_path.parent == Path('.'):
+            filepath = result_dir / filename_path
+        else:
+            filepath = filename_path
+        filepath.parent.mkdir(parents=True, exist_ok=True)
         with open(filepath, 'w', encoding='utf-8') as f:
             json.dump(data, f, separators=(',', ':'), ensure_ascii=False)
         
@@ -223,7 +272,12 @@ class ActiveSetLearner:
                 mapping[f"样本{i+1}"] = {"Pd": sample[0].tolist(), "活动集": list(sample[1])}
         
         # 保存为JSON文件
-        filepath = result_dir / filename
+        filename_path = Path(filename)
+        if filename_path.parent == Path('.'):
+            filepath = result_dir / filename_path
+        else:
+            filepath = filename_path
+        filepath.parent.mkdir(parents=True, exist_ok=True)
         with open(filepath, 'w', encoding='utf-8') as f:
             json.dump(mapping, f, indent=2, ensure_ascii=False)
         

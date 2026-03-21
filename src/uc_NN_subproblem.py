@@ -26,7 +26,9 @@ except ImportError:
 
 # 导入必要的工具函数
 from pypower.ext2int import ext2int
+from pypower.makePTDF import makePTDF
 from pypower.idx_gen import GEN_BUS, PMIN, PMAX
+from pypower.idx_brch import RATE_A
 try:
     from scenario_utils import (
         get_feature_vector,
@@ -206,6 +208,175 @@ def _extract_lambda_power_balance(lambda_field, T: int) -> np.ndarray:
     return arr
 
 
+def _extract_lambda_matrix(
+    lambda_field,
+    key: str,
+    shape: Tuple[int, int],
+) -> np.ndarray:
+    if not isinstance(lambda_field, dict) or key not in lambda_field:
+        return np.zeros(shape, dtype=float)
+    arr = np.array(lambda_field[key], dtype=float)
+    if arr.shape != shape:
+        return np.zeros(shape, dtype=float)
+    return arr
+
+
+def _build_generator_injection_sensitivity(ppc) -> np.ndarray:
+    ppc_int = ext2int(ppc)
+    bus = ppc_int['bus']
+    gen = ppc_int['gen']
+    branch = ppc_int['branch']
+    nb = bus.shape[0]
+    ng = gen.shape[0]
+    G = np.zeros((nb, ng), dtype=float)
+    for g in range(ng):
+        bus_idx = int(gen[g, GEN_BUS])
+        if 0 <= bus_idx < nb:
+            G[bus_idx, g] = 1.0
+    PTDF = makePTDF(ppc_int['baseMVA'], bus, branch)
+    return PTDF @ G
+
+
+def _combine_pg_duals(
+    lambda_power_balance: np.ndarray,
+    lambda_dcpf_upper: np.ndarray,
+    lambda_dcpf_lower: np.ndarray,
+    generator_injection_sensitivity: np.ndarray,
+) -> np.ndarray:
+    T = len(lambda_power_balance)
+    ng = generator_injection_sensitivity.shape[1]
+    combined = np.zeros((ng, T), dtype=float)
+    congestion = lambda_dcpf_upper - lambda_dcpf_lower
+    for t in range(T):
+        combined[:, t] = (
+            lambda_power_balance[t]
+            - generator_injection_sensitivity.T @ congestion[:, t]
+        )
+    return combined
+
+
+def _extract_effective_pg_dual(
+    lambda_field,
+    T: int,
+    ng: int,
+    nl: int,
+    generator_injection_sensitivity: np.ndarray,
+) -> np.ndarray:
+    if isinstance(lambda_field, dict):
+        direct = lambda_field.get('lambda_pg_effective')
+        if direct is not None:
+            arr = np.array(direct, dtype=float)
+            if arr.shape == (ng, T):
+                return arr
+        lambda_pb = _extract_lambda_power_balance(lambda_field, T)
+        lambda_dcpf_upper = _extract_lambda_matrix(
+            lambda_field, 'lambda_dcpf_upper', (nl, T))
+        lambda_dcpf_lower = _extract_lambda_matrix(
+            lambda_field, 'lambda_dcpf_lower', (nl, T))
+        return _combine_pg_duals(
+            lambda_pb,
+            lambda_dcpf_upper,
+            lambda_dcpf_lower,
+            generator_injection_sensitivity,
+        )
+
+    lambda_pb = _extract_lambda_power_balance(lambda_field, T)
+    return np.tile(lambda_pb, (ng, 1))
+
+
+def _has_complete_effective_pg_dual(
+    lambda_field,
+    T: int,
+    ng: int,
+    nl: int,
+) -> bool:
+    if not isinstance(lambda_field, dict):
+        return False
+    direct = lambda_field.get('lambda_pg_effective')
+    if direct is not None:
+        arr = np.array(direct, dtype=float)
+        if arr.shape == (ng, T):
+            return True
+    lambda_pb = np.array(lambda_field.get('lambda_power_balance', []), dtype=float)
+    lambda_du = np.array(lambda_field.get('lambda_dcpf_upper', []), dtype=float)
+    lambda_dl = np.array(lambda_field.get('lambda_dcpf_lower', []), dtype=float)
+    return (
+        lambda_pb.shape == (T,)
+        and lambda_du.shape == (nl, T)
+        and lambda_dl.shape == (nl, T)
+    )
+
+
+def _recover_unit_commitment_matrix(sample: Dict, ng: int, T: int) -> np.ndarray:
+    x_sol = np.zeros((ng, T), dtype=float)
+    if 'active_set' in sample:
+        active_set = sample['active_set']
+        for item in active_set:
+            if isinstance(item, list) and len(item) == 2 and isinstance(item[0], list):
+                g, t = item[0]
+                value = item[1]
+                if 0 <= g < ng and 0 <= t < T:
+                    x_sol[g, t] = value
+        return x_sol
+    if 'unit_commitment_matrix' in sample:
+        uc = np.asarray(sample['unit_commitment_matrix'], dtype=float)
+        rows = min(uc.shape[0], ng)
+        cols = min(uc.shape[1], T)
+        x_sol[:rows, :cols] = uc[:rows, :cols]
+    return x_sol
+
+
+def _solve_effective_pg_dual_from_ed(
+    ppc,
+    Pd: np.ndarray,
+    T_delta: float,
+    x_sol: np.ndarray,
+    generator_injection_sensitivity: np.ndarray,
+    renewable_data: np.ndarray | None = None,
+) -> np.ndarray:
+    try:
+        from src.ed_gurobipy import EconomicDispatchGurobi
+    except ImportError:
+        from ed_gurobipy import EconomicDispatchGurobi
+
+    ed = EconomicDispatchGurobi(
+        ppc,
+        Pd,
+        T_delta,
+        x_sol,
+        renewable_data=renewable_data,
+        verbose=False,
+    )
+    pg_sol, _ = ed.solve()
+    if pg_sol is None:
+        raise RuntimeError(f"ED solve failed with status={ed.model.status}")
+
+    T = Pd.shape[1]
+    nl = ed.branch.shape[0]
+    lambda_pb = np.zeros(T, dtype=float)
+    lambda_dcpf_upper = np.zeros((nl, T), dtype=float)
+    lambda_dcpf_lower = np.zeros((nl, T), dtype=float)
+
+    for t in range(T):
+        constr = ed.model.getConstrByName(f'power_balance_{t}')
+        lambda_pb[t] = float(constr.Pi) if constr is not None else 0.0
+        for l in range(nl):
+            cu = ed.model.getConstrByName(f'flow_upper_{l}_{t}')
+            cl = ed.model.getConstrByName(f'flow_lower_{l}_{t}')
+            lambda_dcpf_upper[l, t] = float(cu.Pi) if cu is not None else 0.0
+            lambda_dcpf_lower[l, t] = max(
+                0.0,
+                -(float(cl.Pi) if cl is not None else 0.0),
+            )
+
+    return _combine_pg_duals(
+        lambda_pb,
+        lambda_dcpf_upper,
+        lambda_dcpf_lower,
+        generator_injection_sensitivity,
+    )
+
+
 def load_active_set_from_json(json_filepath: str, sample_id: Optional[int] = None):
     """从JSON文件加载活动集数据"""
     reader = ActiveSetReader(json_filepath)
@@ -340,7 +511,9 @@ class DualVariablePredictorTrainer:
             
         self.ng = self.gen.shape[0]
         self.nb = self.bus.shape[0]
+        self.nl = self.branch.shape[0]
         self.active_set_data = active_set_data
+        self.generator_injection_sensitivity = _build_generator_injection_sensitivity(ppc)
         
         # 设置设备
         if device is None:
@@ -358,11 +531,17 @@ class DualVariablePredictorTrainer:
         
         # 初始化网络
         if TORCH_AVAILABLE:
-            self.network = DualVariablePredictorNet(
-                input_dim=self.input_dim,
-                output_dim=self.output_dim
-            ).to(self.device)
-            self.optimizer = optim.Adam(self.network.parameters(), lr=1e-3)
+            self.networks = [
+                DualVariablePredictorNet(
+                    input_dim=self.input_dim,
+                    output_dim=self.output_dim
+                ).to(self.device)
+                for _ in range(self.ng)
+            ]
+            self.optimizers = [
+                optim.Adam(network.parameters(), lr=1e-3)
+                for network in self.networks
+            ]
         
         # 求解原始问题获取对偶变量真值
         self.lambda_true = self._solve_for_true_dual_variables()
@@ -3311,6 +3490,245 @@ def run_training(case_name: str = 'case30', n_samples: int = 20, T: int = 8,
     evaluate_trained_models(dual_predictor, trainers, active_set_data)
     
     return dual_predictor, trainers
+
+
+if __name__ == "__main__":
+    pass
+
+
+def _dual_predictor_trainer_init(self, ppc, active_set_data, T_delta, device=None):
+    self.ppc = ppc
+    ppc_int = ext2int(ppc)
+    self.baseMVA = ppc_int['baseMVA']
+    self.bus = ppc_int['bus']
+    self.gen = ppc_int['gen']
+    self.branch = ppc_int['branch']
+    self.gencost = ppc_int['gencost']
+    self.n_samples = len(active_set_data)
+    self.T_delta = T_delta
+    self.T = active_set_data[0]['pd_data'].shape[1] if isinstance(active_set_data, list) else active_set_data['pd_data'].shape[1]
+    self.ng = self.gen.shape[0]
+    self.nb = self.bus.shape[0]
+    self.nl = self.branch.shape[0]
+    self.active_set_data = active_set_data
+    self.generator_injection_sensitivity = _build_generator_injection_sensitivity(ppc)
+
+    if device is None:
+        if TORCH_AVAILABLE and torch.cuda.is_available():
+            self.device = torch.device('cuda')
+        else:
+            self.device = torch.device('cpu')
+    else:
+        self.device = device
+
+    first_sample = active_set_data[0] if isinstance(active_set_data, list) else active_set_data
+    self.input_dim = len(get_feature_vector_from_sample(dict(first_sample)))
+    self.output_dim = self.T
+
+    if TORCH_AVAILABLE:
+        self.networks = [
+            DualVariablePredictorNet(self.input_dim, self.output_dim).to(self.device)
+            for _ in range(self.ng)
+        ]
+        self.optimizers = [
+            optim.Adam(network.parameters(), lr=1e-3)
+            for network in self.networks
+        ]
+
+    self.lambda_true = self._solve_for_true_dual_variables()
+
+
+def _dual_predictor_trainer_solve_true(self) -> np.ndarray:
+    lambda_true = {}
+    needs_solve = []
+
+    for sample_id in range(self.n_samples):
+        sample = self.active_set_data[sample_id]
+        if (
+            'lambda' in sample
+            and sample['lambda'] is not None
+            and _has_complete_effective_pg_dual(sample['lambda'], self.T, self.ng, self.nl)
+        ):
+            lambda_true[sample_id] = _extract_effective_pg_dual(
+                sample['lambda'],
+                self.T,
+                self.ng,
+                self.nl,
+                self.generator_injection_sensitivity,
+            )
+        else:
+            needs_solve.append(sample_id)
+
+    for sample_id in needs_solve:
+        sample = self.active_set_data[sample_id]
+        x_sol = _recover_unit_commitment_matrix(sample, self.ng, self.T)
+        lambda_true[sample_id] = _solve_effective_pg_dual_from_ed(
+            self.ppc,
+            sample['pd_data'],
+            self.T_delta,
+            x_sol,
+            self.generator_injection_sensitivity,
+            renewable_data=sample.get('renewable_data'),
+        )
+
+    return np.array([lambda_true[i] for i in range(self.n_samples)])
+
+
+def _dual_predictor_trainer_extract_features(self, sample_id: int) -> np.ndarray:
+    return get_feature_vector_from_sample(dict(self.active_set_data[sample_id]))
+
+
+def _dual_predictor_trainer_train(self, num_epochs: int = 100, batch_size: int = 8):
+    if not TORCH_AVAILABLE:
+        print("Warning: PyTorch unavailable", flush=True)
+        return
+
+    X = np.array([self._extract_features(i) for i in range(self.n_samples)])
+    Y = self.lambda_true
+    X_tensor = torch.tensor(X, dtype=torch.float32, device=self.device)
+    criterion = nn.MSELoss()
+
+    for unit_id in range(self.ng):
+        Y_tensor = torch.tensor(Y[:, unit_id, :], dtype=torch.float32, device=self.device)
+        dataset = torch.utils.data.TensorDataset(X_tensor, Y_tensor)
+        dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+        network = self.networks[unit_id]
+        optimizer = self.optimizers[unit_id]
+        scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=10, factor=0.5)
+        network.train()
+
+        for epoch in range(num_epochs):
+            epoch_loss = 0.0
+            for batch_X, batch_Y in dataloader:
+                optimizer.zero_grad()
+                pred = network(batch_X)
+                loss = criterion(pred, batch_Y)
+                loss.backward()
+                optimizer.step()
+                epoch_loss += loss.item() * batch_X.size(0)
+
+            epoch_loss /= len(dataset)
+            scheduler.step(epoch_loss)
+
+
+def _dual_predictor_trainer_predict(self, pd_data, renewable_data=None, unit_id=None) -> np.ndarray:
+    if not TORCH_AVAILABLE:
+        raise RuntimeError("PyTorch unavailable")
+
+    if isinstance(pd_data, dict):
+        features = get_feature_vector_from_sample(dict(pd_data))
+    else:
+        features = get_feature_vector(pd_data, renewable_data=renewable_data)
+    pd_tensor = torch.tensor(features, dtype=torch.float32, device=self.device)
+
+    with torch.no_grad():
+        if unit_id is not None:
+            self.networks[unit_id].eval()
+            pred = self.networks[unit_id](pd_tensor.unsqueeze(0)).squeeze(0)
+            return pred.cpu().numpy()
+
+        preds = []
+        for network in self.networks:
+            network.eval()
+            preds.append(network(pd_tensor.unsqueeze(0)).squeeze(0).cpu().numpy())
+    return np.array(preds)
+
+
+def _dual_predictor_trainer_save(self, filepath: str):
+    if TORCH_AVAILABLE:
+        dirpath = os.path.dirname(os.path.abspath(filepath))
+        if dirpath and not os.path.exists(dirpath):
+            os.makedirs(dirpath, exist_ok=True)
+        torch.save(
+            {
+                'network_state_dicts': [network.state_dict() for network in self.networks],
+                'optimizer_state_dicts': [optimizer.state_dict() for optimizer in self.optimizers],
+                'ng': self.ng,
+                'T': self.T,
+            },
+            filepath,
+        )
+
+
+def _dual_predictor_trainer_load(self, filepath: str):
+    if TORCH_AVAILABLE:
+        state = torch.load(filepath, map_location=self.device)
+        if 'network_state_dicts' in state:
+            for network, network_state in zip(self.networks, state['network_state_dicts']):
+                network.load_state_dict(network_state)
+            for optimizer, optimizer_state in zip(self.optimizers, state['optimizer_state_dicts']):
+                optimizer.load_state_dict(optimizer_state)
+        else:
+            for network in self.networks:
+                network.load_state_dict(state['network_state_dict'])
+            for optimizer in self.optimizers:
+                optimizer.load_state_dict(state['optimizer_state_dict'])
+
+
+def _subproblem_get_lambda_values(self) -> np.ndarray:
+    if self.lambda_predictor is not None:
+        lambda_vals = []
+        for sample_id in range(self.n_samples):
+            sample = self.active_set_data[sample_id]
+            lambda_pred = self.lambda_predictor.predict(sample, unit_id=self.unit_id)
+            lambda_vals.append(lambda_pred)
+        return np.array(lambda_vals)
+    return self._solve_for_lambda()
+
+
+def _subproblem_solve_for_lambda(self) -> np.ndarray:
+    lambda_vals = {}
+    needs_solve = []
+
+    for sample_id in range(self.n_samples):
+        sample = self.active_set_data[sample_id]
+        if (
+            'lambda' in sample
+            and sample['lambda'] is not None
+            and _has_complete_effective_pg_dual(
+                sample['lambda'],
+                self.T,
+                self.ng,
+                self.branch.shape[0],
+            )
+        ):
+            effective = _extract_effective_pg_dual(
+                sample['lambda'],
+                self.T,
+                self.ng,
+                self.branch.shape[0],
+                _build_generator_injection_sensitivity(self.ppc),
+            )
+            lambda_vals[sample_id] = effective[self.unit_id]
+        else:
+            needs_solve.append(sample_id)
+
+    for sample_id in needs_solve:
+        sample = self.active_set_data[sample_id]
+        x_sol = _recover_unit_commitment_matrix(sample, self.ng, self.T)
+        effective = _solve_effective_pg_dual_from_ed(
+            self.ppc,
+            sample['pd_data'],
+            self.T_delta,
+            x_sol,
+            _build_generator_injection_sensitivity(self.ppc),
+            renewable_data=sample.get('renewable_data'),
+        )
+        lambda_vals[sample_id] = effective[self.unit_id]
+
+    return np.array([lambda_vals[i] for i in range(self.n_samples)])
+
+
+DualVariablePredictorTrainer.__init__ = _dual_predictor_trainer_init
+DualVariablePredictorTrainer._solve_for_true_dual_variables = _dual_predictor_trainer_solve_true
+DualVariablePredictorTrainer._extract_features = _dual_predictor_trainer_extract_features
+DualVariablePredictorTrainer.train = _dual_predictor_trainer_train
+DualVariablePredictorTrainer.predict = _dual_predictor_trainer_predict
+DualVariablePredictorTrainer.save = _dual_predictor_trainer_save
+DualVariablePredictorTrainer.load = _dual_predictor_trainer_load
+
+SubproblemSurrogateTrainer._get_lambda_values = _subproblem_get_lambda_values
+SubproblemSurrogateTrainer._solve_for_lambda = _subproblem_solve_for_lambda
 
 
 if __name__ == "__main__":

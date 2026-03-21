@@ -122,8 +122,8 @@ class EconomicDispatchGurobi:
                 )
                 flow = PTDF @ (thermal_injection + renewable_injection - self.load_data[:, t])
                 for l in range(self.branch.shape[0]):
-                    self.model.addConstr(flow[l] <= branch_limit[l])
-                    self.model.addConstr(flow[l] >= -branch_limit[l])
+                    self.model.addConstr(flow[l] <= branch_limit[l], name=f'flow_upper_{l}_{t}')
+                    self.model.addConstr(flow[l] >= -branch_limit[l], name=f'flow_lower_{l}_{t}')
         except ImportError:
             print('未安装pypower，DCPF潮流约束未添加。')
         obj = gp.quicksum(self.cpower[g, t] for g in range(self.ng) for t in range(self.T))
