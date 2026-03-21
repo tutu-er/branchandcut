@@ -13,6 +13,7 @@ import pypower.case9
 import pypower.idx_bus
 import json
 from datetime import datetime
+import time
 
 from pathlib import Path
 import io
