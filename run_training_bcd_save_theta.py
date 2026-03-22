@@ -38,6 +38,9 @@ MAX_SAMPLES = None
 MAX_ITER = 50
 NN_EPOCHS = 10
 DUAL_DECAY_ROUND = 10
+RHO_PRIMAL = None
+RHO_DUAL = None
+RHO_OPT = None
 
 # Set to an existing .pth path to resume training from a checkpoint.
 # Relative paths are resolved from the repo root.
@@ -133,6 +136,7 @@ def main() -> None:
     log(f"case: {CASE_NAME}")
     log(f"data: {data_file}")
     log(f"T_DELTA={T_DELTA}, MAX_ITER={MAX_ITER}, NN_EPOCHS={NN_EPOCHS}, DUAL_DECAY_ROUND={DUAL_DECAY_ROUND}")
+    log(f"rho_init: primal={RHO_PRIMAL}, dual={RHO_DUAL}, opt={RHO_OPT}")
     if existing_model_path is not None:
         log(f"resume_from: {existing_model_path}")
 
@@ -151,6 +155,13 @@ def main() -> None:
         log("加载已有 BCD 模型并继续训练")
         print("=" * 72)
         agent.load_model_parameters(str(existing_model_path))
+
+    if RHO_PRIMAL is not None:
+        agent.rho_primal = float(RHO_PRIMAL)
+    if RHO_DUAL is not None:
+        agent.rho_dual = float(RHO_DUAL)
+    if RHO_OPT is not None:
+        agent.rho_opt = float(RHO_OPT)
 
     print("\n" + "=" * 72)
     log("开始 BCD 训练")
@@ -174,6 +185,9 @@ def main() -> None:
         "max_iter": MAX_ITER,
         "nn_epochs": NN_EPOCHS,
         "dual_decay_round": DUAL_DECAY_ROUND,
+        "rho_primal": None if RHO_PRIMAL is None else float(RHO_PRIMAL),
+        "rho_dual": None if RHO_DUAL is None else float(RHO_DUAL),
+        "rho_opt": None if RHO_OPT is None else float(RHO_OPT),
         "resume_from": str(existing_model_path) if existing_model_path is not None else None,
         "model_path": str(model_path),
         "theta_zeta_alias_path": str(alias_path),
