@@ -8,6 +8,8 @@ Train BCD only, then save:
 
 This script is intentionally minimal and is meant for post-training analysis of
 "training-time cached theta/zeta" versus "test-time network forward theta/zeta".
+It also supports resuming from an existing BCD checkpoint by setting
+`BCD_MODEL_FILE` below.
 """
 
 from __future__ import annotations
@@ -36,6 +38,10 @@ MAX_SAMPLES = None
 MAX_ITER = 50
 NN_EPOCHS = 10
 DUAL_DECAY_ROUND = 10
+
+# Set to an existing .pth path to resume training from a checkpoint.
+# Relative paths are resolved from the repo root.
+BCD_MODEL_FILE = None
 
 # Keep this script serial so the saved theta/zeta caches are directly available
 # on the returned Agent_NN_BCD instance.
@@ -89,6 +95,17 @@ def resolve_data_file() -> Path:
     return path
 
 
+def resolve_existing_model_file() -> Path | None:
+    if BCD_MODEL_FILE is None:
+        return None
+    path = Path(BCD_MODEL_FILE)
+    if not path.is_absolute():
+        path = ROOT / path
+    if not path.exists():
+        raise FileNotFoundError(f"BCD model file not found: {path}")
+    return path
+
+
 def build_output_paths(case_name: str, timestamp: str) -> tuple[Path, Path, Path]:
     model_dir = ROOT / "result" / "bcd_models"
     theta_dir = ROOT / "result" / "theta_zeta"
@@ -107,6 +124,7 @@ def main() -> None:
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     data_file = resolve_data_file()
+    existing_model_path = resolve_existing_model_file()
     ppc = load_case(CASE_NAME)
 
     print("\n" + "=" * 72)
@@ -115,6 +133,8 @@ def main() -> None:
     log(f"case: {CASE_NAME}")
     log(f"data: {data_file}")
     log(f"T_DELTA={T_DELTA}, MAX_ITER={MAX_ITER}, NN_EPOCHS={NN_EPOCHS}, DUAL_DECAY_ROUND={DUAL_DECAY_ROUND}")
+    if existing_model_path is not None:
+        log(f"resume_from: {existing_model_path}")
 
     log(f"通过 ActiveSetReader 加载数据: {data_file.name}")
     all_samples = load_active_set_from_json(str(data_file))
@@ -126,6 +146,11 @@ def main() -> None:
     model_path, alias_path, list_path = build_output_paths(CASE_NAME, timestamp)
 
     agent = Agent_NN_BCD(ppc, all_samples, T_DELTA)
+    if existing_model_path is not None:
+        print("\n" + "=" * 72)
+        log("加载已有 BCD 模型并继续训练")
+        print("=" * 72)
+        agent.load_model_parameters(str(existing_model_path))
 
     print("\n" + "=" * 72)
     log("开始 BCD 训练")
@@ -149,6 +174,7 @@ def main() -> None:
         "max_iter": MAX_ITER,
         "nn_epochs": NN_EPOCHS,
         "dual_decay_round": DUAL_DECAY_ROUND,
+        "resume_from": str(existing_model_path) if existing_model_path is not None else None,
         "model_path": str(model_path),
         "theta_zeta_alias_path": str(alias_path),
         "theta_zeta_values_list_path": str(list_path),
