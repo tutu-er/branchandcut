@@ -22,11 +22,35 @@ from src.mti118_data_loader import (
     load_case118_ppc_with_mti_limits,
 )
 
+CASE30_LOAD_SCALE = 1.15
+
 
 def build_case30_base_load(horizon: int) -> tuple[dict, np.ndarray]:
     ppc = get_case30_uc_ppc()
     base_bus_load = np.asarray(ppc["bus"][:, PD], dtype=float)
-    load_matrix = np.repeat(base_bus_load[:, None], horizon, axis=1)
+    load_csv_path = ROOT / "src" / "load.csv"
+    load_profile_raw = np.loadtxt(load_csv_path, delimiter=",", dtype=float)
+    if load_profile_raw.ndim == 1:
+        system_profile = load_profile_raw
+    else:
+        system_profile = np.sum(load_profile_raw, axis=0)
+
+    if system_profile.size == horizon:
+        horizon_profile = system_profile
+    elif system_profile.size % horizon == 0:
+        group_size = system_profile.size // horizon
+        horizon_profile = system_profile.reshape(horizon, group_size).sum(axis=1)
+    else:
+        src_grid = np.linspace(0.0, 1.0, system_profile.size)
+        dst_grid = np.linspace(0.0, 1.0, horizon)
+        horizon_profile = np.interp(dst_grid, src_grid, system_profile)
+
+    normalized_profile = horizon_profile / np.max(horizon_profile)
+    load_matrix = (
+        base_bus_load[:, None]
+        * normalized_profile[None, :]
+        * CASE30_LOAD_SCALE
+    )
     return ppc, load_matrix
 
 
@@ -202,7 +226,7 @@ def main() -> None:
             parallel=False,
             n_workers=4,
             gurobi_threads=2,
-            verbose_solver=True,
+            verbose_solver=False,
             output=None,
         )
     elif case_name == "case118":
