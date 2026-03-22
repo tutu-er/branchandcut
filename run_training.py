@@ -490,9 +490,9 @@ def main():
     T_DELTA         = 1.0
     DUAL_EPOCHS     = 50
     DUAL_BATCH_SIZE = 8
-    MAX_ITER        = 50            # 迭代次数（BCD / surrogate BCD 轮数）
-    DUAL_DECAY_ROUND= 10
-    NN_EPOCHS       = 10            # surrogate 模式每次 BCD 迭代的 NN 训练轮数
+    MAX_ITER        = 100            # 迭代次数（BCD / surrogate BCD 轮数）
+    DUAL_DECAY_ROUND= 20
+    NN_EPOCHS       = 15            # surrogate 模式每次 BCD 迭代的 NN 训练轮数
     UNIT_IDS        = None          # None = 所有机组；或如 [0, 1, 2]
     FP_TEST_SAMPLES = 3             # feasibility_pump 模式：测试样本数
     N_WORKERS_BCD   = 4             # 样本级并行线程数；1 = 串行（BCD 建议先用串行），>1 = 线程并行
@@ -501,8 +501,8 @@ def main():
     JOINT_NN_EPOCHS = 5             # 联合BCD训练每轮theta/zeta NN训练epoch数
     JOINT_SURR_NN_EPOCHS = 5        # 联合BCD训练每轮surrogate NN训练epoch数
     JOINT_DUAL_DECAY_ROUND = 0     # 联合BCD训练dual_para_bound衰减轮次
-    ACTIVE_SETS_FILE = None          # 指定 active_sets JSON 文件路径（None=自动查找最新）
-    BCD_MODEL_FILE   = "result/bcd_models/bcd_model_case30_20260318_000506.pth"           # 指定已有 BCD 模型 .pth 文件路径（None=从头训练；both 模式下可跳过 BCD 训练）
+    ACTIVE_SETS_FILE = "result/active_set/active_sets_case30_T24_n53_20260322_172141.json"          # 指定 active_sets JSON 文件路径（None=自动查找最新）
+    BCD_MODEL_FILE   = None           # 指定已有 BCD 模型 .pth 文件路径（None=从头训练；both 模式下可跳过 BCD 训练）
     SURROGATE_MODEL_DIR = None       # 指定已有 subproblem 模型目录（含 dual_predictor.pth 和 surrogate_unit_*.pth；None=从头训练；both 模式下可跳过 subproblem 训练）
     SPARSE_TOP_K_VARIABLES = 20      # sparse 支持发现：保留的高价值 x[g,t] 变量数量
     SPARSE_MAX_GROUPS = 5            # sparse 支持发现：构造的支持集模板数量上限

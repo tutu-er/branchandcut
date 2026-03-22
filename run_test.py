@@ -65,20 +65,20 @@ if not check_and_install_dependencies_safe():
 #   'bcd'       - 加载 BCD 神经网络模型并报告参数统计
 #   'both'      - 联合加载 BCD + surrogate，以全体代理约束评估（需同时配置下面两个路径）
 #
-MODE      = 'bcd'
+MODE      = 'both'
 RUN_FP    = True       # surrogate / both 模式：是否运行可行性泵测试
 CASE_NAME = 'case30'   # 'case14' / 'case30' / 'case39' / 'case118'
 
 # surrogate / both 模式：已训练 surrogate 模型目录（训练时输出的带时间戳路径）
-MODEL_DIR = 'result/subproblem_models/subproblem_models_case30_20260318_201124'
+MODEL_DIR = 'result/subproblem_models/subproblem_models_case30_20260322_172348'
 
 # bcd / both 模式：已训练 BCD 模型 .pth 文件路径
 # BCD_MODEL_PATH = 'result/bcd_models/bcd_model_case30_20260322_150043.pth'
-BCD_MODEL_PATH = 'result/bcd_models/bcd_model_case30_20260318_000506.pth'
+BCD_MODEL_PATH = 'result/bcd_models/bcd_model_case30_20260322_172348.pth'
 
 TEST_SAMPLES_DEFAULT = 3
 TEST_SAMPLES = TEST_SAMPLES_DEFAULT
-ACTIVE_SETS_FILE = 'result/active_set/active_sets_case30_T24_n340_20260317_152540.json'  # 指定 active_sets JSON 文件路径（None=自动查找最新）
+ACTIVE_SETS_FILE = 'result/active_set/active_sets_case30_T24_n53_20260322_172141.json'  # 指定 active_sets JSON 文件路径（None=自动查找最新）
 
 # ──────────────────────── 导入 ────────────────────────
 
@@ -1527,7 +1527,7 @@ def main():
 
     # ── 配置 ──────────────────────────────────────────────
     MAX_SAMPLES  = None         # 最多使用多少个样本（None=全部）
-    SAMPLE_RANGE = "230:240"         # 指定样本区间，左闭右开；例如 (210, 220) 或 "210:220"
+    SAMPLE_RANGE = "0:10"         # 指定样本区间，左闭右开；例如 (210, 220) 或 "210:220"
     T_DELTA      = 1.0
     UNIT_IDS     = None         # None = 所有机组；或如 [0, 1, 2]
     TEST_SAMPLES = 10  # 测试/评估样本数
