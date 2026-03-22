@@ -16,6 +16,7 @@ sys.path.append(str(ROOT))
 
 from src.ActiveSetLearner import ActiveSetLearner
 from src.active_set_learner_parallel import ParallelActiveSetLearner
+from src.case30_uc_data import get_case30_uc_ppc
 from src.mti118_data_loader import (
     build_case118_daily_samples,
     load_case118_ppc_with_mti_limits,
@@ -23,7 +24,7 @@ from src.mti118_data_loader import (
 
 
 def build_case30_base_load(horizon: int) -> tuple[dict, np.ndarray]:
-    ppc = pypower.case30.case30()
+    ppc = get_case30_uc_ppc()
     base_bus_load = np.asarray(ppc["bus"][:, PD], dtype=float)
     load_matrix = np.repeat(base_bus_load[:, None], horizon, axis=1)
     return ppc, load_matrix

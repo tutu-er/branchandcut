@@ -29,6 +29,7 @@ import pypower.case39
 import pypower.case118
 
 from uc_NN_BCD import Agent_NN_BCD, load_active_set_from_json
+from case30_uc_data import get_case30_uc_ppc
 from mti118_data_loader import load_case118_ppc_with_mti_limits
 
 
@@ -44,14 +45,14 @@ RHO_OPT = None
 
 # Set to an existing .pth path to resume training from a checkpoint.
 # Relative paths are resolved from the repo root.
-BCD_MODEL_FILE = None
+BCD_MODEL_FILE = 'result/bcd_models/bcd_model_case30_20260318_000506.pth'
 
 # Keep this script serial so the saved theta/zeta caches are directly available
 # on the returned Agent_NN_BCD instance.
 USE_PARALLEL = False
 
 # None -> auto-pick latest active set file for the case.
-ACTIVE_SETS_FILE = None
+ACTIVE_SETS_FILE = "result/active_set/active_sets_case30_T24_n340_20260317_152540.json"
 
 
 def log(msg: str) -> None:
@@ -73,7 +74,7 @@ def pick_data_file(result_dir: Path, case_name: str) -> Path | None:
 def load_case(case_name: str):
     case_map = {
         "case14": pypower.case14.case14,
-        "case30": pypower.case30.case30,
+        "case30": get_case30_uc_ppc,
         "case39": pypower.case39.case39,
         "case118": load_case118_ppc_with_mti_limits,
     }

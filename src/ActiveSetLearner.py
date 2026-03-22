@@ -28,6 +28,7 @@ root_dir = Path(__file__).resolve().parent.parent
 sys.path.append(str(root_dir))
 
 from src.case39_pypower import get_case39_pypower
+from src.case30_uc_data import get_case30_uc_ppc
 from src.uc_gurobipy import UnitCommitmentModel
 from src.ed_gurobipy import EconomicDispatchGurobi
 from src.scenario_utils import normalize_sample_arrays
@@ -85,6 +86,8 @@ class ActiveSetLearner:
         self.observed_active_sets = set()
         self.samples = []
         self.M = 1
+        if ppc is None and case_name == 'case30':
+            ppc = get_case30_uc_ppc()
         self.ppc = ppc
         self.T_delta = T_delta
         self.Pd = Pd

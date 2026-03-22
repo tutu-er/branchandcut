@@ -74,7 +74,7 @@ MODEL_DIR = 'result/subproblem_models/subproblem_models_case30_20260318_201124'
 
 # bcd / both 模式：已训练 BCD 模型 .pth 文件路径
 # BCD_MODEL_PATH = 'result/bcd_models/bcd_model_case30_20260322_150043.pth'
-BCD_MODEL_PATH = 'result/bcd_models/bcd_model_case30_20260318_201124.pth'
+BCD_MODEL_PATH = 'result/bcd_models/bcd_model_case30_20260318_000506.pth'
 
 TEST_SAMPLES_DEFAULT = 3
 TEST_SAMPLES = TEST_SAMPLES_DEFAULT
@@ -116,6 +116,7 @@ try:
         load_trained_models,
         ActiveSetReader,
     )
+    from case30_uc_data import get_case30_uc_ppc
     from mti118_data_loader import load_case118_ppc_with_mti_limits
     from scenario_utils import normalize_sample_arrays
 except ImportError as e:
@@ -1542,7 +1543,7 @@ def main():
     log(f"加载 PyPower 案例: {CASE_NAME}")
     ppc_map = {
         'case14': pypower.case14.case14,
-        'case30': pypower.case30.case30,
+        'case30': get_case30_uc_ppc,
         'case39': pypower.case39.case39,
         'case118': load_case118_ppc_with_mti_limits,
     }

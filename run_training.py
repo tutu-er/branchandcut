@@ -85,6 +85,7 @@ try:
         load_trained_models,
     )
     from uc_NN_subproblem_parallel import ParallelSubproblemSurrogateTrainer
+    from case30_uc_data import get_case30_uc_ppc
     from mti118_data_loader import load_case118_ppc_with_mti_limits
     from scenario_utils import has_meaningful_renewable_data, normalize_sample_arrays
     from training_logger import TrainingLogger
@@ -523,7 +524,7 @@ def main():
     log(f"加载 PyPower 案例: {CASE_NAME}")
     ppc_map = {
         'case14': pypower.case14.case14,
-        'case30': pypower.case30.case30,
+        'case30': get_case30_uc_ppc,
         'case39': pypower.case39.case39,
         'case118': load_case118_ppc_with_mti_limits,
     }

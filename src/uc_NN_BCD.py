@@ -389,8 +389,8 @@ class Agent_NN_BCD:
         self.rho_opt = 1e-2
         self.gamma_base = 1e-2   # gamma 缩放基准
         self.rho_max = 10.0     # rho 上限
-        self.theta_reg_weight = 1e-4   # theta L2 正则化权重
-        self.zeta_reg_weight = 1e-4    # zeta L2 正则化权重
+        self.theta_reg_weight = 1e-4   # theta L1 正则化权重（[-1, 1] 死区外生效）
+        self.zeta_reg_weight = 1e-4    # zeta L1 正则化权重（[-1, 1] 死区外生效）
         
         # 约束违反惩罚项的权重和epsilon参数
         self.constraint_violation_weight = 0
@@ -1556,7 +1556,7 @@ class Agent_NN_BCD:
         
         # 创建优化器（只优化theta和zeta网络，mu和ita在loss中通过Gurobi优化）
         all_params = list(self.theta_net.parameters()) + list(self.zeta_net.parameters())
-        self.optimizer = optim.Adam(all_params, lr=1e-4, weight_decay=1e-4)
+        self.optimizer = optim.Adam(all_params, lr=1e-4, weight_decay=0.0)
         
         # 保存变量名列表
         self.theta_var_names = list(self.theta_values.keys())
@@ -2332,7 +2332,7 @@ class Agent_NN_BCD:
             union_analysis = self._current_union_analysis
 
         all_params = list(self.theta_net.parameters()) + list(self.zeta_net.parameters())
-        self.optimizer = optim.Adam(all_params, lr=1e-4, weight_decay=1e-4)
+        self.optimizer = optim.Adam(all_params, lr=1e-4, weight_decay=0.0)
         self.theta_net.train()
         self.zeta_net.train()
 
@@ -3000,9 +3000,11 @@ class Agent_NN_BCD:
 
                 obj_dual = obj_dual + torch.abs(dual_expr)
         
-        # L2 正则化：控制 theta/zeta 参数大小
-        reg_loss = (self.theta_reg_weight * torch.sum(theta_tensor ** 2)
-                    + self.zeta_reg_weight * torch.sum(zeta_tensor ** 2))
+        # L1 正则化：[-1, 1] 死区内不惩罚，仅惩罚超出死区的幅值
+        theta_deadzone_excess = torch.clamp(torch.abs(theta_tensor) - 1.0, min=0.0)
+        zeta_deadzone_excess = torch.clamp(torch.abs(zeta_tensor) - 1.0, min=0.0)
+        reg_loss = (self.theta_reg_weight * torch.sum(theta_deadzone_excess)
+                    + self.zeta_reg_weight * torch.sum(zeta_deadzone_excess))
 
         loss = obj_primal * self.rho_primal + obj_dual * self.rho_dual + obj_opt * self.rho_opt + reg_loss
 
@@ -4123,7 +4125,7 @@ class Agent_NN_BCD:
 
         # 重建优化器
         all_params = list(self.theta_net.parameters()) + list(self.zeta_net.parameters())
-        self.optimizer = optim.Adam(all_params, lr=1e-4, weight_decay=1e-4)
+        self.optimizer = optim.Adam(all_params, lr=1e-4, weight_decay=0.0)
         if state.get("optimizer_state_dict") is not None:
             try:
                 self.optimizer.load_state_dict(state["optimizer_state_dict"])
