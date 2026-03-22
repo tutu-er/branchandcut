@@ -33,12 +33,18 @@ try:
     from scenario_utils import (
         get_feature_vector,
         get_feature_vector_from_sample,
+        get_sample_load_data,
+        get_sample_net_load,
+        get_sample_renewable_data,
         normalize_sample_arrays,
     )
 except ImportError:
     from src.scenario_utils import (
         get_feature_vector,
         get_feature_vector_from_sample,
+        get_sample_load_data,
+        get_sample_net_load,
+        get_sample_renewable_data,
         normalize_sample_arrays,
     )
 
@@ -2315,11 +2321,6 @@ class SubproblemSurrogateTrainer:
 
         self.surrogate_net.eval()
 
-        if isinstance(pd_data, dict):
-            pd_flat = get_feature_vector_from_sample(pd_data)
-        else:
-            pd_flat = get_feature_vector(pd_data, renewable_data=renewable_data)
-        pd_flat = np.asarray(pd_flat, dtype=float).reshape(-1)
         lambda_val = np.asarray(lambda_val, dtype=float).reshape(-1)
         # 机组静态参数（与 _extract_features 保持一致）
         g = self.unit_id
@@ -2332,6 +2333,13 @@ class SubproblemSurrogateTrainer:
             self.gencost[g, 1] / (Pmax + 1e-8),
             self.gencost[g, 2] / (Pmax + 1e-8),
         ])
+        expected_total_dim = int(self.surrogate_net.input_proj.in_features)
+        expected_pd_dim = expected_total_dim - lambda_val.size - unit_params.size
+        pd_flat = self._build_compatible_surrogate_feature_vector(
+            pd_data,
+            renewable_data=renewable_data,
+            expected_pd_dim=expected_pd_dim,
+        )
         features = np.concatenate([pd_flat, lambda_val, unit_params])
         features_tensor = torch.tensor(features, dtype=torch.float32, device=self.device).unsqueeze(0)
 
@@ -2343,6 +2351,92 @@ class SubproblemSurrogateTrainer:
                 gammas.squeeze(0).cpu().numpy(),
                 deltas.squeeze(0).cpu().numpy(),
                 costs.squeeze(0).cpu().numpy())
+
+    def _build_compatible_surrogate_feature_vector(
+        self,
+        pd_data: np.ndarray | dict,
+        renewable_data: np.ndarray | None,
+        expected_pd_dim: int,
+    ) -> np.ndarray:
+        """Build surrogate scenario features that match the loaded model input width.
+
+        Old models were trained on net-load-only features, while newer branches may
+        concatenate [load, renewable]. During FP inference we may receive richer
+        sample dicts than the model was trained on, so select the candidate whose
+        flattened length matches the network's expected scenario dimension.
+        """
+        candidates: list[tuple[str, np.ndarray]] = []
+
+        def _add_row_reduced_candidates(name: str, matrix_2d: np.ndarray) -> None:
+            matrix_2d = np.asarray(matrix_2d, dtype=float)
+            if matrix_2d.ndim != 2:
+                return
+            rows, horizon = matrix_2d.shape
+            if rows * horizon == expected_pd_dim:
+                return
+            if horizon <= 0 or expected_pd_dim % horizon != 0:
+                return
+            target_rows = expected_pd_dim // horizon
+            if target_rows <= 0 or target_rows >= rows:
+                return
+
+            row_activity = np.sum(np.abs(matrix_2d), axis=1)
+            active_order = np.argsort(-row_activity, kind="stable")[:target_rows]
+            active_order = np.sort(active_order)
+            candidates.append(
+                (f"{name}_top_rows_{target_rows}", matrix_2d[active_order, :].reshape(-1))
+            )
+            candidates.append(
+                (f"{name}_leading_rows_{target_rows}", matrix_2d[:target_rows, :].reshape(-1))
+            )
+
+        if isinstance(pd_data, dict):
+            sample = normalize_sample_arrays(dict(pd_data))
+            net_load_matrix = np.asarray(get_sample_net_load(sample), dtype=float)
+            candidates.append(("net_load", net_load_matrix.reshape(-1)))
+            _add_row_reduced_candidates("net_load", net_load_matrix)
+
+            if "load_data" in sample:
+                load_matrix = np.asarray(get_sample_load_data(sample), dtype=float)
+                candidates.append(("load_only", load_matrix.reshape(-1)))
+                _add_row_reduced_candidates("load_only", load_matrix)
+
+            if "load_data" in sample and "renewable_data" in sample:
+                load_matrix = np.asarray(get_sample_load_data(sample), dtype=float)
+                renewable_matrix = np.asarray(get_sample_renewable_data(sample), dtype=float)
+                load_plus_renew = np.concatenate(
+                    [
+                        load_matrix.reshape(-1),
+                        renewable_matrix.reshape(-1),
+                    ]
+                )
+                candidates.append(("load_plus_renewable", load_plus_renew))
+
+            default_feature = np.asarray(get_feature_vector_from_sample(sample), dtype=float).reshape(-1)
+            candidates.append(("default", default_feature))
+        else:
+            pd_arr = np.asarray(pd_data, dtype=float)
+            candidates.append(("pd_only", np.asarray(get_feature_vector(pd_arr), dtype=float).reshape(-1)))
+            _add_row_reduced_candidates("pd_only", pd_arr)
+
+            if renewable_data is not None:
+                candidates.append(
+                    (
+                        "pd_plus_renewable",
+                        np.asarray(get_feature_vector(pd_arr, renewable_data=renewable_data), dtype=float).reshape(-1),
+                    )
+                )
+
+        for _, candidate in candidates:
+            if candidate.size == expected_pd_dim:
+                return candidate
+
+        default_name, default_candidate = candidates[0]
+        raise ValueError(
+            f"Surrogate feature dimension mismatch for unit {self.unit_id}: "
+            f"expected scenario dim {expected_pd_dim}, got candidates "
+            f"{[(name, arr.size) for name, arr in candidates]}; default={default_name}"
+        )
     
     def save(self, filepath: str):
         """保存V3模型"""

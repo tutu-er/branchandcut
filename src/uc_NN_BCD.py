@@ -391,6 +391,11 @@ class Agent_NN_BCD:
         self.rho_max = 10.0     # rho 上限
         self.theta_reg_weight = 1e-4   # theta L1 正则化权重（[-1, 1] 死区外生效）
         self.zeta_reg_weight = 1e-4    # zeta L1 正则化权重（[-1, 1] 死区外生效）
+        self.gurobi_mip_gap = 1e-4
+        self.gurobi_feasibility_tol = 1e-5
+        self.gurobi_optimality_tol = 1e-5
+        self.gurobi_int_feas_tol = 1e-5
+        self.max_theta_constraints_per_time_slot = 10
         
         # 约束违反惩罚项的权重和epsilon参数
         self.constraint_violation_weight = 0
@@ -1212,6 +1217,14 @@ class Agent_NN_BCD:
             'lambda_x_upper': np.zeros((self.ng, self.T)),
             'lambda_x_lower': np.zeros((self.ng, self.T))
         }
+
+    def _apply_fast_gurobi_tolerances(self, model, mip=True):
+        model.Params.OutputFlag = 0
+        model.Params.FeasibilityTol = self.gurobi_feasibility_tol
+        model.Params.OptimalityTol = self.gurobi_optimality_tol
+        if mip:
+            model.Params.MIPGap = self.gurobi_mip_gap
+            model.Params.IntFeasTol = self.gurobi_int_feas_tol
     
     def _create_union_analysis_from_x_init(self, x_init, lambda_init):
         """创建union_analysis（参考uc_NN.py）"""
@@ -1288,8 +1301,27 @@ class Agent_NN_BCD:
         # 收集所有分数时段（去重）
         fractional_times = sorted(set(var['time_slot'] for var in fractional_variables))
 
+        branch_time_priority = {}
+        for sample_lambda in lambda_init or []:
+            if not isinstance(sample_lambda, dict):
+                continue
+            lam_up = np.asarray(sample_lambda.get('lambda_dcpf_upper', np.zeros((self.nl, self.T))), dtype=float)
+            lam_dn = np.asarray(sample_lambda.get('lambda_dcpf_lower', np.zeros((self.nl, self.T))), dtype=float)
+            if lam_up.shape != (self.nl, self.T):
+                lam_up = np.zeros((self.nl, self.T), dtype=float)
+            if lam_dn.shape != (self.nl, self.T):
+                lam_dn = np.zeros((self.nl, self.T), dtype=float)
+            branch_scores = np.abs(lam_up) + np.abs(lam_dn)
+            for time_slot in fractional_times:
+                for branch_id in range(self.nl):
+                    key = (branch_id, time_slot)
+                    score = float(branch_scores[branch_id, time_slot])
+                    if score > branch_time_priority.get(key, 0.0):
+                        branch_time_priority[key] = score
+
         # 对每个 (branch, fractional_time) 构建约束
         for time_slot in fractional_times:
+            time_slot_constraints = []
             for branch_id in range(self.nl):
                 nonzero_coefficients = []
                 for g in range(self.ng):
@@ -1303,13 +1335,25 @@ class Agent_NN_BCD:
                                 'coefficient': coeff,
                             })
                 if nonzero_coefficients:
-                    union_constraints.append({
+                    time_slot_constraints.append({
                         'branch_id': branch_id,
                         'time_slot': time_slot,
                         'constraint_type': 'dcpf',
                         'nonzero_pg_coefficients': nonzero_coefficients,
                         'constraint_name': f'dcpf_{branch_id}_{time_slot}',
+                        'priority_score': branch_time_priority.get((branch_id, time_slot), 0.0),
                     })
+
+            max_keep = self.max_theta_constraints_per_time_slot
+            if max_keep is not None and max_keep > 0 and len(time_slot_constraints) > max_keep:
+                time_slot_constraints.sort(
+                    key=lambda item: (-float(item.get('priority_score', 0.0)), int(item['branch_id']))
+                )
+                time_slot_constraints = time_slot_constraints[:max_keep]
+
+            for constraint in time_slot_constraints:
+                constraint.pop('priority_score', None)
+            union_constraints.extend(time_slot_constraints)
 
         return union_constraints
     
@@ -1992,8 +2036,7 @@ class Agent_NN_BCD:
         total_objective = obj_binary + self.rho_primal * obj_primal + self.rho_opt * obj_opt
         model.setObjective(total_objective, GRB.MINIMIZE)
 
-        model.Params.OutputFlag = 0
-        model.Params.MIPGap = 1e-6
+        self._apply_fast_gurobi_tolerances(model, mip=True)
         model.optimize()
         
         if model.status == GRB.OPTIMAL:
@@ -2279,8 +2322,7 @@ class Agent_NN_BCD:
         total_objective = self.rho_dual * obj_dual + self.rho_opt * obj_opt + penal_mu + penal_ita
         model.setObjective(total_objective, GRB.MINIMIZE)
 
-        model.Params.OutputFlag = 0
-        model.Params.MIPGap = 1e-6
+        self._apply_fast_gurobi_tolerances(model, mip=True)
         model.Params.Presolve = 0
         model.Params.NumericFocus = 2
         model.Params.ScaleFlag = 2
@@ -3900,8 +3942,7 @@ class Agent_NN_BCD:
         
         model.setObjective(obj_model, GRB.MINIMIZE)
         
-        model.Params.OutputFlag = 0
-        model.Params.MIPGap = 1e-10
+        self._apply_fast_gurobi_tolerances(model, mip=False)
         model.optimize()
         
         if model.status == GRB.OPTIMAL:
