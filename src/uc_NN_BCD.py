@@ -377,7 +377,7 @@ class Agent_NN_BCD:
         
         self.iter_number = 0
         
-        self.penalty_factor = 1e2
+        self.penalty_factor = 1e7
         
         # 对偶变量的下界约束
         self.dual_para_bound = 0.1  # mu和ita的最小值
@@ -1606,6 +1606,39 @@ class Agent_NN_BCD:
         print(f"✓ 用NN forward pass生成theta/zeta初值 "
               f"(theta: mean={np.mean(vals):.4f}, std={np.std(vals):.4f}; "
               f"zeta: mean={np.mean(zvals):.4f}, std={np.std(zvals):.4f})", flush=True)
+
+    def refresh_theta_zeta_values_from_networks(self):
+        """Refresh per-sample theta/zeta caches using the current loaded networks."""
+        if not TORCH_AVAILABLE or self.theta_net is None or self.zeta_net is None:
+            return
+
+        if not hasattr(self, "_features_cache") or self._features_cache is None:
+            self._refresh_feature_cache()
+
+        theta_was_training = self.theta_net.training
+        zeta_was_training = self.zeta_net.training
+        self.theta_net.eval()
+        self.zeta_net.eval()
+
+        with torch.no_grad():
+            theta_out = self.theta_net(self._features_cache)
+            zeta_out = self.zeta_net(self._features_cache)
+
+        self.theta_values_list = [
+            self._tensor_to_theta_dict(theta_out[i])
+            for i in range(self.n_samples)
+        ]
+        self.zeta_values_list = [
+            self._tensor_to_zeta_dict(zeta_out[i])
+            for i in range(self.n_samples)
+        ]
+        self.theta_values = self.theta_values_list[0] if self.theta_values_list else {}
+        self.zeta_values = self.zeta_values_list[0] if self.zeta_values_list else {}
+
+        if theta_was_training:
+            self.theta_net.train()
+        if zeta_was_training:
+            self.zeta_net.train()
 
     def _precompute_constant_tensors(self):
         """预计算训练全程不变的常量张量，避免每次 loss 调用时重建（Tier 1）。"""
@@ -3912,6 +3945,50 @@ class Agent_NN_BCD:
             json.dump(data, f, indent=2, ensure_ascii=False)
         
         print(f"✓ theta_values 和 zeta_values 已保存到: {filepath}", flush=True)
+
+    def save_theta_zeta_values_list(self, filepath: str, ensure_dir: bool = True) -> None:
+        """Save per-sample theta/zeta caches for post-training analysis."""
+        import json
+        import os
+
+        if not hasattr(self, 'theta_values_list') or self.theta_values_list is None:
+            raise RuntimeError("theta_values_list 未初始化，无法保存。")
+        if not hasattr(self, 'zeta_values_list') or self.zeta_values_list is None:
+            raise RuntimeError("zeta_values_list 未初始化，无法保存。")
+
+        if ensure_dir:
+            dirpath = os.path.dirname(os.path.abspath(filepath))
+            if dirpath and not os.path.exists(dirpath):
+                os.makedirs(dirpath, exist_ok=True)
+
+        sample_ids = []
+        if hasattr(self, 'active_set_data') and self.active_set_data is not None:
+            for i, sample in enumerate(self.active_set_data):
+                if isinstance(sample, dict):
+                    sample_ids.append(sample.get('sample_id', i))
+                else:
+                    sample_ids.append(i)
+
+        data = {
+            'sample_ids': sample_ids,
+            'theta_var_names': list(getattr(self, 'theta_var_names', [])),
+            'zeta_var_names': list(getattr(self, 'zeta_var_names', [])),
+            'theta_values': {str(k): float(v) for k, v in (self.theta_values or {}).items()},
+            'zeta_values': {str(k): float(v) for k, v in (self.zeta_values or {}).items()},
+            'theta_values_list': [
+                {str(k): float(v) for k, v in values.items()}
+                for values in self.theta_values_list
+            ],
+            'zeta_values_list': [
+                {str(k): float(v) for k, v in values.items()}
+                for values in self.zeta_values_list
+            ],
+        }
+
+        with open(filepath, 'w', encoding='utf-8') as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+
+        print(f"✓ theta_values_list 和 zeta_values_list 已保存到: {filepath}", flush=True)
     
     def load_theta_values(self, filepath: str) -> dict:
         """
@@ -4066,6 +4143,8 @@ class Agent_NN_BCD:
             self.mu = state["mu"]
         if "ita" in state:
             self.ita = state["ita"]
+
+        self.refresh_theta_zeta_values_from_networks()
 
         print(f"✓ 模型参数已从文件加载: {filepath}", flush=True)
 

@@ -2319,6 +2319,8 @@ class SubproblemSurrogateTrainer:
             pd_flat = get_feature_vector_from_sample(pd_data)
         else:
             pd_flat = get_feature_vector(pd_data, renewable_data=renewable_data)
+        pd_flat = np.asarray(pd_flat, dtype=float).reshape(-1)
+        lambda_val = np.asarray(lambda_val, dtype=float).reshape(-1)
         # 机组静态参数（与 _extract_features 保持一致）
         g = self.unit_id
         Pmax = self.gen[g, PMAX]

@@ -793,6 +793,35 @@ def identify_trusted_mask(
 
 # ========================== Step 6 辅助：全局 LP 松弛 ==========================
 
+DEFAULT_SURROGATE_PENALTY = 1e8
+
+
+def _build_surrogate_relaxation_stages() -> List[dict]:
+    """Hard -> soften subproblem -> soften both."""
+    return [
+        {
+            'name': 'hard_bcd_hard_subproblem',
+            'hard_subproblem': True,
+            'hard_bcd': True,
+            'penalty_subproblem': None,
+            'penalty_bcd': None,
+        },
+        {
+            'name': 'hard_bcd_soft_subproblem',
+            'hard_subproblem': False,
+            'hard_bcd': True,
+            'penalty_subproblem': DEFAULT_SURROGATE_PENALTY,
+            'penalty_bcd': None,
+        },
+        {
+            'name': 'soft_bcd_soft_subproblem',
+            'hard_subproblem': False,
+            'hard_bcd': False,
+            'penalty_subproblem': DEFAULT_SURROGATE_PENALTY,
+            'penalty_bcd': DEFAULT_SURROGATE_PENALTY,
+        },
+    ]
+
 def solve_global_LP_relaxation(
     ppc: dict,
     pd_data: np.ndarray | dict,
@@ -804,7 +833,10 @@ def solve_global_LP_relaxation(
     sparse_x_template_library: Optional[SparseConstraintTemplateLibrary] = None,
 ) -> np.ndarray:
     """
-    构建完整 UC LP 松弛（x ∈ [0,1]），加入 V3 代理约束 + BCD theta/zeta 代理约束，求解得 x_LP。
+    构建完整 UC LP 松弛（x ∈ [0,1]），按以下顺序分级尝试代理约束：
+      1. BCD + subproblem 全部硬约束
+      2. 保持 BCD 为硬约束，仅将 subproblem 约束软化到高罚项
+      3. 将 BCD 与 subproblem 都软化到高罚项
 
     Args:
         ppc: PyPower 案例数据
@@ -813,7 +845,7 @@ def solve_global_LP_relaxation(
         trainers: {unit_id: trainer}
         lambda_val: (T,) 功率平衡对偶变量（用于查询代理约束参数）
         agent: （可选）已训练的 Agent_NN_BCD 实例；若提供则额外加入其
-            theta/zeta 参数化代理约束（M-penalty 软约束形式）
+            theta/zeta 参数化代理约束
         sparse_library: （可选）离线筛选出的稀疏参数化约束库。若提供则以
             `lhs(x, pg) - rhs(Pd) <= slack` 的软约束形式加入全局 LP。
         sparse_x_template_library: （可选）x[g,t] 稀疏支持集模板库，以
@@ -828,6 +860,7 @@ def solve_global_LP_relaxation(
         pd_matrix = get_sample_net_load(sample)
     else:
         pd_matrix = pd_data
+    lambda_val = np.asarray(lambda_val, dtype=float).reshape(-1)
 
     ppc_int = ext2int(ppc)
     gen = ppc_int['gen']
@@ -835,23 +868,6 @@ def solve_global_LP_relaxation(
     ng = gen.shape[0]
     T = pd_matrix.shape[1]
     Pd_sum = np.sum(pd_matrix, axis=0)  # (T,)
-
-    model = gp.Model('global_LP_relaxation')
-    model.Params.OutputFlag = 0
-
-    pg = model.addVars(ng, T, lb=0, name='pg')
-    x = model.addVars(ng, T, lb=0, ub=1, name='x')
-    cpower = model.addVars(ng, T, lb=0, name='cpower')
-    coc = model.addVars(ng, T - 1, lb=0, name='coc')   # 启停成本
-
-    # 功率平衡
-    for t in range(T):
-        model.addConstr(
-            gp.quicksum(pg[g, t] for g in range(ng)) == float(Pd_sum[t]),
-            name=f'pb_{t}'
-        )
-
-    # 爬坡参数（与 UnitCommitmentModel 一致）
     Ru = 0.4 * gen[:, PMAX] / T_delta
     Rd = 0.4 * gen[:, PMAX] / T_delta
     Ru_co = 0.3 * gen[:, PMAX]
@@ -861,168 +877,235 @@ def solve_global_LP_relaxation(
     start_cost = gencost[:, 1]   # gencost 第 1 列：启动成本
     shut_cost  = gencost[:, 2]   # gencost 第 2 列：关机成本
 
-    # 代理约束惩罚系数（大 M）：保证 LP 始终可行，违反代理约束时以高代价惩罚
-    # 取值参考 BCD 中 penalty_factor 量级，比发电成本大一个数量级
-    M_SURR = 1e5
-    surr_slacks: list = []          # 收集所有代理约束松弛变量，用于构造惩罚项
-
     T_triples = max(1, T - 2)       # 预计算三时段约束索引范围
+    last_status = None
+    stages = _build_surrogate_relaxation_stages()
 
-    for g in range(ng):
-        # 发电上下限
+    def _infer_agent_theta_zeta(_agent, _sample, _pd_matrix):
+        """Infer sample-specific theta/zeta for the current scenario.
+
+        Fallback order:
+        1. NN forward pass on current sample features
+        2. agent.theta_values / agent.zeta_values static values
+        """
+        theta_fallback = dict(getattr(_agent, 'theta_values', {}) or {})
+        zeta_fallback = dict(getattr(_agent, 'zeta_values', {}) or {})
+
+        if _agent is None:
+            return theta_fallback, zeta_fallback
+
+        theta_net = getattr(_agent, 'theta_net', None)
+        zeta_net = getattr(_agent, 'zeta_net', None)
+        device = getattr(_agent, 'device', None)
+        theta_to_dict = getattr(_agent, '_tensor_to_theta_dict', None)
+        zeta_to_dict = getattr(_agent, '_tensor_to_zeta_dict', None)
+        expected_dim_fn = getattr(_agent, '_get_expected_feature_dim', None)
+
+        if theta_net is None or zeta_net is None or theta_to_dict is None or zeta_to_dict is None:
+            return theta_fallback, zeta_fallback
+
+        try:
+            import torch
+
+            sample_for_features = _sample
+            if sample_for_features is None:
+                sample_for_features = normalize_sample_arrays({'pd_data': _pd_matrix})
+
+            features = np.asarray(get_feature_vector_from_sample(sample_for_features), dtype=np.float32)
+            expected_dim = expected_dim_fn() if callable(expected_dim_fn) else None
+            if expected_dim is not None and features.size != expected_dim:
+                net_load_features = np.asarray(get_sample_net_load(sample_for_features), dtype=np.float32).flatten()
+                if net_load_features.size == expected_dim:
+                    features = net_load_features
+
+            features_tensor = torch.tensor(features, dtype=torch.float32).unsqueeze(0)
+            if device is not None:
+                features_tensor = features_tensor.to(device)
+
+            theta_net.eval()
+            zeta_net.eval()
+            with torch.no_grad():
+                theta_out = theta_net(features_tensor)
+                zeta_out = zeta_net(features_tensor)
+            theta_net.train()
+            zeta_net.train()
+
+            return theta_to_dict(theta_out[0]), zeta_to_dict(zeta_out[0])
+        except Exception:
+            return theta_fallback, zeta_fallback
+
+    for stage_index, stage in enumerate(stages, start=1):
+        model = gp.Model(f"global_LP_relaxation_{stage['name']}")
+        model.Params.OutputFlag = 0
+        model.Params.DualReductions = 0
+
+        pg = model.addVars(ng, T, lb=0, name='pg')
+        x = model.addVars(ng, T, lb=0, ub=1, name='x')
+        cpower = model.addVars(ng, T, lb=0, name='cpower')
+        coc = model.addVars(ng, T - 1, lb=0, name='coc')
+        subproblem_slacks: list = []
+        bcd_slacks: list = []
+
         for t in range(T):
-            model.addConstr(pg[g, t] >= gen[g, PMIN] * x[g, t])
-            model.addConstr(pg[g, t] <= gen[g, PMAX] * x[g, t])
-
-        # 爬坡约束
-        for t in range(1, T):
             model.addConstr(
-                pg[g, t] - pg[g, t-1] <= Ru[g] * x[g, t-1] + Ru_co[g] * (1 - x[g, t-1])
-            )
-            model.addConstr(
-                pg[g, t-1] - pg[g, t] <= Rd[g] * x[g, t] + Rd_co[g] * (1 - x[g, t])
+                gp.quicksum(pg[g, t] for g in range(ng)) == float(Pd_sum[t]),
+                name=f'pb_{t}'
             )
 
-        # 最小开关机时间
-        for tau in range(1, Ton + 1):
-            for t1 in range(T - tau):
-                model.addConstr(x[g, t1+1] - x[g, t1] <= x[g, t1+tau])
-        for tau in range(1, Toff + 1):
-            for t1 in range(T - tau):
-                model.addConstr(-x[g, t1+1] + x[g, t1] <= 1 - x[g, t1+tau])
-
-        # 启停成本（参考 BCD / uc_cplex.py）
-        for t in range(1, T):
-            model.addConstr(
-                coc[g, t-1] >= start_cost[g] * (x[g, t] - x[g, t-1]),
-                name=f'start_cost_{g}_{t}'
-            )
-            model.addConstr(
-                coc[g, t-1] >= shut_cost[g] * (x[g, t-1] - x[g, t]),
-                name=f'shut_cost_{g}_{t}'
-            )
-
-        # 发电成本
-        for t in range(T):
-            model.addConstr(
-                cpower[g, t] >= gencost[g, -2] / T_delta * pg[g, t]
-                               + gencost[g, -1] / T_delta * x[g, t]
-            )
-
-        # V3 全局代理约束（所有已训练机组）——软约束形式（M-penalty）
-        # 参考 BCD 中对原始约束的处理：slack_k >= lhs - delta; obj += M * slack_k
-        # 这样即使代理约束紧张时 LP 仍可行，违背量以大 M 惩罚
-        if g in trainers:
-            alphas, betas, gammas, deltas, *_ = trainers[g].get_surrogate_params(
-                sample if sample is not None else pd_matrix, lambda_val
-            )
-            for k in range(len(alphas)):
-                t_k  = k % T_triples
-                t_k1 = min(t_k + 1, T - 1)
-                t_k2 = min(t_k + 2, T - 1)
-                a = float(alphas[k])
-                b = float(betas[k])
-                c = float(gammas[k])
-                r = float(deltas[k])
-                if abs(a) > 1e-10 or abs(b) > 1e-10 or abs(c) > 1e-10:
-                    slack_k = model.addVar(lb=0, name=f'g{g}_surr_slack_{k}')
-                    model.addConstr(
-                        a * x[g, t_k] + b * x[g, t_k1] + c * x[g, t_k2] - r <= slack_k,
-                        name=f'g{g}_surr_{k}'
-                    )
-                    surr_slacks.append(slack_k)
-
-    # DC 线路潮流约束（PTDF 方法，硬约束）
-    # 假设 pd_data 形状为 (nb, T)，行顺序与 ext2int 后的总线顺序一致
-    try:
-        _PTDF, ptdf_g, branch_limit, active_lines = _build_ptdf_data(ppc_int)
-        ptdf_Pd = _PTDF @ pd_matrix   # (nl, T)：负荷对各线路潮流的贡献
-        for l in active_lines:
-            limit = float(branch_limit[l])
+        for g in range(ng):
             for t in range(T):
-                flow_expr = (
-                    gp.quicksum(float(ptdf_g[l, g]) * pg[g, t] for g in range(ng))
-                    - float(ptdf_Pd[l, t])
-                )
-                model.addConstr(flow_expr <= limit,  name=f'flow_upper_{l}_{t}')
-                model.addConstr(flow_expr >= -limit, name=f'flow_lower_{l}_{t}')
-    except Exception as _dc_err:
-        print(f"  警告: DC 潮流约束构建失败（{_dc_err}），跳过线路约束", flush=True)
+                model.addConstr(pg[g, t] >= gen[g, PMIN] * x[g, t])
+                model.addConstr(pg[g, t] <= gen[g, PMAX] * x[g, t])
 
-    # BCD theta/zeta 代理约束（M-penalty 软约束）
-    # theta 约束：DCPF 参数化约束，形式 Σ theta_{branch,unit,t}*x[unit,t] <= theta_rhs_{branch,t}
-    # zeta  约束：按变量参数化约束，形式 zeta_{unit,t}*x[unit,t] <= zeta_rhs_{unit,t}
-    if agent is not None:
-        _ua = getattr(agent, '_current_union_analysis', None)
-        _tv = getattr(agent, 'theta_values', {}) or {}
-        _zv = getattr(agent, 'zeta_values', {}) or {}
-
-        # --- theta 约束 ---
-        _uc = (_ua or {}).get('union_constraints', [])
-        for _ci in _uc:
-            _bid  = _ci['branch_id']
-            _ts   = _ci['time_slot']
-            _nzc  = _ci.get('nonzero_pg_coefficients', [])
-            _lhs  = gp.LinExpr()
-            for _ci2 in _nzc:
-                _uid   = _ci2['unit_id']
-                _tname = f'theta_branch_{_bid}_unit_{_uid}_time_{_ts}'
-                _coeff = float(_tv.get(_tname, 0.0))
-                if abs(_coeff) > 1e-10 and _uid < ng and _ts < T:
-                    _lhs += _coeff * x[_uid, _ts]
-            _rhs_name = f'theta_rhs_branch_{_bid}_time_{_ts}'
-            _rhs = float(_tv.get(_rhs_name, 1.0))
-            _slack = model.addVar(lb=0, name=f'theta_slack_{_bid}_{_ts}')
-            model.addConstr(_lhs - _rhs <= _slack, name=f'theta_surr_{_bid}_{_ts}')
-            surr_slacks.append(_slack)
-
-        # --- zeta 约束 ---
-        _zuc = (_ua or {}).get('union_zeta_constraints', [])
-        for _zc in _zuc:
-            _uid  = _zc['unit_id']
-            _ts   = _zc['time_slot']
-            _zname = f'zeta_unit_{_uid}_time_{_ts}'
-            _coeff = float(_zv.get(_zname, 0.0))
-            _rhs_name = f'zeta_rhs_unit_{_uid}_time_{_ts}'
-            _rhs = float(_zv.get(_rhs_name, 1.0))
-            if abs(_coeff) > 1e-10 and _uid < ng and _ts < T:
-                _slack = model.addVar(lb=0, name=f'zeta_slack_{_uid}_{_ts}')
+            for t in range(1, T):
                 model.addConstr(
-                    _coeff * x[_uid, _ts] - _rhs <= _slack,
-                    name=f'zeta_surr_{_uid}_{_ts}'
+                    pg[g, t] - pg[g, t-1] <= Ru[g] * x[g, t-1] + Ru_co[g] * (1 - x[g, t-1])
                 )
-                surr_slacks.append(_slack)
+                model.addConstr(
+                    pg[g, t-1] - pg[g, t] <= Rd[g] * x[g, t] + Rd_co[g] * (1 - x[g, t])
+                )
 
-    # 可选的稀疏参数化约束库（M-penalty 软约束）
-    add_sparse_parameterized_constraints(
-        model,
-        x,
-        pg,
-        pd_data,
-        sparse_library=sparse_library,
-        surr_slacks=surr_slacks,
-        name_prefix="sparse",
-    )
-    add_sparse_x_templates_to_model(
-        model,
-        x,
-        template_library=sparse_x_template_library,
-        surr_slacks=surr_slacks,
-        name_prefix="sparse_x",
-    )
+            for tau in range(1, Ton + 1):
+                for t1 in range(T - tau):
+                    model.addConstr(x[g, t1+1] - x[g, t1] <= x[g, t1+tau])
+            for tau in range(1, Toff + 1):
+                for t1 in range(T - tau):
+                    model.addConstr(-x[g, t1+1] + x[g, t1] <= 1 - x[g, t1+tau])
 
-    # 目标：发电成本 + 启停成本 + M × Σ 代理约束违背量（软约束惩罚）
-    obj = (gp.quicksum(cpower[g, t] for g in range(ng) for t in range(T))
-           + gp.quicksum(coc[g, t] for g in range(ng) for t in range(T - 1)))
-    if surr_slacks:
-        obj += M_SURR * gp.quicksum(surr_slacks)
-    model.setObjective(obj, GRB.MINIMIZE)
-    model.optimize()
+            for t in range(1, T):
+                model.addConstr(
+                    coc[g, t-1] >= start_cost[g] * (x[g, t] - x[g, t-1]),
+                    name=f'start_cost_{g}_{t}'
+                )
+                model.addConstr(
+                    coc[g, t-1] >= shut_cost[g] * (x[g, t-1] - x[g, t]),
+                    name=f'shut_cost_{g}_{t}'
+                )
 
-    if model.status == GRB.OPTIMAL:
-        return np.array([[x[g, t].X for t in range(T)] for g in range(ng)])
+            for t in range(T):
+                model.addConstr(
+                    cpower[g, t] >= gencost[g, -2] / T_delta * pg[g, t]
+                                   + gencost[g, -1] / T_delta * x[g, t]
+                )
 
-    print(f"  警告: 全局 LP 松弛求解失败 (status={model.status})，返回零矩阵", flush=True)
+            if g in trainers:
+                alphas, betas, gammas, deltas, *_ = trainers[g].get_surrogate_params(
+                    sample if sample is not None else pd_matrix, lambda_val
+                )
+                for k in range(len(alphas)):
+                    t_k = k % T_triples
+                    t_k1 = min(t_k + 1, T - 1)
+                    t_k2 = min(t_k + 2, T - 1)
+                    a = float(alphas[k])
+                    b = float(betas[k])
+                    c = float(gammas[k])
+                    r = float(deltas[k])
+                    if abs(a) <= 1e-10 and abs(b) <= 1e-10 and abs(c) <= 1e-10:
+                        continue
+                    expr = a * x[g, t_k] + b * x[g, t_k1] + c * x[g, t_k2] - r
+                    if stage['hard_subproblem']:
+                        model.addConstr(expr <= 0.0, name=f'g{g}_surr_{k}')
+                    else:
+                        slack_k = model.addVar(lb=0, name=f'g{g}_surr_slack_{k}')
+                        model.addConstr(expr <= slack_k, name=f'g{g}_surr_{k}')
+                        subproblem_slacks.append(slack_k)
+
+        try:
+            _PTDF, ptdf_g, branch_limit, active_lines = _build_ptdf_data(ppc_int)
+            ptdf_Pd = _PTDF @ pd_matrix
+            for l in active_lines:
+                limit = float(branch_limit[l])
+                for t in range(T):
+                    flow_expr = (
+                        gp.quicksum(float(ptdf_g[l, g]) * pg[g, t] for g in range(ng))
+                        - float(ptdf_Pd[l, t])
+                    )
+                    model.addConstr(flow_expr <= limit, name=f'flow_upper_{l}_{t}')
+                    model.addConstr(flow_expr >= -limit, name=f'flow_lower_{l}_{t}')
+        except Exception as _dc_err:
+            print(f"  警告: DC 潮流约束构建失败（{_dc_err}），跳过线路约束", flush=True)
+
+        if agent is not None:
+            _ua = getattr(agent, '_current_union_analysis', None)
+            _tv, _zv = _infer_agent_theta_zeta(agent, sample, pd_matrix)
+
+            for _ci in (_ua or {}).get('union_constraints', []):
+                _bid = _ci['branch_id']
+                _ts = _ci['time_slot']
+                _lhs = gp.LinExpr()
+                for _ci2 in _ci.get('nonzero_pg_coefficients', []):
+                    _uid = _ci2['unit_id']
+                    _tname = f'theta_branch_{_bid}_unit_{_uid}_time_{_ts}'
+                    _coeff = float(_tv.get(_tname, 0.0))
+                    if abs(_coeff) > 1e-10 and _uid < ng and _ts < T:
+                        _lhs += _coeff * x[_uid, _ts]
+                _rhs_name = f'theta_rhs_branch_{_bid}_time_{_ts}'
+                _rhs = float(_tv.get(_rhs_name, 1.0))
+                expr = _lhs - _rhs
+                if stage['hard_bcd']:
+                    model.addConstr(expr <= 0.0, name=f'theta_surr_{_bid}_{_ts}')
+                else:
+                    _slack = model.addVar(lb=0, name=f'theta_slack_{_bid}_{_ts}')
+                    model.addConstr(expr <= _slack, name=f'theta_surr_{_bid}_{_ts}')
+                    bcd_slacks.append(_slack)
+
+            for _zc in (_ua or {}).get('union_zeta_constraints', []):
+                _uid = _zc['unit_id']
+                _ts = _zc['time_slot']
+                _zname = f'zeta_unit_{_uid}_time_{_ts}'
+                _coeff = float(_zv.get(_zname, 0.0))
+                _rhs_name = f'zeta_rhs_unit_{_uid}_time_{_ts}'
+                _rhs = float(_zv.get(_rhs_name, 1.0))
+                if abs(_coeff) <= 1e-10 or _uid >= ng or _ts >= T:
+                    continue
+                expr = _coeff * x[_uid, _ts] - _rhs
+                if stage['hard_bcd']:
+                    model.addConstr(expr <= 0.0, name=f'zeta_surr_{_uid}_{_ts}')
+                else:
+                    _slack = model.addVar(lb=0, name=f'zeta_slack_{_uid}_{_ts}')
+                    model.addConstr(expr <= _slack, name=f'zeta_surr_{_uid}_{_ts}')
+                    bcd_slacks.append(_slack)
+
+        soft_slacks = subproblem_slacks + bcd_slacks
+        add_sparse_parameterized_constraints(
+            model,
+            x,
+            pg,
+            pd_data,
+            sparse_library=sparse_library,
+            surr_slacks=soft_slacks,
+            name_prefix="sparse",
+        )
+        add_sparse_x_templates_to_model(
+            model,
+            x,
+            template_library=sparse_x_template_library,
+            surr_slacks=soft_slacks,
+            name_prefix="sparse_x",
+        )
+
+        obj = (gp.quicksum(cpower[g, t] for g in range(ng) for t in range(T))
+               + gp.quicksum(coc[g, t] for g in range(ng) for t in range(T - 1)))
+        if subproblem_slacks:
+            obj += stage['penalty_subproblem'] * gp.quicksum(subproblem_slacks)
+        if bcd_slacks:
+            obj += stage['penalty_bcd'] * gp.quicksum(bcd_slacks)
+        model.setObjective(obj, GRB.MINIMIZE)
+        model.optimize()
+
+        last_status = model.status
+        if model.status == GRB.OPTIMAL:
+            if stage_index > 1:
+                print(f"  全局 LP 使用回退阶段求解成功: {stage['name']}", flush=True)
+            return np.array([[x[g, t].X for t in range(T)] for g in range(ng)])
+
+        if stage_index < len(stages):
+            print(
+                f"  全局 LP 阶段 {stage['name']} 不可用 (status={model.status})，尝试下一阶段",
+                flush=True
+            )
+
+    print(f"  警告: 全局 LP 松弛求解失败 (status={last_status})，返回零矩阵", flush=True)
     return np.zeros((ng, T))
 
 def solve_global_LP_relaxation_without_surrogate(
@@ -1478,6 +1561,7 @@ def recover_integer_solution(
     lambda_predictor,
     ppc: dict,
     T_delta: float,
+    agent=None,
     manager=None,
     sparse_library: Optional[SparseSurrogateLibrary] = None,
     sparse_x_template_library: Optional[SparseConstraintTemplateLibrary] = None,
@@ -1569,6 +1653,7 @@ def recover_integer_solution(
             T_delta,
             trainers,
             lambda_val,
+            agent=agent,
             sparse_library=sparse_library,
             sparse_x_template_library=sparse_x_template_library,
         )

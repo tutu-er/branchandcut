@@ -510,8 +510,10 @@ def plot_bcd_analysis(agent, fig_dir: Path, case_name: str) -> None:
     _apply_style()
 
     # ── 图 1：θ / ζ 参数直方图 ────────────────────────────
-    has_theta = hasattr(agent, 'theta_values') and bool(agent.theta_values)
-    has_zeta  = hasattr(agent, 'zeta_values')  and bool(agent.zeta_values)
+    theta_vals = _collect_bcd_param_values(agent, "theta")
+    zeta_vals = _collect_bcd_param_values(agent, "zeta")
+    has_theta = theta_vals.size > 0
+    has_zeta  = zeta_vals.size > 0
 
     if has_theta or has_zeta:
         log("绘制图1：θ / ζ 参数直方图...")
@@ -526,12 +528,12 @@ def plot_bcd_analysis(agent, fig_dir: Path, case_name: str) -> None:
 
         ax_idx = 0
         for flag, attr, label, color in [
-            (has_theta, 'theta_values', r'$\theta$ Values', '#2166AC'),
-            (has_zeta,  'zeta_values',  r'$\zeta$ Values',  '#D6604D'),
+            (has_theta, theta_vals, r'$\theta$ Values', '#2166AC'),
+            (has_zeta,  zeta_vals,  r'$\zeta$ Values',  '#D6604D'),
         ]:
             if not flag:
                 continue
-            vals = np.array(list(getattr(agent, attr).values()), dtype=float)
+            vals = np.asarray(attr, dtype=float)
             ax = axes1[ax_idx]
             n_bins = min(50, max(10, len(vals) // 5))
             ax.hist(vals, bins=n_bins, color=color, alpha=0.72,
@@ -702,9 +704,9 @@ def plot_both_analysis(agent, trainers: dict, fig_dir: Path, case_name: str) -> 
 
     # ── (c) BCD θ 分布 ─────────────────────────────────────
     ax_c = axes[1, 0]
-    has_theta = hasattr(agent, 'theta_values') and bool(agent.theta_values)
+    theta_vals = _collect_bcd_param_values(agent, "theta")
+    has_theta = theta_vals.size > 0
     if has_theta:
-        theta_vals = np.array(list(agent.theta_values.values()), dtype=float)
         n_bins = min(50, max(10, len(theta_vals) // 5))
         ax_c.hist(theta_vals, bins=n_bins, color='#2166AC', alpha=0.65,
                   edgecolor='white', linewidth=0.5, density=True)
@@ -728,9 +730,9 @@ def plot_both_analysis(agent, trainers: dict, fig_dir: Path, case_name: str) -> 
 
     # ── (d) BCD ζ 分布 ─────────────────────────────────────
     ax_d = axes[1, 1]
-    has_zeta = hasattr(agent, 'zeta_values') and bool(agent.zeta_values)
+    zeta_vals = _collect_bcd_param_values(agent, "zeta")
+    has_zeta = zeta_vals.size > 0
     if has_zeta:
-        zeta_vals = np.array(list(agent.zeta_values.values()), dtype=float)
         n_bins = min(50, max(10, len(zeta_vals) // 5))
         ax_d.hist(zeta_vals, bins=n_bins, color='#D6604D', alpha=0.65,
                   edgecolor='white', linewidth=0.5, density=True)
@@ -956,7 +958,7 @@ def run_lp_compare_test(ppc, all_samples: list, dual_predictor, trainers: dict,
         try:
             lambda_val = dual_predictor.predict(pd_data)
             x_LP_init = solve_global_LP_relaxation_without_surrogate(ppc, pd_data, T_DELTA)
-            x_LP = solve_global_LP_relaxation(ppc, pd_data, T_DELTA, trainers, lambda_val,
+            x_LP = solve_global_LP_relaxation(ppc, sample, T_DELTA, trainers, lambda_val,
                                               agent=agent)
         except Exception as e:
             log(f"    LP 求解失败: {e}")
@@ -986,7 +988,7 @@ def run_lp_compare_test(ppc, all_samples: list, dual_predictor, trainers: dict,
 
 
 def run_fp_test(ppc, all_samples: list, dual_predictor, trainers: dict,
-                T_DELTA: float, n_test: int) -> list:
+                T_DELTA: float, n_test: int, agent=None) -> list:
     """对多个样本运行可行性泵并汇总结果。"""
     test_n = min(n_test, len(all_samples))
     print("\n" + "=" * 70)
@@ -1001,6 +1003,7 @@ def run_fp_test(ppc, all_samples: list, dual_predictor, trainers: dict,
         try:
             x_result, success = recover_integer_solution(
                 sample, trainers, dual_predictor, ppc, T_DELTA,
+                agent=agent,
                 verbose=True,
             )
         except Exception as e:
@@ -1076,17 +1079,41 @@ def _print_bcd_stats(agent) -> None:
         total_params = sum(p.numel() for p in agent.zeta_net.parameters())
         log(f"  zeta_net  参数量: {total_params:,}")
 
-    if hasattr(agent, 'theta_values') and agent.theta_values:
-        vals = np.array(list(agent.theta_values.values()), dtype=float)
+    theta_vals = _collect_bcd_param_values(agent, "theta")
+    if theta_vals.size > 0:
+        vals = theta_vals
         log(f"  theta_values 数量: {len(vals)}，"
             f"均值={vals.mean():.4f}，标准差={vals.std():.4f}，"
             f"范围=[{vals.min():.4f}, {vals.max():.4f}]")
 
-    if hasattr(agent, 'zeta_values') and agent.zeta_values:
-        vals = np.array(list(agent.zeta_values.values()), dtype=float)
+    zeta_vals = _collect_bcd_param_values(agent, "zeta")
+    if zeta_vals.size > 0:
+        vals = zeta_vals
         log(f"  zeta_values  数量: {len(vals)}，"
             f"均值={vals.mean():.4f}，标准差={vals.std():.4f}，"
             f"范围=[{vals.min():.4f}, {vals.max():.4f}]")
+
+
+def _collect_bcd_param_values(agent, prefix: str) -> np.ndarray:
+    """Collect sample-specific theta/zeta values; fall back to the legacy single-sample dict."""
+    values_list_attr = f"{prefix}_values_list"
+    single_attr = f"{prefix}_values"
+
+    if hasattr(agent, values_list_attr):
+        values_list = getattr(agent, values_list_attr)
+        flat_vals = []
+        for values in values_list or []:
+            if values:
+                flat_vals.extend(float(v) for v in values.values())
+        if flat_vals:
+            return np.asarray(flat_vals, dtype=float)
+
+    if hasattr(agent, single_attr):
+        values = getattr(agent, single_attr)
+        if values:
+            return np.asarray(list(values.values()), dtype=float)
+
+    return np.asarray([], dtype=float)
 
 
 def _load_bcd_agent(ppc, data_file: Path, bcd_model_path: str,
@@ -1258,7 +1285,9 @@ def plot_lp_surrogate_bar(
 
 
 def analyse_lp_distance(agent, test_n: int, fig_dir: Path,
-                        case_name: str) -> None:
+                        case_name: str, ppc=None, all_samples=None,
+                        dual_predictor=None, trainers=None,
+                        T_DELTA: float | None = None) -> None:
     """计算并对比标准 LP 松弛 vs 含代理约束 LP 与最优解的距离。
 
     对每个样本求解两种 LP，计算 L1 距离和舍入 Hamming 距离，
@@ -1285,15 +1314,31 @@ def analyse_lp_distance(agent, test_n: int, fig_dir: Path,
     x_opt_list: list[np.ndarray] = []
     valid_ids: list[int] = []
 
+    use_joint_surrogate = (
+        ppc is not None and all_samples is not None and dual_predictor is not None
+        and trainers is not None and T_DELTA is not None
+    )
+
     for i in range(n):
         sol_lp = agent.solve_LP_without_theta_constraints(i)
-        sol_surr = agent.solve_LP_with_theta_constraints(i)
-        if sol_lp is None or sol_surr is None:
+        if sol_lp is None:
             log(f"  样本 {i}: LP 求解失败，跳过")
             continue
 
         x_lp = sol_lp[1]       # (ng, T)
-        x_surr = sol_surr[1]   # (ng, T)
+        if use_joint_surrogate:
+            sample = all_samples[i]
+            pd_data = sample['pd_data']
+            lambda_val = dual_predictor.predict(pd_data)
+            x_surr = solve_global_LP_relaxation(
+                ppc, sample, T_DELTA, trainers, lambda_val, agent=agent
+            )
+        else:
+            sol_surr = agent.solve_LP_with_theta_constraints(i)
+            if sol_surr is None:
+                log(f"  sample {i}: surrogate LP solve failed, skip")
+                continue
+            x_surr = sol_surr[1]   # (ng, T)
         x_opt = agent.x_opt[i] # (ng, T)
 
         # L1 距离
@@ -1452,12 +1497,16 @@ def test_both(ppc, data_file: Path, all_samples: list, T_DELTA: float,
     log("── Step 4/4  LP 松弛解质量评估（FP 前置分析）")
     run_lp_compare_test(ppc, all_samples, dual_predictor, trainers,
                         T_DELTA, test_samples, fig_dir, agent=agent)
-    analyse_lp_distance(agent, test_samples, fig_dir, CASE_NAME)
+    analyse_lp_distance(
+        agent, test_samples, fig_dir, CASE_NAME,
+        ppc=ppc, all_samples=all_samples, dual_predictor=dual_predictor,
+        trainers=trainers, T_DELTA=T_DELTA,
+    )
 
     if RUN_FP:
         log("── Step 4/4  以全体代理约束运行可行性泵")
         fp_results = run_fp_test(
-            ppc, all_samples, dual_predictor, trainers, T_DELTA, test_samples
+            ppc, all_samples, dual_predictor, trainers, T_DELTA, test_samples, agent=agent
         )
         plot_fp_results(fp_results, fig_dir, CASE_NAME)
     else:
