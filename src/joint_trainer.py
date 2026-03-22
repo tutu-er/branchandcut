@@ -85,6 +85,63 @@ class JointLPTrainer:
                 for g, trainer in self.trainers.items()
             }
 
+        self._normalize_agent_lambdas()
+
+    def _create_empty_lambda_dict(self) -> Dict[str, np.ndarray]:
+        """Create a zero-filled dual variable dictionary with canonical shapes."""
+        Ton = min(4, self.T)
+        Toff = min(4, self.T)
+        return {
+            'lambda_power_balance': np.zeros(self.T),
+            'lambda_pg_lower': np.zeros((self.ng, self.T)),
+            'lambda_pg_upper': np.zeros((self.ng, self.T)),
+            'lambda_ramp_up': np.zeros((self.ng, self.T - 1)),
+            'lambda_ramp_down': np.zeros((self.ng, self.T - 1)),
+            'lambda_min_on': np.zeros((self.ng, Ton, self.T)),
+            'lambda_min_off': np.zeros((self.ng, Toff, self.T)),
+            'lambda_start_cost': np.zeros((self.ng, self.T - 1)),
+            'lambda_shut_cost': np.zeros((self.ng, self.T - 1)),
+            'lambda_coc_nonneg': np.zeros((self.ng, self.T - 1)),
+            'lambda_cpower': np.zeros((self.ng, self.T)),
+            'lambda_dcpf_upper': np.zeros((self.nl, self.T)),
+            'lambda_dcpf_lower': np.zeros((self.nl, self.T)),
+            'lambda_x_upper': np.zeros((self.ng, self.T)),
+            'lambda_x_lower': np.zeros((self.ng, self.T)),
+        }
+
+    def _normalize_lambda_dict(self, raw_lambda) -> Dict[str, np.ndarray]:
+        """Coerce a raw lambda dict to canonical shapes, padding invalid/missing fields with zeros."""
+        if hasattr(self.agent, '_normalize_lambda_from_data'):
+            normalized = self.agent._normalize_lambda_from_data(raw_lambda)
+            if normalized is not None:
+                return normalized
+
+        empty = self._create_empty_lambda_dict()
+        if not isinstance(raw_lambda, dict):
+            return empty
+
+        normalized: Dict[str, np.ndarray] = {}
+        for key, default in empty.items():
+            value = raw_lambda.get(key)
+            arr = np.asarray(value, dtype=float) if value is not None else None
+            normalized[key] = arr if arr is not None and arr.shape == default.shape else default.copy()
+        return normalized
+
+    def _normalize_agent_lambdas(self) -> None:
+        """Ensure agent.lambda_ entries always match the shapes expected by joint training."""
+        raw_lambdas = getattr(self.agent, 'lambda_', None)
+        if raw_lambdas is None:
+            self.agent.lambda_ = [self._create_empty_lambda_dict() for _ in range(self.n_samples)]
+            return
+
+        normalized = [self._normalize_lambda_dict(lam) for lam in raw_lambdas[:self.n_samples]]
+        if len(normalized) < self.n_samples:
+            normalized.extend(
+                self._create_empty_lambda_dict()
+                for _ in range(self.n_samples - len(normalized))
+            )
+        self.agent.lambda_ = normalized
+
     # ------------------------------------------------------------------ #
     #  PG块：更新 x, pg, cpower, coc
     # ------------------------------------------------------------------ #

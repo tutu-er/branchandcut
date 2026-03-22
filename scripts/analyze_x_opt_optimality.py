@@ -46,7 +46,7 @@ except ModuleNotFoundError:
 
 DEFAULT_CASE = "case30"
 DEFAULT_DATA = "result/active_set/active_sets_case30_T24_n340_20260317_152540.json"
-DEFAULT_BCD_MODEL = "result/bcd_models/bcd_model_case30_20260318_000506.pth"
+DEFAULT_BCD_MODEL = "result/bcd_models/bcd_model_case30_20260322_150043.pth"
 DEFAULT_T_DELTA = 1.0
 DEFAULT_TOL = 1e-6
 DEFAULT_NUM_SAMPLES = 20

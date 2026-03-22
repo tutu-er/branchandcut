@@ -82,6 +82,7 @@ try:
         train_dual_predictor_from_data,
         SubproblemSurrogateTrainer,
         ActiveSetReader,
+        load_trained_models,
     )
     from uc_NN_subproblem_parallel import ParallelSubproblemSurrogateTrainer
     from mti118_data_loader import load_case118_ppc_with_mti_limits
@@ -231,6 +232,29 @@ def run_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS,
         if save_dir:
             trainer.save(os.path.join(save_dir, f'surrogate_unit_{g}.pth'))
 
+    return dual_predictor, trainers
+
+
+def load_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS, load_dir,
+                   logger: 'TrainingLogger | None' = None):
+    """加载已有 dual_predictor 和 subproblem surrogate 模型。"""
+    load_path = Path(load_dir)
+    if not load_path.is_absolute():
+        load_path = Path(__file__).parent / load_path
+    if not load_path.exists():
+        raise FileNotFoundError(f"surrogate 模型目录不存在: {load_path}")
+
+    log(f"从已有目录加载 subproblem 模型，跳过 subproblem 训练: {load_path}")
+    dual_predictor, trainers = load_trained_models(
+        ppc,
+        all_samples,
+        T_DELTA,
+        load_dir=str(load_path),
+        unit_ids=UNIT_IDS,
+    )
+    if logger is not None:
+        for trainer in trainers.values():
+            trainer.logger = logger
     return dual_predictor, trainers
 
 
@@ -478,6 +502,7 @@ def main():
     JOINT_DUAL_DECAY_ROUND = 0     # 联合BCD训练dual_para_bound衰减轮次
     ACTIVE_SETS_FILE = None          # 指定 active_sets JSON 文件路径（None=自动查找最新）
     BCD_MODEL_FILE   = "result/bcd_models/bcd_model_case30_20260318_000506.pth"           # 指定已有 BCD 模型 .pth 文件路径（None=从头训练；both 模式下可跳过 BCD 训练）
+    SURROGATE_MODEL_DIR = None       # 指定已有 subproblem 模型目录（含 dual_predictor.pth 和 surrogate_unit_*.pth；None=从头训练；both 模式下可跳过 subproblem 训练）
     SPARSE_TOP_K_VARIABLES = 20      # sparse 支持发现：保留的高价值 x[g,t] 变量数量
     SPARSE_MAX_GROUPS = 5            # sparse 支持发现：构造的支持集模板数量上限
     SPARSE_GROUP_SIZE = 3            # sparse 支持发现：每条模板最多包含多少个参与变量
@@ -662,13 +687,19 @@ def main():
             T_from_data = all_samples[0]['pd_data'].shape[1]
             log(f"  样本 T={T_from_data}，使用 {len(all_samples)} 个样本")
 
-            # Step 3: surrogate 训练（与 surrogate 模式一致，自行 LP 求解对偶变量）
+            # Step 3: surrogate 训练（或从已有模型加载跳过）
             # BCD 的对偶变量仅在后续联合训练中使用，不注入 subproblem 训练
-            dual_predictor, trainers = run_surrogate(
-                ppc, all_samples, T_DELTA, UNIT_IDS,
-                DUAL_EPOCHS, DUAL_BATCH_SIZE, MAX_ITER, NN_EPOCHS, save_dir,
-                n_workers=N_WORKERS_SUBPROBLEM, logger=logger,
-            )
+            if SURROGATE_MODEL_DIR is not None:
+                dual_predictor, trainers = load_surrogate(
+                    ppc, all_samples, T_DELTA, UNIT_IDS,
+                    SURROGATE_MODEL_DIR, logger=logger,
+                )
+            else:
+                dual_predictor, trainers = run_surrogate(
+                    ppc, all_samples, T_DELTA, UNIT_IDS,
+                    DUAL_EPOCHS, DUAL_BATCH_SIZE, MAX_ITER, NN_EPOCHS, save_dir,
+                    n_workers=N_WORKERS_SUBPROBLEM, logger=logger,
+                )
             print_surrogate_results(trainers, all_samples)
 
             # Step 4: 联合BCD训练（theta/zeta + surrogate 约束，BCD迭代）
