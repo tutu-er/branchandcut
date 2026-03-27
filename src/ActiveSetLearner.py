@@ -28,7 +28,7 @@ root_dir = Path(__file__).resolve().parent.parent
 sys.path.append(str(root_dir))
 
 from src.case39_pypower import get_case39_pypower
-from src.case3_uc_data import get_case3_uc_ppc
+from src.case3_uc_data import get_case3_uc_ppc, get_case3lite_uc_ppc
 from src.case30_uc_data import get_case30_uc_ppc
 from src.uc_gurobipy import UnitCommitmentModel
 from src.ed_gurobipy import EconomicDispatchGurobi
@@ -89,6 +89,8 @@ class ActiveSetLearner:
         self.M = 1
         if ppc is None and case_name == 'case3':
             ppc = get_case3_uc_ppc()
+        if ppc is None and case_name == 'case3lite':
+            ppc = get_case3lite_uc_ppc()
         if ppc is None and case_name == 'case30':
             ppc = get_case30_uc_ppc()
         self.ppc = ppc

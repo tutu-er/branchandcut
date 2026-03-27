@@ -15,7 +15,7 @@ sys.path.append(str(ROOT))
 
 from src.ActiveSetLearner import ActiveSetLearner
 from src.active_set_learner_parallel import ParallelActiveSetLearner
-from src.case_registry import build_case3_base_load, build_case30_base_load
+from src.case_registry import build_case3_base_load, build_case3lite_base_load, build_case30_base_load
 from src.mti118_data_loader import (
     build_case118_daily_samples,
     load_case118_ppc_with_mti_limits,
@@ -156,6 +156,39 @@ def run_case3(
     return learner.save_active_sets_json(filename=output)
 
 
+def run_case3lite(
+    horizon: int = 24,
+    max_samples: int = 200,
+    target_samples: int | None = None,
+    alpha: float = 0.75,
+    delta: float = 0.15,
+    epsilon: float = 0.15,
+    t_delta: float = 1.0,
+    parallel: bool = False,
+    n_workers: int = 4,
+    gurobi_threads: int = 2,
+    verbose_solver: bool = False,
+    output: str | None = None,
+) -> str:
+    ppc, base_load = build_case3lite_base_load(horizon)
+    learner = build_learner(
+        parallel=parallel,
+        alpha=alpha,
+        delta=delta,
+        epsilon=epsilon,
+        ppc=ppc,
+        t_delta=t_delta,
+        pd_data=base_load,
+        case_name="case3lite",
+        n_workers=n_workers,
+        gurobi_threads=gurobi_threads,
+        verbose_solver=verbose_solver,
+    )
+    active_sets = learner.run(max_samples=max_samples, target_samples=target_samples)
+    print(f"case3lite active sets: {len(active_sets)}", flush=True)
+    return learner.save_active_sets_json(filename=output)
+
+
 def run_case118(
     market: str = "DA",
     horizon: int = 24,
@@ -221,6 +254,21 @@ def main() -> None:
 
     if case_name == "case3":
         output_path = run_case3(
+            horizon=24,
+            max_samples=max_samples,
+            target_samples=target_samples,
+            alpha=0.70,
+            delta=0.05,
+            epsilon=0.10,
+            t_delta=1.0,
+            parallel=False,
+            n_workers=4,
+            gurobi_threads=2,
+            verbose_solver=False,
+            output=None,
+        )
+    elif case_name == "case3lite":
+        output_path = run_case3lite(
             horizon=24,
             max_samples=max_samples,
             target_samples=target_samples,

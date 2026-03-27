@@ -52,6 +52,52 @@ def get_case3_uc_ppc() -> dict:
     }
 
 
+def get_case3lite_uc_ppc() -> dict:
+    """Return a milder 3-bus / 3-generator UC case that still yields mixed commitment regimes.
+
+    Compared with ``case3``, this variant eases the network and capacity pressure:
+    lower effective peak load, slightly looser line limits, and a less punitive peaker.
+    The goal is to keep multiple commitment patterns while avoiding the most aggressive
+    congestion/capacity behavior of the current ``case3`` setting.
+    """
+    return {
+        "version": "2",
+        "baseMVA": 100.0,
+        "bus": np.array(
+            [
+                [1, 3, 0.0, 0.0, 0.0, 0.0, 1, 1.00, 0.0, 230.0, 1, 1.05, 0.95],
+                [2, 2, 84.0, 28.0, 0.0, 0.0, 1, 1.00, 0.0, 230.0, 1, 1.05, 0.95],
+                [3, 2, 66.0, 22.0, 0.0, 0.0, 1, 1.00, 0.0, 230.0, 1, 1.05, 0.95],
+            ],
+            dtype=float,
+        ),
+        "gen": np.array(
+            [
+                [1, 70.0, 0.0, 100.0, -100.0, 1.00, 100.0, 1, 135.0, 58.0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                [2, 50.0, 0.0, 100.0, -100.0, 1.00, 100.0, 1, 102.0, 15.0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                [3, 18.0, 0.0, 100.0, -100.0, 1.00, 100.0, 1, 50.0, 5.0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            ],
+            dtype=float,
+        ),
+        "branch": np.array(
+            [
+                [1, 2, 0.0100, 0.1200, 0.020, 90.0, 90.0, 90.0, 0.0, 0.0, 1, -360.0, 360.0],
+                [1, 3, 0.0125, 0.1500, 0.025, 70.0, 70.0, 70.0, 0.0, 0.0, 1, -360.0, 360.0],
+                [2, 3, 0.0075, 0.1000, 0.015, 50.0, 50.0, 50.0, 0.0, 0.0, 1, -360.0, 360.0],
+            ],
+            dtype=float,
+        ),
+        "gencost": np.array(
+            [
+                [2, 130.0, 65.0, 3, 0.0110, 1.80, 110.0],
+                [2, 28.0, 14.0, 3, 0.0140, 2.35, 6.0],
+                [2, 10.0, 5.0, 3, 0.0400, 4.20, 2.0],
+            ],
+            dtype=float,
+        ),
+    }
+
+
 def apply_case3_uc_costs(ppc: dict) -> dict:
     """Overwrite gencost with the canonical case3 UC cost table."""
     ppc_uc = copy.deepcopy(ppc)

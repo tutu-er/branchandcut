@@ -33,7 +33,7 @@ def check_and_install_dependencies():
             print(f"[OK] {import_name}")
         except ImportError:
             missing.append(package_name)
-            print(f"[MISS] {import_name} 未安�?")
+            print(f"[MISS] {import_name} 未安装")
 
     if missing:
         print(f"\n缺少依赖: {', '.join(missing)}")
@@ -65,17 +65,27 @@ if not check_and_install_dependencies_safe():
 #   'bcd'       - 加载 BCD 神经网络模型并报告参数统�?
 #   'both'      - 联合加载 BCD + surrogate，以全体代理约束评估（需同时配置下面两个路径�?
 #
-MODE      = 'surrogate'
+MODE      = 'bcd'
 RUN_FP    = True       # surrogate / both 模式：是否运行可行性泵测试
-CASE_NAME = 'case30'   # 'case14' / 'case30' / 'case39' / 'case118'
+CASE_NAME = 'case3'   # 'case3' / 'case3lite' / 'case14' / 'case30' / 'case39' / 'case118'
 SURROGATE_CONSTRAINT_STRATEGY = 'sensitive'  # 'sensitive' / 'all'
+BCD_LAMBDA_INIT_STRATEGY = 'lp_relaxation'   # 'lp_relaxation' / 'ed_on_x_opt'
+THETA_HOT_START_STRATEGY = 'dcpf_relative'   # 'dcpf_relative' / 'gaussian'
+ZETA_HOT_START_STRATEGY = 'zero'             # 'zero' / 'gaussian'
+THETA_GAUSSIAN_STD = 0.01
+ZETA_GAUSSIAN_STD = 0.01
+BCD_RHO_PRIMAL_INIT = 1e-2
+BCD_RHO_DUAL_INIT = 1e-2
+BCD_RHO_OPT_INIT = 1e-2
+BCD_MAX_THETA_CONSTRAINTS_PER_TIME_SLOT = 10
+BCD_GAMMA_BASE = 1e-2
 
 # surrogate / both 模式：已训练 surrogate 模型目录（训练时输出的带时间戳路径）
 MODEL_DIR = 'result/subproblem_models/subproblem_models_case30_20260322_192148'
 
 # bcd / both 模式：已训练 BCD 模型 .pth 文件路径
 # BCD_MODEL_PATH = 'result/bcd_models/bcd_model_case30_20260322_150043.pth'
-BCD_MODEL_PATH = 'result/bcd_models/bcd_model_case30_20260322_192148.pth'
+BCD_MODEL_PATH = 'result/bcd_models/bcd_model_case3_20260327_154458.pth'
 
 TEST_SAMPLES_DEFAULT = 3
 TEST_SAMPLES = TEST_SAMPLES_DEFAULT
@@ -87,7 +97,7 @@ FP_MAX_UNIT_COMBINATION_CANDIDATES = 12
 FP_MAX_NEARBY_COMMITMENT_HOT_STARTS = 4
 FP_NEARBY_COMMITMENT_POOL_SIZE = 12
 FP_PARALLEL_STARTS = 2
-ACTIVE_SETS_FILE = 'result/active_set/active_sets_case30_T24_n53_20260322_172141.json'  # 指定 active_sets JSON 文件路径（None=自动查找最新）
+ACTIVE_SETS_FILE = 'result/active_set/active_sets_case3_T24_n200_20260327_120417.json'  # 指定 active_sets JSON 文件路径（None=自动查找最新）
 
 # ──────────────────────── 导入 ────────────────────────
 
@@ -223,7 +233,7 @@ def pick_data_file(result_dir: Path, case_name: str) -> Path:
         return specific[-1]
     any_files = sorted(result_dir.glob('active_sets_*.json'))
     if any_files:
-        log(f"未找�?{case_name} 专属文件，使�? {any_files[-1].name}")
+        log(f"未找到 {case_name} 专属文件，使用 {any_files[-1].name}")
         return any_files[-1]
     return None
 
@@ -270,7 +280,7 @@ def _save_fig(fig: 'plt.Figure', path: Path, label: str) -> None:
     fig.savefig(str(path.with_suffix('.png')))
     fig.savefig(str(path.with_suffix('.pdf')))
     plt.close(fig)
-    log(f"  图像已保�? {path.with_suffix('.png')} / .pdf  [{label}]")
+    log(f"  图像已保存: {path.with_suffix('.png')} / .pdf  [{label}]")
 
 
 def plot_surrogate_analysis(trainers: dict, all_samples: list,
@@ -292,7 +302,7 @@ def plot_surrogate_analysis(trainers: dict, all_samples: list,
     n_units = len(unit_ids)
 
     # ── �?1：代理约束系数分布（2×2 violin�?─────────────────
-    log("绘制�?：代理约束系数分�?..")
+    log("绘制图1：代理约束系数分布...")
     fig1, axes = plt.subplots(2, 2, figsize=(9, 6))
     fig1.suptitle(
         f'Surrogate Constraint Coefficient Distributions  [{case_name}]',
@@ -339,7 +349,7 @@ def plot_surrogate_analysis(trainers: dict, all_samples: list,
     _save_fig(fig1, fig_dir / f'{case_name}_surrogate_coefficients', '系数分布')
 
     # ── �?2：约束违反热图（units × time�?────────────────────
-    log("绘制�?：约束违反热�?..")
+    log("绘制图2：约束违反热图...")
     # 取所有单元中最小的 nc 作为公共时间�?
     nc_list = [trainers[uid].num_coupling_constraints for uid in unit_ids]
     nc_common = min(nc_list)
@@ -399,7 +409,7 @@ def plot_surrogate_analysis(trainers: dict, all_samples: list,
     _save_fig(fig2, fig_dir / f'{case_name}_surrogate_violation_heatmap', '违反热图')
 
     # ── �?3：整数性得分（每机组，跨样本均�?± 标准差） ─────
-    log("绘制�?：整数性得�?..")
+    log("绘制图3：整数性得分...")
     integ_means, integ_stds = [], []
     for uid in unit_ids:
         tr = trainers[uid]
@@ -532,7 +542,7 @@ def plot_bcd_analysis(agent, fig_dir: Path, case_name: str) -> None:
     has_zeta  = zeta_vals.size > 0
 
     if has_theta or has_zeta:
-        log("绘制�?：�?/ ζ 参数直方�?..")
+        log("绘制图1：theta / zeta 参数直方图...")
         ncols = int(has_theta) + int(has_zeta)
         fig1, axes1 = plt.subplots(1, ncols, figsize=(5 * ncols, 4))
         if ncols == 1:
@@ -590,7 +600,7 @@ def plot_bcd_analysis(agent, fig_dir: Path, case_name: str) -> None:
     if not net_specs:
         return
 
-    log("绘制�?：神经网络权重层分布...")
+    log("绘制图2：神经网络权重层分布...")
     n_nets = len(net_specs)
     fig2, axes2 = plt.subplots(1, n_nets, figsize=(6 * n_nets, 5))
     if n_nets == 1:
@@ -790,10 +800,10 @@ def print_surrogate_results(trainers: dict, all_samples: list) -> None:
               f"(期望: ({n_samples}, {nc}))")
         print(f"  beta_values  shape: {trainer.beta_values.shape}")
         print(f"  gamma_values shape: {trainer.gamma_values.shape}")
-        print(f"  delta_values shape: {trainer.delta_values.shape}  (RHS，非�?")
+        print(f"  delta_values shape: {trainer.delta_values.shape}  (RHS，非负)")
 
         x0 = trainer.x[0]
-        print(f"  样本0 时序约束示例（最�?条）:")
+        print(f"  样本0 时序约束示例（最多5条）:")
         for t in range(min(5, nc)):
             if t + 2 >= T:
                 break
@@ -808,7 +818,7 @@ def print_surrogate_results(trainers: dict, all_samples: list) -> None:
                   f"(lhs={lhs:.3f}, viol={viol:.4f})")
 
         integrality = float(np.sum(x0 * (1 - x0)))
-        print(f"  整数性指�?样本0): {integrality:.6f}  (0=完全整数)")
+        print(f"  整数性指标(样本0): {integrality:.6f}  (0=完全整数)")
 
 
 def _extract_true_solution(sample: dict, shape: tuple) -> np.ndarray:
@@ -1109,7 +1119,7 @@ def test_surrogate(ppc, all_samples: list, T_DELTA: float,
     print("=" * 70)
 
     if not Path(model_dir).exists():
-        log(f"错误: 模型目录不存�? {model_dir}")
+        log(f"错误: 模型目录不存在: {model_dir}")
         log("请先运行 run_training.py 生成模型，或修改 MODEL_DIR 配置")
         sys.exit(1)
 
@@ -1120,18 +1130,16 @@ def test_surrogate(ppc, all_samples: list, T_DELTA: float,
         constraint_generation_strategy=constraint_generation_strategy,
     )
 
-    log(f"已加�?{len(trainers)} 个机组的代理约束模型")
+    log(f"已加载 {len(trainers)} 个机组的代理约束模型")
     print_surrogate_results(trainers, all_samples[:TEST_SAMPLES])
 
-    # 绘制 surrogate 分析�?
     print("\n" + "=" * 70)
     log("生成 surrogate 分析图表...")
     print("=" * 70)
     plot_surrogate_analysis(trainers, all_samples, fig_dir, CASE_NAME)
 
-    # LP 松弛解质量评估（在可行性泵之前�?
     print("\n" + "=" * 70)
-    log("LP 松弛解质量评估（FP 前置分析�?..")
+    log("LP 松弛解质量评估（FP 前置分析）...")
     print("=" * 70)
     run_lp_compare_test(ppc, all_samples, dual_predictor, trainers,
                         T_DELTA, TEST_SAMPLES, fig_dir)
@@ -1152,11 +1160,11 @@ def _print_bcd_stats(agent) -> None:
 
     if hasattr(agent, 'theta_net') and agent.theta_net is not None:
         total_params = sum(p.numel() for p in agent.theta_net.parameters())
-        log(f"  theta_net 参数�? {total_params:,}")
+        log(f"  theta_net 参数量: {total_params:,}")
 
     if hasattr(agent, 'zeta_net') and agent.zeta_net is not None:
         total_params = sum(p.numel() for p in agent.zeta_net.parameters())
-        log(f"  zeta_net  参数�? {total_params:,}")
+        log(f"  zeta_net  参数量: {total_params:,}")
 
     theta_vals = _collect_bcd_param_values(agent, "theta")
     if theta_vals.size > 0:
@@ -1200,7 +1208,7 @@ def _load_bcd_agent(ppc, data_file: Path, bcd_model_path: str,
     """加载 BCD 数据并恢复 Agent_NN_BCD 模型参数，返回 agent。"""
     model_path = Path(bcd_model_path)
     if not model_path.exists():
-        log(f"错误: BCD 模型文件不存�? {bcd_model_path}")
+        log(f"错误: BCD 模型文件不存在: {bcd_model_path}")
         log("请先运行 run_training.py MODE='bcd'/'both' 生成模型，或修改 BCD_MODEL_PATH 配置")
         sys.exit(1)
 
@@ -1209,9 +1217,30 @@ def _load_bcd_agent(ppc, data_file: Path, bcd_model_path: str,
     all_samples_bcd = apply_sample_range(all_samples_bcd, sample_range)
     if MAX_SAMPLES and len(all_samples_bcd) > MAX_SAMPLES:
         all_samples_bcd = all_samples_bcd[:MAX_SAMPLES]
-    log(f"  使用 {len(all_samples_bcd)} �?BCD 样本")
+    log(f"  使用 {len(all_samples_bcd)} 个 BCD 样本")
+    log(
+        "  BCD 配置: "
+        f"lambda_init={BCD_LAMBDA_INIT_STRATEGY}, "
+        f"max_theta_per_t={BCD_MAX_THETA_CONSTRAINTS_PER_TIME_SLOT}, "
+        f"rho=({BCD_RHO_PRIMAL_INIT}, {BCD_RHO_DUAL_INIT}, {BCD_RHO_OPT_INIT}), "
+        f"gamma_base={BCD_GAMMA_BASE}"
+    )
 
-    agent = Agent_NN_BCD(ppc, all_samples_bcd, T_DELTA)
+    agent = Agent_NN_BCD(
+        ppc,
+        all_samples_bcd,
+        T_DELTA,
+        lambda_init_strategy=BCD_LAMBDA_INIT_STRATEGY,
+        max_theta_constraints_per_time_slot=BCD_MAX_THETA_CONSTRAINTS_PER_TIME_SLOT,
+        theta_hot_start_strategy=THETA_HOT_START_STRATEGY,
+        zeta_hot_start_strategy=ZETA_HOT_START_STRATEGY,
+        theta_gaussian_std=THETA_GAUSSIAN_STD,
+        zeta_gaussian_std=ZETA_GAUSSIAN_STD,
+        rho_primal_init=BCD_RHO_PRIMAL_INIT,
+        rho_dual_init=BCD_RHO_DUAL_INIT,
+        rho_opt_init=BCD_RHO_OPT_INIT,
+        gamma_base=BCD_GAMMA_BASE,
+    )
     agent.load_model_parameters(str(model_path))
     log("BCD 模型加载成功")
     return agent
@@ -1224,6 +1253,8 @@ def plot_lp_surrogate_comparison(
     sample_id: int,
     fig_dir: Path,
     case_name: str,
+    comparison_name: str = "Surrogate LP",
+    file_tag: str = "surrogate",
 ) -> None:
     """绘制单样�?3×2 热图：x* / x_LP / x_LP_surrogate 的状态与误差�?
 
@@ -1253,7 +1284,7 @@ def plot_lp_surrogate_comparison(
         gridspec_kw={'width_ratios': [1, 1], 'hspace': 0.45, 'wspace': 0.15},
     )
     fig.suptitle(
-        f'LP Relaxation vs Surrogate LP  [Sample {sample_id}, {case_name}]',
+        f'LP Relaxation vs {comparison_name}  [Sample {sample_id}, {case_name}]',
         fontsize=13, fontweight='bold', y=1.01,
     )
 
@@ -1262,12 +1293,12 @@ def plot_lp_surrogate_comparison(
     row_titles = [
         r'A. $x^*$ (True Optimum)',
         f'B. $x_{{LP}}$  (L1 = {l1_lp:.2f})',
-        f'C. $x_{{LP,surr}}$  (L1 = {l1_surr:.2f})',
+        f'C. {comparison_name}  (L1 = {l1_surr:.2f})',
     ]
     right_titles = [
         '(reference)',
         f'|$x_{{LP}} - x^*$|',
-        f'|$x_{{LP,surr}} - x^*$|',
+        f'|{comparison_name} - x^*|',
     ]
 
     yticks = list(range(ng))
@@ -1302,8 +1333,8 @@ def plot_lp_surrogate_comparison(
     # 给左列第一行加 colorbar
     fig.colorbar(im_l, ax=axes[0, 0], fraction=0.045, pad=0.03)
 
-    path = fig_dir / f'lp_surrogate_heatmap_sample{sample_id}_{case_name}'
-    _save_fig(fig, path, f'LP vs Surrogate heatmap sample {sample_id}')
+    path = fig_dir / f'lp_{file_tag}_heatmap_sample{sample_id}_{case_name}'
+    _save_fig(fig, path, f'LP vs {comparison_name} heatmap sample {sample_id}')
 
 
 def plot_surrogate_commitment_comparison(
@@ -1405,6 +1436,8 @@ def plot_lp_surrogate_bar(
     hamming_surr: np.ndarray,
     fig_dir: Path,
     case_name: str,
+    comparison_name: str = "Surrogate LP",
+    file_tag: str = "surrogate",
 ) -> None:
     """绘制逐样�?L1 距离�?Hamming 距离对比柱状图（LP vs Surrogate LP）�?
 
@@ -1432,7 +1465,7 @@ def plot_lp_surrogate_bar(
 
     # 左：L1 距离
     ax1.bar(x_pos - bar_w / 2, dist_lp, bar_w, label='Standard LP', color='#2166AC')
-    ax1.bar(x_pos + bar_w / 2, dist_surr, bar_w, label='Surrogate LP', color='#D6604D')
+    ax1.bar(x_pos + bar_w / 2, dist_surr, bar_w, label=comparison_name, color='#D6604D')
     ax1.set_xlabel('Sample')
     ax1.set_ylabel(r'$\| x - x^* \|_1$')
     ax1.set_title('L1 Distance to Optimum')
@@ -1442,7 +1475,7 @@ def plot_lp_surrogate_bar(
 
     # 右：Hamming 距离
     ax2.bar(x_pos - bar_w / 2, hamming_lp, bar_w, label='Standard LP', color='#2166AC')
-    ax2.bar(x_pos + bar_w / 2, hamming_surr, bar_w, label='Surrogate LP', color='#D6604D')
+    ax2.bar(x_pos + bar_w / 2, hamming_surr, bar_w, label=comparison_name, color='#D6604D')
     ax2.set_xlabel('Sample')
     ax2.set_ylabel('Hamming Distance')
     ax2.set_title('Hamming Distance (after rounding)')
@@ -1451,8 +1484,8 @@ def plot_lp_surrogate_bar(
     ax2.legend()
 
     fig.tight_layout()
-    path = fig_dir / f'lp_surrogate_distance_bar_{case_name}'
-    _save_fig(fig, path, 'LP vs Surrogate distance bar')
+    path = fig_dir / f'lp_{file_tag}_distance_bar_{case_name}'
+    _save_fig(fig, path, f'LP vs {comparison_name} distance bar')
 
 
 def analyse_lp_distance(agent, test_n: int, fig_dir: Path,
@@ -1489,6 +1522,9 @@ def analyse_lp_distance(agent, test_n: int, fig_dir: Path,
         ppc is not None and all_samples is not None and dual_predictor is not None
         and trainers is not None and T_DELTA is not None
     )
+    comparison_name = "Surrogate LP" if use_joint_surrogate else "BCD LP"
+    comparison_short = "surr" if use_joint_surrogate else "bcd"
+    comparison_file_tag = "surrogate" if use_joint_surrogate else "bcd"
 
     for i in range(n):
         sol_lp = agent.solve_LP_without_theta_constraints(i)
@@ -1507,7 +1543,7 @@ def analyse_lp_distance(agent, test_n: int, fig_dir: Path,
         else:
             sol_surr = agent.solve_LP_with_theta_constraints(i)
             if sol_surr is None:
-                log(f"  sample {i}: surrogate LP solve failed, skip")
+                log(f"  样本 {i}: {comparison_name} 求解失败，跳过")
                 continue
             x_surr = sol_surr[1]   # (ng, T)
         x_opt = agent.x_opt[i] # (ng, T)
@@ -1530,36 +1566,37 @@ def analyse_lp_distance(agent, test_n: int, fig_dir: Path,
         x_surr_list.append(x_surr)
         x_opt_list.append(x_opt)
 
-        log(f"  样本 {i}: L1(LP)={d_lp:.2f}  L1(surr)={d_surr:.2f}  "
-            f"Hamming(LP)={h_lp}  Hamming(surr)={h_surr}")
+        log(f"  样本 {i}: L1(LP)={d_lp:.2f}  L1({comparison_short})={d_surr:.2f}  "
+            f"Hamming(LP)={h_lp}  Hamming({comparison_short})={h_surr}")
 
     if not valid_ids:
         log("没有有效样本，跳过分析")
         return
 
-    # 汇�?
     nv = len(valid_ids)
     print("\n" + "-" * 60)
-    log(f"汇�?({nv} 个有效样�?:")
+    log(f"汇总 ({nv} 个有效样本):")
     log(f"  平均 L1 距离:      LP={dist_lp_arr[:nv].mean():.2f}  "
-        f"Surrogate={dist_surr_arr[:nv].mean():.2f}")
+        f"{comparison_name}={dist_surr_arr[:nv].mean():.2f}")
     log(f"  平均 Hamming 距离:  LP={hamming_lp_arr[:nv].mean():.1f}  "
-        f"Surrogate={hamming_surr_arr[:nv].mean():.1f}")
+        f"{comparison_name}={hamming_surr_arr[:nv].mean():.1f}")
     reduction = (1 - dist_surr_arr[:nv].mean() / max(dist_lp_arr[:nv].mean(), 1e-9)) * 100
-    log(f"  代理约束 L1 缩减�? {reduction:.1f}%")
+    log(f"  {comparison_name} 相对 LP 的 L1 缩减: {reduction:.1f}%")
     print("-" * 60)
 
-    # 绘图：第一个有效样本的 3×2 热图
     plot_lp_surrogate_comparison(
         x_opt_list[0], x_lp_list[0], x_surr_list[0],
         valid_ids[0], fig_dir, case_name,
+        comparison_name=comparison_name,
+        file_tag=comparison_file_tag,
     )
 
-    # 绘图：逐样本距离柱状图
     plot_lp_surrogate_bar(
         dist_lp_arr[:nv], dist_surr_arr[:nv],
         hamming_lp_arr[:nv], hamming_surr_arr[:nv],
         fig_dir, case_name,
+        comparison_name=comparison_name,
+        file_tag=comparison_file_tag,
     )
 
 
@@ -1619,7 +1656,7 @@ def test_both(ppc, data_file: Path, all_samples: list, T_DELTA: float,
         fig_dir:        图像输出目录�?
     """
     print("\n" + "=" * 70)
-    log("模式: both �?联合评估 BCD 神经网络 + 全体 V3 代理约束")
+    log("模式: both - 联合评估 BCD 神经网络 + 全体 V3 代理约束")
     print("=" * 70)
     if constraint_generation_strategy is not None:
         log(f"约束生成策略: {constraint_generation_strategy}")
@@ -1639,7 +1676,7 @@ def test_both(ppc, data_file: Path, all_samples: list, T_DELTA: float,
     # ── Step 2: 加载 surrogate 全体代理约束模型 ───────────
     log("── Step 2/4  加载全体代理约束模型")
     if not Path(model_dir).exists():
-        log(f"错误: surrogate 模型目录不存�? {model_dir}")
+        log(f"错误: surrogate 模型目录不存在: {model_dir}")
         log("请先运行 run_training.py 生成模型，或修改 MODEL_DIR 配置")
         sys.exit(1)
 
@@ -1649,23 +1686,23 @@ def test_both(ppc, data_file: Path, all_samples: list, T_DELTA: float,
         unit_ids=unit_ids,
         constraint_generation_strategy=constraint_generation_strategy,
     )
-    log(f"已加�?{len(trainers)} 个机组的代理约束模型（全体约束）")
+    log(f"已加载 {len(trainers)} 个机组的代理约束模型（全体约束）")
     print_surrogate_results(trainers, all_samples[:test_samples])
 
     # ── Step 3: 绘图 ───────────────────────────────────────
     log("── Step 3/4  生成分析图表")
     print("\n" + "=" * 70)
-    log("生成 surrogate 分析�?..")
+    log("生成 surrogate 分析图表...")
     print("=" * 70)
     plot_surrogate_analysis(trainers, all_samples, fig_dir, CASE_NAME)
 
     print("\n" + "=" * 70)
-    log("生成 BCD 分析�?..")
+    log("生成 BCD 分析图表...")
     print("=" * 70)
     plot_bcd_analysis(agent, fig_dir, CASE_NAME)
 
     print("\n" + "=" * 70)
-    log("生成 BCD-Surrogate 联合约束表征�?..")
+    log("生成 BCD-Surrogate 联合约束表征图...")
     print("=" * 70)
     plot_both_analysis(agent, trainers, fig_dir, CASE_NAME)
 
@@ -1690,7 +1727,7 @@ def test_both(ppc, data_file: Path, all_samples: list, T_DELTA: float,
         log("── Step 4/4  跳过可行性泵（RUN_FP=False）")
 
 
-# ──────────────────────── 主函�?────────────────────────
+# ──────────────────────── 主函数 ────────────────────────
 
 
 def main():
@@ -1701,11 +1738,11 @@ def main():
     print("=" * 70)
 
     # ── 配置 ──────────────────────────────────────────────
-    MAX_SAMPLES  = None         # 最多使用多少个样本（None=全部�?
-    SAMPLE_RANGE = "1:2"         # 指定样本区间，左闭右开；例�?(210, 220) �?"210:220"
+    MAX_SAMPLES  = None         # 最多使用多少个样本（None=全部）
+    SAMPLE_RANGE = "21:22"        # 指定样本区间，左闭右开；例如 "210:220"
     T_DELTA      = 1.0
     UNIT_IDS     = None         # None = 所有机组；或如 [0, 1, 2]
-    TEST_SAMPLES = 10  # 测试/评估样本�?
+    TEST_SAMPLES = 10  # 测试/评估样本数
     test_samples = TEST_SAMPLES
     sample_range = parse_sample_range(SAMPLE_RANGE)
 
@@ -1716,9 +1753,9 @@ def main():
 
     # ── 加载 PyPower 案例 ────────────────────────────────
     log(f"加载 PyPower 案例: {CASE_NAME}")
-    supported_cases = ['case3', 'case14', 'case30', 'case39', 'case118']
+    supported_cases = ['case3', 'case3lite', 'case14', 'case30', 'case39', 'case118']
     if CASE_NAME not in supported_cases:
-        print(f"未知案例: {CASE_NAME}，可�? {supported_cases}")
+        print(f"未知案例: {CASE_NAME}，可选 {supported_cases}")
         sys.exit(1)
     ppc = get_case_ppc(CASE_NAME)
     n_units = ppc['gen'].shape[0]
@@ -1775,7 +1812,7 @@ def main():
             )
 
         elif MODE == 'both':
-            # both 模式需要同时加�?v3 格式样本（供 surrogate 用）
+            # both 模式需要同时加载 v3 格式样本（供 surrogate 用）
             full_samples = load_json_data(data_file)
             all_samples = apply_sample_range(full_samples, sample_range)
             if MAX_SAMPLES and len(all_samples) > MAX_SAMPLES:
@@ -1793,7 +1830,7 @@ def main():
                       constraint_generation_strategy=SURROGATE_CONSTRAINT_STRATEGY)
 
         else:
-            log(f"未知模式: '{MODE}'，可�? 'surrogate' | 'bcd' | 'both'")
+            log(f"未知模式: '{MODE}'，可选 'surrogate' | 'bcd' | 'both'")
             sys.exit(1)
 
     except Exception as e:
@@ -1802,10 +1839,10 @@ def main():
         traceback.print_exc()
         sys.exit(1)
 
-    # ── 汇�?─────────────────────────────────────────────
+    # ── 汇总 ─────────────────────────────────────────────
     total_time = time.time() - start_time
     print("\n" + "=" * 70)
-    log(f"完成！模�?{MODE}，耗时 {total_time / 60:.1f} 分钟")
+    log(f"完成！模式 {MODE}，耗时 {total_time / 60:.1f} 分钟")
     print("=" * 70)
 
 

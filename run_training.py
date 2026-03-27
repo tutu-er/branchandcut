@@ -77,8 +77,8 @@ BCD_MAX_THETA_CONSTRAINTS_PER_TIME_SLOT = 20
 BCD_GAMMA_BASE = 1e-3
 SUBPROBLEM_RHO_PRIMAL_INIT = 1e-3
 SUBPROBLEM_RHO_DUAL_INIT = 1e-3
-SUBPROBLEM_RHO_OPT_INIT = 1e-3
-SUBPROBLEM_GAMMA = 1e-3
+SUBPROBLEM_RHO_OPT_INIT = 1e-2
+SUBPROBLEM_GAMMA = 1e-4
 
 # ──────────────────────── 导入 ────────────────────────
 
@@ -609,7 +609,7 @@ def main():
     print("=" * 70)
 
     # ── 配置 ──────────────────────────────────────────────
-    CASE_NAME       = 'case3'      # 'case3' / 'case14' / 'case30' / 'case39' / 'case118'
+    CASE_NAME       = 'case3'      # 'case3' / 'case3lite' / 'case14' / 'case30' / 'case39' / 'case118'
     MAX_SAMPLES     = 20           # 最多使用多少个样本（None=全部）
     T_DELTA         = 1.0
     DUAL_EPOCHS     = 50
@@ -661,7 +661,7 @@ def main():
 
     # ── 加载 PyPower 案例 ────────────────────────────────
     log(f"加载 PyPower 案例: {CASE_NAME}")
-    supported_cases = ['case3', 'case14', 'case30', 'case39', 'case118']
+    supported_cases = ['case3', 'case3lite', 'case14', 'case30', 'case39', 'case118']
     if CASE_NAME not in supported_cases:
         print(f"未知案例: {CASE_NAME}，可选: {supported_cases}")
         sys.exit(1)
