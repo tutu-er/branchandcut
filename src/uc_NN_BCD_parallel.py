@@ -87,6 +87,8 @@ class ParallelAgent_NN_BCD(Agent_NN_BCD):
         rho_dual_init: float = 1e-2,
         rho_opt_init: float = 1e-2,
         gamma_base: float = 1e-2,
+        mu_dual_floor_init: float = 0.1,
+        ita_dual_floor_init: float = 0.1,
         n_workers: int = 4,
     ):
         super().__init__(
@@ -104,6 +106,8 @@ class ParallelAgent_NN_BCD(Agent_NN_BCD):
             rho_dual_init=rho_dual_init,
             rho_opt_init=rho_opt_init,
             gamma_base=gamma_base,
+            mu_dual_floor_init=mu_dual_floor_init,
+            ita_dual_floor_init=ita_dual_floor_init,
         )
         self.n_workers = min(n_workers, self.n_samples)
 

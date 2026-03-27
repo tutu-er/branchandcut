@@ -85,6 +85,7 @@ class ParallelSubproblemSurrogateTrainer(SubproblemSurrogateTrainer):
         rho_dual_init: float = 1e-3,
         rho_opt_init: float = 1e-3,
         gamma: float = 1e-3,
+        mu_lower_bound_init: float = 0.1,
         device=None,
         n_workers: int = 4,
     ):
@@ -97,6 +98,7 @@ class ParallelSubproblemSurrogateTrainer(SubproblemSurrogateTrainer):
             rho_dual_init=rho_dual_init,
             rho_opt_init=rho_opt_init,
             gamma=gamma,
+            mu_lower_bound_init=mu_lower_bound_init,
             device=device,
         )
         self.n_workers = min(n_workers, self.n_samples)

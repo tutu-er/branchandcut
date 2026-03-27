@@ -1106,6 +1106,7 @@ class SubproblemSurrogateTrainer:
                  rho_dual_init: float = 1e-3,
                  rho_opt_init: float = 1e-3,
                  gamma: float = 1e-3,
+                 mu_lower_bound_init: float = 0.1,
                  device=None):
         """
         初始化单机组子问题代理约束训练器 - V3三时段版本
@@ -1179,7 +1180,7 @@ class SubproblemSurrogateTrainer:
         self.gamma = float(gamma)
         self.rho_max = 10.0
         self.reg_weight = 1e-4   # alpha/beta/gamma L2 正则化权重
-        self.mu_lower_bound = 0.1
+        self.mu_lower_bound = float(mu_lower_bound_init)
         self.cost_ema_alpha = 0.3  # cost_values EMA平滑系数，越小越平滑
         self.iter_number = 0
         

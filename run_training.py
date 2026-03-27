@@ -75,10 +75,13 @@ BCD_RHO_DUAL_INIT = 1e-3
 BCD_RHO_OPT_INIT = 1e-3
 BCD_MAX_THETA_CONSTRAINTS_PER_TIME_SLOT = 20
 BCD_GAMMA_BASE = 1e-3
+BCD_MU_DUAL_FLOOR_INIT = 0.1
+BCD_ITA_DUAL_FLOOR_INIT = 0.1
 SUBPROBLEM_RHO_PRIMAL_INIT = 1e-3
 SUBPROBLEM_RHO_DUAL_INIT = 1e-3
 SUBPROBLEM_RHO_OPT_INIT = 1e-2
 SUBPROBLEM_GAMMA = 1e-4
+SUBPROBLEM_MU_DUAL_FLOOR_INIT = 2
 
 # ──────────────────────── 导入 ────────────────────────
 
@@ -220,7 +223,8 @@ def run_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS,
                   rho_primal_init: float = 1e-3,
                   rho_dual_init: float = 1e-3,
                   rho_opt_init: float = 1e-3,
-                  subproblem_gamma: float = 1e-3):
+                  subproblem_gamma: float = 1e-3,
+                  mu_lower_bound_init: float = 0.1):
     """V3 代理约束训练（样本级并行），返回 (dual_predictor, trainers)。"""
     import os
     from pypower.ext2int import ext2int
@@ -261,6 +265,7 @@ def run_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS,
                 rho_dual_init=rho_dual_init,
                 rho_opt_init=rho_opt_init,
                 gamma=subproblem_gamma,
+                mu_lower_bound_init=mu_lower_bound_init,
             )
         else:
             log(f"  机组 {g} ({i+1}/{len(unit_ids)}) — 样本级并行 n_workers={n_workers}")
@@ -272,6 +277,7 @@ def run_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS,
                 rho_dual_init=rho_dual_init,
                 rho_opt_init=rho_opt_init,
                 gamma=subproblem_gamma,
+                mu_lower_bound_init=mu_lower_bound_init,
                 n_workers=n_workers,
             )
         if logger is not None:
@@ -358,7 +364,9 @@ def run_bcd(ppc, all_samples: list, T_DELTA, MAX_ITER, bcd_model_dir,
             rho_primal_init: float = 1e-2,
             rho_dual_init: float = 1e-2,
             rho_opt_init: float = 1e-2,
-            gamma_base: float = 1e-2):
+            gamma_base: float = 1e-2,
+            mu_dual_floor_init: float = 0.1,
+            ita_dual_floor_init: float = 0.1):
     """BCD 主代理训练（样本级并行），返回 ParallelAgent_NN_BCD 实例。"""
     log("模式: BCD 主代理训练（Agent_NN_BCD）")
     log(f"使用 {len(all_samples)} 个样本")
@@ -395,6 +403,8 @@ def run_bcd(ppc, all_samples: list, T_DELTA, MAX_ITER, bcd_model_dir,
             rho_dual_init=rho_dual_init,
             rho_opt_init=rho_opt_init,
             gamma_base=gamma_base,
+            mu_dual_floor_init=mu_dual_floor_init,
+            ita_dual_floor_init=ita_dual_floor_init,
         )
     else:
         log(f"使用并行 ParallelAgent_NN_BCD (n_workers={n_workers})")
@@ -412,6 +422,8 @@ def run_bcd(ppc, all_samples: list, T_DELTA, MAX_ITER, bcd_model_dir,
             rho_dual_init=rho_dual_init,
             rho_opt_init=rho_opt_init,
             gamma_base=gamma_base,
+            mu_dual_floor_init=mu_dual_floor_init,
+            ita_dual_floor_init=ita_dual_floor_init,
             n_workers=n_workers,
         )
 
@@ -492,7 +504,9 @@ def run_sparse_bcd(ppc, all_samples: list, T_DELTA, MAX_ITER, bcd_model_dir,
                    rho_primal_init: float = 1e-2,
                    rho_dual_init: float = 1e-2,
                    rho_opt_init: float = 1e-2,
-                   gamma_base: float = 1e-2):
+                   gamma_base: float = 1e-2,
+                   mu_dual_floor_init: float = 0.1,
+                   ita_dual_floor_init: float = 0.1):
     """
     sparse 模式：
     1. 用普通 Agent_NN_BCD 初始化，拿到 x_lp/x_true
@@ -519,6 +533,8 @@ def run_sparse_bcd(ppc, all_samples: list, T_DELTA, MAX_ITER, bcd_model_dir,
         rho_dual_init=rho_dual_init,
         rho_opt_init=rho_opt_init,
         gamma_base=gamma_base,
+        mu_dual_floor_init=mu_dual_floor_init,
+        ita_dual_floor_init=ita_dual_floor_init,
     )
     sparse_dir = Path(__file__).parent / 'result' / 'sparse_templates'
     discovery_result, template_library = build_sparse_template_library_from_bcd_agent(
@@ -557,6 +573,8 @@ def run_sparse_bcd(ppc, all_samples: list, T_DELTA, MAX_ITER, bcd_model_dir,
         rho_dual_init=rho_dual_init,
         rho_opt_init=rho_opt_init,
         gamma_base=gamma_base,
+        mu_dual_floor_init=mu_dual_floor_init,
+        ita_dual_floor_init=ita_dual_floor_init,
     )
 
     return agent, discovery_result, template_library
@@ -629,10 +647,13 @@ def main():
     BCD_RHO_OPT_INIT_VALUE = BCD_RHO_OPT_INIT
     BCD_MAX_THETA_CONSTRAINTS_PER_TIME_SLOT_VALUE = BCD_MAX_THETA_CONSTRAINTS_PER_TIME_SLOT
     BCD_GAMMA_BASE_VALUE = BCD_GAMMA_BASE
+    BCD_MU_DUAL_FLOOR_INIT_VALUE = BCD_MU_DUAL_FLOOR_INIT
+    BCD_ITA_DUAL_FLOOR_INIT_VALUE = BCD_ITA_DUAL_FLOOR_INIT
     SUBPROBLEM_RHO_PRIMAL_INIT_VALUE = SUBPROBLEM_RHO_PRIMAL_INIT
     SUBPROBLEM_RHO_DUAL_INIT_VALUE = SUBPROBLEM_RHO_DUAL_INIT
     SUBPROBLEM_RHO_OPT_INIT_VALUE = SUBPROBLEM_RHO_OPT_INIT
     SUBPROBLEM_GAMMA_VALUE = SUBPROBLEM_GAMMA
+    SUBPROBLEM_MU_DUAL_FLOOR_INIT_VALUE = SUBPROBLEM_MU_DUAL_FLOOR_INIT
     FP_TEST_SAMPLES = 3             # feasibility_pump 模式：测试样本数
     N_WORKERS_BCD   = 1             # 样本级并行线程数；1 = 串行（BCD 建议先用串行），>1 = 线程并行
     N_WORKERS_SUBPROBLEM = 1             # 样本级并行线程数；1 = 串行（BCD 建议先用串行），>1 = 线程并行
@@ -708,7 +729,9 @@ def main():
                     rho_primal_init=BCD_RHO_PRIMAL_INIT_VALUE,
                     rho_dual_init=BCD_RHO_DUAL_INIT_VALUE,
                     rho_opt_init=BCD_RHO_OPT_INIT_VALUE,
-                    gamma_base=BCD_GAMMA_BASE_VALUE)
+                    gamma_base=BCD_GAMMA_BASE_VALUE,
+                    mu_dual_floor_init=BCD_MU_DUAL_FLOOR_INIT_VALUE,
+                    ita_dual_floor_init=BCD_ITA_DUAL_FLOOR_INIT_VALUE)
             if RUN_FP:
                 log("警告: bcd 模式不支持 RUN_FP（需要 trainers），请改用 both 模式")
 
@@ -746,6 +769,8 @@ def main():
                 rho_dual_init=BCD_RHO_DUAL_INIT_VALUE,
                 rho_opt_init=BCD_RHO_OPT_INIT_VALUE,
                 gamma_base=BCD_GAMMA_BASE_VALUE,
+                mu_dual_floor_init=BCD_MU_DUAL_FLOOR_INIT_VALUE,
+                ita_dual_floor_init=BCD_ITA_DUAL_FLOOR_INIT_VALUE,
             )
             if RUN_FP:
                 log("警告: sparse 模式暂不支持 RUN_FP（需要 trainers），请改用 both 模式或单独接入模板库")
@@ -768,6 +793,7 @@ def main():
                 rho_dual_init=SUBPROBLEM_RHO_DUAL_INIT_VALUE,
                 rho_opt_init=SUBPROBLEM_RHO_OPT_INIT_VALUE,
                 subproblem_gamma=SUBPROBLEM_GAMMA_VALUE,
+                mu_lower_bound_init=SUBPROBLEM_MU_DUAL_FLOOR_INIT_VALUE,
             )
             print_surrogate_results(trainers, all_samples)
 
@@ -800,6 +826,8 @@ def main():
                     rho_dual_init=BCD_RHO_DUAL_INIT_VALUE,
                     rho_opt_init=BCD_RHO_OPT_INIT_VALUE,
                     gamma_base=BCD_GAMMA_BASE_VALUE,
+                    mu_dual_floor_init=BCD_MU_DUAL_FLOOR_INIT_VALUE,
+                    ita_dual_floor_init=BCD_ITA_DUAL_FLOOR_INIT_VALUE,
                 )
                 _, sparse_template_library = build_sparse_template_library_from_bcd_agent(
                     _bootstrap_agent,
@@ -832,6 +860,8 @@ def main():
                         rho_dual_init=BCD_RHO_DUAL_INIT_VALUE,
                         rho_opt_init=BCD_RHO_OPT_INIT_VALUE,
                         gamma_base=BCD_GAMMA_BASE_VALUE,
+                        mu_dual_floor_init=BCD_MU_DUAL_FLOOR_INIT_VALUE,
+                        ita_dual_floor_init=BCD_ITA_DUAL_FLOOR_INIT_VALUE,
                     )
                 elif N_WORKERS_BCD <= 1:
                     agent = Agent_NN_BCD(
@@ -844,6 +874,8 @@ def main():
                         rho_dual_init=BCD_RHO_DUAL_INIT_VALUE,
                         rho_opt_init=BCD_RHO_OPT_INIT_VALUE,
                         gamma_base=BCD_GAMMA_BASE_VALUE,
+                        mu_dual_floor_init=BCD_MU_DUAL_FLOOR_INIT_VALUE,
+                        ita_dual_floor_init=BCD_ITA_DUAL_FLOOR_INIT_VALUE,
                     )
                 else:
                     agent = ParallelAgent_NN_BCD(
@@ -854,6 +886,8 @@ def main():
                         rho_dual_init=BCD_RHO_DUAL_INIT_VALUE,
                         rho_opt_init=BCD_RHO_OPT_INIT_VALUE,
                         gamma_base=BCD_GAMMA_BASE_VALUE,
+                        mu_dual_floor_init=BCD_MU_DUAL_FLOOR_INIT_VALUE,
+                        ita_dual_floor_init=BCD_ITA_DUAL_FLOOR_INIT_VALUE,
                         n_workers=N_WORKERS_BCD,
                     )
                 agent.load_model_parameters(str(bcd_path))
@@ -882,6 +916,8 @@ def main():
                     rho_dual_init=BCD_RHO_DUAL_INIT_VALUE,
                     rho_opt_init=BCD_RHO_OPT_INIT_VALUE,
                     gamma_base=BCD_GAMMA_BASE_VALUE,
+                    mu_dual_floor_init=BCD_MU_DUAL_FLOOR_INIT_VALUE,
+                    ita_dual_floor_init=BCD_ITA_DUAL_FLOOR_INIT_VALUE,
                 )
 
             # Step 2: 加载 v3 格式样本（subproblem 独立训练，不注入 BCD 对偶变量）
@@ -910,6 +946,7 @@ def main():
                     rho_dual_init=SUBPROBLEM_RHO_DUAL_INIT_VALUE,
                     rho_opt_init=SUBPROBLEM_RHO_OPT_INIT_VALUE,
                     subproblem_gamma=SUBPROBLEM_GAMMA_VALUE,
+                    mu_lower_bound_init=SUBPROBLEM_MU_DUAL_FLOOR_INIT_VALUE,
                 )
             print_surrogate_results(trainers, all_samples)
 

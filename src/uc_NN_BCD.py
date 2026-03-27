@@ -460,6 +460,8 @@ class Agent_NN_BCD:
         rho_dual_init: float = 1e-2,
         rho_opt_init: float = 1e-2,
         gamma_base: float = 1e-2,
+        mu_dual_floor_init: float = 0.1,
+        ita_dual_floor_init: float = 0.1,
     ):
         self.ppc = ppc
         self.ppc_raw = ppc
@@ -482,6 +484,9 @@ class Agent_NN_BCD:
         # 对偶变量的下界约束
         self.dual_para_bound = 0.1  # mu和ita的最小值
         self.dual_para_bound_quit_iteration = 50
+        self.mu_dual_floor_init = float(mu_dual_floor_init)
+        self.ita_dual_floor_init = float(ita_dual_floor_init)
+        self.dual_para_bound = self.mu_dual_floor_init
         
         # BCD迭代参数
         self.rho_primal = float(rho_primal_init)
@@ -2063,7 +2068,9 @@ class Agent_NN_BCD:
         self._const_zero = torch.tensor(0.0, device=dev)
         self._const_one = torch.tensor(1.0, device=dev)
         self._default_mu_tensor = torch.tensor(
-            getattr(self, 'dual_para_bound', 0.1), dtype=torch.float32, device=dev
+            getattr(self, 'mu_dual_floor_init', getattr(self, 'dual_para_bound', 0.1)),
+            dtype=torch.float32,
+            device=dev,
         )
 
     def _preprocess_union_analysis_cache(self, union_analysis) -> None:
@@ -2448,8 +2455,8 @@ class Agent_NN_BCD:
             dual_decay_round_ = self.dual_para_bound_quit_iteration
             
         if (self.iter_number < dual_decay_round_):
-            mu = model.addVars(self.nl, self.T, lb=self.dual_para_bound, name='mu')
-            ita = model.addVars(self.ng, self.T, lb=self.dual_para_bound, name='ita')
+            mu = model.addVars(self.nl, self.T, lb=self.mu_dual_floor_init, name='mu')
+            ita = model.addVars(self.ng, self.T, lb=self.ita_dual_floor_init, name='ita')
         else:
             mu = model.addVars(self.nl, self.T, lb=0, name='mu')
             ita = model.addVars(self.ng, self.T, lb=0, name='ita')            
@@ -3560,7 +3567,11 @@ class Agent_NN_BCD:
                     obj_opt += parametric_rhs_abs * abs(ita_val)
                 else:
                     # 使用默认ita值
-                    default_ita = getattr(self, 'dual_para_bound', 0.1)
+                    default_ita = getattr(
+                        self,
+                        'ita_dual_floor_init',
+                        getattr(self, 'dual_para_bound', 0.1),
+                    )
                     obj_opt += parametric_rhs_abs * default_ita
 
             model.update()

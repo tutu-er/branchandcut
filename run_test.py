@@ -65,10 +65,10 @@ if not check_and_install_dependencies_safe():
 #   'bcd'       - 加载 BCD 神经网络模型并报告参数统�?
 #   'both'      - 联合加载 BCD + surrogate，以全体代理约束评估（需同时配置下面两个路径�?
 #
-MODE      = 'bcd'
+MODE      = 'both'
 RUN_FP    = True       # surrogate / both 模式：是否运行可行性泵测试
 CASE_NAME = 'case3'   # 'case3' / 'case3lite' / 'case14' / 'case30' / 'case39' / 'case118'
-SURROGATE_CONSTRAINT_STRATEGY = 'sensitive'  # 'sensitive' / 'all'
+SURROGATE_CONSTRAINT_STRATEGY = 'auto'  # 'auto' / 'sensitive' / 'all'
 BCD_LAMBDA_INIT_STRATEGY = 'lp_relaxation'   # 'lp_relaxation' / 'ed_on_x_opt'
 THETA_HOT_START_STRATEGY = 'dcpf_relative'   # 'dcpf_relative' / 'gaussian'
 ZETA_HOT_START_STRATEGY = 'zero'             # 'zero' / 'gaussian'
@@ -81,7 +81,7 @@ BCD_MAX_THETA_CONSTRAINTS_PER_TIME_SLOT = 10
 BCD_GAMMA_BASE = 1e-2
 
 # surrogate / both 模式：已训练 surrogate 模型目录（训练时输出的带时间戳路径）
-MODEL_DIR = 'result/subproblem_models/subproblem_models_case30_20260322_192148'
+MODEL_DIR = 'result/surrogate_models/subproblem_models_case3_20260327_154458'
 
 # bcd / both 模式：已训练 BCD 模型 .pth 文件路径
 # BCD_MODEL_PATH = 'result/bcd_models/bcd_model_case30_20260322_150043.pth'
@@ -134,6 +134,8 @@ try:
     from uc_NN_subproblem import (
         load_trained_models,
         ActiveSetReader,
+        normalize_constraint_generation_strategy,
+        _load_surrogate_model_metadata,
     )
     from case_registry import get_case_ppc
     from mti118_data_loader import load_case118_ppc_with_mti_limits
@@ -168,6 +170,85 @@ if MODE in ('surrogate', 'both'):
 def log(msg: str) -> None:
     ts = datetime.now().strftime("%H:%M:%S")
     print(f"[{ts}] {msg}", flush=True)
+
+
+def _resolve_requested_surrogate_strategy(
+    requested_strategy: str | None,
+) -> str | None:
+    if requested_strategy is None:
+        return None
+    strategy_text = str(requested_strategy).strip().lower()
+    if strategy_text in ("", "auto", "saved", "checkpoint"):
+        return None
+    return normalize_constraint_generation_strategy(strategy_text)
+
+
+def _load_saved_surrogate_strategy(model_dir: str, unit_ids) -> str | None:
+    if unit_ids is None:
+        unit_candidates = list(range(256))
+    else:
+        unit_candidates = list(unit_ids)
+
+    discovered = []
+    for g in unit_candidates:
+        surrogate_path = Path(model_dir) / f"surrogate_unit_{g}.pth"
+        if not surrogate_path.exists():
+            continue
+        metadata = _load_surrogate_model_metadata(str(surrogate_path))
+        discovered.append(
+            normalize_constraint_generation_strategy(
+                metadata.get("constraint_generation_strategy", "sensitive")
+            )
+        )
+
+    if not discovered:
+        return None
+    if len(set(discovered)) > 1:
+        raise ValueError(
+            f"Inconsistent surrogate strategies found in {model_dir}: {sorted(set(discovered))}"
+        )
+    return discovered[0]
+
+
+def load_trained_models_for_test(ppc, all_samples: list, T_DELTA: float,
+                                 model_dir: str, unit_ids,
+                                 requested_strategy: str | None):
+    resolved_strategy = _resolve_requested_surrogate_strategy(requested_strategy)
+    if resolved_strategy is None:
+        saved_strategy = _load_saved_surrogate_strategy(model_dir, unit_ids)
+        if saved_strategy is not None:
+            log(f"约束生成策略: 使用模型保存值 {saved_strategy}")
+        return load_trained_models(
+            ppc, all_samples, T_DELTA,
+            load_dir=model_dir,
+            unit_ids=unit_ids,
+            constraint_generation_strategy=None,
+        )
+
+    try:
+        log(f"约束生成策略: {resolved_strategy}")
+        return load_trained_models(
+            ppc, all_samples, T_DELTA,
+            load_dir=model_dir,
+            unit_ids=unit_ids,
+            constraint_generation_strategy=resolved_strategy,
+        )
+    except ValueError as exc:
+        if "Surrogate model strategy mismatch" not in str(exc):
+            raise
+        saved_strategy = _load_saved_surrogate_strategy(model_dir, unit_ids)
+        if saved_strategy is None:
+            raise
+        log(
+            f"约束生成策略与模型不一致，自动回退到保存值: "
+            f"requested={resolved_strategy}, saved={saved_strategy}"
+        )
+        return load_trained_models(
+            ppc, all_samples, T_DELTA,
+            load_dir=model_dir,
+            unit_ids=unit_ids,
+            constraint_generation_strategy=None,
+        )
 
 
 def load_json_data(data_file: Path) -> list:
@@ -1114,8 +1195,6 @@ def test_surrogate(ppc, all_samples: list, T_DELTA: float,
     """加载 surrogate 模型，打印参数摘要，绘图，并可选运行 FP。"""
     print("\n" + "=" * 70)
     log(f"加载 surrogate 模型: {model_dir}")
-    if constraint_generation_strategy is not None:
-        log(f"约束生成策略: {constraint_generation_strategy}")
     print("=" * 70)
 
     if not Path(model_dir).exists():
@@ -1123,11 +1202,11 @@ def test_surrogate(ppc, all_samples: list, T_DELTA: float,
         log("请先运行 run_training.py 生成模型，或修改 MODEL_DIR 配置")
         sys.exit(1)
 
-    dual_predictor, trainers = load_trained_models(
+    dual_predictor, trainers = load_trained_models_for_test(
         ppc, all_samples, T_DELTA,
-        load_dir=model_dir,
+        model_dir=model_dir,
         unit_ids=unit_ids,
-        constraint_generation_strategy=constraint_generation_strategy,
+        requested_strategy=constraint_generation_strategy,
     )
 
     log(f"已加载 {len(trainers)} 个机组的代理约束模型")
@@ -1658,8 +1737,6 @@ def test_both(ppc, data_file: Path, all_samples: list, T_DELTA: float,
     print("\n" + "=" * 70)
     log("模式: both - 联合评估 BCD 神经网络 + 全体 V3 代理约束")
     print("=" * 70)
-    if constraint_generation_strategy is not None:
-        log(f"约束生成策略: {constraint_generation_strategy}")
 
     # ── Step 1: 加载 BCD 模型 ──────────────────────────────
     log("── Step 1/4  加载 BCD 模型")
@@ -1680,11 +1757,11 @@ def test_both(ppc, data_file: Path, all_samples: list, T_DELTA: float,
         log("请先运行 run_training.py 生成模型，或修改 MODEL_DIR 配置")
         sys.exit(1)
 
-    dual_predictor, trainers = load_trained_models(
+    dual_predictor, trainers = load_trained_models_for_test(
         ppc, all_samples, T_DELTA,
-        load_dir=model_dir,
+        model_dir=model_dir,
         unit_ids=unit_ids,
-        constraint_generation_strategy=constraint_generation_strategy,
+        requested_strategy=constraint_generation_strategy,
     )
     log(f"已加载 {len(trainers)} 个机组的代理约束模型（全体约束）")
     print_surrogate_results(trainers, all_samples[:test_samples])
