@@ -28,6 +28,7 @@ root_dir = Path(__file__).resolve().parent.parent
 sys.path.append(str(root_dir))
 
 from src.case39_pypower import get_case39_pypower
+from src.case3_uc_data import get_case3_uc_ppc
 from src.case30_uc_data import get_case30_uc_ppc
 from src.uc_gurobipy import UnitCommitmentModel
 from src.ed_gurobipy import EconomicDispatchGurobi
@@ -86,6 +87,8 @@ class ActiveSetLearner:
         self.observed_active_sets = set()
         self.samples = []
         self.M = 1
+        if ppc is None and case_name == 'case3':
+            ppc = get_case3_uc_ppc()
         if ppc is None and case_name == 'case30':
             ppc = get_case30_uc_ppc()
         self.ppc = ppc
@@ -95,6 +98,16 @@ class ActiveSetLearner:
         self.case_name = case_name
         self.verbose_solver = verbose_solver
         self._cal_W()  # 计算初始窗口大小
+
+    @staticmethod
+    def _resolve_sample_goal(max_samples, target_samples):
+        if target_samples is None:
+            return max_samples, False
+        if target_samples <= 0:
+            raise ValueError("target_samples must be a positive integer")
+        if max_samples is not None and target_samples > max_samples:
+            raise ValueError("target_samples cannot exceed max_samples")
+        return target_samples, True
 
     def _cal_W(self):
         from scipy.stats import beta
@@ -287,7 +300,7 @@ class ActiveSetLearner:
         print(f"活动集映射关系已保存为JSON文件: {filepath}", flush=True)
         return str(filepath)
 
-    def run(self, max_samples=22000):
+    def run(self, max_samples=22000, target_samples=None):
         """严格按照DiscoverMass算法伪代码实现"""
         # 初始化
         epsilon = self.epsilon
@@ -297,17 +310,23 @@ class ActiveSetLearner:
         samples = []
         iter_count = 0
         # 计算理论最大M
-        M_max = max_samples
+        sample_goal, force_target_samples = self._resolve_sample_goal(
+            max_samples,
+            target_samples,
+        )
         WM = self.W  # 初始窗口大小
+        global_seed_counter = 0
         while True:
             # 计算窗口大小
             iter_count += 1
             print(f"迭代{iter_count}: 当前窗口WM={WM}, 当前M={M}", flush=True)
             # 采样
-            for idx in range(WM):
-                if M >= M_max:
-                    break
-                Pd = self._generate_random_Pd(rng=idx)
+            actual_wm = min(WM, sample_goal - len(samples))
+            if actual_wm <= 0:
+                break
+            for idx in range(actual_wm):
+                seed = global_seed_counter + idx
+                Pd = self._generate_random_Pd(rng=seed)
                 renewable_data = None if self.renewable_data is None else np.asarray(self.renewable_data, dtype=float)
                 try:
                     # 调试时允许显示 Gurobi 日志；默认静默避免打断进度条
@@ -331,23 +350,27 @@ class ActiveSetLearner:
                     continue
                 # 进度条显示
                 bar_len = 30
-                percent = (idx + 1) / WM
+                percent = (idx + 1) / actual_wm
                 filled_len = int(bar_len * percent)
                 bar = '█' * filled_len + '-' * (bar_len - filled_len)
                 print(f"\r  采样进度: |{bar}| {percent:.0%}", end='', flush=True)
+            global_seed_counter += actual_wm
             print(flush=True)
             # 计算发现率
-            window_samples = samples[-WM:]
+            window_samples = samples[-actual_wm:]
             new_active_sets = set()
             for sample in window_samples:
                 active_set = sample['active_set'] if isinstance(sample, dict) else sample[1]
                 if active_set not in O:
                     new_active_sets.add(active_set)
             O.update(new_active_sets)
-            RM_W = len(new_active_sets) / WM
+            RM_W = len(new_active_sets) / max(actual_wm, 1)
             print(f"  发现率RM_W={RM_W:.4f}，目标发现率R={alpha - epsilon:.4f}，累计活动集数={len(O)}", flush=True)
             # 检查停止条件
-            if RM_W < alpha - epsilon or M >= M_max:
+            if len(samples) >= sample_goal:
+                print("  Reached target sample count, stopping.", flush=True)
+                break
+            if (not force_target_samples) and RM_W < alpha - epsilon:
                 print("  停止条件触发，算法终止。", flush=True)
                 break
             M = M + 1
@@ -355,6 +378,9 @@ class ActiveSetLearner:
         self.observed_active_sets = O
         self.M = M
         return O
+
+    def run_fixed_samples(self, num_samples: int):
+        return self.run(target_samples=num_samples)
 
     def run_on_precomputed_scenarios(self, scenarios, max_samples=None):
         """对预先构造的场景列表逐个求解并收集 active sets。"""

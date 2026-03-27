@@ -9,49 +9,17 @@ from src.numpy_compat import ensure_numpy_compat_for_pypower
 ensure_numpy_compat_for_pypower()
 
 import pypower.case30
-from pypower.idx_bus import PD
 
 ROOT = Path(__file__).resolve().parent
 sys.path.append(str(ROOT))
 
 from src.ActiveSetLearner import ActiveSetLearner
 from src.active_set_learner_parallel import ParallelActiveSetLearner
-from src.case30_uc_data import get_case30_uc_ppc
+from src.case_registry import build_case3_base_load, build_case30_base_load
 from src.mti118_data_loader import (
     build_case118_daily_samples,
     load_case118_ppc_with_mti_limits,
 )
-
-CASE30_LOAD_SCALE = 1.15
-
-
-def build_case30_base_load(horizon: int) -> tuple[dict, np.ndarray]:
-    ppc = get_case30_uc_ppc()
-    base_bus_load = np.asarray(ppc["bus"][:, PD], dtype=float)
-    load_csv_path = ROOT / "src" / "load.csv"
-    load_profile_raw = np.loadtxt(load_csv_path, delimiter=",", dtype=float)
-    if load_profile_raw.ndim == 1:
-        system_profile = load_profile_raw
-    else:
-        system_profile = np.sum(load_profile_raw, axis=0)
-
-    if system_profile.size == horizon:
-        horizon_profile = system_profile
-    elif system_profile.size % horizon == 0:
-        group_size = system_profile.size // horizon
-        horizon_profile = system_profile.reshape(horizon, group_size).sum(axis=1)
-    else:
-        src_grid = np.linspace(0.0, 1.0, system_profile.size)
-        dst_grid = np.linspace(0.0, 1.0, horizon)
-        horizon_profile = np.interp(dst_grid, src_grid, system_profile)
-
-    normalized_profile = horizon_profile / np.max(horizon_profile)
-    load_matrix = (
-        base_bus_load[:, None]
-        * normalized_profile[None, :]
-        * CASE30_LOAD_SCALE
-    )
-    return ppc, load_matrix
 
 
 def perturb_sample(sample: dict, scale_low: float, scale_high: float, seed: int) -> dict:
@@ -125,6 +93,7 @@ def build_learner(
 def run_case30(
     horizon: int = 24,
     max_samples: int = 200,
+    target_samples: int | None = None,
     alpha: float = 0.75,
     delta: float = 0.15,
     epsilon: float = 0.15,
@@ -149,8 +118,41 @@ def run_case30(
         gurobi_threads=gurobi_threads,
         verbose_solver=verbose_solver,
     )
-    active_sets = learner.run(max_samples=max_samples)
+    active_sets = learner.run(max_samples=max_samples, target_samples=target_samples)
     print(f"case30 active sets: {len(active_sets)}", flush=True)
+    return learner.save_active_sets_json(filename=output)
+
+
+def run_case3(
+    horizon: int = 24,
+    max_samples: int = 200,
+    target_samples: int | None = None,
+    alpha: float = 0.75,
+    delta: float = 0.15,
+    epsilon: float = 0.15,
+    t_delta: float = 1.0,
+    parallel: bool = False,
+    n_workers: int = 4,
+    gurobi_threads: int = 2,
+    verbose_solver: bool = False,
+    output: str | None = None,
+) -> str:
+    ppc, base_load = build_case3_base_load(horizon)
+    learner = build_learner(
+        parallel=parallel,
+        alpha=alpha,
+        delta=delta,
+        epsilon=epsilon,
+        ppc=ppc,
+        t_delta=t_delta,
+        pd_data=base_load,
+        case_name="case3",
+        n_workers=n_workers,
+        gurobi_threads=gurobi_threads,
+        verbose_solver=verbose_solver,
+    )
+    active_sets = learner.run(max_samples=max_samples, target_samples=target_samples)
+    print(f"case3 active sets: {len(active_sets)}", flush=True)
     return learner.save_active_sets_json(filename=output)
 
 
@@ -213,12 +215,30 @@ def run_case118(
 
 
 def main() -> None:
-    case_name = "case118"
+    case_name = "case3"
+    max_samples = 200
+    target_samples = 200  # e.g. 50 means keep sampling until 50 solved samples are learned
 
-    if case_name == "case30":
+    if case_name == "case3":
+        output_path = run_case3(
+            horizon=24,
+            max_samples=max_samples,
+            target_samples=target_samples,
+            alpha=0.70,
+            delta=0.05,
+            epsilon=0.10,
+            t_delta=1.0,
+            parallel=False,
+            n_workers=4,
+            gurobi_threads=2,
+            verbose_solver=False,
+            output=None,
+        )
+    elif case_name == "case30":
         output_path = run_case30(
             horizon=24,
-            max_samples=200,
+            max_samples=max_samples,
+            target_samples=target_samples,
             alpha=0.70,
             delta=0.05,
             epsilon=0.10,

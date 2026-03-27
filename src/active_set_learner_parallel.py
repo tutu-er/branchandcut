@@ -129,7 +129,7 @@ class ParallelActiveSetLearner(ActiveSetLearner):
             flush=True,
         )
 
-    def run(self, max_samples: int = 22000) -> set:
+    def run(self, max_samples: int = 22000, target_samples: int | None = None) -> set:
         """并行版 DiscoverMass 算法。
 
         Args:
@@ -145,6 +145,10 @@ class ParallelActiveSetLearner(ActiveSetLearner):
         samples: list = []
         iter_count = 0
         global_seed_counter = 0
+        sample_goal, force_target_samples = self._resolve_sample_goal(
+            max_samples,
+            target_samples,
+        )
         WM = self.W
 
         with ProcessPoolExecutor(max_workers=self.n_workers) as pool:
@@ -156,7 +160,7 @@ class ParallelActiveSetLearner(ActiveSetLearner):
                 )
 
                 # 准备本窗口的所有 Pd 扰动
-                actual_wm = min(WM, max_samples - len(samples))
+                actual_wm = min(WM, sample_goal - len(samples))
                 if actual_wm <= 0:
                     break
 
@@ -235,7 +239,10 @@ class ParallelActiveSetLearner(ActiveSetLearner):
                     flush=True,
                 )
 
-                if RM_W < alpha - epsilon or len(samples) >= max_samples:
+                if len(samples) >= sample_goal:
+                    print("  Reached target sample count, stopping.", flush=True)
+                    break
+                if (not force_target_samples) and RM_W < alpha - epsilon:
                     print("  停止条件触发，算法终止。", flush=True)
                     break
                 M += 1
@@ -244,6 +251,9 @@ class ParallelActiveSetLearner(ActiveSetLearner):
         self.observed_active_sets = O
         self.M = M
         return O
+
+    def run_fixed_samples(self, num_samples: int) -> set:
+        return self.run(target_samples=num_samples)
 
     def run_on_precomputed_scenarios(self, scenarios: list[dict], max_samples: int | None = None) -> set:
         limit = len(scenarios) if max_samples is None else min(max_samples, len(scenarios))

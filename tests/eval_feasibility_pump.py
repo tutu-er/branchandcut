@@ -35,12 +35,10 @@ sys.path.insert(0, str(ROOT))
 # 这里采用保守兼容设置，优先保证评估脚本可被 agent 循环稳定调用。
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 
-import pypower.case14
-import pypower.case30
-import pypower.case39
 from pypower.ext2int import ext2int
 from pypower.idx_gen import PMIN, PMAX
 
+from src.case_registry import get_case_ppc
 from src.feasibility_pump import check_uc_feasibility, recover_integer_solution
 from src.uc_NN_BCD import Agent_NN_BCD
 from src.uc_NN_subproblem import (
@@ -59,7 +57,7 @@ def _pick_latest_path(paths: list[Path]) -> Optional[Path]:
     return sorted(paths, key=lambda p: p.stat().st_mtime)[-1]
 
 
-def _build_ppc(case_name: str):
+def _build_ppc_legacy(case_name: str):
     ppc_map = {
         "case14": pypower.case14.case14,
         "case30": pypower.case30.case30,
@@ -68,6 +66,13 @@ def _build_ppc(case_name: str):
     if case_name not in ppc_map:
         raise ValueError(f"未知案例: {case_name}")
     return ppc_map[case_name]()
+
+
+def _build_ppc(case_name: str):
+    try:
+        return get_case_ppc(case_name)
+    except ValueError as exc:
+        raise ValueError(f"Unknown case: {case_name}") from exc
 
 
 def _resolve_surrogate_model_dir(case_name: str) -> Path:
@@ -389,7 +394,7 @@ def test_recover_integer_solution(ppc, active_set_data, trainers, lambda_predict
 
 def parse_args():
     parser = argparse.ArgumentParser(description="评估 feasibility pump，输出格式兼容 agentic_fp_optimizer.py")
-    parser.add_argument("--case", default="case30", choices=["case14", "case30", "case39"])
+    parser.add_argument("--case", default="case30", choices=["case3", "case14", "case30", "case39", "case118"])
     parser.add_argument("--n-check", type=int, default=1, help="MILP 可行性检查样本数")
     parser.add_argument("--n-test", type=int, default=2, help="端到端评估样本数")
     parser.add_argument("--sample-range", help="指定样本范围，格式 start:end，采用左闭右开切片语义")

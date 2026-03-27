@@ -64,6 +64,11 @@ if not check_and_install_dependencies():
 MODE   = 'both'
 ENABLE_SPARSE_SUPPORTS = False
 RUN_FP = True        # True → 训练后运行 feasibility_pump 测试（bcd/sparse 模式不支持）
+SURROGATE_CONSTRAINT_STRATEGY = 'sensitive'  # 'sensitive' / 'all'
+THETA_HOT_START_STRATEGY = 'dcpf_relative'   # 'dcpf_relative' / 'gaussian'
+ZETA_HOT_START_STRATEGY = 'zero'             # 'zero' / 'gaussian'
+THETA_GAUSSIAN_STD = 0.01
+ZETA_GAUSSIAN_STD = 0.01
 
 # ──────────────────────── 导入 ────────────────────────
 
@@ -84,7 +89,7 @@ try:
         ActiveSetReader,
     )
     from uc_NN_subproblem_parallel import ParallelSubproblemSurrogateTrainer
-    from case30_uc_data import get_case30_uc_ppc
+    from case_registry import get_case_ppc
     from mti118_data_loader import load_case118_ppc_with_mti_limits
     from scenario_utils import normalize_sample_arrays
     from training_logger import TrainingLogger
@@ -137,19 +142,36 @@ def load_json_data(data_file: Path) -> list:
 
 
 def inject_bcd_lambda(all_samples: list, bcd_lambdas: list, T: int) -> None:
-    """将 BCD 求解的功率平衡对偶变量注入样本，供 v3 dual predictor 使用。
+    """将 BCD 求解的全局对偶变量注入样本，供 dual predictor 使用。
 
     Args:
         all_samples: v3 格式样本列表，注入后每条样本含 'lambda' 字段。
-        bcd_lambdas: Agent_NN_BCD.lambda_ 列表，每项为含 'lambda_power_balance' 的 dict。
+        bcd_lambdas: Agent_NN_BCD.lambda_ 列表，每项为全局对偶变量 dict。
         T: 时段数，用于生成零向量默认值。
     """
     for i, sample in enumerate(all_samples):
         if i >= len(bcd_lambdas):
             break
         lam_dict = bcd_lambdas[i]
-        pb = lam_dict.get('lambda_power_balance', np.zeros(T))
-        sample['lambda'] = np.asarray(pb, dtype=float)
+        sample['lambda'] = {
+            'lambda_power_balance': np.asarray(
+                lam_dict.get('lambda_power_balance', np.zeros(T)),
+                dtype=float,
+            ).tolist(),
+            'lambda_dcpf_upper': np.asarray(
+                lam_dict.get('lambda_dcpf_upper', np.zeros((0, T))),
+                dtype=float,
+            ).tolist(),
+            'lambda_dcpf_lower': np.asarray(
+                lam_dict.get('lambda_dcpf_lower', np.zeros((0, T))),
+                dtype=float,
+            ).tolist(),
+        }
+        if 'lambda_pg_effective' in lam_dict:
+            sample['lambda']['lambda_pg_effective'] = np.asarray(
+                lam_dict['lambda_pg_effective'],
+                dtype=float,
+            ).tolist()
 
 
 def _file_timestamp_key(path: Path) -> str:
@@ -178,7 +200,8 @@ def pick_data_file(result_dir: Path, case_name: str) -> Path:
 
 def run_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS,
                   DUAL_EPOCHS, DUAL_BATCH_SIZE, MAX_ITER, NN_EPOCHS, save_dir,
-                  n_workers: int = 4, logger: 'TrainingLogger | None' = None):
+                  n_workers: int = 4, logger: 'TrainingLogger | None' = None,
+                  constraint_generation_strategy: str = 'sensitive'):
     """V3 代理约束训练（样本级并行），返回 (dual_predictor, trainers)。"""
     import os
     from pypower.ext2int import ext2int
@@ -213,12 +236,14 @@ def run_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS,
             trainer = SubproblemSurrogateTrainer(
                 ppc, all_samples, T_DELTA, g,
                 lambda_predictor=dual_predictor,
+                constraint_generation_strategy=constraint_generation_strategy,
             )
         else:
             log(f"  机组 {g} ({i+1}/{len(unit_ids)}) — 样本级并行 n_workers={n_workers}")
             trainer = ParallelSubproblemSurrogateTrainer(
                 ppc, all_samples, T_DELTA, g,
                 lambda_predictor=dual_predictor,
+                constraint_generation_strategy=constraint_generation_strategy,
                 n_workers=n_workers,
             )
         if logger is not None:
@@ -270,7 +295,11 @@ def print_surrogate_results(trainers, all_samples):
 def run_bcd(ppc, all_samples: list, T_DELTA, MAX_ITER, bcd_model_dir,
             case_name: str = 'case', timestamp: str = '', n_workers: int = 4, NN_EPOCHS: int = 10, DUAL_DECAY_ROUND: int = 10,
             logger: 'TrainingLogger | None' = None,
-            external_sparse_templates=None):
+            external_sparse_templates=None,
+            theta_hot_start_strategy: str = 'dcpf_relative',
+            zeta_hot_start_strategy: str = 'zero',
+            theta_gaussian_std: float = 0.01,
+            zeta_gaussian_std: float = 0.01):
     """BCD 主代理训练（样本级并行），返回 ParallelAgent_NN_BCD 实例。"""
     log("模式: BCD 主代理训练（Agent_NN_BCD）")
     log(f"使用 {len(all_samples)} 个样本")
@@ -293,10 +322,23 @@ def run_bcd(ppc, all_samples: list, T_DELTA, MAX_ITER, bcd_model_dir,
             all_samples,
             T_DELTA,
             external_sparse_templates=external_sparse_templates,
+            theta_hot_start_strategy=theta_hot_start_strategy,
+            zeta_hot_start_strategy=zeta_hot_start_strategy,
+            theta_gaussian_std=theta_gaussian_std,
+            zeta_gaussian_std=zeta_gaussian_std,
         )
     else:
         log(f"使用并行 ParallelAgent_NN_BCD (n_workers={n_workers})")
-        agent = ParallelAgent_NN_BCD(ppc, all_samples, T_DELTA, n_workers=n_workers)
+        agent = ParallelAgent_NN_BCD(
+            ppc,
+            all_samples,
+            T_DELTA,
+            theta_hot_start_strategy=theta_hot_start_strategy,
+            zeta_hot_start_strategy=zeta_hot_start_strategy,
+            theta_gaussian_std=theta_gaussian_std,
+            zeta_gaussian_std=zeta_gaussian_std,
+            n_workers=n_workers,
+        )
 
     print("\n" + "=" * 70)
     log("开始 BCD 迭代训练")
@@ -365,7 +407,11 @@ def run_sparse_bcd(ppc, all_samples: list, T_DELTA, MAX_ITER, bcd_model_dir,
                    case_name: str = 'case', timestamp: str = '',
                    NN_EPOCHS: int = 10, DUAL_DECAY_ROUND: int = 10,
                    top_k_variables: int = 20, max_groups: int = 5, group_size: int = 3,
-                   logger: 'TrainingLogger | None' = None):
+                   logger: 'TrainingLogger | None' = None,
+                   theta_hot_start_strategy: str = 'dcpf_relative',
+                   zeta_hot_start_strategy: str = 'zero',
+                   theta_gaussian_std: float = 0.01,
+                   zeta_gaussian_std: float = 0.01):
     """
     sparse 模式：
     1. 用普通 Agent_NN_BCD 初始化，拿到 x_lp/x_true
@@ -378,7 +424,15 @@ def run_sparse_bcd(ppc, all_samples: list, T_DELTA, MAX_ITER, bcd_model_dir,
     log("Step 1/3: 初始化 bootstrap Agent_NN_BCD 用于 sparse 变量发现")
     print("=" * 70)
 
-    bootstrap_agent = Agent_NN_BCD(ppc, all_samples, T_DELTA)
+    bootstrap_agent = Agent_NN_BCD(
+        ppc,
+        all_samples,
+        T_DELTA,
+        theta_hot_start_strategy=theta_hot_start_strategy,
+        zeta_hot_start_strategy=zeta_hot_start_strategy,
+        theta_gaussian_std=theta_gaussian_std,
+        zeta_gaussian_std=zeta_gaussian_std,
+    )
     sparse_dir = Path(__file__).parent / 'result' / 'sparse_templates'
     discovery_result, template_library = build_sparse_template_library_from_bcd_agent(
         bootstrap_agent,
@@ -406,6 +460,10 @@ def run_sparse_bcd(ppc, all_samples: list, T_DELTA, MAX_ITER, bcd_model_dir,
         DUAL_DECAY_ROUND=DUAL_DECAY_ROUND,
         logger=logger,
         external_sparse_templates=template_library,
+        theta_hot_start_strategy=theta_hot_start_strategy,
+        zeta_hot_start_strategy=zeta_hot_start_strategy,
+        theta_gaussian_std=theta_gaussian_std,
+        zeta_gaussian_std=zeta_gaussian_std,
     )
 
     return agent, discovery_result, template_library
@@ -427,6 +485,7 @@ def run_feasibility_pump_test(ppc, all_samples, dual_predictor, trainers,
         try:
             x_result, success = recover_integer_solution(
                 sample, trainers, dual_predictor, ppc, T_DELTA,
+                scenario_bank=all_samples,
                 verbose=True,
             )
         except Exception as e:
@@ -457,7 +516,7 @@ def main():
     print("=" * 70)
 
     # ── 配置 ──────────────────────────────────────────────
-    CASE_NAME       = 'case30'      # 'case14' / 'case30' / 'case39' / 'case118'
+    CASE_NAME       = 'case30'      # 'case3' / 'case14' / 'case30' / 'case39' / 'case118'
     MAX_SAMPLES     = 4           # 最多使用多少个样本（None=全部）
     T_DELTA         = 1.0
     DUAL_EPOCHS     = 50
@@ -466,6 +525,11 @@ def main():
     DUAL_DECAY_ROUND= 10
     NN_EPOCHS       = 10            # surrogate 模式每次 BCD 迭代的 NN 训练轮数
     UNIT_IDS        = None          # None = 所有机组；或如 [0, 1, 2]
+    CONSTRAINT_GENERATION_STRATEGY = SURROGATE_CONSTRAINT_STRATEGY
+    THETA_WARM_START_STRATEGY = THETA_HOT_START_STRATEGY
+    ZETA_WARM_START_STRATEGY = ZETA_HOT_START_STRATEGY
+    THETA_WARM_START_GAUSSIAN_STD = THETA_GAUSSIAN_STD
+    ZETA_WARM_START_GAUSSIAN_STD = ZETA_GAUSSIAN_STD
     FP_TEST_SAMPLES = 3             # feasibility_pump 模式：测试样本数
     N_WORKERS_BCD   = 2             # 样本级并行线程数；1 = 串行（BCD 建议先用串行），>1 = 线程并行
     N_WORKERS_SUBPROBLEM = 2             # 样本级并行线程数；1 = 串行（BCD 建议先用串行），>1 = 线程并行
@@ -493,16 +557,11 @@ def main():
 
     # ── 加载 PyPower 案例 ────────────────────────────────
     log(f"加载 PyPower 案例: {CASE_NAME}")
-    ppc_map = {
-        'case14': pypower.case14.case14,
-        'case30': get_case30_uc_ppc,
-        'case39': pypower.case39.case39,
-        'case118': load_case118_ppc_with_mti_limits,
-    }
-    if CASE_NAME not in ppc_map:
-        print(f"未知案例: {CASE_NAME}，可选: {list(ppc_map)}")
+    supported_cases = ['case3', 'case14', 'case30', 'case39', 'case118']
+    if CASE_NAME not in supported_cases:
+        print(f"未知案例: {CASE_NAME}，可选: {supported_cases}")
         sys.exit(1)
-    ppc = ppc_map[CASE_NAME]()
+    ppc = get_case_ppc(CASE_NAME)
     n_units = ppc['gen'].shape[0]
     n_buses = ppc['bus'].shape[0]
     log(f"  {n_units} 机组，{n_buses} 节点")
@@ -535,7 +594,11 @@ def main():
                 all_samples_bcd = all_samples_bcd[:MAX_SAMPLES]
             run_bcd(ppc, all_samples_bcd, T_DELTA, MAX_ITER, bcd_model_dir,
                     case_name=CASE_NAME, timestamp=timestamp, n_workers=N_WORKERS_BCD, NN_EPOCHS=NN_EPOCHS, DUAL_DECAY_ROUND=DUAL_DECAY_ROUND,
-                    logger=logger)
+                    logger=logger,
+                    theta_hot_start_strategy=THETA_WARM_START_STRATEGY,
+                    zeta_hot_start_strategy=ZETA_WARM_START_STRATEGY,
+                    theta_gaussian_std=THETA_WARM_START_GAUSSIAN_STD,
+                    zeta_gaussian_std=ZETA_WARM_START_GAUSSIAN_STD)
             if RUN_FP:
                 log("警告: bcd 模式不支持 RUN_FP（需要 trainers），请改用 both 模式")
 
@@ -563,6 +626,10 @@ def main():
                 max_groups=SPARSE_MAX_GROUPS,
                 group_size=SPARSE_GROUP_SIZE,
                 logger=logger,
+                theta_hot_start_strategy=THETA_WARM_START_STRATEGY,
+                zeta_hot_start_strategy=ZETA_WARM_START_STRATEGY,
+                theta_gaussian_std=THETA_WARM_START_GAUSSIAN_STD,
+                zeta_gaussian_std=ZETA_WARM_START_GAUSSIAN_STD,
             )
             if RUN_FP:
                 log("警告: sparse 模式暂不支持 RUN_FP（需要 trainers），请改用 both 模式或单独接入模板库")
@@ -580,6 +647,7 @@ def main():
                 ppc, all_samples, T_DELTA, UNIT_IDS,
                 DUAL_EPOCHS, DUAL_BATCH_SIZE, MAX_ITER, NN_EPOCHS, save_dir,
                 n_workers=N_WORKERS_SUBPROBLEM, logger=logger,
+                constraint_generation_strategy=CONSTRAINT_GENERATION_STRATEGY,
             )
             print_surrogate_results(trainers, all_samples)
 
@@ -649,6 +717,10 @@ def main():
                     DUAL_DECAY_ROUND=DUAL_DECAY_ROUND,
                     logger=logger,
                     external_sparse_templates=sparse_template_library,
+                    theta_hot_start_strategy=THETA_WARM_START_STRATEGY,
+                    zeta_hot_start_strategy=ZETA_WARM_START_STRATEGY,
+                    theta_gaussian_std=THETA_WARM_START_GAUSSIAN_STD,
+                    zeta_gaussian_std=ZETA_WARM_START_GAUSSIAN_STD,
                 )
 
             # Step 2: 加载 v3 格式样本（subproblem 独立训练，不注入 BCD 对偶变量）
@@ -665,6 +737,7 @@ def main():
                 ppc, all_samples, T_DELTA, UNIT_IDS,
                 DUAL_EPOCHS, DUAL_BATCH_SIZE, MAX_ITER, NN_EPOCHS, save_dir,
                 n_workers=N_WORKERS_SUBPROBLEM, logger=logger,
+                constraint_generation_strategy=CONSTRAINT_GENERATION_STRATEGY,
             )
             print_surrogate_results(trainers, all_samples)
 

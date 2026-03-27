@@ -38,6 +38,7 @@ try:
         get_sample_renewable_data,
         normalize_sample_arrays,
     )
+    from case_registry import get_case_ppc
 except ImportError:
     from src.scenario_utils import (
         get_feature_vector,
@@ -47,6 +48,7 @@ except ImportError:
         get_sample_renewable_data,
         normalize_sample_arrays,
     )
+    from src.case_registry import get_case_ppc
 
 # 导入pypower用于测试
 try:
@@ -62,6 +64,13 @@ except ImportError:
 # 设置输出缓冲（用 reconfigure 原地修改，避免替换 stdout 导致 buffer 被 GC 关闭）
 if hasattr(sys.stdout, 'reconfigure'):
     sys.stdout.reconfigure(encoding='utf-8', line_buffering=True)
+
+
+def _load_demo_ppc(case_name: str):
+    try:
+        return get_case_ppc(case_name)
+    except ValueError as exc:
+        raise ValueError(f"Unknown case_name: {case_name}") from exc
 
 
 # ========================== 数据加载工具 ==========================
@@ -227,6 +236,60 @@ def _extract_lambda_matrix(
     return arr
 
 
+def _pack_global_dual_targets(
+    lambda_power_balance: np.ndarray,
+    lambda_dcpf_upper: np.ndarray,
+    lambda_dcpf_lower: np.ndarray,
+) -> np.ndarray:
+    return np.concatenate(
+        [
+            np.asarray(lambda_power_balance, dtype=float).reshape(-1),
+            np.asarray(lambda_dcpf_upper, dtype=float).reshape(-1),
+            np.asarray(lambda_dcpf_lower, dtype=float).reshape(-1),
+        ]
+    )
+
+
+def _unpack_global_dual_targets(
+    packed_targets: np.ndarray,
+    T: int,
+    nl: int,
+    generator_injection_sensitivity: np.ndarray | None = None,
+) -> Dict[str, np.ndarray]:
+    packed = np.asarray(packed_targets, dtype=float).reshape(-1)
+    full_size = T + 2 * nl * T
+
+    if packed.size == T:
+        lambda_power_balance = packed.copy()
+        lambda_dcpf_upper = np.zeros((nl, T), dtype=float)
+        lambda_dcpf_lower = np.zeros((nl, T), dtype=float)
+    elif packed.size == full_size:
+        offset = 0
+        lambda_power_balance = packed[offset:offset + T]
+        offset += T
+        lambda_dcpf_upper = packed[offset:offset + nl * T].reshape(nl, T)
+        offset += nl * T
+        lambda_dcpf_lower = packed[offset:offset + nl * T].reshape(nl, T)
+    else:
+        raise ValueError(
+            f"Packed dual target has size {packed.size}, expected {T} or {full_size}"
+        )
+
+    payload = {
+        'lambda_power_balance': lambda_power_balance,
+        'lambda_dcpf_upper': lambda_dcpf_upper,
+        'lambda_dcpf_lower': lambda_dcpf_lower,
+    }
+    if generator_injection_sensitivity is not None:
+        payload['lambda_pg_effective'] = _combine_pg_duals(
+            lambda_power_balance,
+            lambda_dcpf_upper,
+            lambda_dcpf_lower,
+            generator_injection_sensitivity,
+        )
+    return payload
+
+
 def _build_generator_injection_sensitivity(ppc) -> np.ndarray:
     ppc_int = ext2int(ppc)
     bus = ppc_int['bus']
@@ -241,6 +304,51 @@ def _build_generator_injection_sensitivity(ppc) -> np.ndarray:
             G[bus_idx, g] = 1.0
     PTDF = makePTDF(ppc_int['baseMVA'], bus, branch)
     return PTDF @ G
+
+
+def _get_custom_generator_array_from_ppc(ppc_raw, ng: int, key: str) -> Optional[np.ndarray]:
+    """Read optional per-generator metadata from raw ppc and align it to ext2int order."""
+    if not isinstance(ppc_raw, dict):
+        return None
+
+    values = ppc_raw.get(key)
+    if values is None:
+        return None
+
+    values = np.asarray(values, dtype=float)
+    if values.shape[0] != ng:
+        return None
+
+    raw_gen = np.asarray(ppc_raw.get('gen'))
+    if raw_gen.shape[0] != ng:
+        return values
+
+    order = np.argsort(raw_gen[:, GEN_BUS], kind='stable')
+    return values[order]
+
+
+def _get_ramp_limits_from_ppc(ppc_raw, gen: np.ndarray, T_delta: float) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Return per-generator ramp limits, preferring optional raw ppc metadata when present."""
+    default_up = 0.4 * gen[:, PMAX] / T_delta
+    default_down = 0.4 * gen[:, PMAX] / T_delta
+    default_up_co = 0.3 * gen[:, PMAX]
+    default_down_co = 0.3 * gen[:, PMAX]
+
+    ramp_up_h = _get_custom_generator_array_from_ppc(
+        ppc_raw, gen.shape[0], 'uc_ramp_up_mw_per_h')
+    ramp_down_h = _get_custom_generator_array_from_ppc(
+        ppc_raw, gen.shape[0], 'uc_ramp_down_mw_per_h')
+
+    if ramp_up_h is None or ramp_down_h is None:
+        return default_up, default_down, default_up_co, default_down_co
+
+    Ru = np.asarray(ramp_up_h, dtype=float) * T_delta
+    Rd = np.asarray(ramp_down_h, dtype=float) * T_delta
+    Ru = np.maximum(Ru, default_up)
+    Rd = np.maximum(Rd, default_down)
+    Ru_co = np.maximum(Ru, gen[:, PMIN])
+    Rd_co = np.maximum(Rd, gen[:, PMIN])
+    return Ru, Rd, Ru_co, Rd_co
 
 
 def _combine_pg_duals(
@@ -313,6 +421,19 @@ def _has_complete_effective_pg_dual(
     )
 
 
+def _has_global_dual_payload(lambda_field, T: int, nl: int) -> bool:
+    if not isinstance(lambda_field, dict):
+        return False
+    lambda_pb = np.array(lambda_field.get('lambda_power_balance', []), dtype=float)
+    lambda_du = np.array(lambda_field.get('lambda_dcpf_upper', []), dtype=float)
+    lambda_dl = np.array(lambda_field.get('lambda_dcpf_lower', []), dtype=float)
+    return (
+        lambda_pb.shape == (T,)
+        and lambda_du.shape == (nl, T)
+        and lambda_dl.shape == (nl, T)
+    )
+
+
 def _recover_unit_commitment_matrix(sample: Dict, ng: int, T: int) -> np.ndarray:
     x_sol = np.zeros((ng, T), dtype=float)
     if 'active_set' in sample:
@@ -332,7 +453,7 @@ def _recover_unit_commitment_matrix(sample: Dict, ng: int, T: int) -> np.ndarray
     return x_sol
 
 
-def _solve_effective_pg_dual_from_ed(
+def _solve_global_dual_payload_from_ed(
     ppc,
     Pd: np.ndarray,
     T_delta: float,
@@ -375,12 +496,35 @@ def _solve_effective_pg_dual_from_ed(
                 -(float(cl.Pi) if cl is not None else 0.0),
             )
 
-    return _combine_pg_duals(
-        lambda_pb,
-        lambda_dcpf_upper,
-        lambda_dcpf_lower,
+    return {
+        'lambda_power_balance': lambda_pb,
+        'lambda_dcpf_upper': lambda_dcpf_upper,
+        'lambda_dcpf_lower': lambda_dcpf_lower,
+        'lambda_pg_effective': _combine_pg_duals(
+            lambda_pb,
+            lambda_dcpf_upper,
+            lambda_dcpf_lower,
+            generator_injection_sensitivity,
+        ),
+    }
+
+
+def _solve_effective_pg_dual_from_ed(
+    ppc,
+    Pd: np.ndarray,
+    T_delta: float,
+    x_sol: np.ndarray,
+    generator_injection_sensitivity: np.ndarray,
+    renewable_data: np.ndarray | None = None,
+) -> np.ndarray:
+    return _solve_global_dual_payload_from_ed(
+        ppc,
+        Pd,
+        T_delta,
+        x_sol,
         generator_injection_sensitivity,
-    )
+        renewable_data=renewable_data,
+    )['lambda_pg_effective']
 
 
 def load_active_set_from_json(json_filepath: str, sample_id: Optional[int] = None):
@@ -501,6 +645,7 @@ class DualVariablePredictorTrainer:
     
     def __init__(self, ppc, active_set_data, T_delta, device=None):
         self.ppc = ppc
+        self.ppc_raw = ppc
         ppc_int = ext2int(ppc)
         self.baseMVA = ppc_int['baseMVA']
         self.bus = ppc_int['bus']
@@ -519,6 +664,8 @@ class DualVariablePredictorTrainer:
         self.nb = self.bus.shape[0]
         self.nl = self.branch.shape[0]
         self.active_set_data = active_set_data
+        self.generator_injection_sensitivity = _build_generator_injection_sensitivity(self.ppc)
+        self.generator_injection_sensitivity = _build_generator_injection_sensitivity(self.ppc)
         self.generator_injection_sensitivity = _build_generator_injection_sensitivity(ppc)
         
         # 设置设备
@@ -849,6 +996,19 @@ class SubproblemSurrogateNet(nn.Module):
         return alphas, betas, gammas, deltas, costs
 
 
+SUPPORTED_CONSTRAINT_GENERATION_STRATEGIES = {"sensitive", "all"}
+
+
+def normalize_constraint_generation_strategy(strategy: str | None) -> str:
+    strategy_norm = "sensitive" if strategy is None else str(strategy).strip().lower()
+    if strategy_norm not in SUPPORTED_CONSTRAINT_GENERATION_STRATEGIES:
+        raise ValueError(
+            f"Unsupported constraint_generation_strategy: {strategy}. "
+            f"Supported: {sorted(SUPPORTED_CONSTRAINT_GENERATION_STRATEGIES)}"
+        )
+    return strategy_norm
+
+
 def identify_sensitive_timesteps(x_vals, threshold_low=0.1, threshold_high=0.9, max_constraints=20):
     """
     识别整数性差的敏感时段（用于三时段约束）
@@ -900,6 +1060,27 @@ def identify_sensitive_timesteps(x_vals, threshold_low=0.1, threshold_high=0.9, 
     return sensitive
 
 
+def select_constraint_timesteps(
+    x_vals,
+    strategy: str = "sensitive",
+    threshold_low: float = 0.1,
+    threshold_high: float = 0.9,
+    max_constraints: int = 20,
+):
+    strategy_norm = normalize_constraint_generation_strategy(strategy)
+    T = len(x_vals)
+    if T < 3:
+        return []
+    if strategy_norm == "all":
+        return list(range(T - 2))
+    return identify_sensitive_timesteps(
+        x_vals,
+        threshold_low=threshold_low,
+        threshold_high=threshold_high,
+        max_constraints=max_constraints,
+    )
+
+
 class SubproblemSurrogateTrainer:
     """
     单机组子问题代理约束的BCD训练器
@@ -919,7 +1100,13 @@ class SubproblemSurrogateTrainer:
     
     def __init__(self, ppc, active_set_data, T_delta, unit_id: int, 
                  lambda_predictor: DualVariablePredictorTrainer = None, 
-                 max_constraints: int = 20, device=None):
+                 max_constraints: int = 20,
+                 constraint_generation_strategy: str = "sensitive",
+                 rho_primal_init: float = 1e-3,
+                 rho_dual_init: float = 1e-3,
+                 rho_opt_init: float = 1e-3,
+                 gamma: float = 1e-3,
+                 device=None):
         """
         初始化单机组子问题代理约束训练器 - V3三时段版本
         
@@ -933,6 +1120,7 @@ class SubproblemSurrogateTrainer:
             device: 计算设备
         """
         self.ppc = ppc
+        self.ppc_raw = ppc
         ppc_int = ext2int(ppc)
         self.baseMVA = ppc_int['baseMVA']
         self.bus = ppc_int['bus']
@@ -942,6 +1130,13 @@ class SubproblemSurrogateTrainer:
         self.n_samples = len(active_set_data)
         self.T_delta = T_delta
         self.unit_id = unit_id
+        self.Ru_all, self.Rd_all, self.Ru_co_all, self.Rd_co_all = _get_ramp_limits_from_ppc(
+            self.ppc_raw, self.gen, self.T_delta
+        )
+        self.constraint_generation_strategy = normalize_constraint_generation_strategy(
+            constraint_generation_strategy
+        )
+        self.requested_max_constraints = max_constraints
         self.max_constraints = max_constraints  # V3新增
         
         if isinstance(active_set_data, list):
@@ -951,6 +1146,10 @@ class SubproblemSurrogateTrainer:
             
         self.ng = self.gen.shape[0]
         self.nb = self.bus.shape[0]
+        if self.constraint_generation_strategy == "all":
+            self.max_constraints = max(self.T - 2, 0)
+        else:
+            self.max_constraints = self.requested_max_constraints
         
         # 获取实际pd_data的维度（可能只包含负荷节点）
         if isinstance(active_set_data, list):
@@ -961,6 +1160,7 @@ class SubproblemSurrogateTrainer:
         self.active_set_data = active_set_data
         
         # 对偶变量预测器
+        self.generator_injection_sensitivity = _build_generator_injection_sensitivity(self.ppc)
         self.lambda_predictor = lambda_predictor
         
         # 设备
@@ -973,10 +1173,10 @@ class SubproblemSurrogateTrainer:
             self.device = device
         
         # BCD迭代参数
-        self.rho_primal = 1e-3
-        self.rho_dual = 1e-3
-        self.rho_opt = 1e-3
-        self.gamma = 1e-3
+        self.rho_primal = float(rho_primal_init)
+        self.rho_dual = float(rho_dual_init)
+        self.rho_opt = float(rho_opt_init)
+        self.gamma = float(gamma)
         self.rho_max = 10.0
         self.reg_weight = 1e-4   # alpha/beta/gamma L2 正则化权重
         self.mu_lower_bound = 0.1
@@ -1116,6 +1316,7 @@ class SubproblemSurrogateTrainer:
         self.cost_optimizer = optim.Adam(self.surrogate_net.cost_net.parameters(), lr=1e-5)
 
         print(f"  - 代理约束网络输入维度: {input_dim}", flush=True)
+        print(f"  - 约束生成策略: {self.constraint_generation_strategy}", flush=True)
         print(f"  - 最大约束数量: {self.max_constraints}", flush=True)
 
     def _generate_initial_values_from_nn(self):
@@ -1151,10 +1352,10 @@ class SubproblemSurrogateTrainer:
         g    = self.unit_id
         Pmin = self.gen[g, PMIN]
         Pmax = self.gen[g, PMAX]
-        Ru    = 0.4 * Pmax / self.T_delta
-        Rd    = 0.4 * Pmax / self.T_delta
-        Ru_co = 0.3 * Pmax
-        Rd_co = 0.3 * Pmax
+        Ru    = float(self.Ru_all[g])
+        Rd    = float(self.Rd_all[g])
+        Ru_co = float(self.Ru_co_all[g])
+        Rd_co = float(self.Rd_co_all[g])
         a     = self.gencost[g, -2] / self.T_delta
         b     = self.gencost[g, -1] / self.T_delta
         sc    = self.gencost[g, 1]
@@ -1258,8 +1459,9 @@ class SubproblemSurrogateTrainer:
                 self.active_set_data[sample_id]['x_true'] = x_init.copy()
 
                 # 识别敏感时段（分数解 → 优先覆盖；全整数 → 按距0.5升序补齐）
-                self.sensitive_timesteps[sample_id] = identify_sensitive_timesteps(
+                self.sensitive_timesteps[sample_id] = select_constraint_timesteps(
                     x_lp,
+                    strategy=self.constraint_generation_strategy,
                     threshold_low=0.1, threshold_high=0.9,
                     max_constraints=self.max_constraints
                 )
@@ -1317,10 +1519,10 @@ class SubproblemSurrogateTrainer:
         Pmax    = self.gen[g, PMAX]
         a       = self.gencost[g, -2] / self.T_delta   # 线性发电成本系数
         b       = self.gencost[g, -1] / self.T_delta   # 无负荷成本系数
-        Ru      = 0.4 * Pmax / self.T_delta
-        Rd      = 0.4 * Pmax / self.T_delta
-        Ru_co   = 0.3 * Pmax
-        Rd_co   = 0.3 * Pmax
+        Ru      = float(self.Ru_all[g])
+        Rd      = float(self.Rd_all[g])
+        Ru_co   = float(self.Ru_co_all[g])
+        Rd_co   = float(self.Rd_co_all[g])
         sc      = self.gencost[g, 1]   # 启动成本
         shc     = self.gencost[g, 2]   # 停机成本
         Ton     = min(4, self.T)
@@ -1519,10 +1721,10 @@ class SubproblemSurrogateTrainer:
         b    = self.gencost[g, -1] / self.T_delta   # 无负荷成本系数
         Pmin = self.gen[g, PMIN]
         Pmax = self.gen[g, PMAX]
-        Ru    = 0.4 * Pmax / self.T_delta
-        Rd    = 0.4 * Pmax / self.T_delta
-        Ru_co = 0.3 * Pmax
-        Rd_co = 0.3 * Pmax
+        Ru    = float(self.Ru_all[g])
+        Rd    = float(self.Rd_all[g])
+        Ru_co = float(self.Ru_co_all[g])
+        Rd_co = float(self.Rd_co_all[g])
         start_cost = self.gencost[g, 1]
         shut_cost  = self.gencost[g, 2]
         Ton  = min(4, self.T)
@@ -1786,7 +1988,7 @@ class SubproblemSurrogateTrainer:
             self.gen[g, PMIN] / (Pmax + 1e-8),                    # Pmin/Pmax ratio
             self.gencost[g, -2] / self.T_delta,                    # 边际成本 a
             self.gencost[g, -1] / self.T_delta / (Pmax + 1e-8),   # 归一化无负荷成本 b
-            0.4 * Pmax / self.T_delta / (Pmax + 1e-8),            # 归一化爬坡率 Ru
+            float(self.Ru_all[g]) / (Pmax + 1e-8),                # 归一化爬坡率 Ru
             self.gencost[g, 1] / (Pmax + 1e-8),                   # 归一化启动成本
             self.gencost[g, 2] / (Pmax + 1e-8),                   # 归一化停机成本
         ])
@@ -1855,10 +2057,10 @@ class SubproblemSurrogateTrainer:
         b_val   = float(self.gencost[g, -1] / self.T_delta)
         Pmin_v  = float(self.gen[g, PMIN])
         Pmax_v  = float(self.gen[g, PMAX])
-        Ru_v    = 0.4 * Pmax_v / self.T_delta
-        Rd_v    = 0.4 * Pmax_v / self.T_delta
-        Ru_co_v = 0.3 * Pmax_v
-        Rd_co_v = 0.3 * Pmax_v
+        Ru_v    = float(self.Ru_all[g])
+        Rd_v    = float(self.Rd_all[g])
+        Ru_co_v = float(self.Ru_co_all[g])
+        Rd_co_v = float(self.Rd_co_all[g])
         start_c = float(self.gencost[g, 1])
         shut_c  = float(self.gencost[g, 2])
         Ton_l   = min(4, self.T)
@@ -2060,10 +2262,10 @@ class SubproblemSurrogateTrainer:
             b_v     = self.gencost[g, -1] / self.T_delta   # 无负荷成本系数
             Pmin_v  = float(self.gen[g, PMIN])
             Pmax_v  = float(self.gen[g, PMAX])
-            Ru_v    = 0.4 * Pmax_v / self.T_delta
-            Rd_v    = 0.4 * Pmax_v / self.T_delta
-            Ru_co_v = 0.3 * Pmax_v
-            Rd_co_v = 0.3 * Pmax_v
+            Ru_v    = float(self.Ru_all[g])
+            Rd_v    = float(self.Rd_all[g])
+            Ru_co_v = float(self.Ru_co_all[g])
+            Rd_co_v = float(self.Rd_co_all[g])
             sc_v    = self.gencost[g, 1]
             shc_v   = self.gencost[g, 2]
             Ton_v   = min(4, self.T)
@@ -2329,7 +2531,7 @@ class SubproblemSurrogateTrainer:
             self.gen[g, PMIN] / (Pmax + 1e-8),
             self.gencost[g, -2] / self.T_delta,
             self.gencost[g, -1] / self.T_delta / (Pmax + 1e-8),
-            0.4 * Pmax / self.T_delta / (Pmax + 1e-8),
+            float(self.Ru_all[g]) / (Pmax + 1e-8),
             self.gencost[g, 1] / (Pmax + 1e-8),
             self.gencost[g, 2] / (Pmax + 1e-8),
         ])
@@ -2454,6 +2656,9 @@ class SubproblemSurrogateTrainer:
                 'rho_dual': self.rho_dual,
                 'rho_opt': self.rho_opt,
                 'num_coupling_constraints': self.num_coupling_constraints,
+                'max_constraints': self.max_constraints,
+                'requested_max_constraints': self.requested_max_constraints,
+                'constraint_generation_strategy': self.constraint_generation_strategy,
                 'lambda_inherent': self.lambda_inherent,
             }
             
@@ -2479,12 +2684,29 @@ class SubproblemSurrogateTrainer:
             self.rho_primal = state['rho_primal']
             self.rho_dual = state['rho_dual']
             self.rho_opt = state['rho_opt']
+            saved_strategy = state.get('constraint_generation_strategy', 'sensitive')
+            self.constraint_generation_strategy = normalize_constraint_generation_strategy(saved_strategy)
+            self.requested_max_constraints = state.get('requested_max_constraints', self.requested_max_constraints)
+            self.max_constraints = state.get('max_constraints', self.max_constraints)
+            self.num_coupling_constraints = state.get('num_coupling_constraints', self.num_coupling_constraints)
             if 'lambda_inherent' in state:
                 self.lambda_inherent = state['lambda_inherent']
             print(f"✓ V3三时段耦合代理约束模型已加载: {filepath}", flush=True)
 
 
 # ========================== 训练代码 ==========================
+
+def _load_surrogate_model_metadata(filepath: str, device=None) -> dict:
+    if not TORCH_AVAILABLE:
+        return {}
+    state = torch.load(filepath, map_location=device, weights_only=False)
+    return {
+        'constraint_generation_strategy': state.get('constraint_generation_strategy', 'sensitive'),
+        'max_constraints': state.get('max_constraints'),
+        'requested_max_constraints': state.get('requested_max_constraints'),
+        'num_coupling_constraints': state.get('num_coupling_constraints'),
+    }
+
 
 def train_dual_predictor_from_data(ppc, active_set_data: List[Dict], T_delta: float = 1.0,
                                     num_epochs: int = 100, batch_size: int = 8,
@@ -2524,6 +2746,7 @@ def train_dual_predictor_from_data(ppc, active_set_data: List[Dict], T_delta: fl
 def train_subproblem_surrogate_from_data(ppc, active_set_data: List[Dict], unit_id: int,
                                           T_delta: float = 1.0, lambda_predictor=None,
                                           max_iter: int = 20, nn_epochs: int = 10,
+                                          constraint_generation_strategy: str = "sensitive",
                                           save_path: str = None, device=None) -> SubproblemSurrogateTrainer:
     """
     训练单机组子问题代理约束
@@ -2549,7 +2772,9 @@ def train_subproblem_surrogate_from_data(ppc, active_set_data: List[Dict], unit_
     # 创建训练器
     trainer = SubproblemSurrogateTrainer(
         ppc, active_set_data, T_delta, unit_id,
-        lambda_predictor=lambda_predictor, device=device
+        lambda_predictor=lambda_predictor,
+        constraint_generation_strategy=constraint_generation_strategy,
+        device=device
     )
     
     # BCD迭代训练
@@ -2563,9 +2788,10 @@ def train_subproblem_surrogate_from_data(ppc, active_set_data: List[Dict], unit_
 
 
 def train_all_subproblem_surrogates(ppc, active_set_data: List[Dict], T_delta: float = 1.0,
-                                     lambda_predictor=None, unit_ids: List[int] = None,
-                                     max_iter: int = 20, nn_epochs: int = 10,
-                                     save_dir: str = None, device=None) -> Dict[int, SubproblemSurrogateTrainer]:
+                                      lambda_predictor=None, unit_ids: List[int] = None,
+                                      max_iter: int = 20, nn_epochs: int = 10,
+                                      constraint_generation_strategy: str = "sensitive",
+                                      save_dir: str = None, device=None) -> Dict[int, SubproblemSurrogateTrainer]:
     """
     训练所有机组的子问题代理约束
     
@@ -2600,7 +2826,9 @@ def train_all_subproblem_surrogates(ppc, active_set_data: List[Dict], T_delta: f
         
         trainer = SubproblemSurrogateTrainer(
             ppc, active_set_data, T_delta, g,
-            lambda_predictor=lambda_predictor, device=device
+            lambda_predictor=lambda_predictor,
+            constraint_generation_strategy=constraint_generation_strategy,
+            device=device
         )
         
         trainer.iter(max_iter=max_iter, nn_epochs=nn_epochs)
@@ -2618,6 +2846,7 @@ def train_complete_model(ppc, active_set_data: List[Dict], T_delta: float = 1.0,
                           unit_ids: List[int] = None,
                           dual_epochs: int = 100, dual_batch_size: int = 8,
                           surrogate_max_iter: int = 20, surrogate_nn_epochs: int = 10,
+                          constraint_generation_strategy: str = "sensitive",
                           save_dir: str = None, device=None):
     """
     完整的训练流程：先训练对偶预测器，再训练所有机组的代理约束
@@ -2676,6 +2905,7 @@ def train_complete_model(ppc, active_set_data: List[Dict], T_delta: float = 1.0,
         ppc, active_set_data, T_delta,
         lambda_predictor=dual_predictor, unit_ids=unit_ids,
         max_iter=surrogate_max_iter, nn_epochs=surrogate_nn_epochs,
+        constraint_generation_strategy=constraint_generation_strategy,
         save_dir=save_dir, device=device
     )
     
@@ -2687,7 +2917,9 @@ def train_complete_model(ppc, active_set_data: List[Dict], T_delta: float = 1.0,
 
 
 def load_trained_models(ppc, active_set_data: List[Dict], T_delta: float,
-                        load_dir: str, unit_ids: List[int] = None, device=None):
+                         load_dir: str, unit_ids: List[int] = None,
+                         constraint_generation_strategy: str | None = None,
+                         device=None):
     """
     加载已训练的模型
     
@@ -2721,17 +2953,47 @@ def load_trained_models(ppc, active_set_data: List[Dict], T_delta: float,
     # 加载代理约束模型
     trainers = {}
     for g in unit_ids:
+        surrogate_path = os.path.join(load_dir, f'surrogate_unit_{g}.pth')
+        if not os.path.exists(surrogate_path):
+            print(f"警告: 未找到机组{g}代理约束模型 {surrogate_path}", flush=True)
+            continue
+
+        metadata = _load_surrogate_model_metadata(surrogate_path, device=device)
+        saved_strategy = normalize_constraint_generation_strategy(
+            metadata.get('constraint_generation_strategy', 'sensitive')
+        )
+        requested_strategy = (
+            saved_strategy
+            if constraint_generation_strategy is None
+            else normalize_constraint_generation_strategy(constraint_generation_strategy)
+        )
+        if requested_strategy != saved_strategy:
+            raise ValueError(
+                f"Surrogate model strategy mismatch for unit {g}: "
+                f"requested={requested_strategy}, saved={saved_strategy}"
+            )
+
+        requested_max_constraints = metadata.get('requested_max_constraints')
+        saved_max_constraints = metadata.get('max_constraints')
+        saved_num_constraints = metadata.get('num_coupling_constraints')
+        trainer_max_constraints = requested_max_constraints
+        if trainer_max_constraints is None:
+            if saved_max_constraints is not None:
+                trainer_max_constraints = saved_max_constraints
+            elif saved_num_constraints is not None:
+                trainer_max_constraints = saved_num_constraints
+            else:
+                trainer_max_constraints = 20
+
         trainer = SubproblemSurrogateTrainer(
             ppc, active_set_data, T_delta, g,
-            lambda_predictor=dual_predictor, device=device
+            lambda_predictor=dual_predictor,
+            max_constraints=trainer_max_constraints,
+            constraint_generation_strategy=requested_strategy,
+            device=device,
         )
-        
-        surrogate_path = os.path.join(load_dir, f'surrogate_unit_{g}.pth')
-        if os.path.exists(surrogate_path):
-            trainer.load(surrogate_path)
-            trainers[g] = trainer
-        else:
-            print(f"警告: 未找到机组{g}代理约束模型 {surrogate_path}", flush=True)
+        trainer.load(surrogate_path)
+        trainers[g] = trainer
     
     print(f"✓ 模型加载完成", flush=True)
     return dual_predictor, trainers
@@ -3276,6 +3538,10 @@ def test_end_to_end(case_name: str = 'case30', n_samples: int = 20,
         ppc = pypower.case30.case30()
     elif case_name == 'case39':
         ppc = pypower.case39.case39()
+    elif case_name == 'case3' or case_name == 'case118':
+        ppc = _load_demo_ppc(case_name)
+    elif case_name == 'case3' or case_name == 'case118':
+        ppc = _load_demo_ppc(case_name)
     else:
         print(f"未知案例: {case_name}", flush=True)
         return
@@ -3438,6 +3704,8 @@ def main():
             ppc = pypower.case30.case30()
         elif case_name == 'case39':
             ppc = pypower.case39.case39()
+        elif case_name == 'case3' or case_name == 'case118':
+            ppc = _load_demo_ppc(case_name)
         else:
             print(f"未知案例: {case_name}")
             return
@@ -3463,7 +3731,7 @@ def main():
         # 仅训练对偶预测器
         print("\n>>> 仅训练对偶变量预测器 <<<\n")
         
-        ppc = pypower.case30.case30()
+        ppc = _load_demo_ppc('case30')
         active_set_data = generate_test_data(ppc, T=8, n_samples=20)
         
         predictor = train_dual_predictor_from_data(
@@ -3476,7 +3744,7 @@ def main():
         # 仅训练指定机组代理约束
         print("\n>>> 仅训练指定机组代理约束 <<<\n")
         
-        ppc = pypower.case30.case30()
+        ppc = _load_demo_ppc('case30')
         active_set_data = generate_test_data(ppc, T=8, n_samples=20)
         
         # 先训练对偶预测器
@@ -3516,7 +3784,7 @@ def main():
         print("\n>>> 运行所有测试 <<<\n")
         
         # 生成共享数据
-        ppc = pypower.case30.case30()
+        ppc = _load_demo_ppc('case30')
         active_set_data = generate_test_data(ppc, T=8, n_samples=15)
         
         # 测试1: 对偶预测器
@@ -3619,23 +3887,20 @@ def _dual_predictor_trainer_init(self, ppc, active_set_data, T_delta, device=Non
 
     first_sample = active_set_data[0] if isinstance(active_set_data, list) else active_set_data
     self.input_dim = len(get_feature_vector_from_sample(dict(first_sample)))
-    self.output_dim = self.T
+    self.output_dim = self.T + 2 * self.nl * self.T
+    self._legacy_mode = None
 
     if TORCH_AVAILABLE:
-        self.networks = [
-            DualVariablePredictorNet(self.input_dim, self.output_dim).to(self.device)
-            for _ in range(self.ng)
-        ]
-        self.optimizers = [
-            optim.Adam(network.parameters(), lr=1e-3)
-            for network in self.networks
-        ]
+        self.network = DualVariablePredictorNet(self.input_dim, self.output_dim).to(self.device)
+        self.optimizer = optim.Adam(self.network.parameters(), lr=1e-3)
 
-    self.lambda_true = self._solve_for_true_dual_variables()
+    self.lambda_targets = self._solve_for_true_dual_variables()
+    self.lambda_true = self.lambda_targets
 
 
 def _dual_predictor_trainer_solve_true(self) -> np.ndarray:
-    lambda_true = {}
+    lambda_targets = {}
+    lambda_payloads = {}
     needs_solve = []
 
     for sample_id in range(self.n_samples):
@@ -3643,14 +3908,23 @@ def _dual_predictor_trainer_solve_true(self) -> np.ndarray:
         if (
             'lambda' in sample
             and sample['lambda'] is not None
-            and _has_complete_effective_pg_dual(sample['lambda'], self.T, self.ng, self.nl)
+            and _has_global_dual_payload(sample['lambda'], self.T, self.nl)
         ):
-            lambda_true[sample_id] = _extract_effective_pg_dual(
-                sample['lambda'],
+            payload = _unpack_global_dual_targets(
+                _pack_global_dual_targets(
+                    _extract_lambda_power_balance(sample['lambda'], self.T),
+                    _extract_lambda_matrix(sample['lambda'], 'lambda_dcpf_upper', (self.nl, self.T)),
+                    _extract_lambda_matrix(sample['lambda'], 'lambda_dcpf_lower', (self.nl, self.T)),
+                ),
                 self.T,
-                self.ng,
                 self.nl,
                 self.generator_injection_sensitivity,
+            )
+            lambda_payloads[sample_id] = payload
+            lambda_targets[sample_id] = _pack_global_dual_targets(
+                payload['lambda_power_balance'],
+                payload['lambda_dcpf_upper'],
+                payload['lambda_dcpf_lower'],
             )
         else:
             needs_solve.append(sample_id)
@@ -3658,7 +3932,7 @@ def _dual_predictor_trainer_solve_true(self) -> np.ndarray:
     for sample_id in needs_solve:
         sample = self.active_set_data[sample_id]
         x_sol = _recover_unit_commitment_matrix(sample, self.ng, self.T)
-        lambda_true[sample_id] = _solve_effective_pg_dual_from_ed(
+        payload = _solve_global_dual_payload_from_ed(
             self.ppc,
             sample['pd_data'],
             self.T_delta,
@@ -3666,8 +3940,15 @@ def _dual_predictor_trainer_solve_true(self) -> np.ndarray:
             self.generator_injection_sensitivity,
             renewable_data=sample.get('renewable_data'),
         )
+        lambda_payloads[sample_id] = payload
+        lambda_targets[sample_id] = _pack_global_dual_targets(
+            payload['lambda_power_balance'],
+            payload['lambda_dcpf_upper'],
+            payload['lambda_dcpf_lower'],
+        )
 
-    return np.array([lambda_true[i] for i in range(self.n_samples)])
+    self.lambda_payloads = [lambda_payloads[i] for i in range(self.n_samples)]
+    return np.array([lambda_targets[i] for i in range(self.n_samples)])
 
 
 def _dual_predictor_trainer_extract_features(self, sample_id: int) -> np.ndarray:
@@ -3680,31 +3961,27 @@ def _dual_predictor_trainer_train(self, num_epochs: int = 100, batch_size: int =
         return
 
     X = np.array([self._extract_features(i) for i in range(self.n_samples)])
-    Y = self.lambda_true
+    Y = self.lambda_targets
     X_tensor = torch.tensor(X, dtype=torch.float32, device=self.device)
+    Y_tensor = torch.tensor(Y, dtype=torch.float32, device=self.device)
+    dataset = torch.utils.data.TensorDataset(X_tensor, Y_tensor)
+    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
     criterion = nn.MSELoss()
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(self.optimizer, patience=10, factor=0.5)
+    self.network.train()
 
-    for unit_id in range(self.ng):
-        Y_tensor = torch.tensor(Y[:, unit_id, :], dtype=torch.float32, device=self.device)
-        dataset = torch.utils.data.TensorDataset(X_tensor, Y_tensor)
-        dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
-        network = self.networks[unit_id]
-        optimizer = self.optimizers[unit_id]
-        scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=10, factor=0.5)
-        network.train()
+    for _epoch in range(num_epochs):
+        epoch_loss = 0.0
+        for batch_X, batch_Y in dataloader:
+            self.optimizer.zero_grad()
+            pred = self.network(batch_X)
+            loss = criterion(pred, batch_Y)
+            loss.backward()
+            self.optimizer.step()
+            epoch_loss += loss.item() * batch_X.size(0)
 
-        for epoch in range(num_epochs):
-            epoch_loss = 0.0
-            for batch_X, batch_Y in dataloader:
-                optimizer.zero_grad()
-                pred = network(batch_X)
-                loss = criterion(pred, batch_Y)
-                loss.backward()
-                optimizer.step()
-                epoch_loss += loss.item() * batch_X.size(0)
-
-            epoch_loss /= len(dataset)
-            scheduler.step(epoch_loss)
+        epoch_loss /= len(dataset)
+        scheduler.step(epoch_loss)
 
 
 def _dual_predictor_trainer_predict(self, pd_data, renewable_data=None, unit_id=None) -> np.ndarray:
@@ -3718,16 +3995,41 @@ def _dual_predictor_trainer_predict(self, pd_data, renewable_data=None, unit_id=
     pd_tensor = torch.tensor(features, dtype=torch.float32, device=self.device)
 
     with torch.no_grad():
-        if unit_id is not None:
-            self.networks[unit_id].eval()
-            pred = self.networks[unit_id](pd_tensor.unsqueeze(0)).squeeze(0)
-            return pred.cpu().numpy()
+        if self._legacy_mode == 'per_unit_effective':
+            if unit_id is not None:
+                self.legacy_networks[unit_id].eval()
+                pred = self.legacy_networks[unit_id](pd_tensor.unsqueeze(0)).squeeze(0)
+                return pred.cpu().numpy()
 
-        preds = []
-        for network in self.networks:
-            network.eval()
-            preds.append(network(pd_tensor.unsqueeze(0)).squeeze(0).cpu().numpy())
-    return np.array(preds)
+            preds = []
+            for network in self.legacy_networks:
+                network.eval()
+                preds.append(network(pd_tensor.unsqueeze(0)).squeeze(0).cpu().numpy())
+            return np.array(preds)
+
+        if self._legacy_mode == 'power_balance_only':
+            self.network.eval()
+            pred = self.network(pd_tensor.unsqueeze(0)).squeeze(0).cpu().numpy()
+            if unit_id is not None:
+                return pred
+            return {
+                'lambda_power_balance': pred,
+                'lambda_dcpf_upper': np.zeros((self.nl, self.T), dtype=float),
+                'lambda_dcpf_lower': np.zeros((self.nl, self.T), dtype=float),
+                'lambda_pg_effective': np.tile(pred, (self.ng, 1)),
+            }
+
+        self.network.eval()
+        packed = self.network(pd_tensor.unsqueeze(0)).squeeze(0).cpu().numpy()
+        payload = _unpack_global_dual_targets(
+            packed,
+            self.T,
+            self.nl,
+            self.generator_injection_sensitivity,
+        )
+        if unit_id is not None:
+            return payload['lambda_pg_effective'][unit_id]
+        return payload
 
 
 def _dual_predictor_trainer_save(self, filepath: str):
@@ -3735,30 +4037,59 @@ def _dual_predictor_trainer_save(self, filepath: str):
         dirpath = os.path.dirname(os.path.abspath(filepath))
         if dirpath and not os.path.exists(dirpath):
             os.makedirs(dirpath, exist_ok=True)
-        torch.save(
-            {
-                'network_state_dicts': [network.state_dict() for network in self.networks],
-                'optimizer_state_dicts': [optimizer.state_dict() for optimizer in self.optimizers],
-                'ng': self.ng,
-                'T': self.T,
-            },
-            filepath,
-        )
+        state = {
+            'ng': self.ng,
+            'nl': self.nl,
+            'T': self.T,
+        }
+        if self._legacy_mode == 'per_unit_effective':
+            state['network_state_dicts'] = [
+                network.state_dict() for network in self.legacy_networks
+            ]
+            state['optimizer_state_dicts'] = [
+                optimizer.state_dict() for optimizer in self.legacy_optimizers
+            ]
+        else:
+            state['network_state_dict'] = self.network.state_dict()
+            state['optimizer_state_dict'] = self.optimizer.state_dict()
+            state['lambda_output_dim'] = self.T if self._legacy_mode == 'power_balance_only' else self.output_dim
+        torch.save(state, filepath)
 
 
 def _dual_predictor_trainer_load(self, filepath: str):
     if TORCH_AVAILABLE:
         state = torch.load(filepath, map_location=self.device)
         if 'network_state_dicts' in state:
-            for network, network_state in zip(self.networks, state['network_state_dicts']):
+            self._legacy_mode = 'per_unit_effective'
+            self.legacy_networks = [
+                DualVariablePredictorNet(self.input_dim, self.T).to(self.device)
+                for _ in range(self.ng)
+            ]
+            self.legacy_optimizers = [
+                optim.Adam(network.parameters(), lr=1e-3)
+                for network in self.legacy_networks
+            ]
+            for network, network_state in zip(self.legacy_networks, state['network_state_dicts']):
                 network.load_state_dict(network_state)
-            for optimizer, optimizer_state in zip(self.optimizers, state['optimizer_state_dicts']):
+            for optimizer, optimizer_state in zip(
+                self.legacy_optimizers,
+                state.get('optimizer_state_dicts', []),
+            ):
                 optimizer.load_state_dict(optimizer_state)
         else:
-            for network in self.networks:
-                network.load_state_dict(state['network_state_dict'])
-            for optimizer in self.optimizers:
-                optimizer.load_state_dict(state['optimizer_state_dict'])
+            legacy_dim = state.get('lambda_output_dim')
+            if legacy_dim == self.output_dim:
+                self._legacy_mode = None
+                self.network.load_state_dict(state['network_state_dict'])
+                if 'optimizer_state_dict' in state:
+                    self.optimizer.load_state_dict(state['optimizer_state_dict'])
+            else:
+                self._legacy_mode = 'power_balance_only'
+                self.network = DualVariablePredictorNet(self.input_dim, self.T).to(self.device)
+                self.optimizer = optim.Adam(self.network.parameters(), lr=1e-3)
+                self.network.load_state_dict(state['network_state_dict'])
+                if 'optimizer_state_dict' in state:
+                    self.optimizer.load_state_dict(state['optimizer_state_dict'])
 
 
 def _subproblem_get_lambda_values(self) -> np.ndarray:
@@ -3766,8 +4097,19 @@ def _subproblem_get_lambda_values(self) -> np.ndarray:
         lambda_vals = []
         for sample_id in range(self.n_samples):
             sample = self.active_set_data[sample_id]
-            lambda_pred = self.lambda_predictor.predict(sample, unit_id=self.unit_id)
-            lambda_vals.append(lambda_pred)
+            lambda_payload = self.lambda_predictor.predict(sample)
+            if isinstance(lambda_payload, dict):
+                effective = _extract_effective_pg_dual(
+                    lambda_payload,
+                    self.T,
+                    self.ng,
+                    self.branch.shape[0],
+                    self.generator_injection_sensitivity,
+                )
+                lambda_vals.append(effective[self.unit_id])
+            else:
+                lambda_pred = self.lambda_predictor.predict(sample, unit_id=self.unit_id)
+                lambda_vals.append(np.asarray(lambda_pred, dtype=float))
         return np.array(lambda_vals)
     return self._solve_for_lambda()
 

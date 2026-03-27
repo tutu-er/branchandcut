@@ -42,6 +42,9 @@ for _p in [str(_SRC_DIR), str(_ROOT_DIR)]:
 from uc_NN_subproblem import (
     SubproblemSurrogateTrainer,
     _extract_lambda_power_balance,
+    _has_complete_effective_pg_dual,
+    _recover_unit_commitment_matrix,
+    _solve_global_dual_payload_from_ed,
     generate_test_data,
     train_all_subproblem_surrogates,
 )
@@ -77,6 +80,11 @@ class ParallelSubproblemSurrogateTrainer(SubproblemSurrogateTrainer):
         unit_id: int,
         lambda_predictor=None,
         max_constraints: int = 20,
+        constraint_generation_strategy: str = "sensitive",
+        rho_primal_init: float = 1e-3,
+        rho_dual_init: float = 1e-3,
+        rho_opt_init: float = 1e-3,
+        gamma: float = 1e-3,
         device=None,
         n_workers: int = 4,
     ):
@@ -84,6 +92,11 @@ class ParallelSubproblemSurrogateTrainer(SubproblemSurrogateTrainer):
             ppc, active_set_data, T_delta, unit_id,
             lambda_predictor=lambda_predictor,
             max_constraints=max_constraints,
+            constraint_generation_strategy=constraint_generation_strategy,
+            rho_primal_init=rho_primal_init,
+            rho_dual_init=rho_dual_init,
+            rho_opt_init=rho_opt_init,
+            gamma=gamma,
             device=device,
         )
         self.n_workers = min(n_workers, self.n_samples)
@@ -241,7 +254,7 @@ def _train_unit_worker(args: dict) -> dict:
     unit_id             = args['unit_id']
     ppc                 = args['ppc']
     active_set_data     = copy.deepcopy(args['active_set_data'])
-    lambda_vals         = args.get('lambda_vals')   # (n_samples, T) ndarray or None
+    lambda_vals         = args.get('lambda_vals')
     T_delta             = args['T_delta']
     max_iter            = args['max_iter']
     nn_epochs           = args['nn_epochs']
@@ -255,7 +268,7 @@ def _train_unit_worker(args: dict) -> dict:
     # 将预计算的 lambda_vals 注入 active_set_data，避免子进程重复求解 LP
     if lambda_vals is not None:
         for i, sample in enumerate(active_set_data):
-            sample['lambda'] = lambda_vals[i].tolist()
+            sample['lambda'] = copy.deepcopy(lambda_vals[i])
 
     # 构建 trainer
     if use_sample_parallel:
@@ -297,11 +310,11 @@ def _precompute_lambda_vals(
     ppc,
     active_set_data: List[Dict],
     T_delta: float,
-) -> np.ndarray:
-    """在主进程中预计算所有样本的 lambda_vals (n_samples, T)。
+) -> List[object]:
+    """在主进程中预计算所有样本的 global lambda payloads。
 
     优先从 active_set_data 中读取已有 lambda 字段；
-    若缺失则通过创建临时 trainer（unit=0）触发 _solve_for_lambda()。
+    若缺失则通过 ED 回退求解并重建完整全局对偶载荷。
 
     Args:
         ppc: PyPower 案例数据。
@@ -309,7 +322,7 @@ def _precompute_lambda_vals(
         T_delta: 时间间隔。
 
     Returns:
-        lambda_vals 数组，shape (n_samples, T)。
+        按样本顺序返回 lambda payload 列表。
     """
     n_samples = len(active_set_data)
     T = active_set_data[0]['pd_data'].shape[1]
@@ -320,20 +333,42 @@ def _precompute_lambda_vals(
         for s in active_set_data
     )
     if all_have_lambda:
-        vals = np.array([
-            _extract_lambda_power_balance(s['lambda'], T)
-            for s in active_set_data
-        ])
+        vals = [copy.deepcopy(s['lambda']) for s in active_set_data]
         print(f"✓ 从数据中读取 {n_samples} 个样本的 lambda_vals", flush=True)
         return vals
 
-    # 否则创建 unit=0 的临时 trainer 触发 lambda 计算（各机组共享同一组 lambda）
-    print("预计算 lambda_vals（unit=0 临时 trainer）...", flush=True)
+    print("预计算 global lambda payloads...", flush=True)
     tmp = SubproblemSurrogateTrainer(
         ppc, active_set_data, T_delta, unit_id=0,
         lambda_predictor=None,
     )
-    return tmp.lambda_vals.copy()
+    payloads: List[object] = []
+    for sample in active_set_data:
+        if (
+            'lambda' in sample
+            and sample['lambda'] is not None
+            and _has_complete_effective_pg_dual(
+                sample['lambda'],
+                T,
+                tmp.ng,
+                tmp.branch.shape[0],
+            )
+        ):
+            payloads.append(copy.deepcopy(sample['lambda']))
+            continue
+
+        x_sol = _recover_unit_commitment_matrix(sample, tmp.ng, T)
+        payloads.append(
+            _solve_global_dual_payload_from_ed(
+                ppc,
+                sample['pd_data'],
+                T_delta,
+                x_sol,
+                tmp.generator_injection_sensitivity,
+                renewable_data=sample.get('renewable_data'),
+            )
+        )
+    return payloads
 
 
 def train_all_surrogates_parallel(
@@ -396,12 +431,12 @@ def train_all_surrogates_parallel(
     # 预计算 lambda_vals（主进程一次，避免每个 worker 重复计算）
     if lambda_predictor is not None:
         n_samples = len(active_set_data)
-        lambda_vals = np.array([
+        lambda_vals = [
             lambda_predictor.predict(normalize_sample_arrays(active_set_data[i]))
             for i in range(n_samples)
-        ])
+        ]
         print(
-            f"✓ 从 lambda_predictor 提取 lambda_vals shape={lambda_vals.shape}",
+            f"✓ 从 lambda_predictor 提取 {len(lambda_vals)} 个样本的 global lambda payloads",
             flush=True,
         )
     else:

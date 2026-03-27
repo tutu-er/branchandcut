@@ -77,9 +77,34 @@ class ParallelAgent_NN_BCD(Agent_NN_BCD):
         active_set_data,
         T_delta: float,
         union_analysis=None,
+        lambda_init_strategy: str = "lp_relaxation",
+        max_theta_constraints_per_time_slot: int = 10,
+        theta_hot_start_strategy: str = "dcpf_relative",
+        zeta_hot_start_strategy: str = "zero",
+        theta_gaussian_std: float = 0.01,
+        zeta_gaussian_std: float = 0.01,
+        rho_primal_init: float = 1e-2,
+        rho_dual_init: float = 1e-2,
+        rho_opt_init: float = 1e-2,
+        gamma_base: float = 1e-2,
         n_workers: int = 4,
     ):
-        super().__init__(ppc, active_set_data, T_delta, union_analysis)
+        super().__init__(
+            ppc,
+            active_set_data,
+            T_delta,
+            union_analysis,
+            lambda_init_strategy=lambda_init_strategy,
+            max_theta_constraints_per_time_slot=max_theta_constraints_per_time_slot,
+            theta_hot_start_strategy=theta_hot_start_strategy,
+            zeta_hot_start_strategy=zeta_hot_start_strategy,
+            theta_gaussian_std=theta_gaussian_std,
+            zeta_gaussian_std=zeta_gaussian_std,
+            rho_primal_init=rho_primal_init,
+            rho_dual_init=rho_dual_init,
+            rho_opt_init=rho_opt_init,
+            gamma_base=gamma_base,
+        )
         self.n_workers = min(n_workers, self.n_samples)
 
     def iter(self, max_iter: int = 20, dual_decay_round: int = 10, nn_epochs: int = 10, union_analysis=None):

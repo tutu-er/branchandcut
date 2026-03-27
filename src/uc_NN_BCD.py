@@ -84,6 +84,40 @@ except ImportError:
 # 设置输出缓冲
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', line_buffering=True)
 
+SUPPORTED_THETA_HOT_START_STRATEGIES = {"dcpf_relative", "gaussian"}
+SUPPORTED_ZETA_HOT_START_STRATEGIES = {"zero", "gaussian"}
+SUPPORTED_LAMBDA_INIT_STRATEGIES = {"lp_relaxation", "ed_on_x_opt"}
+
+
+def normalize_theta_hot_start_strategy(strategy: str | None) -> str:
+    strategy_norm = "dcpf_relative" if strategy is None else str(strategy).strip().lower()
+    if strategy_norm not in SUPPORTED_THETA_HOT_START_STRATEGIES:
+        raise ValueError(
+            f"Unsupported theta_hot_start_strategy: {strategy}. "
+            f"Supported: {sorted(SUPPORTED_THETA_HOT_START_STRATEGIES)}"
+        )
+    return strategy_norm
+
+
+def normalize_zeta_hot_start_strategy(strategy: str | None) -> str:
+    strategy_norm = "zero" if strategy is None else str(strategy).strip().lower()
+    if strategy_norm not in SUPPORTED_ZETA_HOT_START_STRATEGIES:
+        raise ValueError(
+            f"Unsupported zeta_hot_start_strategy: {strategy}. "
+            f"Supported: {sorted(SUPPORTED_ZETA_HOT_START_STRATEGIES)}"
+        )
+    return strategy_norm
+
+
+def normalize_lambda_init_strategy(strategy: str | None) -> str:
+    strategy_norm = "lp_relaxation" if strategy is None else str(strategy).strip().lower()
+    if strategy_norm not in SUPPORTED_LAMBDA_INIT_STRATEGIES:
+        raise ValueError(
+            f"Unsupported lambda_init_strategy: {strategy}. "
+            f"Supported: {sorted(SUPPORTED_LAMBDA_INIT_STRATEGIES)}"
+        )
+    return strategy_norm
+
 # ========================== ActiveSetReader 和 load_active_set_from_json ==========================
 # 从uc_NN.py复制，保持文件独立性
 
@@ -355,6 +389,51 @@ def _get_uc_matrix_from_sample(sample: dict, ng: int, T: int) -> Optional[np.nda
     return None
 
 
+def _get_custom_generator_array_from_ppc(ppc_raw, ng: int, key: str) -> Optional[np.ndarray]:
+    """Read optional per-generator arrays from raw ppc and align them to ext2int generator order."""
+    if not isinstance(ppc_raw, dict):
+        return None
+
+    values = ppc_raw.get(key)
+    if values is None:
+        return None
+
+    values = np.asarray(values, dtype=float)
+    if values.shape[0] != ng:
+        return None
+
+    raw_gen = np.asarray(ppc_raw.get('gen'))
+    if raw_gen.shape[0] != ng:
+        return values
+
+    order = np.argsort(raw_gen[:, GEN_BUS], kind='stable')
+    return values[order]
+
+
+def _get_ramp_limits_from_ppc(ppc_raw, gen: np.ndarray, T_delta: float) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Return per-generator ramp limits, using optional raw ppc metadata when available."""
+    default_up = 0.4 * gen[:, PMAX] / T_delta
+    default_down = 0.4 * gen[:, PMAX] / T_delta
+    default_up_co = 0.3 * gen[:, PMAX]
+    default_down_co = 0.3 * gen[:, PMAX]
+
+    ramp_up_h = _get_custom_generator_array_from_ppc(
+        ppc_raw, gen.shape[0], 'uc_ramp_up_mw_per_h')
+    ramp_down_h = _get_custom_generator_array_from_ppc(
+        ppc_raw, gen.shape[0], 'uc_ramp_down_mw_per_h')
+
+    if ramp_up_h is None or ramp_down_h is None:
+        return default_up, default_down, default_up_co, default_down_co
+
+    Ru = np.asarray(ramp_up_h, dtype=float) * T_delta
+    Rd = np.asarray(ramp_down_h, dtype=float) * T_delta
+    Ru = np.maximum(Ru, default_up)
+    Rd = np.maximum(Rd, default_down)
+    Ru_co = np.maximum(Ru, gen[:, PMIN])
+    Rd_co = np.maximum(Rd, gen[:, PMIN])
+    return Ru, Rd, Ru_co, Rd_co
+
+
 class Agent_NN_BCD:
     """
     结合BCD迭代和神经网络更新的混合方法
@@ -364,8 +443,26 @@ class Agent_NN_BCD:
     - 约束构建：直接优化系数（类似uc_NN.py）
     """
     
-    def __init__(self, ppc, active_set_data, T_delta, union_analysis=None, external_sparse_templates=None):
+    def __init__(
+        self,
+        ppc,
+        active_set_data,
+        T_delta,
+        union_analysis=None,
+        external_sparse_templates=None,
+        lambda_init_strategy: str = "lp_relaxation",
+        max_theta_constraints_per_time_slot: int = 10,
+        theta_hot_start_strategy: str = "dcpf_relative",
+        zeta_hot_start_strategy: str = "zero",
+        theta_gaussian_std: float = 0.01,
+        zeta_gaussian_std: float = 0.01,
+        rho_primal_init: float = 1e-2,
+        rho_dual_init: float = 1e-2,
+        rho_opt_init: float = 1e-2,
+        gamma_base: float = 1e-2,
+    ):
         self.ppc = ppc
+        self.ppc_raw = ppc
         ppc = ext2int(ppc)
         self.baseMVA = ppc['baseMVA']
         self.bus = ppc['bus']
@@ -374,6 +471,9 @@ class Agent_NN_BCD:
         self.gencost = ppc['gencost']
         self.n_samples = len(active_set_data)
         self.T_delta = T_delta
+        self.Ru, self.Rd, self.Ru_co, self.Rd_co = _get_ramp_limits_from_ppc(
+            self.ppc_raw, self.gen, self.T_delta
+        )
         
         self.iter_number = 0
         
@@ -384,10 +484,10 @@ class Agent_NN_BCD:
         self.dual_para_bound_quit_iteration = 50
         
         # BCD迭代参数
-        self.rho_primal = 1e-2
-        self.rho_dual = 1e-2
-        self.rho_opt = 1e-2
-        self.gamma_base = 1e-2   # gamma 缩放基准
+        self.rho_primal = float(rho_primal_init)
+        self.rho_dual = float(rho_dual_init)
+        self.rho_opt = float(rho_opt_init)
+        self.gamma_base = float(gamma_base)   # gamma 缩放基准
         self.rho_max = 10.0     # rho 上限
         self.theta_reg_weight = 1e-4   # theta L1 正则化权重（[-1, 1] 死区外生效）
         self.zeta_reg_weight = 1e-4    # zeta L1 正则化权重（[-1, 1] 死区外生效）
@@ -395,7 +495,7 @@ class Agent_NN_BCD:
         self.gurobi_feasibility_tol = 1e-5
         self.gurobi_optimality_tol = 1e-5
         self.gurobi_int_feas_tol = 1e-5
-        self.max_theta_constraints_per_time_slot = 10
+        self.max_theta_constraints_per_time_slot = int(max_theta_constraints_per_time_slot)
         
         # 约束违反惩罚项的权重和epsilon参数
         self.constraint_violation_weight = 0
@@ -420,6 +520,11 @@ class Agent_NN_BCD:
         
         self.active_set_data = active_set_data
         self.external_sparse_templates = external_sparse_templates
+        self.lambda_init_strategy = normalize_lambda_init_strategy(lambda_init_strategy)
+        self.theta_hot_start_strategy = normalize_theta_hot_start_strategy(theta_hot_start_strategy)
+        self.zeta_hot_start_strategy = normalize_zeta_hot_start_strategy(zeta_hot_start_strategy)
+        self.theta_gaussian_std = float(theta_gaussian_std)
+        self.zeta_gaussian_std = float(zeta_gaussian_std)
         
         # 初始化theta和zeta变量字典
         self.theta_vars = {}
@@ -454,22 +559,7 @@ class Agent_NN_BCD:
             self.zeta_net = None
             self.device = None
             # 回退：用随机初始化填充占位值
-            np.random.seed(42)
-            for i in range(self.n_samples):
-                for key in self.theta_values_list[i]:
-                    if key.startswith('theta_rhs_'):
-                        self.theta_values_list[i][key] = np.random.normal(1.0, 0.01)
-                    else:
-                        self.theta_values_list[i][key] = np.random.normal(0.0, 0.01)
-            np.random.seed(43)
-            for i in range(self.n_samples):
-                for key in self.zeta_values_list[i]:
-                    if key.startswith('zeta_rhs_'):
-                        self.zeta_values_list[i][key] = np.random.normal(1.0, 0.01)
-                    else:
-                        self.zeta_values_list[i][key] = np.random.normal(0.0, 0.01)
-            self.theta_values = self.theta_values_list[0]
-            self.zeta_values = self.zeta_values_list[0]
+        self._apply_hot_start_initial_values(self._current_union_analysis)
 
     def _solve_lp_with_fixed_x(self, Pd: np.ndarray, x_vals: np.ndarray):
         """以固定 x 矩阵构建纯 LP，求解后返回连续变量解和对偶变量字典。
@@ -504,12 +594,10 @@ class Agent_NN_BCD:
                     lp.addConstr(pg[g, t] <= self.gen[g, PMAX] * xgt, name=f'pg_upper_{g}_{t}')
 
             # 爬坡约束（x 为常数）
-            Ru = 0.4 * self.gen[:, PMAX] / self.T_delta
-            Rd = 0.4 * self.gen[:, PMAX] / self.T_delta
             for g in range(self.ng):
                 for t in range(1, self.T):
-                    rhs_up = Ru[g] * float(x_vals[g, t - 1]) + self.gen[g, PMAX] * (1 - float(x_vals[g, t - 1]))
-                    rhs_dn = Rd[g] * float(x_vals[g, t]) + self.gen[g, PMAX] * (1 - float(x_vals[g, t]))
+                    rhs_up = self.Ru[g] * float(x_vals[g, t - 1]) + self.Ru_co[g] * (1 - float(x_vals[g, t - 1]))
+                    rhs_dn = self.Rd[g] * float(x_vals[g, t]) + self.Rd_co[g] * (1 - float(x_vals[g, t]))
                     lp.addConstr(pg[g, t] - pg[g, t - 1] <= rhs_up, name=f'ramp_up_{g}_{t}')
                     lp.addConstr(pg[g, t - 1] - pg[g, t] <= rhs_dn, name=f'ramp_down_{g}_{t}')
 
@@ -584,13 +672,11 @@ class Agent_NN_BCD:
                     lp.addConstr(pg[g, t] <= self.gen[g, PMAX] * x[g, t], name=f'pg_upper_{g}_{t}')
 
             # 爬坡约束
-            Ru = 0.4 * self.gen[:, PMAX] / self.T_delta
-            Rd = 0.4 * self.gen[:, PMAX] / self.T_delta
             for g in range(self.ng):
                 for t in range(1, self.T):
-                    lp.addConstr(pg[g, t] - pg[g, t - 1] <= Ru[g] * x[g, t - 1] + self.gen[g, PMAX] * (1 - x[g, t - 1]),
+                    lp.addConstr(pg[g, t] - pg[g, t - 1] <= self.Ru[g] * x[g, t - 1] + self.Ru_co[g] * (1 - x[g, t - 1]),
                                  name=f'ramp_up_{g}_{t}')
-                    lp.addConstr(pg[g, t - 1] - pg[g, t] <= Rd[g] * x[g, t] + self.gen[g, PMAX] * (1 - x[g, t]),
+                    lp.addConstr(pg[g, t - 1] - pg[g, t] <= self.Rd[g] * x[g, t] + self.Rd_co[g] * (1 - x[g, t]),
                                  name=f'ramp_down_{g}_{t}')
 
             # 最小开关机时间约束（松弛版本）
@@ -709,6 +795,46 @@ class Agent_NN_BCD:
             print(f"警告: _normalize_lambda_from_data 转换失败: {e}", flush=True)
             return None
 
+    def _zero_x_bound_lambda_terms(self, lambda_dict: Optional[dict]) -> dict:
+        if lambda_dict is None:
+            lambda_dict = self._create_empty_lambda_dict()
+        lambda_clean = {
+            key: np.array(val, copy=True) if isinstance(val, np.ndarray) else val
+            for key, val in lambda_dict.items()
+        }
+        lambda_clean['lambda_x_upper'] = np.zeros((self.ng, self.T))
+        lambda_clean['lambda_x_lower'] = np.zeros((self.ng, self.T))
+        return lambda_clean
+
+    def _build_initial_lambda(
+        self,
+        Pd: np.ndarray,
+        x_opt: np.ndarray,
+        lp_lambda: Optional[dict],
+        raw_lambda,
+    ) -> dict:
+        if self.lambda_init_strategy == 'lp_relaxation':
+            if lp_lambda is not None:
+                return lp_lambda
+            lambda_data = self._normalize_lambda_from_data(raw_lambda)
+            return lambda_data if lambda_data is not None else self._create_empty_lambda_dict()
+
+        if self.lambda_init_strategy == 'ed_on_x_opt':
+            _, _, _, ed_lambda = self._solve_lp_with_fixed_x(Pd, x_opt)
+            if ed_lambda is not None:
+                return self._zero_x_bound_lambda_terms(ed_lambda)
+
+            if lp_lambda is not None:
+                return self._zero_x_bound_lambda_terms(lp_lambda)
+
+            lambda_data = self._normalize_lambda_from_data(raw_lambda)
+            if lambda_data is not None:
+                return self._zero_x_bound_lambda_terms(lambda_data)
+
+            return self._create_empty_lambda_dict()
+
+        raise ValueError(f"Unsupported lambda_init_strategy: {self.lambda_init_strategy}")
+
     def _solve_milp_for_x_opt(self, Pd: np.ndarray) -> Optional[np.ndarray]:
         """求解 MILP 获取真值 x（仅返回 x，不返回对偶变量）。
 
@@ -737,13 +863,11 @@ class Agent_NN_BCD:
                     model.addConstr(pg[g, t] >= self.gen[g, PMIN] * x[g, t], name=f'pg_lower_{g}_{t}')
                     model.addConstr(pg[g, t] <= self.gen[g, PMAX] * x[g, t], name=f'pg_upper_{g}_{t}')
 
-            Ru = 0.4 * self.gen[:, PMAX] / self.T_delta
-            Rd = 0.4 * self.gen[:, PMAX] / self.T_delta
             for g in range(self.ng):
                 for t in range(1, self.T):
-                    model.addConstr(pg[g, t] - pg[g, t - 1] <= Ru[g] * x[g, t - 1] + self.gen[g, PMAX] * (1 - x[g, t - 1]),
+                    model.addConstr(pg[g, t] - pg[g, t - 1] <= self.Ru[g] * x[g, t - 1] + self.Ru_co[g] * (1 - x[g, t - 1]),
                                     name=f'ramp_up_{g}_{t}')
-                    model.addConstr(pg[g, t - 1] - pg[g, t] <= Rd[g] * x[g, t] + self.gen[g, PMAX] * (1 - x[g, t]),
+                    model.addConstr(pg[g, t - 1] - pg[g, t] <= self.Rd[g] * x[g, t] + self.Rd_co[g] * (1 - x[g, t]),
                                     name=f'ramp_down_{g}_{t}')
 
             Ton = min(4, self.T)
@@ -833,6 +957,53 @@ class Agent_NN_BCD:
                 x_opt = x_milp if x_milp is not None else x_lp.copy()
 
             # D. 存储：self.x ← x_lp（连续），self.x_opt ← x_opt（真值）
+            pg_sol.append(pg_s)
+            x_sol.append(x_lp)
+            x_opt_sol.append(x_opt.astype(np.float64))
+            coc_sol.append(coc_s)
+            cpower_sol.append(cpower_s)
+            lambda_sol.append(lambda_s)
+
+        pg_sol = np.array(pg_sol)
+        x_sol = np.array(x_sol)
+        x_opt_sol = np.array(x_opt_sol)
+        coc_sol = np.array(coc_sol)
+        cpower_sol = np.array(cpower_sol)
+
+        return pg_sol, x_sol, x_opt_sol, coc_sol, cpower_sol, lambda_sol
+
+    def initialize_solve(self):
+        """Initialize LP-relaxation primal values, x-opt, and initial lambda values."""
+        pg_sol = []
+        x_sol = []
+        x_opt_sol = []
+        coc_sol = []
+        cpower_sol = []
+        lambda_sol = []
+
+        for sample_id in range(self.n_samples):
+            Pd = self.active_set_data[sample_id]['pd_data']
+
+            x_lp, pg_s, coc_s, cpower_s, lp_lambda = self._solve_lp_relaxation(Pd)
+
+            if x_lp is None:
+                print(f"警告: 样本 {sample_id} LP 松弛失败，使用零值回退", flush=True)
+                pg_sol.append(np.zeros((self.ng, self.T)))
+                x_sol.append(np.zeros((self.ng, self.T)))
+                x_opt_sol.append(np.zeros((self.ng, self.T), dtype=np.float64))
+                coc_sol.append(np.zeros((self.ng, self.T - 1)))
+                cpower_sol.append(np.zeros((self.ng, self.T)))
+                lambda_sol.append(self._create_empty_lambda_dict())
+                continue
+
+            x_opt = _get_uc_matrix_from_sample(self.active_set_data[sample_id], self.ng, self.T)
+            if x_opt is None:
+                x_milp = self._solve_milp_for_x_opt(Pd)
+                x_opt = x_milp if x_milp is not None else x_lp.copy()
+
+            raw_lambda = self.active_set_data[sample_id].get('lambda', None)
+            lambda_s = self._build_initial_lambda(Pd, x_opt, lp_lambda, raw_lambda)
+
             pg_sol.append(pg_s)
             x_sol.append(x_lp)
             x_opt_sol.append(x_opt.astype(np.float64))
@@ -1291,6 +1462,100 @@ class Agent_NN_BCD:
 
     def _theta_rhs_name(self, branch_id, anchor_time):
         return f'theta_rhs_branch_{branch_id}_time_{anchor_time}'
+
+    def _zeta_var_name(self, unit_id, time_slot):
+        return f'zeta_unit_{unit_id}_time_{time_slot}'
+
+    def _zeta_rhs_name(self, unit_id, time_slot):
+        return f'zeta_rhs_unit_{unit_id}_time_{time_slot}'
+
+    def _iter_theta_lookup_entries(self, union_analysis=None, dedupe_branch_time=True):
+        """迭代 theta 查找表所需元组，显式区分 anchor/member 时间。"""
+        if union_analysis is None:
+            union_analysis = self._current_union_analysis
+        if not (self.enable_theta_constraints and union_analysis and 'union_constraints' in union_analysis):
+            return
+
+        seen_branch_time: set[tuple[int, int]] = set()
+        for constraint_info in union_analysis['union_constraints']:
+            branch_id = int(constraint_info['branch_id'])
+            anchor_time = int(constraint_info.get('time_slot', 0))
+
+            key = (branch_id, anchor_time)
+            if dedupe_branch_time and key in seen_branch_time:
+                continue
+            seen_branch_time.add(key)
+
+            for coeff_info in constraint_info.get('nonzero_pg_coefficients', []):
+                unit_id = int(coeff_info['unit_id'])
+                member_time = self._theta_member_time_index(constraint_info, coeff_info)
+                theta_name = self._theta_var_name(branch_id, unit_id, member_time)
+                yield unit_id, member_time, branch_id, anchor_time, theta_name
+
+    def _build_theta_value_lookup(self, sample_theta, union_analysis=None):
+        """(unit_id, member_time) -> [(branch_id, anchor_time, theta_value), ...]"""
+        theta_lookup: dict = defaultdict(list)
+        if sample_theta is None:
+            return {}
+
+        for unit_id, member_time, branch_id, anchor_time, theta_name in (
+            self._iter_theta_lookup_entries(union_analysis=union_analysis, dedupe_branch_time=True) or []
+        ):
+            theta_lookup[(unit_id, member_time)].append(
+                (branch_id, anchor_time, sample_theta.get(theta_name, 0.0))
+            )
+
+        return dict(theta_lookup)
+
+    def _build_theta_index_lookup(self, union_analysis=None):
+        """(unit_id, member_time) -> [(theta_idx, branch_id, anchor_time), ...]"""
+        theta_lookup: dict = defaultdict(list)
+        if not hasattr(self, '_theta_name_to_idx'):
+            return {}
+
+        for unit_id, member_time, branch_id, anchor_time, theta_name in (
+            self._iter_theta_lookup_entries(union_analysis=union_analysis, dedupe_branch_time=True) or []
+        ):
+            theta_idx = self._theta_name_to_idx.get(theta_name, -1)
+            if theta_idx >= 0:
+                theta_lookup[(unit_id, member_time)].append((theta_idx, branch_id, anchor_time))
+
+        return dict(theta_lookup)
+
+    def _iter_zeta_lookup_entries(self, union_analysis=None):
+        if union_analysis is None:
+            union_analysis = self._current_union_analysis
+        if not (self.enable_zeta_constraints and union_analysis and 'union_zeta_constraints' in union_analysis):
+            return
+
+        for constraint in union_analysis['union_zeta_constraints']:
+            unit_id = int(constraint['unit_id'])
+            time_slot = int(constraint['time_slot'])
+            yield unit_id, time_slot, self._zeta_var_name(unit_id, time_slot)
+
+    def _build_zeta_value_lookup(self, sample_zeta, union_analysis=None):
+        """(unit_id, time_slot) -> [zeta_value, ...]"""
+        zeta_lookup: dict = defaultdict(list)
+        if sample_zeta is None:
+            return {}
+
+        for unit_id, time_slot, zeta_name in self._iter_zeta_lookup_entries(union_analysis=union_analysis) or []:
+            zeta_lookup[(unit_id, time_slot)].append(sample_zeta.get(zeta_name, 0.0))
+
+        return dict(zeta_lookup)
+
+    def _build_zeta_index_lookup(self, union_analysis=None):
+        """(unit_id, time_slot) -> [zeta_idx, ...]"""
+        zeta_lookup: dict = defaultdict(list)
+        if not hasattr(self, '_zeta_name_to_idx'):
+            return {}
+
+        for unit_id, time_slot, zeta_name in self._iter_zeta_lookup_entries(union_analysis=union_analysis) or []:
+            zeta_idx = self._zeta_name_to_idx.get(zeta_name, -1)
+            if zeta_idx >= 0:
+                zeta_lookup[(unit_id, time_slot)].append(zeta_idx)
+
+        return dict(zeta_lookup)
     
     def _compute_dcpf_constraints_for_fractional_times(self, fractional_variables, lambda_init):
         """计算DCPF约束：per (branch, fractional_time) 构建，每条约束包含多个 generator。"""
@@ -1302,7 +1567,10 @@ class Agent_NN_BCD:
         fractional_times = sorted(set(var['time_slot'] for var in fractional_variables))
 
         branch_time_priority = {}
-        for sample_lambda in lambda_init or []:
+        for sample_id, sample in enumerate(self.active_set_data):
+            sample_lambda = self._normalize_lambda_from_data(sample.get('lambda', None))
+            if sample_lambda is None and lambda_init is not None and sample_id < len(lambda_init):
+                sample_lambda = lambda_init[sample_id] if isinstance(lambda_init[sample_id], dict) else None
             if not isinstance(sample_lambda, dict):
                 continue
             lam_up = np.asarray(sample_lambda.get('lambda_dcpf_upper', np.zeros((self.nl, self.T))), dtype=float)
@@ -1476,6 +1744,98 @@ class Agent_NN_BCD:
         base_dict = initialization_values['zeta_values']
         return [base_dict.copy() for _ in range(self.n_samples)], ita_init
     
+    def _build_theta_hot_start_values(self, union_analysis=None, sample_id: int = 0):
+        if union_analysis is None:
+            union_analysis = self._current_union_analysis
+
+        if not union_analysis or 'union_constraints' not in union_analysis:
+            return {}
+
+        theta_values = {}
+        rng = np.random.default_rng(42 + sample_id)
+        strategy = self.theta_hot_start_strategy
+
+        for constraint in union_analysis['union_constraints']:
+            branch_id = constraint['branch_id']
+            time_slot = constraint['time_slot']
+            nonzero_coefficients = constraint.get('nonzero_pg_coefficients', [])
+
+            if strategy == "dcpf_relative":
+                coeff_scale = max(
+                    (abs(float(coeff_info.get('coefficient', 0.0))) for coeff_info in nonzero_coefficients),
+                    default=1.0,
+                )
+                coeff_scale = max(coeff_scale, 1e-8)
+            else:
+                coeff_scale = 1.0
+
+            for coeff_info in nonzero_coefficients:
+                unit_id = coeff_info['unit_id']
+                member_time = self._theta_member_time_index(constraint, coeff_info)
+                theta_name = self._theta_var_name(branch_id, unit_id, member_time)
+                if strategy == "dcpf_relative":
+                    theta_values[theta_name] = float(coeff_info.get('coefficient', 0.0)) / coeff_scale
+                else:
+                    theta_values[theta_name] = float(rng.normal(0.0, self.theta_gaussian_std))
+
+            theta_rhs_name = self._theta_rhs_name(branch_id, time_slot)
+            if strategy == "dcpf_relative":
+                rhs = float(constraint.get('initial_rhs', 1.0))
+                rhs_scale = max(abs(rhs), 1e-8)
+                theta_values[theta_rhs_name] = rhs / rhs_scale
+            else:
+                theta_values[theta_rhs_name] = float(rng.normal(1.0, self.theta_gaussian_std))
+
+        return theta_values
+
+    def _build_zeta_hot_start_values(self, union_analysis=None, sample_id: int = 0):
+        if union_analysis is None:
+            union_analysis = self._current_union_analysis
+
+        if not union_analysis or 'union_zeta_constraints' not in union_analysis:
+            return {}
+
+        zeta_values = {}
+        rng = np.random.default_rng(84 + sample_id)
+        strategy = self.zeta_hot_start_strategy
+
+        for constraint in union_analysis['union_zeta_constraints']:
+            unit_id = constraint["unit_id"]
+            time_slot = constraint["time_slot"]
+            zeta_name = self._zeta_var_name(unit_id, time_slot)
+            zeta_rhs_name = self._zeta_rhs_name(unit_id, time_slot)
+
+            if strategy == "zero":
+                zeta_values[zeta_name] = 0.0
+                zeta_values[zeta_rhs_name] = 0.0
+            else:
+                zeta_values[zeta_name] = float(rng.normal(0.0, self.zeta_gaussian_std))
+                zeta_values[zeta_rhs_name] = float(rng.normal(0.0, self.zeta_gaussian_std))
+
+        return zeta_values
+
+    def _apply_hot_start_initial_values(self, union_analysis=None):
+        if union_analysis is None:
+            union_analysis = self._current_union_analysis
+
+        self.theta_values_list = [
+            self._build_theta_hot_start_values(union_analysis, sample_id=i)
+            for i in range(self.n_samples)
+        ]
+        self.zeta_values_list = [
+            self._build_zeta_hot_start_values(union_analysis, sample_id=i)
+            for i in range(self.n_samples)
+        ]
+
+        self.theta_values = self.theta_values_list[0] if self.theta_values_list else {}
+        self.zeta_values = self.zeta_values_list[0] if self.zeta_values_list else {}
+
+        print(
+            f"✓ theta/zeta 热启动已应用 "
+            f"(theta={self.theta_hot_start_strategy}, zeta={self.zeta_hot_start_strategy})",
+            flush=True,
+        )
+
     def add_theta_variables_for_branches(self, union_analysis=None):
         """为参数化约束添加theta变量（参考uc_NN.py）"""
         if union_analysis is None:
@@ -1693,10 +2053,10 @@ class Agent_NN_BCD:
             'gencost_fixed': torch.tensor(self.gencost[:, -1] / self.T_delta, dtype=torch.float32, device=dev),
             'start_cost':    torch.tensor(self.gencost[:, 1], dtype=torch.float32, device=dev),
             'shut_cost':     torch.tensor(self.gencost[:, 2], dtype=torch.float32, device=dev),
-            'Ru':            torch.tensor(0.4 * self.gen[:, PMAX] / self.T_delta, dtype=torch.float32, device=dev),
-            'Rd':            torch.tensor(0.4 * self.gen[:, PMAX] / self.T_delta, dtype=torch.float32, device=dev),
-            'Ru_co':         torch.tensor(0.3 * self.gen[:, PMAX], dtype=torch.float32, device=dev),
-            'Rd_co':         torch.tensor(0.3 * self.gen[:, PMAX], dtype=torch.float32, device=dev),
+            'Ru':            torch.tensor(self.Ru, dtype=torch.float32, device=dev),
+            'Rd':            torch.tensor(self.Rd, dtype=torch.float32, device=dev),
+            'Ru_co':         torch.tensor(self.Ru_co, dtype=torch.float32, device=dev),
+            'Rd_co':         torch.tensor(self.Rd_co, dtype=torch.float32, device=dev),
         }
         self._empty_tensor = torch.zeros(0, device=dev)
         # 热路径常量张量：避免循环内 torch.tensor(scalar) 触发 CUDA 分配
@@ -1712,12 +2072,11 @@ class Agent_NN_BCD:
         结果写入:
             _cached_theta_constraints: list[(branch_id, time_slot, constraint_type,
                                             coeff_list[(unit_id, member_time, theta_idx)], rhs_idx)]
-            _dual_theta_lookup: dict[(unit_id, member_time)] -> list[(theta_idx, branch_id)]
+            _dual_theta_lookup: dict[(unit_id, member_time)] -> list[(theta_idx, branch_id, anchor_time)]
             _cached_zeta_constraints: list[(unit_id, time_slot, zeta_idx, rhs_idx)]
             _dual_zeta_lookup: dict[(unit_id, time_slot)] -> list[zeta_idx]
         """
         cached_theta: list = []
-        dual_theta_lookup: dict = defaultdict(list)
         seen_branch_time: set = set()
 
         if self.enable_theta_constraints and union_analysis and 'union_constraints' in union_analysis:
@@ -1741,31 +2100,28 @@ class Agent_NN_BCD:
                     theta_idx = self._theta_name_to_idx.get(theta_name, -1)
                     if theta_idx >= 0:
                         coeff_list.append((unit_id, member_time, theta_idx))
-                        dual_theta_lookup[(unit_id, member_time)].append((theta_idx, branch_id))
 
                 theta_rhs_name = self._theta_rhs_name(branch_id, time_slot)
                 rhs_idx = self._theta_name_to_idx.get(theta_rhs_name, -1)
                 cached_theta.append((branch_id, time_slot, constraint_type, coeff_list, rhs_idx))
 
         cached_zeta: list = []
-        dual_zeta_lookup: dict = defaultdict(list)
 
         if self.enable_zeta_constraints and union_analysis and 'union_zeta_constraints' in union_analysis:
             for constraint in union_analysis['union_zeta_constraints']:
                 unit_id = constraint['unit_id']
                 time_slot = constraint['time_slot']
-                zeta_name = f'zeta_unit_{unit_id}_time_{time_slot}'
+                zeta_name = self._zeta_var_name(unit_id, time_slot)
                 zeta_idx = self._zeta_name_to_idx.get(zeta_name, -1)
-                zeta_rhs_name = f'zeta_rhs_unit_{unit_id}_time_{time_slot}'
+                zeta_rhs_name = self._zeta_rhs_name(unit_id, time_slot)
                 rhs_idx = self._zeta_name_to_idx.get(zeta_rhs_name, -1)
                 if zeta_idx >= 0:
                     cached_zeta.append((unit_id, time_slot, zeta_idx, rhs_idx))
-                    dual_zeta_lookup[(unit_id, time_slot)].append(zeta_idx)
 
         self._cached_theta_constraints = cached_theta
-        self._dual_theta_lookup: dict = dict(dual_theta_lookup)
+        self._dual_theta_lookup: dict = self._build_theta_index_lookup(union_analysis)
         self._cached_zeta_constraints = cached_zeta
-        self._dual_zeta_lookup: dict = dict(dual_zeta_lookup)
+        self._dual_zeta_lookup: dict = self._build_zeta_index_lookup(union_analysis)
         self._cached_union_analysis_id = id(union_analysis)
 
     def _refresh_iter_tensor_cache(self):
@@ -1911,10 +2267,10 @@ class Agent_NN_BCD:
                 obj_opt += (1 - x[g, t]) * abs(self.lambda_[sample_id]['lambda_x_upper'][g, t])
 
         # 爬坡约束
-        Ru = 0.4 * self.gen[:, PMAX] / self.T_delta
-        Rd = 0.4 * self.gen[:, PMAX] / self.T_delta
-        Ru_co = 0.3 * self.gen[:, PMAX]
-        Rd_co = 0.3 * self.gen[:, PMAX]
+        Ru = self.Ru
+        Rd = self.Rd
+        Ru_co = self.Ru_co
+        Rd_co = self.Rd_co
 
         for t in range(1, self.T):
             for g in range(self.ng):
@@ -2124,10 +2480,10 @@ class Agent_NN_BCD:
         PTDF = makePTDF(self.baseMVA, self.bus, self.branch)
         branch_limit = self.branch[:, RATE_A]
 
-        Ru = 0.4 * self.gen[:, PMAX] / self.T_delta
-        Rd = 0.4 * self.gen[:, PMAX] / self.T_delta
-        Ru_co = 0.3 * self.gen[:, PMAX]
-        Rd_co = 0.3 * self.gen[:, PMAX]
+        Ru = self.Ru
+        Rd = self.Rd
+        Ru_co = self.Ru_co
+        Rd_co = self.Rd_co
         start_cost = self.gencost[:, 1]
         shut_cost = self.gencost[:, 2]
         
@@ -2559,10 +2915,10 @@ class Agent_NN_BCD:
         # 预计算常量
         Ton = min(4, self.T)
         Toff = min(4, self.T)
-        Ru = 0.4 * self.gen[:, PMAX] / self.T_delta
-        Rd = 0.4 * self.gen[:, PMAX] / self.T_delta
-        Ru_co = 0.3 * self.gen[:, PMAX]
-        Rd_co = 0.3 * self.gen[:, PMAX]
+        Ru = self.Ru
+        Rd = self.Rd
+        Ru_co = self.Ru_co
+        Rd_co = self.Rd_co
         start_cost = self.gencost[:, 1]
         shut_cost = self.gencost[:, 2]
         
@@ -2584,27 +2940,8 @@ class Agent_NN_BCD:
             sample_zeta = self.zeta_values_list[sample_id] if hasattr(self, 'zeta_values_list') else self.zeta_values
 
             # 预建 theta/zeta 查找表（per-sample）
-            theta_lookup: dict[tuple[int, int], list[tuple[int, float]]] = {}
-            if (self.enable_theta_constraints and union_analysis
-                    and 'union_constraints' in union_analysis
-                    and sample_theta is not None):
-                for _c in union_analysis['union_constraints']:
-                    _b_id = _c['branch_id']
-                    _t_s = _c['time_slot']
-                    for _coeff in _c['nonzero_pg_coefficients']:
-                        _u_id = _coeff['unit_id']
-                        _m_t = self._theta_member_time_index(_c, _coeff)
-                        _name = self._theta_var_name(_b_id, _u_id, _m_t)
-                        _val = sample_theta.get(_name, 0.0)
-                        theta_lookup.setdefault((_m_t, _u_id), []).append((_b_id, _val))
-
-            zeta_lookup: dict[tuple[int, int], float] = {}
-            if (self.enable_zeta_constraints and union_analysis
-                    and 'union_zeta_constraints' in union_analysis
-                    and sample_zeta is not None):
-                for _c in union_analysis['union_zeta_constraints']:
-                    _name = f'zeta_unit_{_c["unit_id"]}_time_{_c["time_slot"]}'
-                    zeta_lookup[(_c['time_slot'], _c['unit_id'])] = sample_zeta.get(_name, 0.0)
+            theta_lookup = self._build_theta_value_lookup(sample_theta, union_analysis=union_analysis)
+            zeta_lookup = self._build_zeta_value_lookup(sample_zeta, union_analysis=union_analysis)
             Pd = self.active_set_data[sample_id]['pd_data']
             pg = self.pg[sample_id, :, :]
             x = self.x[sample_id, :, :]
@@ -2826,15 +3163,14 @@ class Agent_NN_BCD:
                             dual_expr += shut_cost[g] * self.lambda_[sample_id]['lambda_shut_cost'][g, t]
 
                         # theta 相关的对偶约束贡献（O(1) 查找，表在循环外预建）
-                        for _branch_id, _theta_val in theta_lookup.get((t, g), []):
+                        for _branch_id, _anchor_time, _theta_val in theta_lookup.get((g, t), []):
                             if _branch_id < self.nl:
-                                dual_expr += _theta_val * self.mu[sample_id, _branch_id, t]
+                                dual_expr += _theta_val * self.mu[sample_id, _branch_id, _anchor_time]
                             else:
                                 dual_expr += _theta_val * getattr(self, 'dual_para_bound', 0.1)
 
                         # zeta 相关的对偶约束贡献（O(1) 查找）
-                        _zeta_val = zeta_lookup.get((t, g), 0.0)
-                        if _zeta_val:
+                        for _zeta_val in zeta_lookup.get((g, t), []):
                             dual_expr += _zeta_val * self.ita[sample_id, g, t]
 
                         # 对偶约束：梯度 = 0
@@ -3029,10 +3365,10 @@ class Agent_NN_BCD:
                     dual_expr = dual_expr + shut_cost[g] * lambda_shut_cost[g, t]
 
                 # 参数化约束的对偶贡献（theta相关）——使用查找表，O(1) 替代全量扫描
-                for theta_idx, branch_id in self._dual_theta_lookup.get((g, t), []):
+                for theta_idx, branch_id, anchor_time in self._dual_theta_lookup.get((g, t), []):
                     theta = theta_tensor[theta_idx]
                     if branch_id < self.nl:
-                        dual_expr = dual_expr + theta * mu[branch_id, t]
+                        dual_expr = dual_expr + theta * mu[branch_id, anchor_time]
                     else:
                         dual_expr = dual_expr + theta * _default_mu
 
@@ -3735,10 +4071,10 @@ class Agent_NN_BCD:
                 model.addConstr(pg[g, t] <= self.gen[g, PMAX] * x[g, t], name=f'pg_upper_{g}_{t}')
         
         # 爬坡约束
-        Ru = 0.4 * self.gen[:, PMAX] / self.T_delta
-        Rd = 0.4 * self.gen[:, PMAX] / self.T_delta
-        Ru_co = 0.3 * self.gen[:, PMAX]
-        Rd_co = 0.3 * self.gen[:, PMAX]
+        Ru = self.Ru
+        Rd = self.Rd
+        Ru_co = self.Ru_co
+        Rd_co = self.Rd_co
         for g in range(self.ng):
             for t in range(1, self.T):
                 model.addConstr(pg[g, t] - pg[g, t-1] <= Ru[g] * x[g, t-1] + Ru_co[g] * (1 - x[g, t-1]), 
@@ -3827,10 +4163,10 @@ class Agent_NN_BCD:
                 model.addConstr(pg_upper_expr <= 0, name=f'pg_upper_{g}_{t}')
         
         # 爬坡约束
-        Ru = 0.4 * self.gen[:, PMAX] / self.T_delta
-        Rd = 0.4 * self.gen[:, PMAX] / self.T_delta
-        Ru_co = 0.3 * self.gen[:, PMAX]
-        Rd_co = 0.3 * self.gen[:, PMAX]
+        Ru = self.Ru
+        Rd = self.Rd
+        Ru_co = self.Ru_co
+        Rd_co = self.Rd_co
         
         for t in range(1, self.T):
             for g in range(self.ng):

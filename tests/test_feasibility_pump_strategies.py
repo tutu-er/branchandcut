@@ -56,6 +56,7 @@ class _DummyTrainer:
         self.unit_id = unit_id
         self.active_set_data = active_set_data
         self.T = horizon
+        self.generator_injection_sensitivity = np.array([[0.2, 0.6]], dtype=float)
 
     def get_surrogate_params(self, pd_data, lambda_val, renewable_data=None):
         sample = fp._coerce_scenario_sample(pd_data)
@@ -79,7 +80,33 @@ class _DummyLambdaPredictor:
         sample = fp._coerce_scenario_sample(scenario_input)
         load_sum = float(np.sum(fp.get_sample_load_data(sample)))
         self.calls.append(load_sum)
-        return np.full(3, load_sum / 100.0, dtype=float)
+        lambda_pb = np.full(3, load_sum / 100.0, dtype=float)
+        lambda_du = np.full((1, 3), load_sum / 500.0, dtype=float)
+        lambda_dl = np.full((1, 3), load_sum / 1000.0, dtype=float)
+        return {
+            'lambda_power_balance': lambda_pb,
+            'lambda_dcpf_upper': lambda_du,
+            'lambda_dcpf_lower': lambda_dl,
+        }
+
+
+def test_extract_unit_lambda_projects_global_duals_with_dcpf():
+    trainer = _DummyTrainer(1, active_set_data=[], horizon=3)
+    lambda_payload = {
+        'lambda_power_balance': np.array([1.0, 1.5, 2.0], dtype=float),
+        'lambda_dcpf_upper': np.array([[0.3, 0.4, 0.5]], dtype=float),
+        'lambda_dcpf_lower': np.array([[0.1, 0.1, 0.2]], dtype=float),
+    }
+
+    lambda_unit = fp._extract_unit_lambda(
+        lambda_payload,
+        T=3,
+        unit_id=1,
+        trainer=trainer,
+    )
+
+    expected = np.array([0.88, 1.32, 1.82], dtype=float)
+    np.testing.assert_allclose(lambda_unit, expected)
 
 
 def test_collect_integer_solutions_combines_all_strategies(monkeypatch):

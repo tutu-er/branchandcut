@@ -1,17 +1,18 @@
-"""
-可行性泵（Feasibility Pump）实现
+﻿"""
+可行性泵（Feasibility Pump）实�?
 用于从LP松弛解恢复UC问题的整数可行解
 
-Pipeline：
-  1. 求解全局UC LP松弛（加入代理约束）→ x_LP
+Pipeline�?
+  1. 求解全局UC LP松弛（加入代理约束）�?x_LP
   2. 通过各机组子问题LP（含代理约束 + 参数扰动）收集多组整数解
-  3. 以"LP整数性强 + 多来源一致"识别高可信度变量并固定
-  4. 可行性泵：LP投影（最小化 L1 距离）+ 四舍五入，迭代至整数可行
+  3. �?LP整数性强 + 多来源一�?识别高可信度变量并固�?
+  4. 可行性泵：LP投影（最小化 L1 距离�? 四舍五入，迭代至整数可行
 """
 
 import numpy as np
 import gurobipy as gp
 from gurobipy import GRB
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, List, Optional, Tuple
 
 from pypower.ext2int import ext2int
@@ -65,20 +66,87 @@ except ImportError:
 
 def round_to_integer(x_LP: np.ndarray, threshold: float = 0.5) -> np.ndarray:
     """
-    将LP松弛解四舍五入为整数解。
+    将LP松弛解四舍五入为整数解�?
 
     Args:
-        x_LP: LP松弛解，shape (ng, T) 或 (T,)，值域 [0, 1]
-        threshold: 四舍五入阈值（默认0.5）
+        x_LP: LP松弛解，shape (ng, T) �?(T,)，值域 [0, 1]
+        threshold: 四舍五入阈值（默认0.5�?
 
     Returns:
-        整数解，shape 与输入相同，值为 0 或 1
+        整数解，shape 与输入相同，值为 0 �?1
     """
     return (x_LP >= threshold).astype(int)
 
 
+def _extract_unit_lambda(
+    lambda_val,
+    T: int,
+    unit_id: Optional[int] = None,
+    trainer: Optional['SubproblemSurrogateTrainer'] = None,
+) -> np.ndarray:
+    """Normalize lambda payloads to a single unit/time vector of shape (T,)."""
+    if isinstance(lambda_val, dict):
+        if 'lambda_pg_effective' in lambda_val:
+            arr = np.asarray(lambda_val['lambda_pg_effective'], dtype=float)
+        else:
+            arr = np.asarray(
+                lambda_val.get('lambda_power_balance', np.zeros(T)),
+                dtype=float,
+            )
+            lambda_du = np.asarray(
+                lambda_val.get('lambda_dcpf_upper', np.zeros((0, T))),
+                dtype=float,
+            )
+            lambda_dl = np.asarray(
+                lambda_val.get('lambda_dcpf_lower', np.zeros((0, T))),
+                dtype=float,
+            )
+            sensitivity = getattr(trainer, 'generator_injection_sensitivity', None)
+            if (
+                sensitivity is not None
+                and arr.shape == (T,)
+                and lambda_du.ndim == 2
+                and lambda_dl.shape == lambda_du.shape
+                and lambda_du.shape[1] == T
+                and lambda_du.shape[0] == sensitivity.shape[0]
+            ):
+                arr = arr[np.newaxis, :] - sensitivity.T @ (lambda_du - lambda_dl)
+    else:
+        arr = np.asarray(lambda_val, dtype=float)
+
+    if arr.ndim == 0:
+        return np.full(T, float(arr), dtype=float)
+
+    if arr.ndim == 1:
+        if arr.size == T:
+            return arr.astype(float, copy=True)
+        if arr.size == 1:
+            return np.full(T, float(arr[0]), dtype=float)
+        if arr.size % T == 0:
+            arr = arr.reshape(-1, T)
+        else:
+            raise ValueError(f"lambda_val has incompatible shape {arr.shape}, expected (*, {T})")
+
+    if arr.ndim >= 2:
+        if arr.shape[-1] != T:
+            if arr.size % T != 0:
+                raise ValueError(f"lambda_val has incompatible shape {arr.shape}, expected last dim {T}")
+            arr = arr.reshape(-1, T)
+        else:
+            arr = arr.reshape(-1, T)
+
+        idx = 0 if unit_id is None else int(unit_id)
+        if idx < 0 or idx >= arr.shape[0]:
+            raise IndexError(
+                f"unit_id={unit_id} out of range for lambda_val with shape {arr.shape}"
+            )
+        return arr[idx].astype(float, copy=True)
+
+    raise ValueError(f"Unsupported lambda_val shape: {arr.shape}")
+
+
 def _repair_min_up_down_heuristic(x_int: np.ndarray, T_delta: float) -> np.ndarray:
-    """对整数点做轻量最小开关机时间修复，提升热启动质量。"""
+    """Apply a light minimum up/down time repair to a binary schedule."""
     x_repaired = np.asarray(x_int, dtype=int).copy()
     ng, T = x_repaired.shape
     Ton = min(int(4 * T_delta), T - 1)
@@ -92,7 +160,7 @@ def _repair_min_up_down_heuristic(x_int: np.ndarray, T_delta: float) -> np.ndarr
         while changed:
             changed = False
 
-            # 启动后必须至少持续 Ton 个时段开机
+            # 启动后必须至少持�?Ton 个时段开�?
             for t in range(T - 1):
                 if x_repaired[g, t] == 0 and x_repaired[g, t + 1] == 1:
                     end = min(T, t + 1 + Ton)
@@ -100,7 +168,7 @@ def _repair_min_up_down_heuristic(x_int: np.ndarray, T_delta: float) -> np.ndarr
                         x_repaired[g, t + 1:end] = 1
                         changed = True
 
-            # 关机后必须至少持续 Toff 个时段停机
+            # 关机后必须至少持�?Toff 个时段停�?
             for t in range(T - 1):
                 if x_repaired[g, t] == 1 and x_repaired[g, t + 1] == 0:
                     end = min(T, t + 1 + Toff)
@@ -112,7 +180,7 @@ def _repair_min_up_down_heuristic(x_int: np.ndarray, T_delta: float) -> np.ndarr
 
 
 def _temporal_neighbor_average(x: np.ndarray, radius: int = 1) -> np.ndarray:
-    """按时间维计算邻域平均，用于方向性热启动与周边平均约束。"""
+    """Compute a temporal neighborhood average along the time axis."""
     x_arr = np.asarray(x, dtype=float)
     if x_arr.ndim == 1:
         x_arr = x_arr[np.newaxis, :]
@@ -131,7 +199,7 @@ def _build_directional_hot_start(
     x_surr_LP: np.ndarray,
     trusted_mask: np.ndarray
 ) -> np.ndarray:
-    """利用 surrogate 相对 LP 的方向性，生成非对称热启动点。"""
+    """Build a directional hot start by comparing surrogate LP and global LP."""
     lp_round = round_to_integer(x_LP)
     surr_round = round_to_integer(x_surr_LP)
 
@@ -142,7 +210,7 @@ def _build_directional_hot_start(
                      + 0.5 * _temporal_neighbor_average(surr_round, radius=1)
 
     # surrogate 比全局 LP 更强调局部结构，因此给更高权重；
-    # direction 与邻域平均共同决定是否做“反四舍五入”。
+    # direction 与邻域平均共同决定是否做“反四舍五入”�?
     directional_score = (
         0.35 * x_LP
         + 0.65 * x_surr_LP
@@ -171,7 +239,7 @@ def _build_directional_hot_start(
 
 
 def _neighbor_average_1d(arr: np.ndarray, radius: int = 1) -> np.ndarray:
-    """对 surrogate 约束参数做邻域平均平滑。"""
+    """Compute a 1D neighborhood average for surrogate parameters."""
     arr = np.asarray(arr, dtype=float)
     out = np.zeros_like(arr, dtype=float)
     n = len(arr)
@@ -191,7 +259,7 @@ def _perturb_surrogate_outputs(
     perturb_std: float = 0.10,
     neighborhood_weight: float = 0.35
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """对 surrogate 网络输出参数做扰动，并引入周边平均约束。"""
+    """Perturb surrogate outputs and blend them with neighborhood averages."""
     def _perturb_one(arr: np.ndarray, clip_nonnegative: bool = False) -> np.ndarray:
         arr = np.asarray(arr, dtype=float)
         scale = np.maximum(np.abs(arr), 1.0)
@@ -221,19 +289,22 @@ def _coerce_scenario_sample(pd_data: np.ndarray | dict) -> dict:
 def _predict_lambda_for_scenario(
     lambda_predictor,
     scenario_sample: dict,
-    fallback_lambda: np.ndarray,
-) -> np.ndarray:
+    fallback_lambda,
+):
     """Predict lambda for a scenario when possible, otherwise reuse the current lambda."""
     if lambda_predictor is None:
-        return np.asarray(fallback_lambda, dtype=float)
+        return fallback_lambda
     try:
         lambda_pred = lambda_predictor.predict(scenario_sample)
+        if isinstance(lambda_pred, dict):
+            return lambda_pred
         lambda_pred = np.asarray(lambda_pred, dtype=float)
-        if lambda_pred.shape == np.asarray(fallback_lambda, dtype=float).shape:
+        fallback_arr = np.asarray(fallback_lambda, dtype=float)
+        if lambda_pred.shape == fallback_arr.shape:
             return lambda_pred
     except Exception:
         pass
-    return np.asarray(fallback_lambda, dtype=float)
+    return fallback_lambda
 
 
 def _get_scenario_bank(
@@ -294,6 +365,128 @@ def _find_similar_scenarios(
     return [normalize_sample_arrays(dict(shortlist[idx])) for idx in chosen_idx]
 
 
+def _extract_commitment_from_sample(
+    sample: dict,
+    ng: int,
+    T: int,
+) -> Optional[np.ndarray]:
+    """Extract a binary commitment matrix from a historical sample when available."""
+    if not isinstance(sample, dict):
+        return None
+
+    if 'x_true' in sample and sample['x_true'] is not None:
+        x_true = np.asarray(sample['x_true'], dtype=float)
+        if x_true.ndim == 2:
+            x_sol = np.zeros((ng, T), dtype=float)
+            rows = min(ng, x_true.shape[0])
+            cols = min(T, x_true.shape[1])
+            x_sol[:rows, :cols] = x_true[:rows, :cols]
+            return round_to_integer(np.clip(x_sol, 0.0, 1.0))
+
+    if 'unit_commitment_matrix' in sample and sample['unit_commitment_matrix'] is not None:
+        uc = np.asarray(sample['unit_commitment_matrix'], dtype=float)
+        if uc.ndim == 2:
+            x_sol = np.zeros((ng, T), dtype=float)
+            rows = min(ng, uc.shape[0])
+            cols = min(T, uc.shape[1])
+            x_sol[:rows, :cols] = uc[:rows, :cols]
+            return round_to_integer(np.clip(x_sol, 0.0, 1.0))
+
+    active_set = sample.get('active_set', None)
+    if not isinstance(active_set, list):
+        return None
+
+    x_sol = np.zeros((ng, T), dtype=float)
+    found_commitment = False
+    for item in active_set:
+        if isinstance(item, list) and len(item) == 2 and isinstance(item[0], list) and len(item[0]) == 2:
+            g, t = item[0]
+            value = item[1]
+        elif isinstance(item, dict):
+            g = item.get('unit_id', item.get('generator_id', item.get('g')))
+            t = item.get('time_slot', item.get('time', item.get('t')))
+            value = item.get('value', item.get('x'))
+        else:
+            continue
+
+        if g is None or t is None or value is None:
+            continue
+        g = int(g)
+        t = int(t)
+        if 0 <= g < ng and 0 <= t < T:
+            x_sol[g, t] = float(value)
+            found_commitment = True
+
+    if not found_commitment:
+        return None
+    return round_to_integer(np.clip(x_sol, 0.0, 1.0))
+
+
+def _build_nearby_commitment_candidates(
+    target_sample: dict,
+    trainers: Dict[int, 'SubproblemSurrogateTrainer'],
+    scenario_bank: Optional[List[dict]],
+    ng: int,
+    T: int,
+    n_candidates: int,
+    candidate_pool_size: int,
+    rng: np.random.Generator,
+) -> List[Tuple[str, np.ndarray]]:
+    """Build hot starts from nearby scenarios' historical optimal commitments."""
+    if n_candidates <= 0:
+        return []
+
+    if scenario_bank is None:
+        scenario_bank = _get_scenario_bank(trainers)
+    else:
+        scenario_bank = [
+            normalize_sample_arrays(dict(sample))
+            for sample in scenario_bank
+            if isinstance(sample, dict)
+        ]
+    if not scenario_bank:
+        return []
+
+    target_features = get_feature_vector_from_sample(dict(target_sample))
+    scored_candidates: List[Tuple[float, dict]] = []
+    for sample in scenario_bank:
+        try:
+            feature_vec = get_feature_vector_from_sample(dict(sample))
+        except Exception:
+            continue
+        if feature_vec.shape != target_features.shape:
+            continue
+        distance = _feature_distance(target_features, feature_vec)
+        if distance <= 1e-12:
+            continue
+        scored_candidates.append((distance, sample))
+
+    if not scored_candidates:
+        return []
+
+    scored_candidates.sort(key=lambda item: item[0])
+    preferred_pool = scored_candidates[:max(candidate_pool_size, n_candidates)]
+    fallback_pool = scored_candidates[max(candidate_pool_size, n_candidates):]
+
+    nearby_candidates: List[Tuple[str, np.ndarray]] = []
+    seen = set()
+    ordered_pool = preferred_pool + fallback_pool
+    for _distance, scenario in ordered_pool:
+        commitment = _extract_commitment_from_sample(scenario, ng, T)
+        if commitment is None:
+            continue
+        key = _candidate_key(commitment)
+        if key in seen:
+            continue
+        seen.add(key)
+        nearby_candidates.append(
+            (f"nearby_opt_commitment_{len(nearby_candidates) + 1}", commitment)
+        )
+        if len(nearby_candidates) >= n_candidates:
+            break
+    return nearby_candidates
+
+
 def _generate_load_perturbed_scenarios(
     base_sample: dict,
     n_candidates: int,
@@ -343,8 +536,13 @@ def _build_surrogate_parameter_candidates(
     """Build multiple surrogate parameter sets from direct/randomized and scenario-based strategies."""
     parameter_sets: List[Tuple[str, np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = []
 
-    base_lambda_arr = np.asarray(base_lambda, dtype=float)
-    alphas, betas, gammas, deltas, *_ = trainer.get_surrogate_params(base_sample, base_lambda_arr)
+    base_lambda_unit = _extract_unit_lambda(
+        base_lambda,
+        trainer.T,
+        unit_id=trainer.unit_id,
+        trainer=trainer,
+    )
+    alphas, betas, gammas, deltas, *_ = trainer.get_surrogate_params(base_sample, base_lambda_unit)
     parameter_sets.append(("base", alphas, betas, gammas, deltas))
 
     for idx in range(n_param_perturbations):
@@ -368,8 +566,14 @@ def _build_surrogate_parameter_candidates(
         rng=rng,
     )
     for idx, scenario in enumerate(similar_scenarios):
-        lambda_sim = _predict_lambda_for_scenario(lambda_predictor, scenario, base_lambda_arr)
-        alpha_s, beta_s, gamma_s, delta_s, *_ = trainer.get_surrogate_params(scenario, lambda_sim)
+        lambda_sim = _predict_lambda_for_scenario(lambda_predictor, scenario, base_lambda)
+        lambda_sim_unit = _extract_unit_lambda(
+            lambda_sim,
+            trainer.T,
+            unit_id=trainer.unit_id,
+            trainer=trainer,
+        )
+        alpha_s, beta_s, gamma_s, delta_s, *_ = trainer.get_surrogate_params(scenario, lambda_sim_unit)
         parameter_sets.append((f"similar_scenario_{idx}", alpha_s, beta_s, gamma_s, delta_s))
 
     perturbed_scenarios = _generate_load_perturbed_scenarios(
@@ -379,8 +583,14 @@ def _build_surrogate_parameter_candidates(
         rng=rng,
     )
     for idx, scenario in enumerate(perturbed_scenarios):
-        lambda_pert = _predict_lambda_for_scenario(lambda_predictor, scenario, base_lambda_arr)
-        alpha_p, beta_p, gamma_p, delta_p, *_ = trainer.get_surrogate_params(scenario, lambda_pert)
+        lambda_pert = _predict_lambda_for_scenario(lambda_predictor, scenario, base_lambda)
+        lambda_pert_unit = _extract_unit_lambda(
+            lambda_pert,
+            trainer.T,
+            unit_id=trainer.unit_id,
+            trainer=trainer,
+        )
+        alpha_p, beta_p, gamma_p, delta_p, *_ = trainer.get_surrogate_params(scenario, lambda_pert_unit)
         parameter_sets.append((f"load_perturbed_{idx}", alpha_p, beta_p, gamma_p, delta_p))
 
     return parameter_sets
@@ -417,15 +627,197 @@ def _select_pool_restart_candidate(
     return chosen
 
 
+def _candidate_key(x_candidate: np.ndarray) -> tuple:
+    """Return a hashable key for binary-candidate deduplication."""
+    return tuple(np.asarray(x_candidate, dtype=int).flatten().tolist())
+
+
+def _compute_vote_majority(
+    x_init_k: np.ndarray,
+    x_init_k_m: np.ndarray
+) -> np.ndarray:
+    """Aggregate surrogate-derived integer candidates into a majority reference."""
+    vote_sum = x_init_k.astype(float)
+    n_votes = 1
+    if x_init_k_m.size > 0:
+        vote_sum = vote_sum + np.sum(x_init_k_m.astype(float), axis=1)
+        n_votes += x_init_k_m.shape[1]
+    return (vote_sum / max(n_votes, 1) >= 0.5).astype(int)
+
+
+def _compute_hot_start_support_reference(
+    x_LP: np.ndarray,
+    x_surr_LP: np.ndarray,
+    x_init_k: np.ndarray,
+    x_init_k_m: np.ndarray,
+    nearby_commitment_pool: Optional[np.ndarray] = None,
+) -> np.ndarray:
+    """Build a soft support map from LP, surrogate, unit LP, perturbation, and nearby pools."""
+    support = (
+        0.45 * np.asarray(x_LP, dtype=float)
+        + 0.35 * np.asarray(x_surr_LP, dtype=float)
+        + 0.55 * np.asarray(x_init_k, dtype=float)
+    )
+    total_weight = 1.35
+
+    if x_init_k_m.size > 0:
+        support += 0.25 * np.mean(np.asarray(x_init_k_m, dtype=float), axis=1)
+        total_weight += 0.25
+
+    if nearby_commitment_pool is not None and nearby_commitment_pool.size > 0:
+        support += 0.18 * np.mean(np.asarray(nearby_commitment_pool, dtype=float), axis=0)
+        total_weight += 0.18
+
+    return np.clip(support / max(total_weight, 1e-8), 0.0, 1.0)
+
+
+def _score_hot_start_candidate(
+    x_candidate: np.ndarray,
+    x_LP: np.ndarray,
+    x_surr_LP: np.ndarray,
+    vote_reference: np.ndarray,
+    trusted_mask: np.ndarray,
+    support_reference: Optional[np.ndarray] = None,
+    nearby_commitment_pool: Optional[np.ndarray] = None,
+) -> float:
+    """Score a binary hot start against LP, surrogate LP, and vote references."""
+    x_candidate = np.asarray(x_candidate, dtype=int)
+    lp_round = round_to_integer(x_LP)
+    surr_round = round_to_integer(x_surr_LP)
+
+    trusted_match = float(np.sum(x_candidate[trusted_mask] == lp_round[trusted_mask]))
+    vote_match = float(np.sum(x_candidate == vote_reference))
+    surrogate_match = float(np.sum(x_candidate == surr_round))
+    lp_dist = float(np.sum(np.abs(x_candidate - x_LP)))
+    surr_dist = float(np.sum(np.abs(x_candidate - x_surr_LP)))
+    support_match = 0.0
+    nearby_agreement = 0.0
+
+    if support_reference is not None:
+        support_reference = np.clip(np.asarray(support_reference, dtype=float), 0.0, 1.0)
+        support_match = float(np.sum(
+            x_candidate * support_reference
+            + (1 - x_candidate) * (1.0 - support_reference)
+        ))
+
+    if nearby_commitment_pool is not None and nearby_commitment_pool.size > 0:
+        nearby_commitment_pool = np.asarray(nearby_commitment_pool, dtype=int)
+        nearby_agreement = float(np.mean(np.sum(
+            nearby_commitment_pool == x_candidate,
+            axis=tuple(range(1, nearby_commitment_pool.ndim)),
+        )))
+
+    return (
+        3.0 * trusted_match
+        + 1.8 * vote_match
+        + 0.6 * surrogate_match
+        + 0.35 * support_match
+        + 0.08 * nearby_agreement
+        - 0.45 * lp_dist
+        - 0.30 * surr_dist
+    )
+
+
+def _build_unit_combination_hot_starts(
+    x_LP: np.ndarray,
+    x_surr_LP: np.ndarray,
+    x_init_k: np.ndarray,
+    x_init_k_m: np.ndarray,
+    trusted_mask: np.ndarray,
+    T_delta: float,
+    support_reference: Optional[np.ndarray] = None,
+    nearby_commitment_pool: Optional[np.ndarray] = None,
+    max_unit_options_per_generator: int = 4,
+    max_combination_candidates: int = 12,
+) -> List[Tuple[str, np.ndarray]]:
+    """Assemble mixed global starts from top per-unit candidates using beam search."""
+    ng, _T = x_LP.shape
+    if ng == 0:
+        return []
+
+    lp_round = round_to_integer(x_LP)
+    surr_round = round_to_integer(x_surr_LP)
+    directional = _build_directional_hot_start(x_LP, x_surr_LP, trusted_mask)
+    vote_majority = _compute_vote_majority(x_init_k, x_init_k_m)
+    n_perturb = x_init_k_m.shape[1] if x_init_k_m.ndim >= 3 else 0
+
+    unit_option_lists: List[List[Tuple[str, np.ndarray, float]]] = []
+    for g in range(ng):
+        option_specs: List[Tuple[str, np.ndarray]] = [
+            ("lp", lp_round[g]),
+            ("surr", surr_round[g]),
+            ("directional", directional[g]),
+            ("unit_lp", x_init_k[g]),
+            ("vote", vote_majority[g]),
+        ]
+        if nearby_commitment_pool is not None and nearby_commitment_pool.size > 0:
+            for m in range(nearby_commitment_pool.shape[0]):
+                option_specs.append((f"nearby{m + 1}", nearby_commitment_pool[m, g]))
+        for m in range(n_perturb):
+            option_specs.append((f"pert{m + 1}", x_init_k_m[g, m]))
+
+        unique_options: List[Tuple[str, np.ndarray, float]] = []
+        seen = set()
+        for name, row in option_specs:
+            row_int = np.asarray(row, dtype=int)
+            key = tuple(row_int.tolist())
+            if key in seen:
+                continue
+            seen.add(key)
+            score = _score_hot_start_candidate(
+                row_int,
+                x_LP[g],
+                x_surr_LP[g],
+                vote_majority[g],
+                trusted_mask[g],
+                support_reference=None if support_reference is None else support_reference[g],
+                nearby_commitment_pool=(
+                    None if nearby_commitment_pool is None or nearby_commitment_pool.size == 0
+                    else nearby_commitment_pool[:, g, :]
+                ),
+            )
+            unique_options.append((name, row_int, score))
+
+        unique_options.sort(key=lambda item: item[2], reverse=True)
+        unit_option_lists.append(unique_options[:max(1, max_unit_options_per_generator)])
+
+    beam: List[Tuple[float, List[np.ndarray]]] = [(0.0, [])]
+    beam_width = max(1, max_combination_candidates)
+    for g in range(ng):
+        next_beam: List[Tuple[float, List[np.ndarray]]] = []
+        for partial_score, partial_rows in beam:
+            for _name, row, row_score in unit_option_lists[g]:
+                next_beam.append((partial_score + row_score, partial_rows + [row]))
+        next_beam.sort(key=lambda item: item[0], reverse=True)
+        beam = next_beam[:beam_width]
+
+    mixed_candidates: List[Tuple[str, np.ndarray]] = []
+    seen = set()
+    for idx, (_score, rows) in enumerate(beam, start=1):
+        candidate = np.stack(rows, axis=0).astype(int, copy=False)
+        repaired = _repair_min_up_down_heuristic(candidate, T_delta)
+        key = _candidate_key(repaired)
+        if key in seen:
+            continue
+        seen.add(key)
+        mixed_candidates.append((f"unit_combo_{idx}", repaired))
+
+    return mixed_candidates
+
+
 def _build_hot_start_candidates(
     x_LP: np.ndarray,
     x_surr_LP: np.ndarray,
     x_init_k: np.ndarray,
     x_init_k_m: np.ndarray,
     trusted_mask: np.ndarray,
-    T_delta: float
+    T_delta: float,
+    nearby_commitment_candidates: Optional[List[Tuple[str, np.ndarray]]] = None,
+    max_perturbation_hot_starts: int = 6,
+    max_unit_options_per_generator: int = 4,
+    max_unit_combination_candidates: int = 12,
 ) -> List[Tuple[str, np.ndarray]]:
-    """根据全局 LP 与 surrogate LP 解构造多组启发式热启动点。"""
+    """Build multiple global hot-start candidates from LP and surrogate references."""
     lp_round = round_to_integer(x_LP)
     surr_round = round_to_integer(x_surr_LP)
     directional = _build_directional_hot_start(x_LP, x_surr_LP, trusted_mask)
@@ -452,22 +844,80 @@ def _build_hot_start_candidates(
     candidate_specs = [
         ("lp_round", lp_round),
         ("surrogate_lp_round", surr_round),
+        ("unit_lp_round", x_init_k),
         ("directional_surrogate_start", directional),
+    ]
+    nearby_commitment_pool = None
+    if nearby_commitment_candidates:
+        candidate_specs.extend(list(nearby_commitment_candidates))
+        nearby_commitment_pool = np.stack(
+            [np.asarray(candidate, dtype=int) for _name, candidate in nearby_commitment_candidates],
+            axis=0,
+        )
+    candidate_specs.extend([
         ("lp_surrogate_confidence_mix", blended),
         ("lp_surrogate_agreement", agreement),
         ("vote_majority", majority),
         ("trusted_vote_mix", trusted_ref),
         ("trusted_confidence_mix", confidence_mix),
-    ]
+    ])
+    support_reference = _compute_hot_start_support_reference(
+        x_LP,
+        x_surr_LP,
+        x_init_k,
+        x_init_k_m,
+        nearby_commitment_pool=nearby_commitment_pool,
+    )
+    if x_init_k_m.ndim >= 3 and x_init_k_m.shape[1] > 0:
+        vote_reference = _compute_vote_majority(x_init_k, x_init_k_m)
+        perturbation_specs: List[Tuple[str, np.ndarray, float]] = []
+        for m in range(x_init_k_m.shape[1]):
+            candidate = x_init_k_m[:, m, :]
+            score = _score_hot_start_candidate(
+                candidate,
+                x_LP,
+                x_surr_LP,
+                vote_reference,
+                trusted_mask,
+                support_reference=support_reference,
+                nearby_commitment_pool=nearby_commitment_pool,
+            )
+            perturbation_specs.append((f"perturbed_unit_pool_{m + 1}", candidate, score))
+        perturbation_specs.sort(key=lambda item: item[2], reverse=True)
+        candidate_specs.extend(
+            (name, candidate)
+            for name, candidate, _score in perturbation_specs[:max(0, max_perturbation_hot_starts)]
+        )
+
+    candidate_specs.extend(
+        _build_unit_combination_hot_starts(
+            x_LP,
+            x_surr_LP,
+            x_init_k,
+            x_init_k_m,
+            trusted_mask,
+            T_delta,
+            support_reference=support_reference,
+            nearby_commitment_pool=nearby_commitment_pool,
+            max_unit_options_per_generator=max_unit_options_per_generator,
+            max_combination_candidates=max_unit_combination_candidates,
+        )
+    )
 
     unique_candidates: List[Tuple[str, np.ndarray]] = []
-    seen = set()
+    key_to_index: Dict[tuple, int] = {}
     for name, x_candidate in candidate_specs:
         repaired = _repair_min_up_down_heuristic(x_candidate, T_delta)
-        key = tuple(repaired.flatten().tolist())
-        if key not in seen:
-            seen.add(key)
+        key = _candidate_key(repaired)
+        if key not in key_to_index:
+            key_to_index[key] = len(unique_candidates)
             unique_candidates.append((name, repaired))
+            continue
+
+        existing_idx = key_to_index[key]
+        existing_name, _existing_candidate = unique_candidates[existing_idx]
+        if name.startswith("nearby_opt_commitment_") and not existing_name.startswith("nearby_opt_commitment_"):
+            unique_candidates[existing_idx] = (name, repaired)
 
     return unique_candidates
 
@@ -478,27 +928,35 @@ def _rank_hot_start_candidates(
     x_surr_LP: np.ndarray,
     x_init_k: np.ndarray,
     x_init_k_m: np.ndarray,
-    trusted_mask: np.ndarray
+    trusted_mask: np.ndarray,
+    nearby_commitment_candidates: Optional[List[Tuple[str, np.ndarray]]] = None,
 ) -> List[Tuple[str, np.ndarray, float]]:
-    """按与 LP / surrogate LP / 投票参考的一致性对热启动候选排序。"""
-    lp_round = round_to_integer(x_LP)
-    surr_round = round_to_integer(x_surr_LP)
-    vote_sum = x_init_k.astype(float) + np.sum(x_init_k_m.astype(float), axis=1)
-    vote_majority = (vote_sum / (1 + x_init_k_m.shape[1]) >= 0.5).astype(int)
+    """Rank hot starts by agreement with LP, surrogate LP, and vote references."""
+    vote_majority = _compute_vote_majority(x_init_k, x_init_k_m)
+    nearby_commitment_pool = None
+    if nearby_commitment_candidates:
+        nearby_commitment_pool = np.stack(
+            [np.asarray(candidate, dtype=int) for _name, candidate in nearby_commitment_candidates],
+            axis=0,
+        )
+    support_reference = _compute_hot_start_support_reference(
+        x_LP,
+        x_surr_LP,
+        x_init_k,
+        x_init_k_m,
+        nearby_commitment_pool=nearby_commitment_pool,
+    )
 
     ranked: List[Tuple[str, np.ndarray, float]] = []
     for name, x_candidate in candidates:
-        trusted_match = float(np.sum(x_candidate[trusted_mask] == lp_round[trusted_mask]))
-        vote_match = float(np.sum(x_candidate == vote_majority))
-        lp_dist = float(np.sum(np.abs(x_candidate - x_LP)))
-        surr_dist = float(np.sum(np.abs(x_candidate - x_surr_LP)))
-        surrogate_match = float(np.sum(x_candidate == surr_round))
-        score = (
-            3.0 * trusted_match
-            + 1.5 * vote_match
-            + 0.5 * surrogate_match
-            - 0.75 * lp_dist
-            - 0.50 * surr_dist
+        score = _score_hot_start_candidate(
+            x_candidate,
+            x_LP,
+            x_surr_LP,
+            vote_majority,
+            trusted_mask,
+            support_reference=support_reference,
+            nearby_commitment_pool=nearby_commitment_pool,
         )
         ranked.append((name, x_candidate, score))
 
@@ -506,7 +964,39 @@ def _rank_hot_start_candidates(
     return ranked
 
 
-# ========================== 内部辅助：代理约束添加 ==========================
+# ========================== 内部辅助：代理约束添�?==========================
+
+def _run_fp_hot_start_task(
+    task_idx: int,
+    name: str,
+    x_start: np.ndarray,
+    trusted_mask: np.ndarray,
+    ppc: dict,
+    pd_data: np.ndarray,
+    T_delta: float,
+    x_pool: Optional[np.ndarray],
+    max_iter: int,
+    stall_perturbation_mode: str,
+    stall_flip_fraction: float,
+    rng_seed: int,
+) -> Tuple[int, str, np.ndarray, bool]:
+    """Run one FP task with an isolated RNG for optional parallel execution."""
+    task_rng = np.random.default_rng(int(rng_seed))
+    x_result, success = run_feasibility_pump(
+        x_start,
+        trusted_mask,
+        ppc,
+        pd_data,
+        T_delta,
+        x_pool=x_pool,
+        max_iter=max_iter,
+        stall_perturbation_mode=stall_perturbation_mode,
+        stall_flip_fraction=stall_flip_fraction,
+        rng=task_rng,
+        verbose=False,
+    )
+    return task_idx, name, x_result, success
+
 
 def _add_surrogate_constraints(
     model: gp.Model,
@@ -519,7 +1009,7 @@ def _add_surrogate_constraints(
     prefix: str = ''
 ) -> None:
     """
-    向 Gurobi 模型添加 V3 三时段代理约束。
+    �?Gurobi 模型添加 V3 三时段代理约束�?
 
     约束形式：alphas[k]*x[t_k] + betas[k]*x[t_k+1] + gammas[k]*x[t_k+2] <= deltas[k]
     时段映射：t_k = k % (T-2)（循环分配，确保 t_k+2 不越界）
@@ -530,7 +1020,7 @@ def _add_surrogate_constraints(
         alphas: (max_constraints,) 第一时段系数
         betas: (max_constraints,) 第二时段系数
         gammas: (max_constraints,) 第三时段系数
-        deltas: (max_constraints,) 右端项
+        deltas: (max_constraints,) 右端�?
         T: 时段总数
         prefix: 约束命名前缀（用于区分不同机组）
     """
@@ -547,19 +1037,19 @@ def _add_surrogate_constraints(
             )
 
 
-# ========================== 内部辅助：DC 潮流数据预计算 ==========================
+# ========================== 内部辅助：DC 潮流数据预计�?==========================
 
 def _build_ptdf_data(ppc_int: dict) -> tuple:
-    """计算 DC 潮流约束所需的 PTDF 矩阵与发电机-总线关联矩阵。
+    """计算 DC 潮流约束所需�?PTDF 矩阵与发电机-总线关联矩阵�?
 
     Args:
-        ppc_int: ext2int 处理后的 PyPower 案例字典（总线已 0-indexed）。
+        ppc_int: ext2int 处理后的 PyPower 案例字典（总线�?0-indexed）�?
 
     Returns:
-        PTDF:         (nl, nb) 功率转移分布因子矩阵（无量纲）。
-        ptdf_g:       (nl, ng) PTDF @ G_bus，即 pg 变量的线路潮流系数（MW/MW）。
-        branch_limit: (nl,)   线路热容量上限，RATE_A（MW）。
-        active_lines: 需施加约束的线路索引列表（RATE_A > 0 且线路在线）。
+        PTDF:         (nl, nb) 功率转移分布因子矩阵（无量纲）�?
+        ptdf_g:       (nl, ng) PTDF @ G_bus，即 pg 变量的线路潮流系数（MW/MW）�?
+        branch_limit: (nl,)   线路热容量上限，RATE_A（MW）�?
+        active_lines: 需施加约束的线路索引列表（RATE_A > 0 且线路在线）�?
     """
     gen    = ppc_int['gen']
     branch = ppc_int['branch']
@@ -569,7 +1059,7 @@ def _build_ptdf_data(ppc_int: dict) -> tuple:
 
     PTDF = makePTDF(ppc_int['baseMVA'], ppc_int['bus'], branch)  # (nl, nb)
 
-    # 发电机-总线关联矩阵（ext2int 后总线 0-indexed）
+    # 发电�?总线关联矩阵（ext2int 后总线 0-indexed�?
     G_bus = np.zeros((nb, ng))
     for g in range(ng):
         bus_idx = int(gen[g, GEN_BUS])
@@ -586,7 +1076,7 @@ def _build_ptdf_data(ppc_int: dict) -> tuple:
     return PTDF, ptdf_g, branch_limit, active_lines
 
 
-# ========================== 内部辅助：单机组 LP（多代理约束） ==========================
+# ========================== 内部辅助：单机组 LP（多代理约束�?==========================
 
 def _solve_unit_LP_with_surrogate(
     trainer: SubproblemSurrogateTrainer,
@@ -597,7 +1087,7 @@ def _solve_unit_LP_with_surrogate(
     deltas: np.ndarray
 ) -> np.ndarray:
     """
-    求解单机组子问题 LP（使用 V3 三时段代理约束）。
+    求解单机组子问题 LP（使�?V3 三时段代理约束）�?
 
     Args:
         trainer: 该机组的 SubproblemSurrogateTrainer
@@ -605,10 +1095,11 @@ def _solve_unit_LP_with_surrogate(
         alphas, betas, gammas, deltas: V3 代理约束参数，各 shape (max_constraints,)
 
     Returns:
-        x_LP: (T,) LP 松弛解；若不可行返回零向量
+        x_LP: (T,) LP 松弛解；若不可行返回零向�?
     """
     g = trainer.unit_id
     T = trainer.T
+    lambda_unit = _extract_unit_lambda(lambda_val, T, unit_id=g, trainer=trainer)
 
     model = gp.Model('unit_lp_surrogate')
     model.Params.OutputFlag = 0
@@ -617,7 +1108,7 @@ def _solve_unit_LP_with_surrogate(
     x = model.addVars(T, lb=0, ub=1, name='x')
     cpower = model.addVars(T, lb=0, name='cpower')
 
-    # 发电上下限
+    # 发电上下�?
     for t in range(T):
         model.addConstr(pg[t] >= trainer.gen[g, PMIN] * x[t])
         model.addConstr(pg[t] <= trainer.gen[g, PMAX] * x[t])
@@ -631,9 +1122,13 @@ def _solve_unit_LP_with_surrogate(
         model.addConstr(pg[t] - pg[t-1] <= Ru * x[t-1] + Ru_co * (1 - x[t-1]))
         model.addConstr(pg[t-1] - pg[t] <= Rd * x[t] + Rd_co * (1 - x[t]))
 
-    # 最小开关机时间
-    Ton = min(int(4 * trainer.T_delta), T - 1)
-    Toff = min(int(4 * trainer.T_delta), T - 1)
+    # 最小开关机时间：优先读取算例真实 min_up/min_down，缺失时回退到默认值
+    ppc_ref = getattr(trainer, 'ppc_raw', getattr(trainer, 'ppc', {'gen': trainer.gen}))
+    min_up_steps, min_down_steps = _get_min_up_down_time_steps(
+        ppc_ref, trainer.ng, trainer.T_delta, T,
+    )
+    Ton = int(min_up_steps[g])
+    Toff = int(min_down_steps[g])
     for tau in range(1, Ton + 1):
         for t1 in range(T - tau):
             model.addConstr(x[t1+1] - x[t1] <= x[t1+tau])
@@ -641,20 +1136,20 @@ def _solve_unit_LP_with_surrogate(
         for t1 in range(T - tau):
             model.addConstr(-x[t1+1] + x[t1] <= 1 - x[t1+tau])
 
-    # 发电成本（线性化）
+    # 发电成本（线性化�?
     for t in range(T):
         model.addConstr(
             cpower[t] >= trainer.gencost[g, -2] / trainer.T_delta * pg[t]
                        + trainer.gencost[g, -1] / trainer.T_delta * x[t]
         )
 
-    # V3 三时段代理约束
+    # V3 三时段代理约�?
     x_dict = {t: x[t] for t in range(T)}
     _add_surrogate_constraints(model, x_dict, alphas, betas, gammas, deltas, T)
 
     # 目标：最小化成本 - 拉格朗日对偶项
     obj = gp.quicksum(cpower[t] for t in range(T))
-    obj -= gp.quicksum(float(lambda_val[t]) * pg[t] for t in range(T))
+    obj -= gp.quicksum(float(lambda_unit[t]) * pg[t] for t in range(T))
     model.setObjective(obj, GRB.MINIMIZE)
     model.optimize()
 
@@ -680,25 +1175,22 @@ def collect_integer_solutions(
     rng: Optional[np.random.Generator] = None
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
-    收集多组整数解（来自子问题 LP + 代理参数扰动）。
+    收集多组整数解（来自子问�?LP + 代理参数扰动）�?
 
     Args:
         pd_data: (nb_load, T) 负荷数据
-        lambda_val: (T,) 功率平衡对偶变量
+        lambda_val: 全局对偶变量载荷；可为功率平衡向量、每机组有效系数矩阵或全局 dual dict
         trainers: {unit_id: SubproblemSurrogateTrainer}
-        n_perturbations: 直接随机化 surrogate 参数的扰动次数
-        n_similar_scenarios: 从历史场景库检索相似负荷/新能源样本的次数
+        n_perturbations: 直接随机�?surrogate 参数的扰动次�?        n_similar_scenarios: 从历史场景库检索相似负�?新能源样本的次数
         similar_scenario_pool_size: 相似场景候选池大小
-        n_load_perturbations: 对当前负荷做小扰动后重新过 NN 的次数
-        load_perturbation_scale: 负荷小扰动幅度
-        perturb_std: surrogate 网络输出参数扰动标准差（相对值）
+        n_load_perturbations: 对当前负荷做小扰动后重新�?NN 的次�?        load_perturbation_scale: 负荷小扰动幅�?        perturb_std: surrogate 网络输出参数扰动标准差（相对值）
         neighborhood_weight: 周边平均约束权重，越大表示越强调相邻约束平滑
         lambda_predictor: 可选，对场景扰动后重新预测 lambda
         rng: 随机数生成器
 
     Returns:
-        x_surr_lp:  (ng, T) surrogate 子问题 LP 连续解
-        x_init_k:   (ng, T) 各机组子问题 LP 整数解
+        x_surr_lp:  (ng, T) surrogate 子问�?LP 连续�?
+        x_init_k:   (ng, T) 各机组子问题 LP 整数�?
         x_init_k_m: (ng, n_candidates, T) 多策略扰动后的多组整数解
     """
     if rng is None:
@@ -735,12 +1227,12 @@ def collect_integer_solutions(
         )
         _base_name, alphas, betas, gammas, deltas = param_candidates[0]
 
-        # 原始子问题 LP
+        # 原始子问�?LP
         x_LP_k = _solve_unit_LP_with_surrogate(trainer, lambda_val, alphas, betas, gammas, deltas)
         x_surr_lp[g] = x_LP_k
         x_init_k[g] = round_to_integer(x_LP_k)
 
-        # 直接参数随机化 + 相似场景检索 + 小负荷扰动场景，共同生成多组解
+        # Solve additional unit LPs from perturbed / retrieved surrogate parameters.
         for m, (_name, alphas_m, betas_m, gammas_m, deltas_m) in enumerate(param_candidates[1:]):
             x_LP_m = _solve_unit_LP_with_surrogate(
                 trainer, lambda_val, alphas_m, betas_m, gammas_m, deltas_m
@@ -750,7 +1242,7 @@ def collect_integer_solutions(
     return x_surr_lp, x_init_k, x_init_k_m
 
 
-# ========================== Step 3：识别高可信度变量 ==========================
+# ========================== Step 3：识别高可信度变�?==========================
 
 def identify_trusted_mask(
     x_LP: np.ndarray,
@@ -759,16 +1251,16 @@ def identify_trusted_mask(
     conf_threshold: float = 0.15
 ) -> np.ndarray:
     """
-    识别高可信度（整数性强且多来源一致）的变量。
+    识别高可信度（整数性强且多来源一致）的变量�?
 
-    条件1：LP 值远离 0.5（x_LP < conf_threshold 或 x_LP > 1 - conf_threshold）
-    条件2：多数投票结果与 round(x_LP) 一致
+    条件1：LP 值远�?0.5（x_LP < conf_threshold �?x_LP > 1 - conf_threshold�?
+    条件2：多数投票结果与 round(x_LP) 一�?
 
     Args:
-        x_LP:       (ng, T) 全局 LP 松弛解
-        x_init_k:   (ng, T) 子问题 LP 整数解
-        x_init_k_m: (ng, n_perturbations, T) 扰动整数解
-        conf_threshold: LP 整数性置信阈值
+        x_LP:       (ng, T) 全局 LP 松弛�?
+        x_init_k:   (ng, T) 子问�?LP 整数�?
+        x_init_k_m: (ng, n_perturbations, T) 扰动整数�?
+        conf_threshold: LP 整数性置信阈�?
 
     Returns:
         trusted_mask: (ng, T) bool 数组，True 表示高可信度（固定）
@@ -778,11 +1270,11 @@ def identify_trusted_mask(
     near_one = x_LP > 1.0 - conf_threshold
     integrality_confident = near_zero | near_one
 
-    # 条件2：多数投票一致性
+    # 条件2：多数投票一致�?
     n_pert = x_init_k_m.shape[1]
     x_ref = np.round(x_LP).astype(int)
 
-    # 汇总所有投票（x_init_k + 所有扰动解）
+    # 汇总所有投票（x_init_k + 所有扰动解�?
     vote_sum = x_init_k.astype(float) + np.sum(x_init_k_m.astype(float), axis=1)
     n_votes = 1 + n_pert
     majority = (vote_sum / n_votes >= 0.5).astype(int)
@@ -833,26 +1325,23 @@ def solve_global_LP_relaxation(
     sparse_x_template_library: Optional[SparseConstraintTemplateLibrary] = None,
 ) -> np.ndarray:
     """
-    构建完整 UC LP 松弛（x ∈ [0,1]），按以下顺序分级尝试代理约束：
-      1. BCD + subproblem 全部硬约束
-      2. 保持 BCD 为硬约束，仅将 subproblem 约束软化到高罚项
-      3. 将 BCD 与 subproblem 都软化到高罚项
-
+    构建完整 UC LP 松弛（x �?[0,1]），按以下顺序分级尝试代理约束：
+      1. BCD + subproblem 全部硬约�?      2. 保持 BCD 为硬约束，仅�?subproblem 约束软化到高罚项
+      3. �?BCD �?subproblem 都软化到高罚�?
     Args:
         ppc: PyPower 案例数据
         pd_data: (nb_load, T) 负荷数据
         T_delta: 时间间隔（小时）
         trainers: {unit_id: trainer}
-        lambda_val: (T,) 功率平衡对偶变量（用于查询代理约束参数）
+        lambda_val: 全局对偶变量载荷（用于查询每机组代理约束参数）
         agent: （可选）已训练的 Agent_NN_BCD 实例；若提供则额外加入其
-            theta/zeta 参数化代理约束
-        sparse_library: （可选）离线筛选出的稀疏参数化约束库。若提供则以
-            `lhs(x, pg) - rhs(Pd) <= slack` 的软约束形式加入全局 LP。
-        sparse_x_template_library: （可选）x[g,t] 稀疏支持集模板库，以
-            `sum x[g_k, t_k] <= rhs + slack` 的形式软注入。
+            theta/zeta 参数化代理约�?        sparse_library: （可选）离线筛选出的稀疏参数化约束库。若提供则以
+            `lhs(x, pg) - rhs(Pd) <= slack` 的软约束形式加入全局 LP�?
+        sparse_x_template_library: （可选）x[g,t] 稀疏支持集模板库，�?
+            `sum x[g_k, t_k] <= rhs + slack` 的形式软注入�?
 
     Returns:
-        x_LP: (ng, T) LP 松弛解；若不可行返回零矩阵
+        x_LP: (ng, T) LP 松弛解；若不可行返回零矩�?
     """
     sample = None
     if isinstance(pd_data, dict):
@@ -860,8 +1349,6 @@ def solve_global_LP_relaxation(
         pd_matrix = get_sample_net_load(sample)
     else:
         pd_matrix = pd_data
-    lambda_val = np.asarray(lambda_val, dtype=float).reshape(-1)
-
     ppc_int = ext2int(ppc)
     gen = ppc_int['gen']
     gencost = ppc_int['gencost']
@@ -874,8 +1361,8 @@ def solve_global_LP_relaxation(
     Rd_co = 0.3 * gen[:, PMAX]
     Ton = min(int(4 * T_delta), T - 1)
     Toff = min(int(4 * T_delta), T - 1)
-    start_cost = gencost[:, 1]   # gencost 第 1 列：启动成本
-    shut_cost  = gencost[:, 2]   # gencost 第 2 列：关机成本
+    start_cost = gencost[:, 1]   # gencost �?1 列：启动成本
+    shut_cost  = gencost[:, 2]   # gencost �?2 列：关机成本
 
     T_triples = max(1, T - 2)       # 预计算三时段约束索引范围
     last_status = None
@@ -989,8 +1476,14 @@ def solve_global_LP_relaxation(
                 )
 
             if g in trainers:
+                lambda_unit = _extract_unit_lambda(
+                    lambda_val,
+                    T,
+                    unit_id=g,
+                    trainer=trainers[g],
+                )
                 alphas, betas, gammas, deltas, *_ = trainers[g].get_surrogate_params(
-                    sample if sample is not None else pd_matrix, lambda_val
+                    sample if sample is not None else pd_matrix, lambda_unit
                 )
                 for k in range(len(alphas)):
                     t_k = k % T_triples
@@ -1023,7 +1516,7 @@ def solve_global_LP_relaxation(
                     model.addConstr(flow_expr <= limit, name=f'flow_upper_{l}_{t}')
                     model.addConstr(flow_expr >= -limit, name=f'flow_lower_{l}_{t}')
         except Exception as _dc_err:
-            print(f"  警告: DC 潮流约束构建失败（{_dc_err}），跳过线路约束", flush=True)
+            print(f"  Warning: failed to build DC flow constraints ({_dc_err}); skip them", flush=True)
 
         if agent is not None:
             _ua = getattr(agent, '_current_union_analysis', None)
@@ -1101,7 +1594,7 @@ def solve_global_LP_relaxation(
 
         if stage_index < len(stages):
             print(
-                f"  全局 LP 阶段 {stage['name']} 不可用 (status={model.status})，尝试下一阶段",
+                f"  全局 LP 阶段 {stage['name']} 不可�?(status={model.status})，尝试下一阶段",
                 flush=True
             )
 
@@ -1114,7 +1607,7 @@ def solve_global_LP_relaxation_without_surrogate(
     T_delta: float
 ) -> np.ndarray:
     """
-    构建完整 UC LP 松弛（x ∈ [0,1]），不含任何代理约束，仅含 UC 基础约束和 DC 潮流约束。
+    构建完整 UC LP 松弛（x �?[0,1]），不含任何代理约束，仅�?UC 基础约束�?DC 潮流约束�?
 
     Args:
         ppc: PyPower 案例数据
@@ -1122,7 +1615,7 @@ def solve_global_LP_relaxation_without_surrogate(
         T_delta: 时间间隔（小时）
 
     Returns:
-        x_LP: (ng, T) LP 松弛解；若不可行返回零矩阵
+        x_LP: (ng, T) LP 松弛解；若不可行返回零矩�?
     """
     ppc_int = ext2int(ppc)
     gen = ppc_int['gen']
@@ -1153,11 +1646,11 @@ def solve_global_LP_relaxation_without_surrogate(
     Rd_co = 0.3 * gen[:, PMAX]
     Ton = min(int(4 * T_delta), T - 1)
     Toff = min(int(4 * T_delta), T - 1)
-    start_cost = gencost[:, 1]   # gencost 第 1 列：启动成本
-    shut_cost  = gencost[:, 2]   # gencost 第 2 列：关机成本
+    start_cost = gencost[:, 1]   # gencost �?1 列：启动成本
+    shut_cost  = gencost[:, 2]   # gencost �?2 列：关机成本
 
     for g in range(ng):
-        # 发电上下限
+        # 发电上下�?
         for t in range(T):
             model.addConstr(pg[g, t] >= gen[g, PMIN] * x[g, t])
             model.addConstr(pg[g, t] <= gen[g, PMAX] * x[g, t])
@@ -1179,7 +1672,7 @@ def solve_global_LP_relaxation_without_surrogate(
             for t1 in range(T - tau):
                 model.addConstr(-x[g, t1+1] + x[g, t1] <= 1 - x[g, t1+tau])
 
-        # 启停成本（参考 BCD / uc_cplex.py）
+        # 启停成本（参�?BCD / uc_cplex.py�?
         for t in range(1, T):
             model.addConstr(
                 coc[g, t-1] >= start_cost[g] * (x[g, t] - x[g, t-1]),
@@ -1197,8 +1690,8 @@ def solve_global_LP_relaxation_without_surrogate(
                                + gencost[g, -1] / T_delta * x[g, t]
             )
 
-    # DC 线路潮流约束（PTDF 方法，硬约束）
-    # 假设 pd_data 形状为 (nb, T)，行顺序与 ext2int 后的总线顺序一致
+    # DC 线路潮流约束（PTDF 方法，硬约束�?
+    # 假设 pd_data 形状�?(nb, T)，行顺序�?ext2int 后的总线顺序一�?
     try:
         _PTDF, ptdf_g, branch_limit, active_lines = _build_ptdf_data(ppc_int)
         ptdf_Pd = _PTDF @ pd_data   # (nl, T)：负荷对各线路潮流的贡献
@@ -1212,9 +1705,9 @@ def solve_global_LP_relaxation_without_surrogate(
                 model.addConstr(flow_expr <= limit,  name=f'flow_upper_{l}_{t}')
                 model.addConstr(flow_expr >= -limit, name=f'flow_lower_{l}_{t}')
     except Exception as _dc_err:
-        print(f"  警告: DC 潮流约束构建失败（{_dc_err}），跳过线路约束", flush=True)
+        print(f"  Warning: failed to build DC flow constraints ({_dc_err}); skip them", flush=True)
 
-    # 目标：发电成本 + 启停成本
+    # 目标：发电成�?+ 启停成本
     obj = (gp.quicksum(cpower[g, t] for g in range(ng) for t in range(T))
            + gp.quicksum(coc[g, t] for g in range(ng) for t in range(T - 1)))
     model.setObjective(obj, GRB.MINIMIZE)
@@ -1227,7 +1720,42 @@ def solve_global_LP_relaxation_without_surrogate(
     return np.zeros((ng, T))
 
 
-# ========================== Step 5：可行性验证 ==========================
+# ========================== Step 5：可行性验�?==========================
+
+def _get_ordered_ppc_generator_array(ppc: dict, key: str, ng: int) -> Optional[np.ndarray]:
+    values = ppc.get(key)
+    if values is None:
+        return None
+
+    values = np.asarray(values)
+    if values.shape[0] != ng:
+        return None
+
+    raw_gen = np.asarray(ppc.get('gen'))
+    if raw_gen.shape[0] != ng:
+        return values
+
+    order = np.argsort(raw_gen[:, GEN_BUS], kind='stable')
+    return values[order]
+
+
+def _get_min_up_down_time_steps(ppc: dict, ng: int, T_delta: float, horizon: int) -> Tuple[np.ndarray, np.ndarray]:
+    default_steps = min(max(int(4 * T_delta), 1), max(horizon - 1, 0))
+
+    min_up_h = _get_ordered_ppc_generator_array(ppc, 'uc_min_up_time_h', ng)
+    min_down_h = _get_ordered_ppc_generator_array(ppc, 'uc_min_down_time_h', ng)
+    if min_up_h is None or min_down_h is None:
+        return (
+            np.full(ng, default_steps, dtype=int),
+            np.full(ng, default_steps, dtype=int),
+        )
+
+    min_up = np.maximum(np.ceil(np.asarray(min_up_h, dtype=float) / T_delta).astype(int), 1)
+    min_down = np.maximum(np.ceil(np.asarray(min_down_h, dtype=float) / T_delta).astype(int), 1)
+    min_up = np.minimum(min_up, max(horizon - 1, 0))
+    min_down = np.minimum(min_down, max(horizon - 1, 0))
+    return min_up, min_down
+
 
 def check_uc_feasibility(
     x_int: np.ndarray,
@@ -1237,42 +1765,41 @@ def check_uc_feasibility(
     tol: float = 1e-6
 ) -> Tuple[bool, str]:
     """
-    验证给定整数解是否满足 UC 约束。
+    验证给定整数解是否满�?UC 约束�?
 
     检查顺序：
     1. 最小开关机时间约束（代数检查）
-    2. 功率平衡 + 爬坡约束（固定 x，求解 LP 验证 pg 可行性）
+    2. 功率平衡 + 爬坡约束（固�?x，求�?LP 验证 pg 可行性）
 
     Args:
-        x_int: (ng, T) 整数解（值为 0 或 1）
+        x_int: (ng, T) 整数解（值为 0 �?1�?
         ppc: PyPower 案例数据
         pd_data: (nb_load, T) 负荷数据
         T_delta: 时间间隔
-        tol: 约束违反容忍度
+        tol: 约束违反容忍�?
 
     Returns:
-        (is_feasible, reason): True 表示可行，否则附带违反原因
+        (is_feasible, reason): True 表示可行，否则附带违反原�?
     """
     ppc_int = ext2int(ppc)
     gen = ppc_int['gen']
     ng, T = x_int.shape
     Pd_sum = np.sum(pd_data, axis=0)
 
-    Ton = min(int(4 * T_delta), T - 1)
-    Toff = min(int(4 * T_delta), T - 1)
+    min_up_steps, min_down_steps = _get_min_up_down_time_steps(ppc, ng, T_delta, T)
 
-    # 检查1：最小开关机时间（代数）
+    # 检�?：最小开关机时间（代数）
     for g in range(ng):
-        for tau in range(1, Ton + 1):
+        for tau in range(1, min_up_steps[g] + 1):
             for t1 in range(T - tau):
                 if x_int[g, t1+1] - x_int[g, t1] > x_int[g, t1+tau] + tol:
-                    return False, f"最小开机时间违反: 机组{g}, t1={t1}, tau={tau}"
-        for tau in range(1, Toff + 1):
+                    return False, f"最小开机时间违�? 机组{g}, t1={t1}, tau={tau}"
+        for tau in range(1, min_down_steps[g] + 1):
             for t1 in range(T - tau):
                 if -x_int[g, t1+1] + x_int[g, t1] > 1 - x_int[g, t1+tau] + tol:
-                    return False, f"最小关机时间违反: 机组{g}, t1={t1}, tau={tau}"
+                    return False, f"最小关机时间违�? 机组{g}, t1={t1}, tau={tau}"
 
-    # 检查2：功率平衡 + 爬坡（LP 软可行性）
+    # 检�?：功率平�?+ 爬坡（LP 软可行性）
     model = gp.Model('uc_feasibility_check')
     model.Params.OutputFlag = 0
 
@@ -1303,8 +1830,8 @@ def check_uc_feasibility(
             == float(Pd_sum[t])
         )
 
-    # 检查3：DC 线路潮流约束（作为硬约束加入 LP）
-    # 功率平衡含松弛变量；若 LP 因线路约束不可行则说明网络拥塞
+    # 检�?：DC 线路潮流约束（作为硬约束加入 LP�?
+    # 功率平衡含松弛变量；�?LP 因线路约束不可行则说明网络拥�?
     _dc_lines_added = False
     try:
         _PTDF, ptdf_g, branch_limit, active_lines = _build_ptdf_data(ppc_int)
@@ -1320,7 +1847,7 @@ def check_uc_feasibility(
                 model.addConstr(flow_expr >= -limit)
         _dc_lines_added = True
     except Exception:
-        pass   # DC 约束不可用时退化为仅检查功率平衡
+        pass   # DC 约束不可用时退化为仅检查功率平�?
 
     obj = gp.quicksum(slack_pos[t] + slack_neg[t] for t in range(T))
     model.setObjective(obj, GRB.MINIMIZE)
@@ -1329,15 +1856,15 @@ def check_uc_feasibility(
     if model.status == GRB.OPTIMAL:
         total_slack = model.ObjVal
         if total_slack > tol:
-            return False, f"功率平衡不可行: 总松弛量={total_slack:.4f} MW"
+            return False, f"功率平衡不可�? 总松弛量={total_slack:.4f} MW"
         return True, "可行"
 
     if model.status == GRB.INFEASIBLE and _dc_lines_added:
-        return False, "DC 线路潮流约束不可行（网络拥塞）"
-    return False, f"可行性 LP 求解失败: status={model.status}"
+        return False, "DC flow constraints are infeasible"
+    return False, f"可行�?LP 求解失败: status={model.status}"
 
 
-# ========================== Step 4：可行性泵主循环 ==========================
+# ========================== Step 4：可行性泵主循�?==========================
 
 def run_feasibility_pump(
     x_curr: np.ndarray,
@@ -1353,22 +1880,20 @@ def run_feasibility_pump(
     verbose: bool = False
 ) -> Tuple[np.ndarray, bool]:
     """
-    可行性泵主循环。
+    可行性泵主循环�?
 
-    在固定高可信度变量的条件下，通过"LP投影 → 四舍五入"循环寻找整数可行解。
-    从第二次迭代（iteration >= 1）起，若提供 x_pool，则将 x 约束为已知整数解的凸组合。
+    在固定高可信度变量的条件下，通过"LP投影 �?四舍五入"循环寻找整数可行解�?
+    从第二次迭代（iteration >= 1）起，若提供 x_pool，则�?x 约束为已知整数解的凸组合�?
 
     Args:
-        x_curr: (ng, T) 初始整数点（0/1 矩阵）
+        x_curr: (ng, T) 初始整数点（0/1 矩阵�?
         trusted_mask: (ng, T) bool，True 表示固定不变
         ppc: PyPower 案例数据
         pd_data: (nb_load, T) 负荷数据
         T_delta: 时间间隔
         x_pool: (n_pool, ng, T) 整数解池，iteration >= 1 时用于凸组合约束（可选）
-        max_iter: 最大迭代次数
-        stall_perturbation_mode: 停滞时的扰动策略：`flip`/`pool_restart`/`pool_then_flip`
-        stall_flip_fraction: 停滞时随机翻转的非可信变量比例
-        rng: 随机数生成器（用于振荡扰动）
+        max_iter: 最大迭代次�?        stall_perturbation_mode: 停滞时的扰动策略：`flip`/`pool_restart`/`pool_then_flip`
+        stall_flip_fraction: 停滞时随机翻转的非可信变量比�?        rng: 随机数生成器（用于振荡扰动）
         verbose: 是否打印迭代信息
 
     Returns:
@@ -1389,7 +1914,7 @@ def run_feasibility_pump(
     Ton = min(int(4 * T_delta), T - 1)
     Toff = min(int(4 * T_delta), T - 1)
 
-    # 预计算 DC 潮流数据（循环外一次性完成，避免重复构建 PTDF）
+    # 预计�?DC 潮流数据（循环外一次性完成，避免重复构建 PTDF�?
     _dc_available = False
     _ptdf_g = None
     _ptdf_Pd = None
@@ -1400,10 +1925,10 @@ def run_feasibility_pump(
         _ptdf_Pd = _PTDF @ pd_data   # (nl, T)
         _dc_available = True
         if verbose:
-            print(f"  FP: DC 潮流约束已启用（{len(_active_lines)} 条有效线路）", flush=True)
+            print(f"  FP: DC flow constraints enabled ({len(_active_lines)} active lines)", flush=True)
     except Exception as _e:
         if verbose:
-            print(f"  FP 警告: DC 潮流约束不可用（{_e}）", flush=True)
+            print(f"  FP warning: DC flow constraints unavailable ({_e})", flush=True)
 
     history: List[tuple] = []
     no_improve_count = 0
@@ -1411,14 +1936,14 @@ def run_feasibility_pump(
     x_curr = x_curr.copy()
 
     for iteration in range(max_iter):
-        # 检验当前点是否已可行
+        # 检验当前点是否已可�?
         is_feas, reason = check_uc_feasibility(x_curr, ppc, pd_data, T_delta)
         if is_feas:
             if verbose:
-                print(f"  FP: 第{iteration}轮找到可行解", flush=True)
+                print(f"  FP: found feasible solution at iteration {iteration}", flush=True)
             return x_curr, True
 
-        # LP Projection：最小化 L1(x, x_curr)，满足 UC 连续约束
+        # LP Projection：最小化 L1(x, x_curr)，满�?UC 连续约束
         model = gp.Model('fp_projection')
         model.Params.OutputFlag = 0
 
@@ -1433,7 +1958,7 @@ def run_feasibility_pump(
                 name=f'pb_{t}'
             )
 
-        # iteration >= 1 且提供了 x_pool：将 x 约束为整数解池的凸组合
+        # iteration >= 1 且提供了 x_pool：将 x 约束为整数解池的凸组�?
         if x_pool is not None and iteration >= 1:
             n_pool = x_pool.shape[0]
             omega = model.addVars(ng, n_pool, lb=0, name='omega')
@@ -1447,7 +1972,7 @@ def run_feasibility_pump(
                     )
 
         for g in range(ng):
-            # 发电上下限
+            # 发电上下�?
             for t in range(T):
                 model.addConstr(pg[g, t] >= gen[g, PMIN] * x[g, t])
                 model.addConstr(pg[g, t] <= gen[g, PMAX] * x[g, t])
@@ -1469,7 +1994,7 @@ def run_feasibility_pump(
                 for t1 in range(T - tau):
                     model.addConstr(-x[g, t1+1] + x[g, t1] <= 1 - x[g, t1+tau])
 
-            # 每个变量的 L1 距离约束 or 固定可信变量
+            # 每个变量�?L1 距离约束 or 固定可信变量
             for t in range(T):
                 x_ref = float(x_curr[g, t])
                 if trusted_mask[g, t]:
@@ -1479,7 +2004,7 @@ def run_feasibility_pump(
                     model.addConstr(d[g, t] >= x[g, t] - x_ref)
                     model.addConstr(d[g, t] >= x_ref - x[g, t])
 
-        # DC 线路潮流约束（使用预计算的 PTDF 数据）
+        # DC 线路潮流约束（使用预计算�?PTDF 数据�?
         if _dc_available:
             for l in _active_lines:
                 limit = float(_branch_limit[l])
@@ -1491,7 +2016,7 @@ def run_feasibility_pump(
                     model.addConstr(flow_expr <= limit)
                     model.addConstr(flow_expr >= -limit)
 
-        # 目标：最小化 L1 距离（仅对非可信变量）
+        # 目标：最小化 L1 距离（仅对非可信变量�?
         obj = gp.quicksum(
             d[g, t]
             for g in range(ng)
@@ -1503,27 +2028,27 @@ def run_feasibility_pump(
 
         if model.status != GRB.OPTIMAL:
             if verbose:
-                print(f"  FP: 第{iteration}轮 LP 投影失败 (status={model.status})", flush=True)
+                print(f"  FP: LP projection failed at iteration {iteration} (status={model.status})", flush=True)
             break
 
         x_LP_proj = np.array([[x[g, t].X for t in range(T)] for g in range(ng)])
 
-        # 四舍五入得到新整数点，强制保持可信变量
+        # 四舍五入得到新整数点，强制保持可信变�?
         x_next = round_to_integer(x_LP_proj)
         x_next[trusted_mask] = x_curr[trusted_mask]
 
         if verbose:
             l1_dist = float(model.ObjVal)
             changed = int(np.sum(x_next != x_curr))
-            print(f"  FP iter {iteration}: L1投影={l1_dist:.3f}, 变化位数={changed}", flush=True)
+            print(f"  FP iter {iteration}: L1 projection={l1_dist:.3f}, changed_bits={changed}", flush=True)
 
-        # 振荡检测（最近历史中出现过相同点）
+        # 振荡检测（最近历史中出现过相同点�?
         x_key = tuple(x_next.flatten())
         if x_key in history:
             no_improve_count += 1
             if no_improve_count >= 3:
                 if verbose:
-                    print(f"  FP: 检测到振荡，触发停滞扰动策略 {stall_perturbation_mode}", flush=True)
+                    print(f"  FP: detected stall/cycle, applying perturbation mode {stall_perturbation_mode}", flush=True)
 
                 if stall_perturbation_mode in ('pool_restart', 'pool_then_flip'):
                     pool_candidate = _select_pool_restart_candidate(x_next, x_pool, trusted_mask, rng)
@@ -1549,11 +2074,11 @@ def run_feasibility_pump(
         x_curr = x_next
 
     if verbose:
-        print(f"  FP: 达到最大迭代 {max_iter} 次，未找到可行解", flush=True)
+        print(f"  FP: reached max_iter={max_iter} without feasibility", flush=True)
     return x_curr, False
 
 
-# ========================== Step 6：顶层接口 ==========================
+# ========================== Step 6：顶层接�?==========================
 
 def recover_integer_solution(
     pd_data: np.ndarray | dict,
@@ -1578,47 +2103,46 @@ def recover_integer_solution(
     stall_perturbation_mode: str = 'pool_then_flip',
     stall_flip_fraction: float = 0.10,
     verbose: bool = True,
-    rng: Optional[np.random.Generator] = None
+    rng: Optional[np.random.Generator] = None,
+    max_perturbation_hot_starts: int = 6,
+    max_unit_options_per_generator: int = 4,
+    max_unit_combination_candidates: int = 12,
+    max_nearby_commitment_hot_starts: int = 4,
+    nearby_commitment_pool_size: int = 12,
+    parallel_fp_starts: int = 1,
+    scenario_bank: Optional[List[dict]] = None,
 ) -> Tuple[Optional[np.ndarray], bool]:
     """
-    顶层接口：从 LP 松弛解恢复 UC 整数可行解。
+    顶层接口：从 LP 松弛解恢�?UC 整数可行解�?
 
-    Pipeline：
+    Pipeline�?
       1. 通过 lambda_predictor 获取对偶变量
-      2. 求解全局 UC LP 松弛（含代理约束）→ x_LP，启发式四舍五入 → x_init
+      2. 求解全局 UC LP 松弛（含代理约束）→ x_LP，启发式四舍五入 �?x_init
          （若提供 manager，则使用 manager.solve_global 替代默认 LP 求解器）
-      3. 各机组子问题 LP（+ 参数扰动）收集 surrogate LP 连续解与多组整数解
+      3. 各机组子问题 LP�? 参数扰动）收�?surrogate LP 连续解与多组整数�?
       4. 识别高可信度变量（整数性强 + 多来源一致）
-      5. 基于全局 LP / surrogate LP 构造多组热启动候选
+      5. 基于全局 LP / surrogate LP 构造多组热启动候�?
       6. 可行性泵：按热启动候选优先级依次尝试
 
     Args:
         pd_data: (nb_load, T) 负荷数据
-        trainers: {unit_id: SubproblemSurrogateTrainer} 已训练的代理约束训练器
-        lambda_predictor: 对偶变量预测器，需支持 `predict(pd_data) -> (T,)`
+        trainers: {unit_id: SubproblemSurrogateTrainer} 已训练的代理约束训练�?
+        lambda_predictor: 对偶变量预测器，需支持返回全局 dual dict 或可兼容的旧格式
         ppc: PyPower 案例数据
         T_delta: 时间间隔（小时）
         manager: （可选）UnifiedSurrogateManager 实例；若提供则使用其
-            solve_global 方法求解全局 LP 松弛（同时包含 theta/zeta 和 V3 代理约束）
-        sparse_library: （可选）离线筛选出的稀疏参数化约束库，仅在显式提供时启用
-        sparse_x_template_library: （可选）稀疏 x 支持集模板库，仅在显式提供时启用
-        n_perturbations: 直接随机化 surrogate 参数的次数
-        n_similar_scenarios: 检索相似负荷/新能源场景并重过 NN 的次数
-        similar_scenario_pool_size: 相似场景检索的候选池大小
-        n_load_perturbations: 小负荷扰动后重过 NN 的次数
-        load_perturbation_scale: 小负荷扰动幅度
-        conf_threshold: LP 整数性置信阈值
-        max_fp_iter: 可行性泵最大迭代次数
-        perturb_std: surrogate 网络输出参数扰动标准差
-        neighborhood_weight: 周边平均约束权重
-        use_hot_start: 是否启用基于 LP 与 surrogate LP 的热启动候选
-        stall_perturbation_mode: FP 停滞时的扰动策略
-        stall_flip_fraction: FP 停滞时随机翻转比例
-        verbose: 是否打印进度
-        rng: 随机数生成器（传 None 则使用固定种子 42）
-
+            solve_global 方法求解全局 LP 松弛（同时包�?theta/zeta �?V3 代理约束�?
+        sparse_library: （可选）离线筛选出的稀疏参数化约束库，仅在显式提供时启�?
+        sparse_x_template_library: （可选）稀�?x 支持集模板库，仅在显式提供时启用
+        n_perturbations: 直接随机�?surrogate 参数的次�?        n_similar_scenarios: 检索相似负�?新能源场景并重过 NN 的次�?        similar_scenario_pool_size: 相似场景检索的候选池大小
+        n_load_perturbations: 小负荷扰动后重过 NN 的次�?        load_perturbation_scale: 小负荷扰动幅�?        conf_threshold: LP 整数性置信阈�?        max_fp_iter: 可行性泵最大迭代次�?        perturb_std: surrogate 网络输出参数扰动标准�?        neighborhood_weight: 周边平均约束权重
+        use_hot_start: 是否启用基于 LP �?surrogate LP 的热启动候�?        stall_perturbation_mode: FP 停滞时的扰动策略
+        stall_flip_fraction: FP 停滞时随机翻转比�?        verbose: 是否打印进度
+        rng: 随机数生成器（传 None 则使用固定种�?42�?
+        scenario_bank: 可选历史样本库。若提供，则优先从这里检索邻近样本最优开机解；
+            否则回退到 trainers[*].active_set_data
     Returns:
-        (x_feasible, success): 整数解矩阵 (ng, T)，以及是否为可行解
+        (x_feasible, success): 整数解矩�?(ng, T)，以及是否为可行�?
     """
     sample = None
     if isinstance(pd_data, dict):
@@ -1631,12 +2155,12 @@ def recover_integer_solution(
     if rng is None:
         rng = np.random.default_rng(42)
 
-    # Step 1：获取对偶变量
+    # Step 1：获取对偶变�?
     if verbose:
         print("Step 1: 获取对偶变量 lambda ...", flush=True)
-    lambda_val = lambda_predictor.predict(scenario_input)  # (T,)
+    lambda_val = lambda_predictor.predict(scenario_input)
 
-    # Step 2：全局 LP 松弛 + 启发式四舍五入
+    # Step 2：全局 LP 松弛 + 启发式四舍五�?
     if verbose:
         print("Step 2: 求解全局 UC LP 松弛 ...", flush=True)
     if manager is not None:
@@ -1659,13 +2183,13 @@ def recover_integer_solution(
         )
     x_init = round_to_integer(x_LP)
 
-    integrality_gap = float(np.mean(np.minimum(x_LP, 1 - x_LP)))  # 平均到0或1的距离
+    integrality_gap = float(np.mean(np.minimum(x_LP, 1 - x_LP)))  # 平均�?�?的距�?
     if verbose:
-        print(f"  整数性间隙（平均）: {integrality_gap:.4f}", flush=True)
+        print(f"  整数性间隙（平均�? {integrality_gap:.4f}", flush=True)
 
     # Step 3：收集多组整数解
     if verbose:
-        print("Step 3: 收集多组整数解（子问题 LP + 扰动）...", flush=True)
+        print("Step 3: 收集多组整数解（子问�?LP + 扰动�?..", flush=True)
     x_surr_lp, x_init_k, x_init_k_m = collect_integer_solutions(
         scenario_input, lambda_val, trainers,
         n_perturbations=n_perturbations,
@@ -1679,7 +2203,7 @@ def recover_integer_solution(
         rng=rng
     )
 
-    # Step 4：识别高可信度变量
+    # Step 4：识别高可信度变�?
     if verbose:
         print("Step 4: 识别高可信度变量 ...", flush=True)
     trusted_mask = identify_trusted_mask(
@@ -1690,12 +2214,43 @@ def recover_integer_solution(
     if verbose:
         print(f"  可信变量: {n_trusted}/{ng*T} ({100*n_trusted/(ng*T):.1f}%)", flush=True)
 
-    # Step 5：基于全局 LP 与 surrogate LP 的启发式热启动候选
+    # Step 5：基于全局 LP �?surrogate LP 的启发式热启动候�?
     hot_start_candidates: List[Tuple[str, np.ndarray, float]] = []
+    nearby_commitment_candidates = _build_nearby_commitment_candidates(
+        _coerce_scenario_sample(scenario_input),
+        trainers,
+        scenario_bank,
+        ng,
+        T,
+        n_candidates=max_nearby_commitment_hot_starts,
+        candidate_pool_size=nearby_commitment_pool_size,
+        rng=rng,
+    )
+    if verbose:
+        print(
+            f"  Nearby historical commitment hot starts: {len(nearby_commitment_candidates)}",
+            flush=True,
+        )
     if use_hot_start:
         hot_start_candidates = _rank_hot_start_candidates(
-            _build_hot_start_candidates(x_LP, x_surr_lp, x_init_k, x_init_k_m, trusted_mask, T_delta),
-            x_LP, x_surr_lp, x_init_k, x_init_k_m, trusted_mask
+            _build_hot_start_candidates(
+                x_LP,
+                x_surr_lp,
+                x_init_k,
+                x_init_k_m,
+                trusted_mask,
+                T_delta,
+                nearby_commitment_candidates=nearby_commitment_candidates,
+                max_perturbation_hot_starts=max_perturbation_hot_starts,
+                max_unit_options_per_generator=max_unit_options_per_generator,
+                max_unit_combination_candidates=max_unit_combination_candidates,
+            ),
+            x_LP,
+            x_surr_lp,
+            x_init_k,
+            x_init_k_m,
+            trusted_mask,
+            nearby_commitment_candidates=nearby_commitment_candidates,
         )
     else:
         hot_start_candidates = [
@@ -1703,7 +2258,7 @@ def recover_integer_solution(
             ("surrogate_lp_round", _repair_min_up_down_heuristic(x_init_k, T_delta), -1.0),
         ]
 
-    # 构建整数解池：子问题整数解 + 扰动解 + 热启动候选，供 FP 投影阶段使用
+    # 构建整数解池：子问题整数�?+ 扰动�?+ 热启动候选，�?FP 投影阶段使用
     x_pool_list = [x_init_k]
     x_pool_list.extend(list(x_init_k_m.transpose(1, 0, 2)))
     x_pool_list.extend([x_start for _, x_start, _ in hot_start_candidates])
@@ -1711,29 +2266,97 @@ def recover_integer_solution(
     x_pool_unique: List[np.ndarray] = []
     x_pool_seen = set()
     for x_candidate in x_pool_list:
-        key = tuple(np.asarray(x_candidate, dtype=int).flatten().tolist())
+        key = _candidate_key(x_candidate)
         if key not in x_pool_seen:
             x_pool_seen.add(key)
             x_pool_unique.append(np.asarray(x_candidate, dtype=int))
     x_pool = np.stack(x_pool_unique, axis=0)
 
     if verbose:
-        print("Step 5: 运行可行性泵热启动 ...", flush=True)
+        print("Step 5: 运行可行性泵热启动...", flush=True)
         for idx, (name, _x_start, score) in enumerate(hot_start_candidates, start=1):
-            print(f"  热启动候选 {idx}: {name}, score={score:.2f}", flush=True)
+            print(f"  热启动候选{idx}: {name}, score={score:.2f}", flush=True)
 
-    x_result = hot_start_candidates[0][1] if hot_start_candidates else x_init
+    parallel_warm_result = None
+    pending_fp_starts: List[Tuple[int, str, np.ndarray, float]] = []
+    for idx, (name, x_start, score) in enumerate(hot_start_candidates, start=1):
+        start_feas, _reason = check_uc_feasibility(x_start, ppc, pd_data, T_delta)
+        if start_feas:
+            if verbose:
+                print(f"  Hot start {idx}: {name} is already feasible; skip FP", flush=True)
+            return x_start, True
+        pending_fp_starts.append((idx, name, x_start, score))
+
+    requested_parallel_count = min(max(1, int(parallel_fp_starts)), len(pending_fp_starts))
+    executed_parallel_count = requested_parallel_count if requested_parallel_count > 1 else 0
+    if executed_parallel_count > 1:
+        if verbose:
+            print(f"  Launching {executed_parallel_count} FP hot starts in parallel", flush=True)
+
+        seeded_tasks = []
+        for idx, name, x_start, _score in pending_fp_starts[:executed_parallel_count]:
+            task_seed = int(rng.integers(0, np.iinfo(np.uint32).max))
+            seeded_tasks.append((idx, name, x_start, task_seed))
+
+        with ThreadPoolExecutor(max_workers=executed_parallel_count) as executor:
+            future_to_task = {
+                executor.submit(
+                    _run_fp_hot_start_task,
+                    idx,
+                    name,
+                    x_start,
+                    trusted_mask,
+                    ppc,
+                    pd_data,
+                    T_delta,
+                    x_pool,
+                    max_fp_iter,
+                    stall_perturbation_mode,
+                    stall_flip_fraction,
+                    task_seed,
+                ): (idx, name)
+                for idx, name, x_start, task_seed in seeded_tasks
+            }
+            parallel_results: Dict[int, np.ndarray] = {}
+            for future in as_completed(future_to_task):
+                idx, name = future_to_task[future]
+                try:
+                    task_idx, _task_name, task_result, task_success = future.result()
+                except Exception as exc:
+                    if verbose:
+                        print(f"  Parallel FP hot start {idx}: {name} failed with {exc}", flush=True)
+                    continue
+                parallel_results[task_idx] = task_result
+                parallel_warm_result = task_result
+                if verbose:
+                    status = "success" if task_success else "no_feasible_solution"
+                    print(f"  Parallel FP hot start {task_idx}: {name} -> {status}", flush=True)
+                if task_success:
+                    return task_result, True
+
+            if pending_fp_starts:
+                first_parallel_idx = pending_fp_starts[0][0]
+                parallel_warm_result = parallel_results.get(first_parallel_idx, parallel_warm_result)
+
+    hot_start_candidates = [
+        (name, x_start, score)
+        for idx, name, x_start, score in pending_fp_starts[executed_parallel_count:]
+    ]
+
+    x_result = parallel_warm_result if parallel_warm_result is not None else (
+        hot_start_candidates[0][1] if hot_start_candidates else x_init
+    )
     success = False
 
     for idx, (name, x_start, _score) in enumerate(hot_start_candidates, start=1):
         start_feas, _reason = check_uc_feasibility(x_start, ppc, pd_data, T_delta)
         if start_feas:
             if verbose:
-                print(f"  热启动候选 {idx}（{name}）已直接可行，无需进入 FP", flush=True)
+                print(f"  Hot start {idx}: {name} is already feasible; skip FP", flush=True)
             return x_start, True
 
         if verbose:
-            print(f"  运行 FP 热启动 {idx}/{len(hot_start_candidates)}: {name}", flush=True)
+            print(f"  Run FP hot start {idx}/{len(hot_start_candidates)}: {name}", flush=True)
         x_result, success = run_feasibility_pump(
             x_start, trusted_mask, ppc, pd_data, T_delta,
             x_pool=x_pool,
@@ -1747,7 +2370,9 @@ def recover_integer_solution(
             break
 
     if verbose:
-        status_str = "✓ 找到可行解" if success else "✗ 未找到可行解（返回最近整数点）"
+        status_str = "FP finished: feasible solution found" if success else "FP finished: no feasible solution"
         print(status_str, flush=True)
 
     return x_result, success
+
+
