@@ -1139,6 +1139,9 @@ class SubproblemSurrogateNet(nn.Module):
         hidden_dims: List[int] = None,
         x_cost_scale: float = 1.0,
         pg_cost_scale: float = 1.0,
+        coupling_coeff_scale: float = 2.0,
+        delta_base: float = 3.0,
+        delta_scale: float = 2.0,
     ):
         super(SubproblemSurrogateNet, self).__init__()
 
@@ -1146,6 +1149,9 @@ class SubproblemSurrogateNet(nn.Module):
         self.max_constraints = max_constraints
         self.x_cost_scale = float(max(x_cost_scale, 1e-6))
         self.pg_cost_scale = float(max(pg_cost_scale, 1e-6))
+        self.coupling_coeff_scale = float(max(coupling_coeff_scale, 1e-6))
+        self.delta_base = float(delta_base)
+        self.delta_scale = float(max(delta_scale, 1e-6))
 
         if hidden_dims is None:
             hidden_dims = [512, 256, 256]
@@ -1182,8 +1188,7 @@ class SubproblemSurrogateNet(nn.Module):
         self.delta_net = nn.Sequential(
             nn.Linear(feat_dim, head_hidden), nn.LayerNorm(head_hidden), nn.LeakyReLU(0.01),
             nn.Linear(head_hidden, head_mid), nn.LayerNorm(head_mid), nn.LeakyReLU(0.01),
-            nn.Linear(head_mid, self.max_constraints),
-            nn.Softplus()
+            nn.Linear(head_mid, self.max_constraints)
         )
 
         # x 调整项头：输出 T 个值，后续经 tanh 缩放到启停成本量级
@@ -1208,12 +1213,12 @@ class SubproblemSurrogateNet(nn.Module):
                 if module.bias is not None:
                     nn.init.zeros_(module.bias)
 
-        # delta头最后一个Linear的偏置初始化为正值（Softplus前）
+        # delta头最后一个Linear的偏置初始化为0，使初始RHS中心落在delta_base
         delta_linears = [m for m in self.delta_net if isinstance(m, nn.Linear)]
         if delta_linears:
             last_linear = delta_linears[-1]
             if last_linear.bias is not None:
-                nn.init.constant_(last_linear.bias, 1.0)
+                nn.init.zeros_(last_linear.bias)
 
     def forward(self, x):
         """
@@ -1233,16 +1238,22 @@ class SubproblemSurrogateNet(nn.Module):
         features = self.input_proj(x)
         for block in self.res_blocks:
             features = block(features)
-        alphas = self.alpha_net(features)
-        betas = self.beta_net(features)
-        gammas = self.gamma_net(features)
-        deltas = self.delta_net(features)
+        alphas = torch.tanh(self.alpha_net(features)) * self.coupling_coeff_scale
+        betas = torch.tanh(self.beta_net(features)) * self.coupling_coeff_scale
+        gammas = torch.tanh(self.gamma_net(features)) * self.coupling_coeff_scale
+        deltas = self.delta_base + torch.tanh(self.delta_net(features)) * self.delta_scale
         costs = torch.tanh(self.cost_net(features)) * self.x_cost_scale
         pg_costs = torch.tanh(self.pg_cost_net(features)) * self.pg_cost_scale
         return alphas, betas, gammas, deltas, costs, pg_costs
 
 
-SUPPORTED_CONSTRAINT_GENERATION_STRATEGIES = {"sensitive", "all"}
+CONSTRAINT_STRATEGY_ALL = "all"
+CONSTRAINT_STRATEGY_ALL_TEMPLATES_RHS3 = "all_templates_rhs3"
+SUPPORTED_CONSTRAINT_GENERATION_STRATEGIES = {
+    "sensitive",
+    CONSTRAINT_STRATEGY_ALL,
+    CONSTRAINT_STRATEGY_ALL_TEMPLATES_RHS3,
+}
 
 
 def normalize_constraint_generation_strategy(strategy: str | None) -> str:
@@ -1317,11 +1328,13 @@ def select_constraint_timesteps(
     T = len(x_vals)
     if T < 3:
         return []
-    if strategy_norm == "all":
+    if strategy_norm == CONSTRAINT_STRATEGY_ALL_TEMPLATES_RHS3:
         expanded_timesteps = []
         for t in range(T - 2):
             expanded_timesteps.extend([t] * 4)
         return expanded_timesteps
+    if strategy_norm == CONSTRAINT_STRATEGY_ALL:
+        return list(range(T - 2))
     return identify_sensitive_timesteps(
         x_vals,
         threshold_low=threshold_low,
@@ -1388,7 +1401,7 @@ class SubproblemSurrogateTrainer:
         self.constraint_generation_strategy = normalize_constraint_generation_strategy(
             constraint_generation_strategy
         )
-        self.all_mode_group_size = 4 if self.constraint_generation_strategy == "all" else 1
+        self.all_mode_group_size = 4 if self.constraint_generation_strategy == CONSTRAINT_STRATEGY_ALL_TEMPLATES_RHS3 else 1
         self.requested_max_constraints = max_constraints
         self.max_constraints = max_constraints  # V3新增
         
@@ -1399,8 +1412,10 @@ class SubproblemSurrogateTrainer:
             
         self.ng = self.gen.shape[0]
         self.nb = self.bus.shape[0]
-        if self.constraint_generation_strategy == "all":
+        if self.constraint_generation_strategy == CONSTRAINT_STRATEGY_ALL_TEMPLATES_RHS3:
             self.max_constraints = max(self.all_mode_group_size * (self.T - 2), 0)
+        elif self.constraint_generation_strategy == CONSTRAINT_STRATEGY_ALL:
+            self.max_constraints = max(self.T - 2, 0)
         else:
             self.max_constraints = self.requested_max_constraints
         
@@ -1471,7 +1486,7 @@ class SubproblemSurrogateTrainer:
         self.alpha_values = np.zeros((self.n_samples, self.num_coupling_constraints))
         self.beta_values = np.zeros((self.n_samples, self.num_coupling_constraints))
         self.gamma_values = np.zeros((self.n_samples, self.num_coupling_constraints))
-        self.delta_values = np.ones((self.n_samples, self.num_coupling_constraints))
+        self.delta_values = np.full((self.n_samples, self.num_coupling_constraints), 3.0)
         self.cost_values = np.zeros((self.n_samples, self.T))
         self.pg_cost_values = np.zeros((self.n_samples, self.T))
 
@@ -1619,7 +1634,7 @@ class SubproblemSurrogateTrainer:
 
     def _apply_initial_surrogate_templates(self):
         """Apply deterministic surrogate templates for expanded all-mode constraints."""
-        if self.constraint_generation_strategy != "all" or self.num_coupling_constraints <= 0:
+        if self.constraint_generation_strategy != CONSTRAINT_STRATEGY_ALL_TEMPLATES_RHS3 or self.num_coupling_constraints <= 0:
             return
 
         base_patterns = np.array(
@@ -1638,10 +1653,10 @@ class SubproblemSurrogateTrainer:
         self.alpha_values[:] = np.tile(base_patterns[:, 0], n_groups)
         self.beta_values[:] = np.tile(base_patterns[:, 1], n_groups)
         self.gamma_values[:] = np.tile(base_patterns[:, 2], n_groups)
-        self.delta_values[:] = 1.0
+        self.delta_values[:] = 3.0
 
     def _uses_group_mu_lower_bound(self) -> bool:
-        return self.constraint_generation_strategy == "all" and self.all_mode_group_size > 1
+        return self.constraint_generation_strategy == CONSTRAINT_STRATEGY_ALL_TEMPLATES_RHS3 and self.all_mode_group_size > 1
 
     def _get_mu_lower_bound_phase(self) -> str:
         if self.iter_number < self.mu_individual_lower_bound_round:
@@ -2574,7 +2589,7 @@ class SubproblemSurrogateTrainer:
                 alphas_tensor = alphas_out.squeeze(0)[:nc]   # (num_coupling_constraints,)
                 betas_tensor = betas_out.squeeze(0)[:nc]
                 gammas_tensor = gammas_out.squeeze(0)[:nc]
-                deltas_tensor = deltas_out.squeeze(0)[:nc]   # Softplus保证非负
+                deltas_tensor = deltas_out.squeeze(0)[:nc]   # 受控在 delta_base ± delta_scale
                 costs_tensor = costs_out.squeeze(0)[:self.T]  # (T,)
                 pg_costs_tensor = pg_costs_out.squeeze(0)[:self.T]
 
@@ -3077,7 +3092,7 @@ class SubproblemSurrogateTrainer:
             self.alpha_values = state['alpha_values']
             self.beta_values = state['beta_values']
             self.gamma_values = state['gamma_values']
-            self.delta_values = state.get('delta_values', np.ones_like(self.gamma_values))
+            self.delta_values = state.get('delta_values', np.full_like(self.gamma_values, 3.0))
             self.cost_values = state.get('cost_values', np.zeros((self.n_samples, self.T)))
             self.pg_cost_values = state.get('pg_cost_values', np.zeros((self.n_samples, self.T)))
             self.mu = state['mu']
