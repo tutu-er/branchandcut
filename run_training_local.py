@@ -167,9 +167,9 @@ def inject_bcd_lambda(all_samples: list, bcd_lambdas: list, T: int) -> None:
                 dtype=float,
             ).tolist(),
         }
-        if 'lambda_pg_effective' in lam_dict:
-            sample['lambda']['lambda_pg_effective'] = np.asarray(
-                lam_dict['lambda_pg_effective'],
+        if 'lambda_pg_electricity_price' in lam_dict:
+            sample['lambda_pg_electricity_price'] = np.asarray(
+                lam_dict['lambda_pg_electricity_price'],
                 dtype=float,
             ).tolist()
 

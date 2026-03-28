@@ -377,7 +377,9 @@ def _extract_effective_pg_dual(
     generator_injection_sensitivity: np.ndarray,
 ) -> np.ndarray:
     if isinstance(lambda_field, dict):
-        direct = lambda_field.get('lambda_pg_effective')
+        direct = lambda_field.get('lambda_pg_electricity_price')
+        if direct is None:
+            direct = lambda_field.get('lambda_pg_effective')
         if direct is not None:
             arr = np.array(direct, dtype=float)
             if arr.shape == (ng, T):
@@ -406,7 +408,9 @@ def _has_complete_effective_pg_dual(
 ) -> bool:
     if not isinstance(lambda_field, dict):
         return False
-    direct = lambda_field.get('lambda_pg_effective')
+    direct = lambda_field.get('lambda_pg_electricity_price')
+    if direct is None:
+        direct = lambda_field.get('lambda_pg_effective')
     if direct is not None:
         arr = np.array(direct, dtype=float)
         if arr.shape == (ng, T):
@@ -546,6 +550,8 @@ def _extract_pg_electricity_price_matrix(source, T: int, ng: int) -> Optional[np
         return None
     if isinstance(source, dict):
         direct = source.get('lambda_pg_electricity_price')
+        if direct is None:
+            direct = source.get('lambda_pg_effective')
         if direct is None:
             return None
         arr = np.asarray(direct, dtype=float)
@@ -3448,8 +3454,8 @@ def evaluate_trained_models(dual_predictor: DualVariablePredictorTrainer,
     
     for sample_id in range(n_eval):
         sample = active_set_data[sample_id]
-        lambda_pred = dual_predictor.predict(sample)
-        lambda_true = dual_predictor.lambda_true[sample_id]
+        lambda_pred = np.asarray(dual_predictor.predict(sample), dtype=float).reshape(-1)
+        lambda_true = np.asarray(dual_predictor.lambda_true[sample_id], dtype=float).reshape(-1)
         
         mse = np.mean((lambda_pred - lambda_true) ** 2)
         mae = np.mean(np.abs(lambda_pred - lambda_true))
@@ -3585,8 +3591,8 @@ def test_dual_predictor(ppc=None, active_set_data=None, save_path: str = None):
     
     for sample_id in range(min(5, len(active_set_data))):
         test_pd = active_set_data[sample_id]['pd_data']
-        lambda_pred = predictor.predict(test_pd)
-        lambda_true = predictor.lambda_true[sample_id]
+        lambda_pred = np.asarray(predictor.predict(test_pd), dtype=float).reshape(-1)
+        lambda_true = np.asarray(predictor.lambda_true[sample_id], dtype=float).reshape(-1)
         
         mse = np.mean((lambda_pred - lambda_true) ** 2)
         mae = np.mean(np.abs(lambda_pred - lambda_true))
@@ -4312,7 +4318,7 @@ def _dual_predictor_trainer_init(self, ppc, active_set_data, T_delta, device=Non
 
     first_sample = active_set_data[0] if isinstance(active_set_data, list) else active_set_data
     self.input_dim = len(get_feature_vector_from_sample(dict(first_sample)))
-    self.output_dim = self.T + 2 * self.nl * self.T
+    self.output_dim = self.ng * self.T
     self._legacy_mode = None
 
     if TORCH_AVAILABLE:
@@ -4326,51 +4332,28 @@ def _dual_predictor_trainer_init(self, ppc, active_set_data, T_delta, device=Non
 def _dual_predictor_trainer_solve_true(self) -> np.ndarray:
     lambda_targets = {}
     lambda_payloads = {}
-    needs_solve = []
-
     for sample_id in range(self.n_samples):
         sample = self.active_set_data[sample_id]
-        if (
-            'lambda' in sample
-            and sample['lambda'] is not None
-            and _has_global_dual_payload(sample['lambda'], self.T, self.nl)
-        ):
-            payload = _unpack_global_dual_targets(
-                _pack_global_dual_targets(
-                    _extract_lambda_power_balance(sample['lambda'], self.T),
-                    _extract_lambda_matrix(sample['lambda'], 'lambda_dcpf_upper', (self.nl, self.T)),
-                    _extract_lambda_matrix(sample['lambda'], 'lambda_dcpf_lower', (self.nl, self.T)),
-                ),
-                self.T,
-                self.nl,
-                self.generator_injection_sensitivity,
+        effective = _get_sample_pg_electricity_price_matrix(sample, self.T, self.ng)
+        if effective is None:
+            x_sol = _recover_unit_commitment_matrix(sample, self.ng, self.T)
+            payload = _solve_pg_electricity_price_from_ed(
+                self.ppc,
+                sample['pd_data'],
+                self.T_delta,
+                x_sol,
+                renewable_data=sample.get('renewable_data'),
+                verbose=False,
             )
-            lambda_payloads[sample_id] = payload
-            lambda_targets[sample_id] = _pack_global_dual_targets(
-                payload['lambda_power_balance'],
-                payload['lambda_dcpf_upper'],
-                payload['lambda_dcpf_lower'],
-            )
+            effective = np.asarray(payload['lambda_pg_electricity_price'], dtype=float)
+            sample['lambda_pg_electricity_price'] = effective.copy()
         else:
-            needs_solve.append(sample_id)
-
-    for sample_id in needs_solve:
-        sample = self.active_set_data[sample_id]
-        x_sol = _recover_unit_commitment_matrix(sample, self.ng, self.T)
-        payload = _solve_global_dual_payload_from_ed(
-            self.ppc,
-            sample['pd_data'],
-            self.T_delta,
-            x_sol,
-            self.generator_injection_sensitivity,
-            renewable_data=sample.get('renewable_data'),
-        )
+            effective = np.asarray(effective, dtype=float)
+            payload = {
+                'lambda_pg_electricity_price': effective,
+            }
         lambda_payloads[sample_id] = payload
-        lambda_targets[sample_id] = _pack_global_dual_targets(
-            payload['lambda_power_balance'],
-            payload['lambda_dcpf_upper'],
-            payload['lambda_dcpf_lower'],
-        )
+        lambda_targets[sample_id] = effective.reshape(-1)
 
     self.lambda_payloads = [lambda_payloads[i] for i in range(self.n_samples)]
     return np.array([lambda_targets[i] for i in range(self.n_samples)])
@@ -4430,30 +4413,34 @@ def _dual_predictor_trainer_predict(self, pd_data, renewable_data=None, unit_id=
             for network in self.legacy_networks:
                 network.eval()
                 preds.append(network(pd_tensor.unsqueeze(0)).squeeze(0).cpu().numpy())
-            return np.array(preds)
+            return np.array(preds, dtype=float)
 
         if self._legacy_mode == 'power_balance_only':
             self.network.eval()
             pred = self.network(pd_tensor.unsqueeze(0)).squeeze(0).cpu().numpy()
             if unit_id is not None:
                 return pred
-            return {
-                'lambda_power_balance': pred,
-                'lambda_dcpf_upper': np.zeros((self.nl, self.T), dtype=float),
-                'lambda_dcpf_lower': np.zeros((self.nl, self.T), dtype=float),
-                'lambda_pg_effective': np.tile(pred, (self.ng, 1)),
-            }
+            return np.tile(pred, (self.ng, 1))
+
+        if self._legacy_mode == 'global_dual_payload':
+            self.network.eval()
+            packed = self.network(pd_tensor.unsqueeze(0)).squeeze(0).cpu().numpy()
+            payload = _unpack_global_dual_targets(
+                packed,
+                self.T,
+                self.nl,
+                self.generator_injection_sensitivity,
+            )
+            effective = np.asarray(payload['lambda_pg_effective'], dtype=float)
+            if unit_id is not None:
+                return effective[unit_id]
+            return effective
 
         self.network.eval()
         packed = self.network(pd_tensor.unsqueeze(0)).squeeze(0).cpu().numpy()
-        payload = _unpack_global_dual_targets(
-            packed,
-            self.T,
-            self.nl,
-            self.generator_injection_sensitivity,
-        )
+        payload = packed.reshape(self.ng, self.T)
         if unit_id is not None:
-            return payload['lambda_pg_effective'][unit_id]
+            return payload[unit_id]
         return payload
 
 
@@ -4508,6 +4495,13 @@ def _dual_predictor_trainer_load(self, filepath: str):
                 self.network.load_state_dict(state['network_state_dict'])
                 if 'optimizer_state_dict' in state:
                     self.optimizer.load_state_dict(state['optimizer_state_dict'])
+            elif legacy_dim == self.T + 2 * self.nl * self.T:
+                self._legacy_mode = 'global_dual_payload'
+                self.network = DualVariablePredictorNet(self.input_dim, legacy_dim).to(self.device)
+                self.optimizer = optim.Adam(self.network.parameters(), lr=1e-3)
+                self.network.load_state_dict(state['network_state_dict'])
+                if 'optimizer_state_dict' in state:
+                    self.optimizer.load_state_dict(state['optimizer_state_dict'])
             else:
                 self._legacy_mode = 'power_balance_only'
                 self.network = DualVariablePredictorNet(self.input_dim, self.T).to(self.device)
@@ -4520,7 +4514,6 @@ def _dual_predictor_trainer_load(self, filepath: str):
 def _subproblem_get_lambda_values(self) -> np.ndarray:
     if self.lambda_predictor is not None:
         lambda_vals = []
-        all_resolved = True
         for sample_id in range(self.n_samples):
             sample = self.active_set_data[sample_id]
             predicted = self.lambda_predictor.predict(sample)
@@ -4528,9 +4521,6 @@ def _subproblem_get_lambda_values(self) -> np.ndarray:
             if effective is not None:
                 lambda_vals.append(effective[self.unit_id])
                 continue
-            if isinstance(predicted, dict):
-                all_resolved = False
-                break
             predicted_arr = np.asarray(predicted, dtype=float)
             if predicted_arr.shape == (self.T,):
                 lambda_vals.append(predicted_arr)
@@ -4538,12 +4528,12 @@ def _subproblem_get_lambda_values(self) -> np.ndarray:
                 lambda_vals.append(predicted_arr[self.unit_id])
             elif predicted_arr.shape == (self.T, self.ng):
                 lambda_vals.append(predicted_arr.T[self.unit_id])
-                continue
-            all_resolved = False
-            break
-        if all_resolved and len(lambda_vals) == self.n_samples:
-            return np.array(lambda_vals)
-        print("⚠ lambda_predictor 未提供新的电价格式，回退到手动 ED 求解 electricity price", flush=True)
+            else:
+                raise ValueError(
+                    f"lambda_predictor must output lambda_pg_electricity_price with shape "
+                    f"(ng, T) or (T,), got {predicted_arr.shape}"
+                )
+        return np.array(lambda_vals)
     return self._solve_for_lambda()
 
 

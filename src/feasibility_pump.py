@@ -86,7 +86,9 @@ def _extract_unit_lambda(
 ) -> np.ndarray:
     """Normalize lambda payloads to a single unit/time vector of shape (T,)."""
     if isinstance(lambda_val, dict):
-        if 'lambda_pg_effective' in lambda_val:
+        if 'lambda_pg_electricity_price' in lambda_val:
+            arr = np.asarray(lambda_val['lambda_pg_electricity_price'], dtype=float)
+        elif 'lambda_pg_effective' in lambda_val:
             arr = np.asarray(lambda_val['lambda_pg_effective'], dtype=float)
         else:
             arr = np.asarray(
