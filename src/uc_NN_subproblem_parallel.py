@@ -41,10 +41,10 @@ for _p in [str(_SRC_DIR), str(_ROOT_DIR)]:
 
 from uc_NN_subproblem import (
     SubproblemSurrogateTrainer,
-    _extract_lambda_power_balance,
-    _has_complete_effective_pg_dual,
+    _extract_pg_electricity_price_matrix,
+    _get_sample_pg_electricity_price_matrix,
     _recover_unit_commitment_matrix,
-    _solve_global_dual_payload_from_ed,
+    _solve_pg_electricity_price_from_ed,
     generate_test_data,
     train_all_subproblem_surrogates,
 )
@@ -84,8 +84,10 @@ class ParallelSubproblemSurrogateTrainer(SubproblemSurrogateTrainer):
         rho_primal_init: float = 1e-3,
         rho_dual_init: float = 1e-3,
         rho_opt_init: float = 1e-3,
-        gamma: float = 1e-3,
+        gamma_base: float = 1e-3,
         mu_lower_bound_init: float = 0.1,
+        mu_individual_lower_bound_round: int = 3,
+        mu_group_lower_bound_round: int = 50,
         device=None,
         n_workers: int = 4,
     ):
@@ -97,8 +99,10 @@ class ParallelSubproblemSurrogateTrainer(SubproblemSurrogateTrainer):
             rho_primal_init=rho_primal_init,
             rho_dual_init=rho_dual_init,
             rho_opt_init=rho_opt_init,
-            gamma=gamma,
+            gamma_base=gamma_base,
             mu_lower_bound_init=mu_lower_bound_init,
+            mu_individual_lower_bound_round=mu_individual_lower_bound_round,
+            mu_group_lower_bound_round=mu_group_lower_bound_round,
             device=device,
         )
         self.n_workers = min(n_workers, self.n_samples)
@@ -117,6 +121,8 @@ class ParallelSubproblemSurrogateTrainer(SubproblemSurrogateTrainer):
         )
 
         EPS = 1e-10
+        gamma = self.gamma_base / (self.n_samples * max_iter)
+        self.gamma = gamma
 
         for i in range(max_iter):
             print(f"{prefix} 🔄 迭代 {i+1}/{max_iter}", flush=True)
@@ -132,6 +138,7 @@ class ParallelSubproblemSurrogateTrainer(SubproblemSurrogateTrainer):
                     self.gamma_values[s].copy(),
                     self.delta_values[s].copy(),
                     self.cost_values[s].copy(),
+                    self.pg_cost_values[s].copy(),
                 )
                 for s in range(self.n_samples)
             ]
@@ -141,9 +148,9 @@ class ParallelSubproblemSurrogateTrainer(SubproblemSurrogateTrainer):
                 future_to_sid = {
                     executor.submit(
                         self.iter_with_primal_block,
-                        s, alphas, betas, gammas, deltas, costs,
+                        s, alphas, betas, gammas, deltas, costs, pg_costs,
                     ): s
-                    for s, alphas, betas, gammas, deltas, costs in primal_args
+                    for s, alphas, betas, gammas, deltas, costs, pg_costs in primal_args
                 }
                 for future in as_completed(future_to_sid):
                     s = future_to_sid[future]
@@ -164,7 +171,7 @@ class ParallelSubproblemSurrogateTrainer(SubproblemSurrogateTrainer):
                     self.cpower[s] = np.where(np.abs(cpower_sol) < EPS, 0, cpower_sol)
 
             # ── 2. Dual block（线程并行） ────────────────────────────
-            lb_mu = 0.0 if self.iter_number >= 50 else self.mu_lower_bound
+            lb_mu = self._current_mu_lower_bound_value()
 
             dual_args = [
                 (
@@ -174,6 +181,7 @@ class ParallelSubproblemSurrogateTrainer(SubproblemSurrogateTrainer):
                     self.gamma_values[s].copy(),
                     self.delta_values[s].copy(),
                     self.cost_values[s].copy(),
+                    self.pg_cost_values[s].copy(),
                 )
                 for s in range(self.n_samples)
             ]
@@ -183,9 +191,9 @@ class ParallelSubproblemSurrogateTrainer(SubproblemSurrogateTrainer):
                 future_to_sid = {
                     executor.submit(
                         self.iter_with_dual_block,
-                        s, alphas, betas, gammas, deltas, costs,
+                        s, alphas, betas, gammas, deltas, costs, pg_costs,
                     ): s
-                    for s, alphas, betas, gammas, deltas, costs in dual_args
+                    for s, alphas, betas, gammas, deltas, costs, pg_costs in dual_args
                 }
                 for future in as_completed(future_to_sid):
                     s = future_to_sid[future]
@@ -200,7 +208,7 @@ class ParallelSubproblemSurrogateTrainer(SubproblemSurrogateTrainer):
                 lambda_inherent_sol, mu_sol = dual_results[s]
                 if lambda_inherent_sol is not None:
                     self.lambda_inherent[s] = lambda_inherent_sol
-                    self.mu[s] = np.maximum(mu_sol, lb_mu)
+                    self.mu[s] = self._apply_mu_lower_bound_policy(mu_sol, lb_mu)
 
             # ── 3. NN block（串行，批次化训练） ──────────────────────
             self.iter_with_surrogate_nn(num_epochs=nn_epochs)
@@ -217,9 +225,10 @@ class ParallelSubproblemSurrogateTrainer(SubproblemSurrogateTrainer):
                 flush=True,
             )
 
-            self.rho_primal = min(self.rho_primal + self.gamma * obj_primal, self.rho_max)
-            self.rho_dual   = min(self.rho_dual   + self.gamma * obj_dual,   self.rho_max)
-            self.rho_opt    = min(self.rho_opt    + self.gamma * obj_opt,    self.rho_max)
+            if i >= 3:
+                self.rho_primal = min(self.rho_primal + gamma * obj_primal, self.rho_max)
+                self.rho_dual   = min(self.rho_dual   + gamma * obj_dual,   self.rho_max)
+                self.rho_opt    = min(self.rho_opt    + gamma * obj_opt,    self.rho_max)
             
             print(f"{prefix}   ρ_primal={self.rho_primal:.4f}, ρ_dual={self.rho_dual:.4f}, ρ_opt={self.rho_opt:.4f}", flush=True)
 
@@ -260,6 +269,9 @@ def _train_unit_worker(args: dict) -> dict:
     T_delta             = args['T_delta']
     max_iter            = args['max_iter']
     nn_epochs           = args['nn_epochs']
+    gamma_base          = args.get('gamma_base', 1e-3)
+    mu_individual_lower_bound_round = args.get('mu_individual_lower_bound_round', 3)
+    mu_group_lower_bound_round = args.get('mu_group_lower_bound_round', 50)
     sample_n_workers    = args.get('sample_n_workers', 4)
     use_sample_parallel = args.get('use_sample_parallel', True)
     save_dir            = args.get('save_dir')
@@ -270,7 +282,7 @@ def _train_unit_worker(args: dict) -> dict:
     # 将预计算的 lambda_vals 注入 active_set_data，避免子进程重复求解 LP
     if lambda_vals is not None:
         for i, sample in enumerate(active_set_data):
-            sample['lambda'] = copy.deepcopy(lambda_vals[i])
+            sample['lambda_pg_electricity_price'] = copy.deepcopy(lambda_vals[i])
 
     # 构建 trainer
     if use_sample_parallel:
@@ -279,12 +291,18 @@ def _train_unit_worker(args: dict) -> dict:
         trainer = ParallelSubproblemSurrogateTrainer(
             ppc, active_set_data, T_delta, unit_id,
             lambda_predictor=None,
+            gamma_base=gamma_base,
+            mu_individual_lower_bound_round=mu_individual_lower_bound_round,
+            mu_group_lower_bound_round=mu_group_lower_bound_round,
             n_workers=sample_n_workers,
         )
     else:
         trainer = SubproblemSurrogateTrainer(
             ppc, active_set_data, T_delta, unit_id,
             lambda_predictor=None,
+            gamma_base=gamma_base,
+            mu_individual_lower_bound_round=mu_individual_lower_bound_round,
+            mu_group_lower_bound_round=mu_group_lower_bound_round,
         )
 
     trainer.iter(max_iter=max_iter, nn_epochs=nn_epochs)
@@ -301,6 +319,8 @@ def _train_unit_worker(args: dict) -> dict:
         'beta_values':  trainer.beta_values,
         'gamma_values': trainer.gamma_values,
         'delta_values': trainer.delta_values,
+        'cost_values':  trainer.cost_values,
+        'pg_cost_values': trainer.pg_cost_values,
         'mu':           trainer.mu,
         'rho_primal':   trainer.rho_primal,
         'rho_dual':     trainer.rho_dual,
@@ -373,6 +393,63 @@ def _precompute_lambda_vals(
     return payloads
 
 
+def _precompute_lambda_vals(
+    ppc,
+    active_set_data: List[Dict],
+    T_delta: float,
+    lambda_predictor=None,
+) -> List[object]:
+    """Precompute per-unit electricity-price matrices for all samples."""
+    n_samples = len(active_set_data)
+    tmp = SubproblemSurrogateTrainer(
+        ppc, active_set_data, T_delta, unit_id=0,
+        lambda_predictor=None,
+    )
+    T = tmp.T
+    ng = tmp.ng
+
+    if lambda_predictor is not None:
+        predicted_vals: List[np.ndarray] = []
+        all_resolved = True
+        for sample in active_set_data:
+            predicted = lambda_predictor.predict(normalize_sample_arrays(sample))
+            effective = _extract_pg_electricity_price_matrix(predicted, T, ng)
+            if effective is None:
+                all_resolved = False
+                break
+            predicted_vals.append(effective)
+        if all_resolved and len(predicted_vals) == n_samples:
+            print(f"✓ 从 lambda_predictor 提取 {n_samples} 个样本的 electricity prices", flush=True)
+            return predicted_vals
+        print("⚠ lambda_predictor 未提供新的电价格式，回退到手动 ED 预计算", flush=True)
+
+    cached_vals = [
+        _get_sample_pg_electricity_price_matrix(sample, T, ng)
+        for sample in active_set_data
+    ]
+    if all(val is not None for val in cached_vals):
+        print(f"✓ 从样本缓存读取 {n_samples} 个 electricity prices", flush=True)
+        return [np.asarray(val, dtype=float).copy() for val in cached_vals]
+
+    print("预计算 electricity prices...", flush=True)
+    price_vals: List[np.ndarray] = []
+    for sample, cached_val in zip(active_set_data, cached_vals):
+        if cached_val is not None:
+            price_vals.append(np.asarray(cached_val, dtype=float).copy())
+            continue
+        x_sol = _recover_unit_commitment_matrix(sample, ng, T)
+        payload = _solve_pg_electricity_price_from_ed(
+            ppc,
+            sample['pd_data'],
+            T_delta,
+            x_sol,
+            renewable_data=sample.get('renewable_data'),
+            verbose=False,
+        )
+        price_vals.append(payload['lambda_pg_electricity_price'])
+    return price_vals
+
+
 def train_all_surrogates_parallel(
     ppc,
     active_set_data: List[Dict],
@@ -381,6 +458,9 @@ def train_all_surrogates_parallel(
     unit_ids: Optional[List[int]] = None,
     max_iter: int = 20,
     nn_epochs: int = 10,
+    gamma_base: float = 1e-3,
+    mu_individual_lower_bound_round: int = 3,
+    mu_group_lower_bound_round: int = 50,
     save_dir: Optional[str] = None,
     device=None,
     n_workers: Optional[int] = None,
@@ -445,6 +525,13 @@ def train_all_surrogates_parallel(
         lambda_vals = _precompute_lambda_vals(ppc, active_set_data, T_delta)
 
     # 构造每个 worker 的参数 dict
+    lambda_vals = _precompute_lambda_vals(
+        ppc,
+        active_set_data,
+        T_delta,
+        lambda_predictor=lambda_predictor,
+    )
+
     worker_args = [
         {
             'ppc':                ppc,
@@ -454,6 +541,9 @@ def train_all_surrogates_parallel(
             'T_delta':            T_delta,
             'max_iter':           max_iter,
             'nn_epochs':          nn_epochs,
+            'gamma_base':         gamma_base,
+            'mu_individual_lower_bound_round': mu_individual_lower_bound_round,
+            'mu_group_lower_bound_round': mu_group_lower_bound_round,
             'sample_n_workers':   sample_n_workers,
             'use_sample_parallel': use_sample_parallel,
             'save_dir':           save_dir,

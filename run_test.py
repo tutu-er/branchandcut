@@ -97,6 +97,9 @@ FP_MAX_UNIT_COMBINATION_CANDIDATES = 12
 FP_MAX_NEARBY_COMMITMENT_HOT_STARTS = 4
 FP_NEARBY_COMMITMENT_POOL_SIZE = 12
 FP_PARALLEL_STARTS = 2
+USE_CASE3LITE_CUSTOM_FP = True
+CASE3LITE_CUSTOM_FP_MAX_GLOBAL_COMBINATIONS = 24
+CASE3LITE_CUSTOM_FP_PLOT_DIR = 'result/figures_case3lite_custom_fp'
 ACTIVE_SETS_FILE = 'result/active_set/active_sets_case3lite_T24_n200_20260328_102856.json'  # 指定 active_sets JSON 文件路径（None=自动查找最新）
 
 # ──────────────────────── 导入 ────────────────────────
@@ -160,6 +163,7 @@ if MODE in ('surrogate', 'both'):
             solve_global_LP_relaxation_without_surrogate,
             _solve_unit_LP_with_surrogate,
         )
+        from feasibility_pump_case3lite import recover_integer_solution_case3lite
     except ImportError as e:
         print(f"feasibility_pump 模块导入失败: {e}")
         sys.exit(1)
@@ -936,7 +940,7 @@ def _build_subproblem_commitment_matrix(
         if not (0 <= unit_idx < ng):
             continue
         try:
-            alphas, betas, gammas, deltas, _ = trainer.get_surrogate_params(
+            alphas, betas, gammas, deltas, *_ = trainer.get_surrogate_params(
                 sample, lambda_val, renewable_data=renewable_data,
             )
             x_unit = _solve_unit_LP_with_surrogate(
@@ -1151,25 +1155,44 @@ def run_fp_test(ppc, all_samples: list, dual_predictor, trainers: dict,
     results = []
     if scenario_bank is None:
         scenario_bank = all_samples
+    custom_fp_plot_dir = None
+    if CASE_NAME == 'case3lite' and USE_CASE3LITE_CUSTOM_FP:
+        custom_fp_plot_dir = (Path(__file__).parent / CASE3LITE_CUSTOM_FP_PLOT_DIR).resolve()
+        custom_fp_plot_dir.mkdir(parents=True, exist_ok=True)
+        log(f"  case3lite custom FP plots -> {custom_fp_plot_dir}")
     for i in range(test_n):
         sample = all_samples[i]
         pd_data = sample['pd_data']
         log(f"  样本 {i + 1}/{test_n}，pd_data shape={pd_data.shape}")
         try:
-            x_result, success = recover_integer_solution(
-                sample, trainers, dual_predictor, ppc, T_DELTA,
-                agent=agent,
-                max_fp_iter=FP_MAX_ITER,
-                conf_threshold=FP_CONF_THRESHOLD,
-                max_perturbation_hot_starts=FP_MAX_PERTURBATION_HOT_STARTS,
-                max_unit_options_per_generator=FP_MAX_UNIT_OPTIONS_PER_GENERATOR,
-                max_unit_combination_candidates=FP_MAX_UNIT_COMBINATION_CANDIDATES,
-                max_nearby_commitment_hot_starts=FP_MAX_NEARBY_COMMITMENT_HOT_STARTS,
-                nearby_commitment_pool_size=FP_NEARBY_COMMITMENT_POOL_SIZE,
-                parallel_fp_starts=FP_PARALLEL_STARTS,
-                scenario_bank=scenario_bank,
-                verbose=True,
-            )
+            if CASE_NAME == 'case3lite' and USE_CASE3LITE_CUSTOM_FP:
+                x_result, success, _details = recover_integer_solution_case3lite(
+                    sample, trainers, dual_predictor, ppc, T_DELTA,
+                    agent=agent,
+                    max_fp_iter=FP_MAX_ITER,
+                    conf_threshold=FP_CONF_THRESHOLD,
+                    n_perturbations=FP_MAX_PERTURBATION_HOT_STARTS,
+                    scenario_bank=scenario_bank,
+                    plot_dir=custom_fp_plot_dir,
+                    sample_tag=f'sample_{i:03d}',
+                    max_global_combinations=CASE3LITE_CUSTOM_FP_MAX_GLOBAL_COMBINATIONS,
+                    verbose=True,
+                )
+            else:
+                x_result, success = recover_integer_solution(
+                    sample, trainers, dual_predictor, ppc, T_DELTA,
+                    agent=agent,
+                    max_fp_iter=FP_MAX_ITER,
+                    conf_threshold=FP_CONF_THRESHOLD,
+                    max_perturbation_hot_starts=FP_MAX_PERTURBATION_HOT_STARTS,
+                    max_unit_options_per_generator=FP_MAX_UNIT_OPTIONS_PER_GENERATOR,
+                    max_unit_combination_candidates=FP_MAX_UNIT_COMBINATION_CANDIDATES,
+                    max_nearby_commitment_hot_starts=FP_MAX_NEARBY_COMMITMENT_HOT_STARTS,
+                    nearby_commitment_pool_size=FP_NEARBY_COMMITMENT_POOL_SIZE,
+                    parallel_fp_starts=FP_PARALLEL_STARTS,
+                    scenario_bank=scenario_bank,
+                    verbose=True,
+                )
         except Exception as e:
             log(f"    异常: {e}")
             import traceback

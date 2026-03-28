@@ -490,7 +490,7 @@ class UnitCommitmentModel:
 
         # 功率平衡约束对对偶目标的贡献
         for t in range(self.T):
-            dual_obj -= lambda_power_balance[t] * np.sum(Pd[:, t])
+            dual_obj -= lambda_power_balance[t] * np.sum(self.Pd[:, t])
         
         # 爬坡约束对对偶目标的贡献
         for g in range(self.ng):
@@ -507,7 +507,7 @@ class UnitCommitmentModel:
         for l in range(self.nl):
             ptdf_row = PTDF[l, :]
             for t in range(self.T):
-                flow_constant = ptdf_row @ Pd[:, t]
+                flow_constant = ptdf_row @ self.Pd[:, t]
                 dual_obj += lambda_dcpf_upper[l, t] * (branch_limit[l] + flow_constant)
                 dual_obj += lambda_dcpf_lower[l, t] * (branch_limit[l] - flow_constant)
         

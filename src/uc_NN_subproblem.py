@@ -1,4 +1,4 @@
-import numpy as np
+﻿import numpy as np
 import gurobipy as gp
 from gurobipy import GRB
 import sys
@@ -486,14 +486,27 @@ def _solve_global_dual_payload_from_ed(
 
     for t in range(T):
         constr = ed.model.getConstrByName(f'power_balance_{t}')
+        # For the equality balance constraint, Gurobi's Pi already matches the
+        # economic marginal price convention used by the subproblem:
+        #   min cost - lambda^T pg, with stationarity a - lambda + ... = 0.
         lambda_pb[t] = float(constr.Pi) if constr is not None else 0.0
         for l in range(nl):
             cu = ed.model.getConstrByName(f'flow_upper_{l}_{t}')
             cl = ed.model.getConstrByName(f'flow_lower_{l}_{t}')
-            lambda_dcpf_upper[l, t] = float(cu.Pi) if cu is not None else 0.0
+            # Recover canonical nonnegative multipliers for:
+            #   flow_upper:  flow - limit <= 0
+            #   flow_lower: -flow - limit <= 0
+            # In the ED model these are encoded as:
+            #   flow <= limit      -> Pi is nonpositive when binding
+            #   flow >= -limit     -> Pi is nonnegative when binding
+            # So the correct mapping is upper = -Pi, lower = +Pi.
+            lambda_dcpf_upper[l, t] = max(
+                0.0,
+                -(float(cu.Pi) if cu is not None else 0.0),
+            )
             lambda_dcpf_lower[l, t] = max(
                 0.0,
-                -(float(cl.Pi) if cl is not None else 0.0),
+                float(cl.Pi) if cl is not None else 0.0,
             )
 
     return {
@@ -525,6 +538,221 @@ def _solve_effective_pg_dual_from_ed(
         generator_injection_sensitivity,
         renewable_data=renewable_data,
     )['lambda_pg_effective']
+
+
+def _extract_pg_electricity_price_matrix(source, T: int, ng: int) -> Optional[np.ndarray]:
+    """Extract the full per-unit electricity-price matrix when available."""
+    if source is None:
+        return None
+    if isinstance(source, dict):
+        direct = source.get('lambda_pg_electricity_price')
+        if direct is None:
+            return None
+        arr = np.asarray(direct, dtype=float)
+    else:
+        arr = np.asarray(source, dtype=float)
+    if arr.shape == (ng, T):
+        return arr
+    if arr.shape == (T, ng):
+        return arr.T
+    return None
+
+
+def _get_sample_pg_electricity_price_matrix(sample: Dict, T: int, ng: int) -> Optional[np.ndarray]:
+    """Read cached electricity prices from a sample when they exist."""
+    direct = _extract_pg_electricity_price_matrix(
+        sample.get('lambda_pg_electricity_price'),
+        T,
+        ng,
+    )
+    if direct is not None:
+        return direct
+    return _extract_pg_electricity_price_matrix(sample.get('lambda'), T, ng)
+
+
+def _solve_pg_electricity_price_from_ed(
+    ppc,
+    Pd: np.ndarray,
+    T_delta: float,
+    x_sol: np.ndarray,
+    renewable_data: np.ndarray | None = None,
+    verbose: bool = False,
+) -> Dict[str, np.ndarray]:
+    """
+    Solve ED with fixed commitment and recover the full pg stationarity price.
+
+    The returned electricity price includes every dual term that enters the pg
+    KKT condition in the fixed-x ED:
+      - power balance
+      - pg lower / upper bounds
+      - ramp up / down
+      - DC flow upper / lower
+    """
+    ppc_int = ext2int(ppc)
+    gen = ppc_int['gen']
+    bus = ppc_int['bus']
+    branch = ppc_int['branch']
+    gencost = ppc_int['gencost']
+
+    ng = gen.shape[0]
+    nb = bus.shape[0]
+    nl = branch.shape[0]
+    T = Pd.shape[1]
+
+    load_data = np.asarray(Pd, dtype=float)
+    renewable_arr = None if renewable_data is None else np.asarray(renewable_data, dtype=float)
+    if renewable_arr is not None and renewable_arr.shape != load_data.shape:
+        raise ValueError(
+            f"renewable_data shape {renewable_arr.shape} does not match load shape {load_data.shape}"
+        )
+
+    renewable_bus_ids = (
+        np.where(np.any(renewable_arr > 1e-9, axis=1))[0]
+        if renewable_arr is not None else np.array([], dtype=int)
+    )
+    nr = len(renewable_bus_ids)
+    R = np.zeros((nb, nr), dtype=float)
+    for r, bus_idx in enumerate(renewable_bus_ids):
+        R[bus_idx, r] = 1.0
+
+    G = np.zeros((nb, ng), dtype=float)
+    for g in range(ng):
+        bus_idx = int(gen[g, GEN_BUS])
+        if 0 <= bus_idx < nb:
+            G[bus_idx, g] = 1.0
+
+    PTDF = makePTDF(ppc_int['baseMVA'], bus, branch)
+    PTDF_G = PTDF @ G
+    branch_limit = branch[:, RATE_A]
+    Ru, Rd, Ru_co, Rd_co = _get_ramp_limits_from_ppc(ppc, gen, T_delta)
+
+    model = gp.Model("subproblem_ed_price")
+    model.Params.OutputFlag = 1 if verbose else 0
+    model.Params.LogToConsole = 1 if verbose else 0
+
+    pg = model.addVars(ng, T, lb=0.0, name='pg')
+    cpower = model.addVars(ng, T, lb=0.0, name='cpower')
+    p_ren = model.addVars(nr, T, lb=0.0, name='p_ren') if nr > 0 else None
+
+    for t in range(T):
+        renewable_supply = gp.quicksum(p_ren[r, t] for r in range(nr)) if nr > 0 else 0.0
+        model.addConstr(
+            gp.quicksum(pg[g, t] for g in range(ng)) + renewable_supply == float(np.sum(load_data[:, t])),
+            name=f'power_balance_{t}',
+        )
+        for g in range(ng):
+            model.addConstr(
+                pg[g, t] >= float(gen[g, PMIN] * x_sol[g, t]),
+                name=f'pg_lower_{g}_{t}',
+            )
+            model.addConstr(
+                pg[g, t] <= float(gen[g, PMAX] * x_sol[g, t]),
+                name=f'pg_upper_{g}_{t}',
+            )
+            model.addConstr(
+                cpower[g, t] >= float(gencost[g, -2] / T_delta) * pg[g, t]
+                + float(gencost[g, -1] / T_delta * x_sol[g, t]),
+                name=f'cpower_{g}_{t}',
+            )
+        for r, bus_idx in enumerate(renewable_bus_ids):
+            model.addConstr(
+                p_ren[r, t] <= float(renewable_arr[bus_idx, t]),
+                name=f'ren_upper_{r}_{t}',
+            )
+
+    for t in range(1, T):
+        for g in range(ng):
+            model.addConstr(
+                pg[g, t] - pg[g, t - 1]
+                <= float(Ru[g] * x_sol[g, t - 1] + Ru_co[g] * (1 - x_sol[g, t - 1])),
+                name=f'ramp_up_{g}_{t}',
+            )
+            model.addConstr(
+                pg[g, t - 1] - pg[g, t]
+                <= float(Rd[g] * x_sol[g, t] + Rd_co[g] * (1 - x_sol[g, t])),
+                name=f'ramp_down_{g}_{t}',
+            )
+
+    for t in range(T):
+        thermal_injection = G @ np.array([pg[g, t] for g in range(ng)], dtype=object)
+        renewable_injection = (
+            R @ np.array([p_ren[r, t] for r in range(nr)], dtype=object)
+            if nr > 0 else 0.0
+        )
+        flow = PTDF @ (thermal_injection + renewable_injection - load_data[:, t])
+        for l in range(nl):
+            model.addConstr(flow[l] <= float(branch_limit[l]), name=f'flow_upper_{l}_{t}')
+            model.addConstr(flow[l] >= -float(branch_limit[l]), name=f'flow_lower_{l}_{t}')
+
+    model.setObjective(
+        gp.quicksum(cpower[g, t] for g in range(ng) for t in range(T)),
+        GRB.MINIMIZE,
+    )
+    model.optimize()
+
+    if model.status != GRB.OPTIMAL:
+        raise RuntimeError(f"ED solve for electricity price failed with status={model.status}")
+
+    lambda_power_balance = np.zeros(T, dtype=float)
+    lambda_pg_lower = np.zeros((ng, T), dtype=float)
+    lambda_pg_upper = np.zeros((ng, T), dtype=float)
+    lambda_ramp_up = np.zeros((ng, T - 1), dtype=float)
+    lambda_ramp_down = np.zeros((ng, T - 1), dtype=float)
+    lambda_flow_upper = np.zeros((nl, T), dtype=float)
+    lambda_flow_lower = np.zeros((nl, T), dtype=float)
+
+    for t in range(T):
+        lambda_power_balance[t] = float(model.getConstrByName(f'power_balance_{t}').Pi)
+        for g in range(ng):
+            lambda_pg_lower[g, t] = float(model.getConstrByName(f'pg_lower_{g}_{t}').Pi)
+            lambda_pg_upper[g, t] = float(model.getConstrByName(f'pg_upper_{g}_{t}').Pi)
+        for l in range(nl):
+            lambda_flow_upper[l, t] = float(model.getConstrByName(f'flow_upper_{l}_{t}').Pi)
+            lambda_flow_lower[l, t] = float(model.getConstrByName(f'flow_lower_{l}_{t}').Pi)
+
+    for t in range(1, T):
+        for g in range(ng):
+            lambda_ramp_up[g, t - 1] = float(model.getConstrByName(f'ramp_up_{g}_{t}').Pi)
+            lambda_ramp_down[g, t - 1] = float(model.getConstrByName(f'ramp_down_{g}_{t}').Pi)
+
+    effective = np.zeros((ng, T), dtype=float)
+    lambda_ramp_contrib = np.zeros((ng, T), dtype=float)
+    lambda_flow_contrib = np.zeros((ng, T), dtype=float)
+    for g in range(ng):
+        for t in range(T):
+            ramp_contrib = 0.0
+            if t > 0:
+                ramp_contrib += lambda_ramp_up[g, t - 1]
+                ramp_contrib -= lambda_ramp_down[g, t - 1]
+            if t < T - 1:
+                ramp_contrib -= lambda_ramp_up[g, t]
+                ramp_contrib += lambda_ramp_down[g, t]
+
+            flow_contrib = float(
+                np.dot(PTDF_G[:, g], lambda_flow_upper[:, t] + lambda_flow_lower[:, t])
+            )
+            effective[g, t] = (
+                lambda_power_balance[t]
+                + lambda_pg_lower[g, t]
+                + lambda_pg_upper[g, t]
+                + ramp_contrib
+                + flow_contrib
+            )
+            lambda_ramp_contrib[g, t] = ramp_contrib
+            lambda_flow_contrib[g, t] = flow_contrib
+
+    return {
+        'lambda_pg_electricity_price': effective,
+        'lambda_power_balance': lambda_power_balance,
+        'lambda_pg_lower': lambda_pg_lower,
+        'lambda_pg_upper': lambda_pg_upper,
+        'lambda_ramp_up': lambda_ramp_up,
+        'lambda_ramp_down': lambda_ramp_down,
+        'lambda_flow_upper': lambda_flow_upper,
+        'lambda_flow_lower': lambda_flow_lower,
+        'lambda_ramp_contrib': lambda_ramp_contrib,
+        'lambda_flow_contrib': lambda_flow_contrib,
+    }
 
 
 def load_active_set_from_json(json_filepath: str, sample_id: Optional[int] = None):
@@ -903,11 +1131,21 @@ class SubproblemSurrogateNet(nn.Module):
     - 机组静态参数作为额外特征
     """
 
-    def __init__(self, input_dim: int, T: int, max_constraints: int = 20, hidden_dims: List[int] = None):
+    def __init__(
+        self,
+        input_dim: int,
+        T: int,
+        max_constraints: int = 20,
+        hidden_dims: List[int] = None,
+        x_cost_scale: float = 1.0,
+        pg_cost_scale: float = 1.0,
+    ):
         super(SubproblemSurrogateNet, self).__init__()
 
         self.T = T
         self.max_constraints = max_constraints
+        self.x_cost_scale = float(max(x_cost_scale, 1e-6))
+        self.pg_cost_scale = float(max(pg_cost_scale, 1e-6))
 
         if hidden_dims is None:
             hidden_dims = [512, 256, 256]
@@ -948,8 +1186,14 @@ class SubproblemSurrogateNet(nn.Module):
             nn.Softplus()
         )
 
-        # 目标成本系数头：输出 T 个值，无激活（允许正负）
+        # x 调整项头：输出 T 个值，后续经 tanh 缩放到启停成本量级
         self.cost_net = nn.Sequential(
+            nn.Linear(feat_dim, head_hidden), nn.LayerNorm(head_hidden), nn.LeakyReLU(0.01),
+            nn.Linear(head_hidden, head_mid), nn.LayerNorm(head_mid), nn.LeakyReLU(0.01),
+            nn.Linear(head_mid, self.T)
+        )
+        # pg 调整项头：输出 T 个值，后续经 tanh 缩放到边际成本量级
+        self.pg_cost_net = nn.Sequential(
             nn.Linear(feat_dim, head_hidden), nn.LayerNorm(head_hidden), nn.LeakyReLU(0.01),
             nn.Linear(head_hidden, head_mid), nn.LayerNorm(head_mid), nn.LeakyReLU(0.01),
             nn.Linear(head_mid, self.T)
@@ -983,7 +1227,8 @@ class SubproblemSurrogateNet(nn.Module):
             betas: t+1时段系数 (batch_size, max_constraints)
             gammas: t+2时段系数 (batch_size, max_constraints)
             deltas: 右端项 (batch_size, max_constraints)
-            costs: 目标成本系数 (batch_size, T)
+            costs: x 调整项 (batch_size, T)
+            pg_costs: pg 调整项 (batch_size, T)
         """
         features = self.input_proj(x)
         for block in self.res_blocks:
@@ -992,8 +1237,9 @@ class SubproblemSurrogateNet(nn.Module):
         betas = self.beta_net(features)
         gammas = self.gamma_net(features)
         deltas = self.delta_net(features)
-        costs = self.cost_net(features)
-        return alphas, betas, gammas, deltas, costs
+        costs = torch.tanh(self.cost_net(features)) * self.x_cost_scale
+        pg_costs = torch.tanh(self.pg_cost_net(features)) * self.pg_cost_scale
+        return alphas, betas, gammas, deltas, costs, pg_costs
 
 
 SUPPORTED_CONSTRAINT_GENERATION_STRATEGIES = {"sensitive", "all"}
@@ -1072,7 +1318,10 @@ def select_constraint_timesteps(
     if T < 3:
         return []
     if strategy_norm == "all":
-        return list(range(T - 2))
+        expanded_timesteps = []
+        for t in range(T - 2):
+            expanded_timesteps.extend([t] * 4)
+        return expanded_timesteps
     return identify_sensitive_timesteps(
         x_vals,
         threshold_low=threshold_low,
@@ -1105,8 +1354,10 @@ class SubproblemSurrogateTrainer:
                  rho_primal_init: float = 1e-3,
                  rho_dual_init: float = 1e-3,
                  rho_opt_init: float = 1e-3,
-                 gamma: float = 1e-3,
+                 gamma_base: float = 1e-3,
                  mu_lower_bound_init: float = 0.1,
+                 mu_individual_lower_bound_round: int = 3,
+                 mu_group_lower_bound_round: int = 50,
                  device=None):
         """
         初始化单机组子问题代理约束训练器 - V3三时段版本
@@ -1137,6 +1388,7 @@ class SubproblemSurrogateTrainer:
         self.constraint_generation_strategy = normalize_constraint_generation_strategy(
             constraint_generation_strategy
         )
+        self.all_mode_group_size = 4 if self.constraint_generation_strategy == "all" else 1
         self.requested_max_constraints = max_constraints
         self.max_constraints = max_constraints  # V3新增
         
@@ -1148,7 +1400,7 @@ class SubproblemSurrogateTrainer:
         self.ng = self.gen.shape[0]
         self.nb = self.bus.shape[0]
         if self.constraint_generation_strategy == "all":
-            self.max_constraints = max(self.T - 2, 0)
+            self.max_constraints = max(self.all_mode_group_size * (self.T - 2), 0)
         else:
             self.max_constraints = self.requested_max_constraints
         
@@ -1177,12 +1429,25 @@ class SubproblemSurrogateTrainer:
         self.rho_primal = float(rho_primal_init)
         self.rho_dual = float(rho_dual_init)
         self.rho_opt = float(rho_opt_init)
-        self.gamma = float(gamma)
+        self.gamma_base = float(gamma_base)
+        self.gamma = self.gamma_base
         self.rho_max = 10.0
         self.reg_weight = 1e-4   # alpha/beta/gamma L2 正则化权重
         self.mu_lower_bound = float(mu_lower_bound_init)
+        self.mu_individual_lower_bound_round = max(int(mu_individual_lower_bound_round), 0)
+        self.mu_group_lower_bound_round = max(
+            int(mu_group_lower_bound_round),
+            self.mu_individual_lower_bound_round,
+        )
         self.cost_ema_alpha = 0.3  # cost_values EMA平滑系数，越小越平滑
+        self.pg_cost_ema_alpha = 0.3
         self.iter_number = 0
+        unit_a = float(self.gencost[self.unit_id, -2] / self.T_delta)
+        unit_b = float(self.gencost[self.unit_id, -1] / self.T_delta)
+        unit_sc = float(self.gencost[self.unit_id, 1])
+        unit_shc = float(self.gencost[self.unit_id, 2])
+        self.x_cost_scale = max(abs(unit_sc), abs(unit_shc), abs(unit_b), 1.0)
+        self.pg_cost_scale = max(abs(unit_a), 1.0)
         
         # 初始化原始变量和对偶变量存储
         self.pg = np.zeros((self.n_samples, self.T))
@@ -1210,6 +1475,7 @@ class SubproblemSurrogateTrainer:
         self.gamma_values = np.zeros((self.n_samples, self.num_coupling_constraints))
         self.delta_values = np.ones((self.n_samples, self.num_coupling_constraints))
         self.cost_values = np.zeros((self.n_samples, self.T))
+        self.pg_cost_values = np.zeros((self.n_samples, self.T))
 
         # 初始化神经网络，并用forward pass生成初值
         if TORCH_AVAILABLE:
@@ -1218,6 +1484,8 @@ class SubproblemSurrogateTrainer:
         else:
             # 回退：保持zeros/ones默认值
             pass
+
+        self._apply_initial_surrogate_templates()
         
         # 初始化求解
         self._initialize_solve()
@@ -1306,19 +1574,25 @@ class SubproblemSurrogateTrainer:
             input_dim=input_dim,
             T=self.T,
             max_constraints=self.max_constraints,
-            hidden_dims=[256, 256]  # 两层残差块
+            hidden_dims=[256, 256],  # 两层残差块
+            x_cost_scale=self.x_cost_scale,
+            pg_cost_scale=self.pg_cost_scale,
         ).to(self.device)
 
         # 分离参数组：主优化器管理 backbone + alpha/beta/gamma/delta 头
-        cost_net_params = set(self.surrogate_net.cost_net.parameters())
-        main_params = [p for p in self.surrogate_net.parameters() if p not in cost_net_params]
+        aux_params = set(self.surrogate_net.cost_net.parameters()) | set(self.surrogate_net.pg_cost_net.parameters())
+        main_params = [p for p in self.surrogate_net.parameters() if p not in aux_params]
         self.optimizer = optim.Adam(main_params, lr=1e-4)
-        # cost_net 单独优化器，学习率更低以稳定 cost_values
-        self.cost_optimizer = optim.Adam(self.surrogate_net.cost_net.parameters(), lr=1e-5)
+        # x/pg 调整项头单独优化，学习率更低以稳定辅助成本
+        self.cost_optimizer = optim.Adam(
+            list(self.surrogate_net.cost_net.parameters()) + list(self.surrogate_net.pg_cost_net.parameters()),
+            lr=1e-5,
+        )
 
         print(f"  - 代理约束网络输入维度: {input_dim}", flush=True)
         print(f"  - 约束生成策略: {self.constraint_generation_strategy}", flush=True)
         print(f"  - 最大约束数量: {self.max_constraints}", flush=True)
+        print(f"  - x_cost_scale={self.x_cost_scale:.4f}, pg_cost_scale={self.pg_cost_scale:.4f}", flush=True)
 
     def _generate_initial_values_from_nn(self):
         """用未训练的 SubproblemSurrogateNet forward pass 生成 alpha/beta/gamma/delta 初值。"""
@@ -1329,20 +1603,78 @@ class SubproblemSurrogateTrainer:
         feat_tensor = torch.tensor(np.array(features_list), dtype=torch.float32).to(self.device)
 
         with torch.no_grad():
-            alphas, betas, gammas, deltas, costs = self.surrogate_net(feat_tensor)
+            alphas, betas, gammas, deltas, costs, pg_costs = self.surrogate_net(feat_tensor)
 
         self.alpha_values = alphas.cpu().numpy()
         self.beta_values = betas.cpu().numpy()
         self.gamma_values = gammas.cpu().numpy()
         self.delta_values = deltas.cpu().numpy()
         self.cost_values = np.zeros((self.n_samples, self.T))  # 强制初值为零，避免未训练NN的随机输出干扰
+        self.pg_cost_values = np.zeros((self.n_samples, self.T))
 
         self.surrogate_net.train()
 
         print(f"  ✓ 用NN forward pass生成代理约束初值 "
               f"(alpha: mean={self.alpha_values.mean():.4f}; "
               f"delta: mean={self.delta_values.mean():.4f}; "
-              f"cost: forced to 0)", flush=True)
+              f"cost/pg_cost: forced to 0)", flush=True)
+
+    def _apply_initial_surrogate_templates(self):
+        """Apply deterministic surrogate templates for expanded all-mode constraints."""
+        if self.constraint_generation_strategy != "all" or self.num_coupling_constraints <= 0:
+            return
+
+        base_patterns = np.array(
+            [
+                [1.0, 0.0, 1.0],
+                [-1.0, 0.0, 1.0],
+                [1.0, 0.0, -1.0],
+                [-1.0, 0.0, -1.0],
+            ],
+            dtype=float,
+        )
+        n_groups = self.num_coupling_constraints // self.all_mode_group_size
+        if n_groups <= 0:
+            return
+
+        self.alpha_values[:] = np.tile(base_patterns[:, 0], n_groups)
+        self.beta_values[:] = np.tile(base_patterns[:, 1], n_groups)
+        self.gamma_values[:] = np.tile(base_patterns[:, 2], n_groups)
+        self.delta_values[:] = 1.0
+
+    def _uses_group_mu_lower_bound(self) -> bool:
+        return self.constraint_generation_strategy == "all" and self.all_mode_group_size > 1
+
+    def _get_mu_lower_bound_phase(self) -> str:
+        if self.iter_number < self.mu_individual_lower_bound_round:
+            return "individual"
+        if self.iter_number < self.mu_group_lower_bound_round:
+            return "group" if self._uses_group_mu_lower_bound() else "individual"
+        return "none"
+
+    def _current_mu_lower_bound_value(self) -> float:
+        return self.mu_lower_bound if self._get_mu_lower_bound_phase() != "none" else 0.0
+
+    def _apply_mu_lower_bound_policy(self, mu_values: np.ndarray, lb_mu: float) -> np.ndarray:
+        """Preserve grouped lower-bound semantics for mu in all mode."""
+        mu_arr = np.maximum(np.asarray(mu_values, dtype=float).reshape(-1), 0.0)
+        if lb_mu <= 0:
+            return mu_arr
+
+        phase = self._get_mu_lower_bound_phase()
+        if phase == "individual" or not self._uses_group_mu_lower_bound():
+            return np.maximum(mu_arr, lb_mu)
+        if phase == "none":
+            return mu_arr
+
+        for start in range(0, mu_arr.size, self.all_mode_group_size):
+            stop = min(start + self.all_mode_group_size, mu_arr.size)
+            if stop - start != self.all_mode_group_size:
+                continue
+            deficit = lb_mu - float(np.sum(mu_arr[start:stop]))
+            if deficit > 0:
+                mu_arr[start:stop] += deficit / self.all_mode_group_size
+        return mu_arr
 
     def _initialize_solve(self):
         """初始化求解：从active_set提取x，求解LP获取初始原始解和对偶变量（lambda_inherent）。
@@ -1494,7 +1826,16 @@ class SubproblemSurrogateTrainer:
                     'lambda_x_lower':    np.zeros(self.T),
                 }
     
-    def iter_with_primal_block(self, sample_id: int, alphas: np.ndarray, betas: np.ndarray, gammas: np.ndarray, deltas: np.ndarray, costs: np.ndarray = None):
+    def iter_with_primal_block(
+        self,
+        sample_id: int,
+        alphas: np.ndarray,
+        betas: np.ndarray,
+        gammas: np.ndarray,
+        deltas: np.ndarray,
+        costs: np.ndarray = None,
+        pg_costs: np.ndarray = None,
+    ):
         """
         BCD迭代：原始块 - V3三时段耦合约束版本
         固定代理约束参数(alphas, betas, gammas, deltas)和对偶变量(mu)，更新原始变量(pg, x)
@@ -1666,12 +2007,16 @@ class SubproblemSurrogateTrainer:
         obj_cost = 0
         if costs is not None:
             obj_cost = gp.quicksum(costs[t] * x[t] for t in range(self.T))
+        obj_pg_cost = 0
+        if pg_costs is not None:
+            obj_pg_cost = gp.quicksum(pg_costs[t] * pg[t] for t in range(self.T))
         model.setObjective(
             self.rho_primal * obj_primal
             + self.rho_opt  * obj_opt
             + obj_binary
-            + obj_cost,
-            GRB.MINIMIZE
+            + obj_cost
+            + obj_pg_cost,
+            GRB.MINIMIZE,
         )
         model.optimize()
 
@@ -1691,8 +2036,16 @@ class SubproblemSurrogateTrainer:
             print(f"警告: 原始块求解失败，状态: {model.status}", flush=True)
             return None, None, None, None
     
-    def iter_with_dual_block(self, sample_id: int, alphas: np.ndarray, betas: np.ndarray,
-                             gammas: np.ndarray, deltas: np.ndarray, costs: np.ndarray = None):
+    def iter_with_dual_block(
+        self,
+        sample_id: int,
+        alphas: np.ndarray,
+        betas: np.ndarray,
+        gammas: np.ndarray,
+        deltas: np.ndarray,
+        costs: np.ndarray = None,
+        pg_costs: np.ndarray = None,
+    ):
         """
         BCD迭代：对偶块 - V3三时段耦合约束完整版本
         固定原始变量(pg, x, coc)和代理约束参数，联合更新所有对偶变量：
@@ -1731,8 +2084,8 @@ class SubproblemSurrogateTrainer:
         Ton  = min(4, self.T)
         Toff = min(4, self.T)
 
-        # 下界：前50次迭代保持正值，之后允许为0
-        lb = self.mu_lower_bound if self.iter_number < 50 else 0.0
+        phase = self._get_mu_lower_bound_phase()
+        lb = self._current_mu_lower_bound_value()
 
         model = gp.Model('dual_block_v3')
         model.Params.OutputFlag = 0
@@ -1761,7 +2114,16 @@ class SubproblemSurrogateTrainer:
                 lam_min_off[tau - 1, t1] = model.addVar(lb=0, name=f'lam_min_off_{tau-1}_{t1}')
 
         # 代理耦合约束对偶变量
-        mu = model.addVars(self.num_coupling_constraints, lb=lb, name='mu')
+        mu_var_lb = lb if phase == "individual" else 0.0
+        mu = model.addVars(self.num_coupling_constraints, lb=mu_var_lb, name='mu')
+        if phase == "group" and lb > 0 and self._uses_group_mu_lower_bound():
+            for group_idx in range(self.num_coupling_constraints // self.all_mode_group_size):
+                group_start = group_idx * self.all_mode_group_size
+                group_stop = group_start + self.all_mode_group_size
+                model.addConstr(
+                    gp.quicksum(mu[k] for k in range(group_start, group_stop)) >= lb,
+                    name=f'mu_group_lb_{group_idx}',
+                )
 
         # lambda_cpower 由驻点条件固定为 1，不需要作为变量
 
@@ -1770,9 +2132,9 @@ class SubproblemSurrogateTrainer:
 
         # ===== obj_dual：KKT 驻点条件 =====
 
-        # -- pg[t] 驻点：  a - lambda[t] - lam_pg_lower[t] + lam_pg_upper[t] + ramp_terms = 0
+        # -- pg[t] 驻点：  a + c_pg[t] - lambda[t] - lam_pg_lower[t] + lam_pg_upper[t] + ramp_terms = 0
         for t in range(self.T):
-            expr = a - lambda_val[t]
+            expr = a + (pg_costs[t] if pg_costs is not None else 0) - lambda_val[t]
             expr -= lam_pg_lower[t]
             expr += lam_pg_upper[t]
             if t > 0:
@@ -1999,6 +2361,7 @@ class SubproblemSurrogateTrainer:
     def loss_function_differentiable(self, sample_id: int, alphas_tensor: torch.Tensor,
                                      betas_tensor: torch.Tensor, gammas_tensor: torch.Tensor,
                                      deltas_tensor: torch.Tensor, costs_tensor: torch.Tensor,
+                                     pg_costs_tensor: torch.Tensor,
                                      device) -> torch.Tensor:
         """
         可微分的loss函数 - V3三时段耦合约束版本
@@ -2025,6 +2388,8 @@ class SubproblemSurrogateTrainer:
         # 从BCD迭代得到的变量
         x_val   = torch.tensor(self.x[sample_id],   dtype=torch.float32, device=device)  # (T,)
         mu_vals = torch.tensor(self.mu[sample_id],  dtype=torch.float32, device=device)  # (num_coupling_constraints,)
+        lambda_val = torch.tensor(self.lambda_vals[sample_id], dtype=torch.float32, device=device)
+        lam_inh = self.lambda_inherent[sample_id]  # dict or None
         
         # ========== 计算obj_primal ==========
         # V3三时段约束违反量（按 sensitive_timesteps 索引）
@@ -2047,7 +2412,26 @@ class SubproblemSurrogateTrainer:
             coupling_abs = torch.abs(coupling_lhs - deltas_tensor[k])
             obj_opt = obj_opt + coupling_abs * mu_vals[k]
         
-        # ========== 计算obj_dual：x[t] KKT驻点条件（完整版） ==========
+        # ========== 计算obj_dual：pg/x[t] KKT驻点条件（完整版） ==========
+        obj_dual = torch.tensor(0.0, device=device, requires_grad=True)
+        a_val = float(self.gencost[g, -2] / self.T_delta)
+        if lam_inh is not None:
+            lam_ru = lam_inh['lambda_ramp_up']
+            lam_rd = lam_inh['lambda_ramp_down']
+            for t in range(self.T):
+                pg_const = a_val - float(lambda_val[t])
+                pg_const -= float(lam_inh['lambda_pg_lower'][t])
+                pg_const += float(lam_inh['lambda_pg_upper'][t])
+                if t > 0:
+                    pg_const += float(lam_ru[t - 1])
+                    pg_const -= float(lam_rd[t - 1])
+                if t < self.T - 1:
+                    pg_const -= float(lam_ru[t])
+                    pg_const += float(lam_rd[t])
+                obj_dual = obj_dual + torch.abs(
+                    torch.tensor(pg_const, dtype=torch.float32, device=device) + pg_costs_tensor[t]
+                )
+
         # x[t]驻点：b + Pmin*lam_pg_lower[t] - Pmax*lam_pg_upper[t]
         #           + ramp_co_terms + min_on/off_terms + start/shut_terms
         #           + coupling_terms(alpha,beta,gamma,mu) + lam_x_upper[t] - lam_x_lower[t] = 0
@@ -2066,10 +2450,6 @@ class SubproblemSurrogateTrainer:
         shut_c  = float(self.gencost[g, 2])
         Ton_l   = min(4, self.T)
         Toff_l  = min(4, self.T)
-
-        lam_inh = self.lambda_inherent[sample_id]  # dict or None
-
-        obj_dual = torch.tensor(0.0, device=device, requires_grad=True)
         for t in range(self.T):
             # 固有约束贡献（常数部分）
             inherent_const = b_val
@@ -2137,7 +2517,8 @@ class SubproblemSurrogateTrainer:
         reg_loss = self.reg_weight * (torch.sum(alphas_tensor ** 2)
                                       + torch.sum(betas_tensor ** 2)
                                       + torch.sum(gammas_tensor ** 2)
-                                      + torch.sum(costs_tensor ** 2))
+                                      + torch.sum(costs_tensor ** 2)
+                                      + torch.sum(pg_costs_tensor ** 2))
 
         # 总损失：三项BCD目标 + 正则化
         loss = (self.rho_primal * obj_primal +
@@ -2159,13 +2540,16 @@ class SubproblemSurrogateTrainer:
         optimizer_persist_after = 5
         rebuild = (self.iter_number < optimizer_persist_after)
         if rebuild or not hasattr(self, '_surr_optimizer') or self._surr_optimizer is None:
-            # 分离 cost_net 参数，主优化器不管理 cost_net
-            cost_net_params = set(self.surrogate_net.cost_net.parameters())
-            main_params = [p for p in self.surrogate_net.parameters() if p not in cost_net_params]
+            # 分离 x/pg 辅助成本头参数，主优化器不管理这些低学习率头
+            aux_params = set(self.surrogate_net.cost_net.parameters()) | set(self.surrogate_net.pg_cost_net.parameters())
+            main_params = [p for p in self.surrogate_net.parameters() if p not in aux_params]
             self._surr_optimizer = optim.Adam(
                 main_params, lr=3e-4, weight_decay=1e-4)
             self._surr_cost_optimizer = optim.Adam(
-                self.surrogate_net.cost_net.parameters(), lr=3e-5, weight_decay=1e-4)
+                list(self.surrogate_net.cost_net.parameters()) + list(self.surrogate_net.pg_cost_net.parameters()),
+                lr=3e-5,
+                weight_decay=1e-4,
+            )
             self._surr_scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
                 self._surr_optimizer, T_0=max(num_epochs, 1), T_mult=1)
 
@@ -2186,19 +2570,20 @@ class SubproblemSurrogateTrainer:
                 features = self._extract_features(sample_id)
                 features_tensor = torch.tensor(features, dtype=torch.float32, device=self.device).unsqueeze(0)
 
-                # V3前向传播：输出 (alphas, betas, gammas, deltas, costs)
-                alphas_out, betas_out, gammas_out, deltas_out, costs_out = self.surrogate_net(features_tensor)
+                # V3前向传播：输出 (alphas, betas, gammas, deltas, c_x, c_pg)
+                alphas_out, betas_out, gammas_out, deltas_out, costs_out, pg_costs_out = self.surrogate_net(features_tensor)
                 nc = self.num_coupling_constraints
                 alphas_tensor = alphas_out.squeeze(0)[:nc]   # (num_coupling_constraints,)
                 betas_tensor = betas_out.squeeze(0)[:nc]
                 gammas_tensor = gammas_out.squeeze(0)[:nc]
                 deltas_tensor = deltas_out.squeeze(0)[:nc]   # Softplus保证非负
                 costs_tensor = costs_out.squeeze(0)[:self.T]  # (T,)
+                pg_costs_tensor = pg_costs_out.squeeze(0)[:self.T]
 
                 # 计算loss（V3版本，传入5个参数）+ scaled backward
                 loss = self.loss_function_differentiable(
                     sample_id, alphas_tensor, betas_tensor, gammas_tensor, deltas_tensor,
-                    costs_tensor, self.device
+                    costs_tensor, pg_costs_tensor, self.device
                 )
                 (loss / actual_batch_size).backward()
                 epoch_loss += loss.detach().cpu().item()
@@ -2214,6 +2599,11 @@ class SubproblemSurrogateTrainer:
                 self.cost_values[sample_id] = (
                     (1 - self.cost_ema_alpha) * self.cost_values[sample_id]
                     + self.cost_ema_alpha * new_costs
+                )
+                new_pg_costs = pg_costs_tensor.detach().cpu().numpy()
+                self.pg_cost_values[sample_id] = (
+                    (1 - self.pg_cost_ema_alpha) * self.pg_cost_values[sample_id]
+                    + self.pg_cost_ema_alpha * new_pg_costs
                 )
 
                 # batch 满或 epoch 结束：clip + step
@@ -2350,7 +2740,7 @@ class SubproblemSurrogateTrainer:
                 lam_ru = lam_inh['lambda_ramp_up']
                 lam_rd = lam_inh['lambda_ramp_down']
                 for t in range(self.T):
-                    pg_stat = a_v - lambda_val[t]
+                    pg_stat = a_v + self.pg_cost_values[sample_id][t] - lambda_val[t]
                     pg_stat -= float(lam_inh['lambda_pg_lower'][t])
                     pg_stat += float(lam_inh['lambda_pg_upper'][t])
                     if t > 0:
@@ -2425,6 +2815,8 @@ class SubproblemSurrogateTrainer:
         if not hasattr(self, 'logger'):
             self.logger = None
         print(f"开始BCD迭代训练 (机组{self.unit_id}, V3三时段耦合约束)...", flush=True)
+        gamma = self.gamma_base / (self.n_samples * max(max_iter, 1))
+        self.gamma = gamma
         
         for i in range(max_iter):
             print(f"🔄 迭代 {i+1}/{max_iter}", flush=True)
@@ -2439,9 +2831,10 @@ class SubproblemSurrogateTrainer:
                 gammas = self.gamma_values[sample_id]
                 deltas = self.delta_values[sample_id]
                 costs = self.cost_values[sample_id]
+                pg_costs = self.pg_cost_values[sample_id]
 
                 pg_sol, x_sol, coc_sol, cpower_sol = self.iter_with_primal_block(
-                    sample_id, alphas, betas, gammas, deltas, costs
+                    sample_id, alphas, betas, gammas, deltas, costs, pg_costs
                 )
                 
                 if pg_sol is not None:
@@ -2452,20 +2845,21 @@ class SubproblemSurrogateTrainer:
                     self.cpower[sample_id] = np.where(np.abs(cpower_sol) < EPS, 0, cpower_sol)
             
             # 2. 对偶块迭代（V3：联合更新固有约束对偶变量和代理耦合对偶变量）
-            lb_mu = 0.0 if self.iter_number >= 50 else self.mu_lower_bound
+            lb_mu = self._current_mu_lower_bound_value()
             for sample_id in range(self.n_samples):
                 alphas = self.alpha_values[sample_id]
                 betas  = self.beta_values[sample_id]
                 gammas = self.gamma_values[sample_id]
                 deltas = self.delta_values[sample_id]
                 costs  = self.cost_values[sample_id]
+                pg_costs = self.pg_cost_values[sample_id]
 
                 lambda_inherent_sol, mu_sol = self.iter_with_dual_block(
-                    sample_id, alphas, betas, gammas, deltas, costs
+                    sample_id, alphas, betas, gammas, deltas, costs, pg_costs
                 )
                 if lambda_inherent_sol is not None:
                     self.lambda_inherent[sample_id] = lambda_inherent_sol
-                    self.mu[sample_id] = np.maximum(mu_sol, lb_mu)
+                    self.mu[sample_id] = self._apply_mu_lower_bound_policy(mu_sol, lb_mu)
             
             # 3. 神经网络更新代理约束参数（V3：自动输出4个参数）
             self.iter_with_surrogate_nn(num_epochs=nn_epochs)
@@ -2478,10 +2872,11 @@ class SubproblemSurrogateTrainer:
 
             print(f"  obj_primal: {obj_primal:.6f}, obj_dual: {obj_dual:.6f}, obj_opt: {obj_opt:.6f}", flush=True)
 
-            # 更新惩罚参数（累加式，与BCD标准一致）
-            self.rho_primal = min(self.rho_primal + self.gamma * obj_primal, self.rho_max)
-            self.rho_dual   = min(self.rho_dual   + self.gamma * obj_dual,   self.rho_max)
-            self.rho_opt    = min(self.rho_opt    + self.gamma * obj_opt,    self.rho_max)
+            # 前3次迭代冻结rho，之后再按累加式更新
+            if i >= 3:
+                self.rho_primal = min(self.rho_primal + gamma * obj_primal, self.rho_max)
+                self.rho_dual   = min(self.rho_dual   + gamma * obj_dual,   self.rho_max)
+                self.rho_opt    = min(self.rho_opt    + gamma * obj_opt,    self.rho_max)
 
             print(f"  ρ_primal={self.rho_primal:.4f}, ρ_dual={self.rho_dual:.4f}, ρ_opt={self.rho_opt:.4f}", flush=True)
             print("  " + "-" * 40, flush=True)
@@ -2508,7 +2903,7 @@ class SubproblemSurrogateTrainer:
         pd_data: np.ndarray | dict,
         lambda_val: np.ndarray,
         renewable_data: np.ndarray | None = None,
-    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         """
         获取V3三时段耦合代理约束参数
 
@@ -2517,7 +2912,8 @@ class SubproblemSurrogateTrainer:
             betas: (max_constraints,) 第二时段系数
             gammas: (max_constraints,) 第三时段系数
             deltas: (max_constraints,) 右端项
-            costs: (T,) 目标成本系数
+            costs: (T,) x 调整项
+            pg_costs: (T,) pg 调整项
         """
         if not TORCH_AVAILABLE:
             raise RuntimeError("PyTorch不可用")
@@ -2547,13 +2943,14 @@ class SubproblemSurrogateTrainer:
         features_tensor = torch.tensor(features, dtype=torch.float32, device=self.device).unsqueeze(0)
 
         with torch.no_grad():
-            alphas, betas, gammas, deltas, costs = self.surrogate_net(features_tensor)
+            alphas, betas, gammas, deltas, costs, pg_costs = self.surrogate_net(features_tensor)
 
         return (alphas.squeeze(0).cpu().numpy(),
                 betas.squeeze(0).cpu().numpy(),
                 gammas.squeeze(0).cpu().numpy(),
                 deltas.squeeze(0).cpu().numpy(),
-                costs.squeeze(0).cpu().numpy())
+                costs.squeeze(0).cpu().numpy(),
+                pg_costs.squeeze(0).cpu().numpy())
 
     def _build_compatible_surrogate_feature_vector(
         self,
@@ -2652,6 +3049,7 @@ class SubproblemSurrogateTrainer:
                 'gamma_values': self.gamma_values,
                 'delta_values': self.delta_values,
                 'cost_values': self.cost_values,
+                'pg_cost_values': self.pg_cost_values,
                 'mu': self.mu,
                 'rho_primal': self.rho_primal,
                 'rho_dual': self.rho_dual,
@@ -2660,6 +3058,8 @@ class SubproblemSurrogateTrainer:
                 'max_constraints': self.max_constraints,
                 'requested_max_constraints': self.requested_max_constraints,
                 'constraint_generation_strategy': self.constraint_generation_strategy,
+                'mu_individual_lower_bound_round': self.mu_individual_lower_bound_round,
+                'mu_group_lower_bound_round': self.mu_group_lower_bound_round,
                 'lambda_inherent': self.lambda_inherent,
             }
             
@@ -2681,12 +3081,21 @@ class SubproblemSurrogateTrainer:
             self.gamma_values = state['gamma_values']
             self.delta_values = state.get('delta_values', np.ones_like(self.gamma_values))
             self.cost_values = state.get('cost_values', np.zeros((self.n_samples, self.T)))
+            self.pg_cost_values = state.get('pg_cost_values', np.zeros((self.n_samples, self.T)))
             self.mu = state['mu']
             self.rho_primal = state['rho_primal']
             self.rho_dual = state['rho_dual']
             self.rho_opt = state['rho_opt']
             saved_strategy = state.get('constraint_generation_strategy', 'sensitive')
             self.constraint_generation_strategy = normalize_constraint_generation_strategy(saved_strategy)
+            self.mu_individual_lower_bound_round = state.get(
+                'mu_individual_lower_bound_round',
+                self.mu_individual_lower_bound_round,
+            )
+            self.mu_group_lower_bound_round = max(
+                state.get('mu_group_lower_bound_round', self.mu_group_lower_bound_round),
+                self.mu_individual_lower_bound_round,
+            )
             self.requested_max_constraints = state.get('requested_max_constraints', self.requested_max_constraints)
             self.max_constraints = state.get('max_constraints', self.max_constraints)
             self.num_coupling_constraints = state.get('num_coupling_constraints', self.num_coupling_constraints)
@@ -2706,6 +3115,8 @@ def _load_surrogate_model_metadata(filepath: str, device=None) -> dict:
         'max_constraints': state.get('max_constraints'),
         'requested_max_constraints': state.get('requested_max_constraints'),
         'num_coupling_constraints': state.get('num_coupling_constraints'),
+        'mu_individual_lower_bound_round': state.get('mu_individual_lower_bound_round'),
+        'mu_group_lower_bound_round': state.get('mu_group_lower_bound_round'),
     }
 
 
@@ -2748,6 +3159,8 @@ def train_subproblem_surrogate_from_data(ppc, active_set_data: List[Dict], unit_
                                           T_delta: float = 1.0, lambda_predictor=None,
                                           max_iter: int = 20, nn_epochs: int = 10,
                                           constraint_generation_strategy: str = "sensitive",
+                                          mu_individual_lower_bound_round: int = 3,
+                                          mu_group_lower_bound_round: int = 50,
                                           save_path: str = None, device=None) -> SubproblemSurrogateTrainer:
     """
     训练单机组子问题代理约束
@@ -2775,6 +3188,8 @@ def train_subproblem_surrogate_from_data(ppc, active_set_data: List[Dict], unit_
         ppc, active_set_data, T_delta, unit_id,
         lambda_predictor=lambda_predictor,
         constraint_generation_strategy=constraint_generation_strategy,
+        mu_individual_lower_bound_round=mu_individual_lower_bound_round,
+        mu_group_lower_bound_round=mu_group_lower_bound_round,
         device=device
     )
     
@@ -2792,6 +3207,8 @@ def train_all_subproblem_surrogates(ppc, active_set_data: List[Dict], T_delta: f
                                       lambda_predictor=None, unit_ids: List[int] = None,
                                       max_iter: int = 20, nn_epochs: int = 10,
                                       constraint_generation_strategy: str = "sensitive",
+                                      mu_individual_lower_bound_round: int = 3,
+                                      mu_group_lower_bound_round: int = 50,
                                       save_dir: str = None, device=None) -> Dict[int, SubproblemSurrogateTrainer]:
     """
     训练所有机组的子问题代理约束
@@ -2829,6 +3246,8 @@ def train_all_subproblem_surrogates(ppc, active_set_data: List[Dict], T_delta: f
             ppc, active_set_data, T_delta, g,
             lambda_predictor=lambda_predictor,
             constraint_generation_strategy=constraint_generation_strategy,
+            mu_individual_lower_bound_round=mu_individual_lower_bound_round,
+            mu_group_lower_bound_round=mu_group_lower_bound_round,
             device=device
         )
         
@@ -3487,13 +3906,14 @@ def test_save_load(ppc=None, active_set_data=None):
         trainer2.load(surrogate_path)
         
         # 验证代理约束参数一致
-        alpha1, beta1, gamma1, delta1, costs1 = trainer.get_surrogate_params(test_pd, trainer.lambda_vals[0])
-        alpha2, beta2, gamma2, delta2, costs2 = trainer2.get_surrogate_params(test_pd, trainer2.lambda_vals[0])
+        alpha1, beta1, gamma1, delta1, costs1, pg_costs1 = trainer.get_surrogate_params(test_pd, trainer.lambda_vals[0])
+        alpha2, beta2, gamma2, delta2, costs2, pg_costs2 = trainer2.get_surrogate_params(test_pd, trainer2.lambda_vals[0])
         diff_alpha = np.max(np.abs(alpha1 - alpha2))
         diff_beta = np.max(np.abs(beta1 - beta2))
         diff_gamma = np.max(np.abs(gamma1 - gamma2))
         diff_delta = np.max(np.abs(delta1 - delta2))
         diff_costs = np.max(np.abs(costs1 - costs2))
+        diff_pg_costs = np.max(np.abs(pg_costs1 - pg_costs2))
         print(
             "  代理约束加载验证: "
             f"alpha差异 = {diff_alpha:.8f}, "
@@ -3503,7 +3923,7 @@ def test_save_load(ppc=None, active_set_data=None):
             f"cost差异 = {diff_costs:.8f}",
             flush=True
         )
-        assert max(diff_alpha, diff_beta, diff_gamma, diff_delta, diff_costs) < 1e-5, "代理约束加载失败"
+        assert max(diff_alpha, diff_beta, diff_gamma, diff_delta, diff_costs, diff_pg_costs) < 1e-5, "代理约束加载失败"
         
         print("\n✓ 模型保存和加载测试通过", flush=True)
         
@@ -4096,63 +4516,47 @@ def _dual_predictor_trainer_load(self, filepath: str):
 def _subproblem_get_lambda_values(self) -> np.ndarray:
     if self.lambda_predictor is not None:
         lambda_vals = []
+        all_resolved = True
         for sample_id in range(self.n_samples):
             sample = self.active_set_data[sample_id]
-            lambda_payload = self.lambda_predictor.predict(sample)
-            if isinstance(lambda_payload, dict):
-                effective = _extract_effective_pg_dual(
-                    lambda_payload,
-                    self.T,
-                    self.ng,
-                    self.branch.shape[0],
-                    self.generator_injection_sensitivity,
-                )
+            predicted = self.lambda_predictor.predict(sample)
+            effective = _extract_pg_electricity_price_matrix(predicted, self.T, self.ng)
+            if effective is not None:
                 lambda_vals.append(effective[self.unit_id])
-            else:
-                lambda_pred = self.lambda_predictor.predict(sample, unit_id=self.unit_id)
-                lambda_vals.append(np.asarray(lambda_pred, dtype=float))
-        return np.array(lambda_vals)
+                continue
+            predicted_arr = np.asarray(predicted, dtype=float)
+            if predicted_arr.shape == (self.T,):
+                lambda_vals.append(predicted_arr)
+            elif predicted_arr.shape == (self.ng, self.T):
+                lambda_vals.append(predicted_arr[self.unit_id])
+            elif predicted_arr.shape == (self.T, self.ng):
+                lambda_vals.append(predicted_arr.T[self.unit_id])
+                continue
+            all_resolved = False
+            break
+        if all_resolved and len(lambda_vals) == self.n_samples:
+            return np.array(lambda_vals)
+        print("⚠ lambda_predictor 未提供新的电价格式，回退到手动 ED 求解 electricity price", flush=True)
     return self._solve_for_lambda()
 
 
 def _subproblem_solve_for_lambda(self) -> np.ndarray:
     lambda_vals = {}
-    needs_solve = []
-
     for sample_id in range(self.n_samples):
         sample = self.active_set_data[sample_id]
-        if (
-            'lambda' in sample
-            and sample['lambda'] is not None
-            and _has_complete_effective_pg_dual(
-                sample['lambda'],
-                self.T,
-                self.ng,
-                self.branch.shape[0],
+        effective = _get_sample_pg_electricity_price_matrix(sample, self.T, self.ng)
+        if effective is None:
+            x_sol = _recover_unit_commitment_matrix(sample, self.ng, self.T)
+            payload = _solve_pg_electricity_price_from_ed(
+                self.ppc,
+                sample['pd_data'],
+                self.T_delta,
+                x_sol,
+                renewable_data=sample.get('renewable_data'),
+                verbose=False,
             )
-        ):
-            effective = _extract_effective_pg_dual(
-                sample['lambda'],
-                self.T,
-                self.ng,
-                self.branch.shape[0],
-                _build_generator_injection_sensitivity(self.ppc),
-            )
-            lambda_vals[sample_id] = effective[self.unit_id]
-        else:
-            needs_solve.append(sample_id)
-
-    for sample_id in needs_solve:
-        sample = self.active_set_data[sample_id]
-        x_sol = _recover_unit_commitment_matrix(sample, self.ng, self.T)
-        effective = _solve_effective_pg_dual_from_ed(
-            self.ppc,
-            sample['pd_data'],
-            self.T_delta,
-            x_sol,
-            _build_generator_injection_sensitivity(self.ppc),
-            renewable_data=sample.get('renewable_data'),
-        )
+            effective = payload['lambda_pg_electricity_price']
+            sample['lambda_pg_electricity_price'] = effective.copy()
         lambda_vals[sample_id] = effective[self.unit_id]
 
     return np.array([lambda_vals[i] for i in range(self.n_samples)])
