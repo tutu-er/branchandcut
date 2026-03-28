@@ -1857,14 +1857,13 @@ class SubproblemSurrogateTrainer:
             alpha_t * x_t + beta_t * x_{t+1} + gamma_t * x_{t+2} <= delta_t  (t = 0..T-3)
 
         目标函数（参考BCD软约束形式）:
-            min  (cost - λᵀ × pg)
-                 + rho_primal * Σ_{all} max(0, violation)   [原问题约束 + 耦合约束]
+            min  rho_primal * Σ_{all} max(0, violation)   [原问题约束 + 耦合约束]
                  + rho_opt    * Σ_{all} |violation| * dual  [互补松弛]
                  + obj_binary
 
         原问题约束均以软约束形式处理（violation变量），与BCD一致。
         lambda_inherent 由 _initialize_solve 在初始化阶段从单机组LP提取，保证非None。
-        cost-lambda项不入目标函数，经济方向由对偶变量通过obj_opt传递（与BCD一致）。
+        c_x / c_pg 均不入原始块目标；相关调整仅通过 dual block / 驻点损失传递。
         """
         g = self.unit_id
         mu_vals = self.mu[sample_id]           # (num_coupling_constraints,)
@@ -2017,18 +2016,10 @@ class SubproblemSurrogateTrainer:
                                   for k in range(len(sensitive_t)))
 
         # --- 目标函数 ---
-        obj_cost = 0
-        if costs is not None:
-            obj_cost = gp.quicksum(costs[t] * x[t] for t in range(self.T))
-        obj_pg_cost = 0
-        if pg_costs is not None:
-            obj_pg_cost = gp.quicksum(pg_costs[t] * pg[t] for t in range(self.T))
         model.setObjective(
             self.rho_primal * obj_primal
             + self.rho_opt  * obj_opt
-            + obj_binary
-            + obj_cost
-            + obj_pg_cost,
+            + obj_binary,
             GRB.MINIMIZE,
         )
         model.optimize()
