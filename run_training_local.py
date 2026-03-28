@@ -201,7 +201,8 @@ def pick_data_file(result_dir: Path, case_name: str) -> Path:
 def run_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS,
                   DUAL_EPOCHS, DUAL_BATCH_SIZE, MAX_ITER, NN_EPOCHS, save_dir,
                   n_workers: int = 4, logger: 'TrainingLogger | None' = None,
-                  constraint_generation_strategy: str = 'sensitive'):
+                  constraint_generation_strategy: str = 'sensitive',
+                  subproblem_gamma_base: float = 1e-3):
     """V3 代理约束训练（样本级并行），返回 (dual_predictor, trainers)。"""
     import os
     from pypower.ext2int import ext2int
@@ -237,6 +238,7 @@ def run_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS,
                 ppc, all_samples, T_DELTA, g,
                 lambda_predictor=dual_predictor,
                 constraint_generation_strategy=constraint_generation_strategy,
+                gamma_base=subproblem_gamma_base,
             )
         else:
             log(f"  机组 {g} ({i+1}/{len(unit_ids)}) — 样本级并行 n_workers={n_workers}")
@@ -244,6 +246,7 @@ def run_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS,
                 ppc, all_samples, T_DELTA, g,
                 lambda_predictor=dual_predictor,
                 constraint_generation_strategy=constraint_generation_strategy,
+                gamma_base=subproblem_gamma_base,
                 n_workers=n_workers,
             )
         if logger is not None:

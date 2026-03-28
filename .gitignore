@@ -69,3 +69,4 @@ coverage.xml
 result/
 logs/
 *.log
+*.gz

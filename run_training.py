@@ -61,7 +61,7 @@ if not check_and_install_dependencies():
 #   'sparse'    - 稀疏支持集发现 → sparse BCD 训练
 #   'both'      - BCD 训练 → surrogate 训练 → 联合 BCD 训练
 #
-MODE   = 'both'
+MODE   = 'surrogate'
 ENABLE_SPARSE_SUPPORTS = False
 RUN_FP = True        # True → 训练后运行 feasibility_pump 测试（bcd/sparse 模式不支持）
 SURROGATE_CONSTRAINT_STRATEGY = 'all'  # 'sensitive' / 'all'
@@ -74,14 +74,16 @@ BCD_RHO_PRIMAL_INIT = 1e-3
 BCD_RHO_DUAL_INIT = 1e-3
 BCD_RHO_OPT_INIT = 1e-3
 BCD_MAX_THETA_CONSTRAINTS_PER_TIME_SLOT = 20
-BCD_GAMMA_BASE = 5e-3
-BCD_MU_DUAL_FLOOR_INIT = 1
-BCD_ITA_DUAL_FLOOR_INIT = 1
-SUBPROBLEM_RHO_PRIMAL_INIT = 5e-4
-SUBPROBLEM_RHO_DUAL_INIT = 1e-3
+BCD_GAMMA_BASE = 1e-3
+BCD_MU_DUAL_FLOOR_INIT = 0.1
+BCD_ITA_DUAL_FLOOR_INIT = 0.1
+SUBPROBLEM_RHO_PRIMAL_INIT = 1e-4
+SUBPROBLEM_RHO_DUAL_INIT = 1e-4
 SUBPROBLEM_RHO_OPT_INIT = 1e-3
-SUBPROBLEM_GAMMA = 1e-4
-SUBPROBLEM_MU_DUAL_FLOOR_INIT = 1
+SUBPROBLEM_GAMMA_BASE = 1e-3
+SUBPROBLEM_MU_DUAL_FLOOR_INIT = 0.1
+SUBPROBLEM_MU_DUAL_FLOOR_INDIVIDUAL_ROUND = 10
+SUBPROBLEM_MU_DUAL_FLOOR_DECAY_ROUND = 50
 
 # ──────────────────────── 导入 ────────────────────────
 
@@ -223,8 +225,10 @@ def run_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS,
                   rho_primal_init: float = 1e-3,
                   rho_dual_init: float = 1e-3,
                   rho_opt_init: float = 1e-3,
-                  subproblem_gamma: float = 1e-3,
-                  mu_lower_bound_init: float = 0.1):
+                  subproblem_gamma_base: float = 1e-3,
+                  mu_lower_bound_init: float = 0.1,
+                  mu_individual_lower_bound_round: int = 3,
+                  mu_group_lower_bound_round: int = 50):
     """V3 代理约束训练（样本级并行），返回 (dual_predictor, trainers)。"""
     import os
     from pypower.ext2int import ext2int
@@ -264,8 +268,10 @@ def run_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS,
                 rho_primal_init=rho_primal_init,
                 rho_dual_init=rho_dual_init,
                 rho_opt_init=rho_opt_init,
-                gamma=subproblem_gamma,
+                gamma_base=subproblem_gamma_base,
                 mu_lower_bound_init=mu_lower_bound_init,
+                mu_individual_lower_bound_round=mu_individual_lower_bound_round,
+                mu_group_lower_bound_round=mu_group_lower_bound_round,
             )
         else:
             log(f"  机组 {g} ({i+1}/{len(unit_ids)}) — 样本级并行 n_workers={n_workers}")
@@ -276,8 +282,10 @@ def run_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS,
                 rho_primal_init=rho_primal_init,
                 rho_dual_init=rho_dual_init,
                 rho_opt_init=rho_opt_init,
-                gamma=subproblem_gamma,
+                gamma_base=subproblem_gamma_base,
                 mu_lower_bound_init=mu_lower_bound_init,
+                mu_individual_lower_bound_round=mu_individual_lower_bound_round,
+                mu_group_lower_bound_round=mu_group_lower_bound_round,
                 n_workers=n_workers,
             )
         if logger is not None:
@@ -652,8 +660,10 @@ def main():
     SUBPROBLEM_RHO_PRIMAL_INIT_VALUE = SUBPROBLEM_RHO_PRIMAL_INIT
     SUBPROBLEM_RHO_DUAL_INIT_VALUE = SUBPROBLEM_RHO_DUAL_INIT
     SUBPROBLEM_RHO_OPT_INIT_VALUE = SUBPROBLEM_RHO_OPT_INIT
-    SUBPROBLEM_GAMMA_VALUE = SUBPROBLEM_GAMMA
+    SUBPROBLEM_GAMMA_BASE_VALUE = SUBPROBLEM_GAMMA_BASE
     SUBPROBLEM_MU_DUAL_FLOOR_INIT_VALUE = SUBPROBLEM_MU_DUAL_FLOOR_INIT
+    SUBPROBLEM_MU_DUAL_FLOOR_INDIVIDUAL_ROUND_VALUE = SUBPROBLEM_MU_DUAL_FLOOR_INDIVIDUAL_ROUND
+    SUBPROBLEM_MU_DUAL_FLOOR_DECAY_ROUND_VALUE = SUBPROBLEM_MU_DUAL_FLOOR_DECAY_ROUND
     FP_TEST_SAMPLES = 3             # feasibility_pump 模式：测试样本数
     N_WORKERS_BCD   = 1             # 样本级并行线程数；1 = 串行（BCD 建议先用串行），>1 = 线程并行
     N_WORKERS_SUBPROBLEM = 1             # 样本级并行线程数；1 = 串行（BCD 建议先用串行），>1 = 线程并行
@@ -792,8 +802,10 @@ def main():
                 rho_primal_init=SUBPROBLEM_RHO_PRIMAL_INIT_VALUE,
                 rho_dual_init=SUBPROBLEM_RHO_DUAL_INIT_VALUE,
                 rho_opt_init=SUBPROBLEM_RHO_OPT_INIT_VALUE,
-                subproblem_gamma=SUBPROBLEM_GAMMA_VALUE,
+                subproblem_gamma_base=SUBPROBLEM_GAMMA_BASE_VALUE,
                 mu_lower_bound_init=SUBPROBLEM_MU_DUAL_FLOOR_INIT_VALUE,
+                mu_individual_lower_bound_round=SUBPROBLEM_MU_DUAL_FLOOR_INDIVIDUAL_ROUND_VALUE,
+                mu_group_lower_bound_round=SUBPROBLEM_MU_DUAL_FLOOR_DECAY_ROUND_VALUE,
             )
             print_surrogate_results(trainers, all_samples)
 
@@ -945,8 +957,10 @@ def main():
                     rho_primal_init=SUBPROBLEM_RHO_PRIMAL_INIT_VALUE,
                     rho_dual_init=SUBPROBLEM_RHO_DUAL_INIT_VALUE,
                     rho_opt_init=SUBPROBLEM_RHO_OPT_INIT_VALUE,
-                    subproblem_gamma=SUBPROBLEM_GAMMA_VALUE,
+                    subproblem_gamma_base=SUBPROBLEM_GAMMA_BASE_VALUE,
                     mu_lower_bound_init=SUBPROBLEM_MU_DUAL_FLOOR_INIT_VALUE,
+                    mu_individual_lower_bound_round=SUBPROBLEM_MU_DUAL_FLOOR_INDIVIDUAL_ROUND_VALUE,
+                    mu_group_lower_bound_round=SUBPROBLEM_MU_DUAL_FLOOR_DECAY_ROUND_VALUE,
                 )
             print_surrogate_results(trainers, all_samples)
 
