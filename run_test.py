@@ -65,10 +65,10 @@ if not check_and_install_dependencies_safe():
 #   'bcd'       - 加载 BCD 神经网络模型并报告参数统�?
 #   'both'      - 联合加载 BCD + surrogate，以全体代理约束评估（需同时配置下面两个路径�?
 #
-MODE      = 'both'
+MODE      = 'bcd'
 RUN_FP    = True       # surrogate / both 模式：是否运行可行性泵测试
-CASE_NAME = 'case3'   # 'case3' / 'case3lite' / 'case14' / 'case30' / 'case39' / 'case118'
-SURROGATE_CONSTRAINT_STRATEGY = 'auto'  # 'auto' / 'sensitive' / 'all'
+CASE_NAME = 'case3lite'   # 'case3' / 'case3lite' / 'case14' / 'case30' / 'case39' / 'case118'
+SURROGATE_CONSTRAINT_STRATEGY = 'all'  # 'auto' / 'sensitive' / 'all'
 BCD_LAMBDA_INIT_STRATEGY = 'lp_relaxation'   # 'lp_relaxation' / 'ed_on_x_opt'
 THETA_HOT_START_STRATEGY = 'dcpf_relative'   # 'dcpf_relative' / 'gaussian'
 ZETA_HOT_START_STRATEGY = 'zero'             # 'zero' / 'gaussian'
@@ -81,11 +81,11 @@ BCD_MAX_THETA_CONSTRAINTS_PER_TIME_SLOT = 10
 BCD_GAMMA_BASE = 1e-2
 
 # surrogate / both 模式：已训练 surrogate 模型目录（训练时输出的带时间戳路径）
-MODEL_DIR = 'result/surrogate_models/subproblem_models_case3_20260327_154458'
+MODEL_DIR = 'result/surrogate_models/subproblem_models_case3lite_20260328_112148'
 
 # bcd / both 模式：已训练 BCD 模型 .pth 文件路径
 # BCD_MODEL_PATH = 'result/bcd_models/bcd_model_case30_20260322_150043.pth'
-BCD_MODEL_PATH = 'result/bcd_models/bcd_model_case3_20260327_154458.pth'
+BCD_MODEL_PATH = 'result/bcd_models/bcd_model_case3lite_20260328_112148.pth'
 
 TEST_SAMPLES_DEFAULT = 3
 TEST_SAMPLES = TEST_SAMPLES_DEFAULT
@@ -97,7 +97,7 @@ FP_MAX_UNIT_COMBINATION_CANDIDATES = 12
 FP_MAX_NEARBY_COMMITMENT_HOT_STARTS = 4
 FP_NEARBY_COMMITMENT_POOL_SIZE = 12
 FP_PARALLEL_STARTS = 2
-ACTIVE_SETS_FILE = 'result/active_set/active_sets_case3_T24_n200_20260327_120417.json'  # 指定 active_sets JSON 文件路径（None=自动查找最新）
+ACTIVE_SETS_FILE = 'result/active_set/active_sets_case3lite_T24_n200_20260328_102856.json'  # 指定 active_sets JSON 文件路径（None=自动查找最新）
 
 # ──────────────────────── 导入 ────────────────────────
 
@@ -1816,7 +1816,7 @@ def main():
 
     # ── 配置 ──────────────────────────────────────────────
     MAX_SAMPLES  = None         # 最多使用多少个样本（None=全部）
-    SAMPLE_RANGE = "21:22"        # 指定样本区间，左闭右开；例如 "210:220"
+    SAMPLE_RANGE = "0:1"        # 指定样本区间，左闭右开；例如 "210:220"
     T_DELTA      = 1.0
     UNIT_IDS     = None         # None = 所有机组；或如 [0, 1, 2]
     TEST_SAMPLES = 10  # 测试/评估样本数

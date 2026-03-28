@@ -248,9 +248,9 @@ def run_case118(
 
 
 def main() -> None:
-    case_name = "case3"
-    max_samples = 200
-    target_samples = 200  # e.g. 50 means keep sampling until 50 solved samples are learned
+    case_name = "case3lite"
+    max_samples = 100
+    target_samples = 100  # e.g. 50 means keep sampling until 50 solved samples are learned
 
     if case_name == "case3":
         output_path = run_case3(
