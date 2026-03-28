@@ -4524,6 +4524,9 @@ def _subproblem_get_lambda_values(self) -> np.ndarray:
             if effective is not None:
                 lambda_vals.append(effective[self.unit_id])
                 continue
+            if isinstance(predicted, dict):
+                all_resolved = False
+                break
             predicted_arr = np.asarray(predicted, dtype=float)
             if predicted_arr.shape == (self.T,):
                 lambda_vals.append(predicted_arr)
