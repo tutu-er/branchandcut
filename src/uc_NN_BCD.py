@@ -456,6 +456,7 @@ class Agent_NN_BCD:
         zeta_hot_start_strategy: str = "zero",
         theta_gaussian_std: float = 0.01,
         zeta_gaussian_std: float = 0.01,
+        enable_dropout_during_nn_training: bool = True,
         rho_primal_init: float = 1e-2,
         rho_dual_init: float = 1e-2,
         rho_opt_init: float = 1e-2,
@@ -530,6 +531,7 @@ class Agent_NN_BCD:
         self.zeta_hot_start_strategy = normalize_zeta_hot_start_strategy(zeta_hot_start_strategy)
         self.theta_gaussian_std = float(theta_gaussian_std)
         self.zeta_gaussian_std = float(zeta_gaussian_std)
+        self.enable_dropout_during_nn_training = bool(enable_dropout_during_nn_training)
         
         # 初始化theta和zeta变量字典
         self.theta_vars = {}
@@ -2738,13 +2740,28 @@ class Agent_NN_BCD:
 
         all_params = list(self.theta_net.parameters()) + list(self.zeta_net.parameters())
         self.optimizer = optim.Adam(all_params, lr=1e-4, weight_decay=0.0)
-        self.theta_net.train()
-        self.zeta_net.train()
+        if self.enable_dropout_during_nn_training:
+            self.theta_net.train()
+            self.zeta_net.train()
+        else:
+            # Keep gradients enabled while disabling stochastic dropout masks.
+            self.theta_net.eval()
+            self.zeta_net.eval()
 
         for epoch in range(num_epochs):
             epoch_total_loss = 0.0
+            epoch_component_sums = {
+                'obj_primal': None,
+                'obj_dual': None,
+                'obj_opt': None,
+                'primal_term': None,
+                'dual_term': None,
+                'opt_term': None,
+                'reg_term': None,
+            }
             self.optimizer.zero_grad()
             batch_count = 0
+            need_epoch_breakdown = self.n_samples > 0 and (epoch == 0 or epoch == num_epochs - 1)
 
             for sample_id in range(self.n_samples):
                 batch_start = (sample_id // batch_size) * batch_size
@@ -2760,13 +2777,28 @@ class Agent_NN_BCD:
                 zeta_tensor = zeta_output[0]
 
                 # 计算可微分的loss + scaled backward
-                differentiable_loss = self.loss_function_differentiable(
-                    sample_id,
-                    theta_tensor,
-                    zeta_tensor,
-                    union_analysis,
-                    device=self.device
-                )
+                if need_epoch_breakdown:
+                    differentiable_loss, loss_components = self.loss_function_differentiable(
+                        sample_id,
+                        theta_tensor,
+                        zeta_tensor,
+                        union_analysis,
+                        device=self.device,
+                        return_components=True,
+                    )
+                    for key in epoch_component_sums:
+                        if epoch_component_sums[key] is None:
+                            epoch_component_sums[key] = loss_components[key]
+                        else:
+                            epoch_component_sums[key] = epoch_component_sums[key] + loss_components[key]
+                else:
+                    differentiable_loss = self.loss_function_differentiable(
+                        sample_id,
+                        theta_tensor,
+                        zeta_tensor,
+                        union_analysis,
+                        device=self.device,
+                    )
                 (differentiable_loss / actual_batch_size).backward()
                 epoch_total_loss += differentiable_loss.detach().cpu().item()
                 batch_count += 1
@@ -2781,7 +2813,22 @@ class Agent_NN_BCD:
 
             if self.n_samples > 0 and (epoch == 0 or epoch == num_epochs - 1):
                 avg_loss = epoch_total_loss / self.n_samples
-                print(f"[NN-theta/zeta] epoch {epoch+1}/{num_epochs}, avg_loss = {avg_loss:.6f}", flush=True)
+                avg_components = {
+                    key: float((value / self.n_samples).cpu().item())
+                    for key, value in epoch_component_sums.items()
+                }
+                print(
+                    f"[NN-theta/zeta] epoch {epoch+1}/{num_epochs}, avg_loss = {avg_loss:.6f}, "
+                    f"avg_terms(primal={avg_components['primal_term']:.6f}, "
+                    f"dual={avg_components['dual_term']:.6f}, "
+                    f"opt={avg_components['opt_term']:.6f}, "
+                    f"reg={avg_components['reg_term']:.6f})",
+                    flush=True,
+                )
+                self._last_nn_loss_breakdown = {
+                    'avg_loss': avg_loss,
+                    **avg_components,
+                }
 
         # 记录最终 epoch loss 供 logger 使用
         if self.n_samples > 0:
@@ -3212,7 +3259,8 @@ class Agent_NN_BCD:
         return obj_primal, obj_dual, obj_opt
     
     def loss_function_differentiable(self, sample_id, theta_tensor, zeta_tensor,
-                                     union_analysis=None, device=None):
+                                     union_analysis=None, device=None,
+                                     return_components: bool = False):
         """
         可微分的loss函数，用于神经网络训练（完全复制自uc_NN.py）
         """
@@ -3265,7 +3313,7 @@ class Agent_NN_BCD:
         mu  = self._mu_cache[sample_id]   # (nl, T)
         ita = self._ita_cache[sample_id]  # (ng, T)
         
-        use_fb_for_loss = getattr(self, 'use_fischer_burmeister', False)
+        use_fb_for_loss = getattr(self, 'use_fischer_burmeister_for_loss', False)
         
         final_loss = self._compute_loss_with_lambda(
             sample_id, theta_tensor, zeta_tensor, mu, ita,
@@ -3276,7 +3324,8 @@ class Agent_NN_BCD:
             lambda_ramp_down, lambda_ramp_up,
             gen_PMIN, gen_PMAX, gencost_fixed, start_cost, shut_cost,
             Ru, Rd, Ru_co, Rd_co, Ton, Toff, union_analysis, device,
-            use_fischer_burmeister=use_fb_for_loss
+            use_fischer_burmeister=use_fb_for_loss,
+            return_components=return_components,
         )
         
         return final_loss
@@ -3288,7 +3337,8 @@ class Agent_NN_BCD:
                                    lambda_ramp_down, lambda_ramp_up,
                                    gen_PMIN, gen_PMAX, gencost_fixed, start_cost, shut_cost,
                                    Ru, Rd, Ru_co, Rd_co, Ton, Toff, union_analysis, device,
-                                   use_fischer_burmeister=False):
+                                   use_fischer_burmeister=False,
+                                   return_components: bool = False):
         """
         计算包含Lambda变量的loss（完全复制自uc_NN.py）
         """
@@ -3401,9 +3451,24 @@ class Agent_NN_BCD:
         reg_loss = (self.theta_reg_weight * torch.sum(theta_deadzone_excess)
                     + self.zeta_reg_weight * torch.sum(zeta_deadzone_excess))
 
-        loss = obj_primal * self.rho_primal + obj_dual * self.rho_dual + obj_opt * self.rho_opt + reg_loss
+        primal_term = obj_primal * self.rho_primal
+        dual_term = obj_dual * self.rho_dual
+        opt_term = obj_opt * self.rho_opt
+        loss = primal_term + dual_term + opt_term + reg_loss
 
-        return loss
+        if not return_components:
+            return loss
+
+        components = {
+            'obj_primal': obj_primal.detach(),
+            'obj_dual': obj_dual.detach(),
+            'obj_opt': obj_opt.detach(),
+            'primal_term': primal_term.detach(),
+            'dual_term': dual_term.detach(),
+            'opt_term': opt_term.detach(),
+            'reg_term': reg_loss.detach(),
+        }
+        return loss, components
       
     def _add_parametric_penalties_pg_block(self, model, x, sample_id, theta_values=None, union_analysis=None, PTDF=None, branch_limit=None):
         """

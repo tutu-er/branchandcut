@@ -94,6 +94,7 @@ THETA_HOT_START_STRATEGY = 'dcpf_relative'   # 'dcpf_relative' / 'gaussian'
 ZETA_HOT_START_STRATEGY = 'zero'             # 'zero' / 'gaussian'
 THETA_GAUSSIAN_STD = 0.01
 ZETA_GAUSSIAN_STD = 0.01
+BCD_ENABLE_DROPOUT_DURING_NN_TRAINING = True
 BCD_RHO_PRIMAL_INIT = 1e-3
 BCD_RHO_DUAL_INIT = 1e-3
 BCD_RHO_OPT_INIT = 1e-3
@@ -425,6 +426,7 @@ def run_bcd(ppc, all_samples: list, T_DELTA, MAX_ITER, bcd_model_dir,
             zeta_hot_start_strategy: str = 'zero',
             theta_gaussian_std: float = 0.01,
             zeta_gaussian_std: float = 0.01,
+            enable_dropout_during_nn_training: bool = True,
             rho_primal_init: float = 1e-2,
             rho_dual_init: float = 1e-2,
             rho_opt_init: float = 1e-2,
@@ -436,7 +438,8 @@ def run_bcd(ppc, all_samples: list, T_DELTA, MAX_ITER, bcd_model_dir,
     log(f"使用 {len(all_samples)} 个样本")
     log(
         f"theta热启动={theta_hot_start_strategy}, "
-        f"zeta热启动={zeta_hot_start_strategy}"
+        f"zeta热启动={zeta_hot_start_strategy}, "
+        f"nn_dropout={'on' if enable_dropout_during_nn_training else 'off'}"
     )
 
     print("\n" + "=" * 70)
@@ -463,6 +466,7 @@ def run_bcd(ppc, all_samples: list, T_DELTA, MAX_ITER, bcd_model_dir,
             zeta_hot_start_strategy=zeta_hot_start_strategy,
             theta_gaussian_std=theta_gaussian_std,
             zeta_gaussian_std=zeta_gaussian_std,
+            enable_dropout_during_nn_training=enable_dropout_during_nn_training,
             rho_primal_init=rho_primal_init,
             rho_dual_init=rho_dual_init,
             rho_opt_init=rho_opt_init,
@@ -482,6 +486,7 @@ def run_bcd(ppc, all_samples: list, T_DELTA, MAX_ITER, bcd_model_dir,
             zeta_hot_start_strategy=zeta_hot_start_strategy,
             theta_gaussian_std=theta_gaussian_std,
             zeta_gaussian_std=zeta_gaussian_std,
+            enable_dropout_during_nn_training=enable_dropout_during_nn_training,
             rho_primal_init=rho_primal_init,
             rho_dual_init=rho_dual_init,
             rho_opt_init=rho_opt_init,
@@ -565,6 +570,7 @@ def run_sparse_bcd(ppc, all_samples: list, T_DELTA, MAX_ITER, bcd_model_dir,
                    zeta_hot_start_strategy: str = 'zero',
                    theta_gaussian_std: float = 0.01,
                    zeta_gaussian_std: float = 0.01,
+                   enable_dropout_during_nn_training: bool = True,
                    rho_primal_init: float = 1e-2,
                    rho_dual_init: float = 1e-2,
                    rho_opt_init: float = 1e-2,
@@ -593,6 +599,7 @@ def run_sparse_bcd(ppc, all_samples: list, T_DELTA, MAX_ITER, bcd_model_dir,
         zeta_hot_start_strategy=zeta_hot_start_strategy,
         theta_gaussian_std=theta_gaussian_std,
         zeta_gaussian_std=zeta_gaussian_std,
+        enable_dropout_during_nn_training=enable_dropout_during_nn_training,
         rho_primal_init=rho_primal_init,
         rho_dual_init=rho_dual_init,
         rho_opt_init=rho_opt_init,
@@ -633,6 +640,7 @@ def run_sparse_bcd(ppc, all_samples: list, T_DELTA, MAX_ITER, bcd_model_dir,
         zeta_hot_start_strategy=zeta_hot_start_strategy,
         theta_gaussian_std=theta_gaussian_std,
         zeta_gaussian_std=zeta_gaussian_std,
+        enable_dropout_during_nn_training=enable_dropout_during_nn_training,
         rho_primal_init=rho_primal_init,
         rho_dual_init=rho_dual_init,
         rho_opt_init=rho_opt_init,
@@ -697,6 +705,7 @@ def main():
     ZETA_WARM_START_STRATEGY = ZETA_HOT_START_STRATEGY
     THETA_WARM_START_GAUSSIAN_STD = THETA_GAUSSIAN_STD
     ZETA_WARM_START_GAUSSIAN_STD = ZETA_GAUSSIAN_STD
+    BCD_ENABLE_DROPOUT_DURING_NN_TRAINING_VALUE = BCD_ENABLE_DROPOUT_DURING_NN_TRAINING
     BCD_LAMBDA_INIT_STRATEGY_VALUE = BCD_LAMBDA_INIT_STRATEGY
     BCD_RHO_PRIMAL_INIT_VALUE = BCD_RHO_PRIMAL_INIT
     BCD_RHO_DUAL_INIT_VALUE = BCD_RHO_DUAL_INIT
@@ -779,6 +788,7 @@ def main():
                     zeta_hot_start_strategy=ZETA_WARM_START_STRATEGY,
                     theta_gaussian_std=THETA_WARM_START_GAUSSIAN_STD,
                     zeta_gaussian_std=ZETA_WARM_START_GAUSSIAN_STD,
+                    enable_dropout_during_nn_training=BCD_ENABLE_DROPOUT_DURING_NN_TRAINING_VALUE,
                     rho_primal_init=BCD_RHO_PRIMAL_INIT_VALUE,
                     rho_dual_init=BCD_RHO_DUAL_INIT_VALUE,
                     rho_opt_init=BCD_RHO_OPT_INIT_VALUE,
@@ -885,6 +895,7 @@ def main():
                     T_DELTA,
                     lambda_init_strategy=BCD_LAMBDA_INIT_STRATEGY_VALUE,
                     max_theta_constraints_per_time_slot=BCD_MAX_THETA_CONSTRAINTS_PER_TIME_SLOT_VALUE,
+                    enable_dropout_during_nn_training=BCD_ENABLE_DROPOUT_DURING_NN_TRAINING_VALUE,
                     rho_primal_init=BCD_RHO_PRIMAL_INIT_VALUE,
                     rho_dual_init=BCD_RHO_DUAL_INIT_VALUE,
                     rho_opt_init=BCD_RHO_OPT_INIT_VALUE,
@@ -919,6 +930,7 @@ def main():
                         external_sparse_templates=sparse_template_library,
                         lambda_init_strategy=BCD_LAMBDA_INIT_STRATEGY_VALUE,
                         max_theta_constraints_per_time_slot=BCD_MAX_THETA_CONSTRAINTS_PER_TIME_SLOT_VALUE,
+                        enable_dropout_during_nn_training=BCD_ENABLE_DROPOUT_DURING_NN_TRAINING_VALUE,
                         rho_primal_init=BCD_RHO_PRIMAL_INIT_VALUE,
                         rho_dual_init=BCD_RHO_DUAL_INIT_VALUE,
                         rho_opt_init=BCD_RHO_OPT_INIT_VALUE,
@@ -933,6 +945,7 @@ def main():
                         T_DELTA,
                         lambda_init_strategy=BCD_LAMBDA_INIT_STRATEGY_VALUE,
                         max_theta_constraints_per_time_slot=BCD_MAX_THETA_CONSTRAINTS_PER_TIME_SLOT_VALUE,
+                        enable_dropout_during_nn_training=BCD_ENABLE_DROPOUT_DURING_NN_TRAINING_VALUE,
                         rho_primal_init=BCD_RHO_PRIMAL_INIT_VALUE,
                         rho_dual_init=BCD_RHO_DUAL_INIT_VALUE,
                         rho_opt_init=BCD_RHO_OPT_INIT_VALUE,
@@ -945,6 +958,7 @@ def main():
                         ppc, all_samples_bcd, T_DELTA,
                         lambda_init_strategy=BCD_LAMBDA_INIT_STRATEGY_VALUE,
                         max_theta_constraints_per_time_slot=BCD_MAX_THETA_CONSTRAINTS_PER_TIME_SLOT_VALUE,
+                        enable_dropout_during_nn_training=BCD_ENABLE_DROPOUT_DURING_NN_TRAINING_VALUE,
                         rho_primal_init=BCD_RHO_PRIMAL_INIT_VALUE,
                         rho_dual_init=BCD_RHO_DUAL_INIT_VALUE,
                         rho_opt_init=BCD_RHO_OPT_INIT_VALUE,
@@ -975,6 +989,7 @@ def main():
                     zeta_hot_start_strategy=ZETA_WARM_START_STRATEGY,
                     theta_gaussian_std=THETA_WARM_START_GAUSSIAN_STD,
                     zeta_gaussian_std=ZETA_WARM_START_GAUSSIAN_STD,
+                    enable_dropout_during_nn_training=BCD_ENABLE_DROPOUT_DURING_NN_TRAINING_VALUE,
                     rho_primal_init=BCD_RHO_PRIMAL_INIT_VALUE,
                     rho_dual_init=BCD_RHO_DUAL_INIT_VALUE,
                     rho_opt_init=BCD_RHO_OPT_INIT_VALUE,
