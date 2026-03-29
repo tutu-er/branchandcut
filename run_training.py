@@ -61,9 +61,33 @@ if not check_and_install_dependencies():
 #   'sparse'    - 稀疏支持集发现 → sparse BCD 训练
 #   'both'      - BCD 训练 → surrogate 训练 → 联合 BCD 训练
 #
-MODE   = 'surrogate'
+MODE = 'surrogate'
 ENABLE_SPARSE_SUPPORTS = False
-RUN_FP = True        # True → 训练后运行 feasibility_pump 测试（bcd/sparse 模式不支持）
+RUN_FP = True
+
+# 顶部集中配置区：训练相关参数统一在这里调整
+CASE_NAME = 'case3lite'      # 'case3' / 'case3lite' / 'case14' / 'case30' / 'case39' / 'case118'
+MAX_SAMPLES = 30             # None = 使用全部样本
+T_DELTA = 1.0
+DUAL_EPOCHS = 200
+DUAL_BATCH_SIZE = 8
+MAX_ITER = 200
+DUAL_DECAY_ROUND = 50
+NN_EPOCHS = 15
+UNIT_IDS = None              # None = 所有机组；或如 [0, 1, 2]
+FP_TEST_SAMPLES = 3
+N_WORKERS_BCD = 1
+N_WORKERS_SUBPROBLEM = 1
+JOINT_MAX_ITER = 10
+JOINT_NN_EPOCHS = 5
+JOINT_SURR_NN_EPOCHS = 5
+JOINT_DUAL_DECAY_ROUND = 0
+ACTIVE_SETS_FILE = "result/active_set/active_sets_case3lite_T24_n200_20260328_102856.json"  # None = 自动查找最新
+BCD_MODEL_FILE = None
+SURROGATE_MODEL_DIR = None
+SPARSE_TOP_K_VARIABLES = 20
+SPARSE_MAX_GROUPS = 5
+SPARSE_GROUP_SIZE = 3
 SURROGATE_CONSTRAINT_STRATEGY = 'all_templates_sign4'  # 'sensitive' / 'all' / 'all_templates_sign4' / 'all_single_time'
 BCD_LAMBDA_INIT_STRATEGY = 'ed_on_x_opt'   # 'lp_relaxation' / 'ed_on_x_opt'
 THETA_HOT_START_STRATEGY = 'dcpf_relative'   # 'dcpf_relative' / 'gaussian'
@@ -663,15 +687,7 @@ def main():
     print("=" * 70)
 
     # ── 配置 ──────────────────────────────────────────────
-    CASE_NAME       = 'case3lite'      # 'case3' / 'case3lite' / 'case14' / 'case30' / 'case39' / 'case118'
-    MAX_SAMPLES     = 30           # 最多使用多少个样本（None=全部）
-    T_DELTA         = 1.0
-    DUAL_EPOCHS     = 200
-    DUAL_BATCH_SIZE = 8
-    MAX_ITER        = 200            # 迭代次数（BCD / surrogate BCD 轮数）
-    DUAL_DECAY_ROUND= 50
-    NN_EPOCHS       = 15            # surrogate 模式每次 BCD 迭代的 NN 训练轮数
-    UNIT_IDS        = None          # None = 所有机组；或如 [0, 1, 2]
+    # 顶部集中配置区：本函数内只做派生值整理
     CONSTRAINT_GENERATION_STRATEGY = SURROGATE_CONSTRAINT_STRATEGY
     THETA_WARM_START_STRATEGY = THETA_HOT_START_STRATEGY
     ZETA_WARM_START_STRATEGY = ZETA_HOT_START_STRATEGY
@@ -699,19 +715,6 @@ def main():
     SUBPROBLEM_PG_COST_SCALE_MULTIPLIER_VALUE = SUBPROBLEM_PG_COST_SCALE_MULTIPLIER
     SUBPROBLEM_PG_COST_LR_VALUE = SUBPROBLEM_PG_COST_LR
     SUBPROBLEM_PG_COST_SURR_LR_VALUE = SUBPROBLEM_PG_COST_SURR_LR
-    FP_TEST_SAMPLES = 3             # feasibility_pump 模式：测试样本数
-    N_WORKERS_BCD   = 1             # 样本级并行线程数；1 = 串行（BCD 建议先用串行），>1 = 线程并行
-    N_WORKERS_SUBPROBLEM = 1             # 样本级并行线程数；1 = 串行（BCD 建议先用串行），>1 = 线程并行
-    JOINT_MAX_ITER  = 10            # 联合BCD训练外层迭代次数
-    JOINT_NN_EPOCHS = 5             # 联合BCD训练每轮theta/zeta NN训练epoch数
-    JOINT_SURR_NN_EPOCHS = 5        # 联合BCD训练每轮surrogate NN训练epoch数
-    JOINT_DUAL_DECAY_ROUND = 0     # 联合BCD训练dual_para_bound衰减轮次
-    ACTIVE_SETS_FILE = "result/active_set/active_sets_case3lite_T24_n200_20260328_102856.json"          # 指定 active_sets JSON 文件路径（None=自动查找最新）
-    BCD_MODEL_FILE   = None           # 指定已有 BCD 模型 .pth 文件路径（None=从头训练；both 模式下可跳过 BCD 训练）
-    SURROGATE_MODEL_DIR = None       # 指定已有 subproblem 模型目录（含 dual_predictor.pth 和 surrogate_unit_*.pth；None=从头训练；both 模式下可跳过 subproblem 训练）
-    SPARSE_TOP_K_VARIABLES = 20      # sparse 支持发现：保留的高价值 x[g,t] 变量数量
-    SPARSE_MAX_GROUPS = 5            # sparse 支持发现：构造的支持集模板数量上限
-    SPARSE_GROUP_SIZE = 3            # sparse 支持发现：每条模板最多包含多少个参与变量
 
     # 创建训练指标收集器
     logger = TrainingLogger()

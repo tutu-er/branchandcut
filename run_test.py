@@ -89,8 +89,13 @@ MODEL_DIR = 'result/surrogate_models/subproblem_models_case3lite_20260329_151459
 # BCD_MODEL_PATH = 'result/bcd_models/bcd_model_case30_20260322_150043.pth'
 BCD_MODEL_PATH = 'result/bcd_models/bcd_model_case3lite_20260328_112148.pth'
 
+# 顶部集中配置区：测试相关参数统一在这里调整
+MAX_SAMPLES = None         # None = 使用全部样本
+SAMPLE_RANGE = "0:1"       # 左闭右开；例如 "210:220"
+T_DELTA = 1.0
+UNIT_IDS = None            # None = 所有机组；或如 [0, 1, 2]
 TEST_SAMPLES_DEFAULT = 3
-TEST_SAMPLES = TEST_SAMPLES_DEFAULT
+TEST_SAMPLES = 10
 FP_MAX_ITER = 50
 FP_CONF_THRESHOLD = 0.15
 FP_MAX_PERTURBATION_HOT_STARTS = 6
@@ -2028,12 +2033,6 @@ def main():
     print(f"测试脚本  模式: {MODE}  算例: {CASE_NAME}")
     print("=" * 70)
 
-    # ── 配置 ──────────────────────────────────────────────
-    MAX_SAMPLES  = None         # 最多使用多少个样本（None=全部）
-    SAMPLE_RANGE = "0:1"        # 指定样本区间，左闭右开；例如 "210:220"
-    T_DELTA      = 1.0
-    UNIT_IDS     = None         # None = 所有机组；或如 [0, 1, 2]
-    TEST_SAMPLES = 10  # 测试/评估样本数
     test_samples = TEST_SAMPLES
     sample_range = parse_sample_range(SAMPLE_RANGE)
 

@@ -1226,6 +1226,33 @@ class SubproblemSurrogateNet(nn.Module):
             if last_linear.bias is not None:
                 nn.init.zeros_(last_linear.bias)
 
+    def encode_features(self, x):
+        features = self.input_proj(x)
+        for block in self.res_blocks:
+            features = block(features)
+        return features
+
+    def forward_main(self, x):
+        """
+        主代理网络前向传播。
+
+        Returns:
+            alphas/betas/gammas/deltas/costs
+        """
+        features = self.encode_features(x)
+        alphas = torch.tanh(self.alpha_net(features)) * self.coupling_coeff_scale
+        betas = torch.tanh(self.beta_net(features)) * self.coupling_coeff_scale
+        gammas = torch.tanh(self.gamma_net(features)) * self.coupling_coeff_scale
+        deltas = self.delta_base + torch.tanh(self.delta_net(features)) * self.delta_scale
+        costs = torch.tanh(self.cost_net(features)) * self.x_cost_scale
+        return alphas, betas, gammas, deltas, costs
+
+    def forward_pg_cost(self, x):
+        """c_pg 单独前向传播。"""
+        features = self.encode_features(x)
+        pg_costs = torch.tanh(self.pg_cost_net(features)) * self.pg_cost_scale
+        return pg_costs
+
     def forward(self, x):
         """
         前向传播
@@ -1241,15 +1268,8 @@ class SubproblemSurrogateNet(nn.Module):
             costs: x 调整项 (batch_size, T)
             pg_costs: pg 调整项 (batch_size, T)
         """
-        features = self.input_proj(x)
-        for block in self.res_blocks:
-            features = block(features)
-        alphas = torch.tanh(self.alpha_net(features)) * self.coupling_coeff_scale
-        betas = torch.tanh(self.beta_net(features)) * self.coupling_coeff_scale
-        gammas = torch.tanh(self.gamma_net(features)) * self.coupling_coeff_scale
-        deltas = self.delta_base + torch.tanh(self.delta_net(features)) * self.delta_scale
-        costs = torch.tanh(self.cost_net(features)) * self.x_cost_scale
-        pg_costs = torch.tanh(self.pg_cost_net(features)) * self.pg_cost_scale
+        alphas, betas, gammas, deltas, costs = self.forward_main(x)
+        pg_costs = self.forward_pg_cost(x)
         return alphas, betas, gammas, deltas, costs, pg_costs
 
 
@@ -1850,6 +1870,14 @@ class SubproblemSurrogateTrainer:
             return pg_costs_tensor
         return torch.zeros_like(pg_costs_tensor)
 
+    def _set_c_pg_training_mode(self, enabled: bool) -> None:
+        """冻结主代理参数，仅训练 c_pg head；退出时恢复全部可训练。"""
+        for param in self.surrogate_net.parameters():
+            param.requires_grad_(not enabled)
+        if enabled:
+            for param in self.surrogate_net.pg_cost_net.parameters():
+                param.requires_grad_(True)
+
     def _generate_initial_values_from_nn(self):
         """用未训练的 SubproblemSurrogateNet forward pass 生成 alpha/beta/gamma/delta 初值。"""
         self.surrogate_net.eval()
@@ -1859,7 +1887,8 @@ class SubproblemSurrogateTrainer:
         feat_tensor = torch.tensor(np.array(features_list), dtype=torch.float32).to(self.device)
 
         with torch.no_grad():
-            alphas, betas, gammas, deltas, costs, pg_costs = self.surrogate_net(feat_tensor)
+            alphas, betas, gammas, deltas, costs = self.surrogate_net.forward_main(feat_tensor)
+            pg_costs = self.surrogate_net.forward_pg_cost(feat_tensor)
 
         self.alpha_values = alphas.cpu().numpy()
         self.beta_values = betas.cpu().numpy()
@@ -2640,27 +2669,12 @@ class SubproblemSurrogateTrainer:
     def loss_function_differentiable(self, sample_id: int, alphas_tensor: torch.Tensor,
                                      betas_tensor: torch.Tensor, gammas_tensor: torch.Tensor,
                                      deltas_tensor: torch.Tensor, costs_tensor: torch.Tensor,
-                                     pg_costs_tensor: torch.Tensor,
                                      device) -> torch.Tensor:
         """
-        可微分的loss函数 - V3三时段耦合约束版本
-        
-        使用BCD迭代得到的变量值(x, mu)计算loss
-        
-        Loss = rho_primal * obj_primal + rho_dual * obj_dual + rho_opt * obj_opt
-        
-        其中:
-        - obj_primal: 三时段约束违反量 Σ_t max(0, alpha_t*x_t + beta_t*x_{t+1} + gamma_t*x_{t+2} - delta_t)
-        - obj_dual: 对偶约束违反量（简化）
-        - obj_opt: 互补松弛条件 Σ_t |alpha_t*x_t + beta_t*x_{t+1} + gamma_t*x_{t+2} - delta_t| * mu_t
-        
-        Args:
-            sample_id: 样本索引
-            alphas_tensor: (max_constraints,) 第一时段系数
-            betas_tensor: (max_constraints,) 第二时段系数
-            gammas_tensor: (max_constraints,) 第三时段系数
-            deltas_tensor: (max_constraints,) 右端项
-            device: 计算设备
+        主代理网络 loss。
+
+        这里只训练 alpha/beta/gamma/delta/c_x，显式剥离 c_pg 对应的驻点项。
+        c_pg 使用独立训练器和独立 loss。
         """
         g = self.unit_id
         
@@ -2704,26 +2718,7 @@ class SubproblemSurrogateTrainer:
             coupling_abs = torch.abs(coupling_lhs - deltas_tensor[k])
             obj_opt = obj_opt + coupling_abs * mu_vals[k]
         
-        # ========== 计算obj_dual：仅保留对 NN 参数有梯度的 pg/x 驻点项 ==========
-        obj_dual_pg = torch.tensor(0.0, device=device, requires_grad=True)
-        a_val = float(self.gencost[g, -2] / self.T_delta)
-        if lam_inh is not None:
-            lam_ru = lam_inh['lambda_ramp_up']
-            lam_rd = lam_inh['lambda_ramp_down']
-            for t in range(self.T):
-                pg_const = a_val - float(lambda_val[t])
-                pg_const -= float(lam_inh['lambda_pg_lower'][t])
-                pg_const += float(lam_inh['lambda_pg_upper'][t])
-                if t > 0:
-                    pg_const += float(lam_ru[t - 1])
-                    pg_const -= float(lam_rd[t - 1])
-                if t < self.T - 1:
-                    pg_const -= float(lam_ru[t])
-                    pg_const += float(lam_rd[t])
-                obj_dual_pg = obj_dual_pg + torch.abs(
-                    torch.tensor(pg_const, dtype=torch.float32, device=device) + pg_costs_tensor[t]
-                )
-
+        # ========== 计算obj_dual_x ==========
         # x[t]驻点：b + Pmin*lam_pg_lower[t] - Pmax*lam_pg_upper[t]
         #           + ramp_co_terms + min_on/off_terms + start/shut_terms
         #           + coupling_terms(alpha,beta,gamma,mu) + lam_x_upper[t] - lam_x_lower[t] = 0
@@ -2810,15 +2805,12 @@ class SubproblemSurrogateTrainer:
 
             obj_dual_x = obj_dual_x + torch.abs(dual_expr)
 
-        obj_dual = obj_dual_pg + obj_dual_x
-        
         # 死区正则：限制幅值失控，但不给模板附近/小范围波动施加默认回拉。
         reg_loss = self.reg_weight * (
             self._deadband_quadratic(alphas_tensor, self.coeff_reg_deadband)
             + self._deadband_quadratic(betas_tensor, self.coeff_reg_deadband)
             + self._deadband_quadratic(gammas_tensor, self.coeff_reg_deadband)
             + self._deadband_quadratic(costs_tensor, self.aux_cost_reg_deadband)
-            + self._deadband_quadratic(pg_costs_tensor, self.aux_cost_reg_deadband)
         )
         if self._uses_template_rhs_bases():
             delta_base_tensor = torch.tensor(
@@ -2838,18 +2830,59 @@ class SubproblemSurrogateTrainer:
             )
 
         # 总损失：三项BCD目标 + 正则化
-        loss = (self.rho_primal * obj_primal +
-                self.rho_dual_pg * obj_dual_pg +
-                self.rho_dual_x * obj_dual_x +
-                self.rho_opt    * obj_opt    +
-                reg_loss)
+        loss = (
+            self.rho_primal * obj_primal
+            + self.rho_dual_x * obj_dual_x
+            + self.rho_opt * obj_opt
+            + reg_loss
+        )
 
         return loss
+
+    def loss_function_c_pg_differentiable(
+        self,
+        sample_id: int,
+        pg_costs_tensor: torch.Tensor,
+        device,
+    ) -> torch.Tensor:
+        """c_pg 单独 loss，只优化 pg 驻点项和 c_pg 自身正则。"""
+        g = self.unit_id
+        lambda_val = torch.tensor(
+            self.lambda_vals[sample_id],
+            dtype=torch.float32,
+            device=device,
+        )
+        lam_inh = self.lambda_inherent[sample_id]
+        obj_dual_pg = torch.tensor(0.0, device=device, requires_grad=True)
+        a_val = float(self.gencost[g, -2] / self.T_delta)
+
+        if lam_inh is not None:
+            lam_ru = lam_inh['lambda_ramp_up']
+            lam_rd = lam_inh['lambda_ramp_down']
+            for t in range(self.T):
+                pg_const = a_val - float(lambda_val[t])
+                pg_const -= float(lam_inh['lambda_pg_lower'][t])
+                pg_const += float(lam_inh['lambda_pg_upper'][t])
+                if t > 0:
+                    pg_const += float(lam_ru[t - 1])
+                    pg_const -= float(lam_rd[t - 1])
+                if t < self.T - 1:
+                    pg_const -= float(lam_ru[t])
+                    pg_const += float(lam_rd[t])
+                obj_dual_pg = obj_dual_pg + torch.abs(
+                    torch.tensor(pg_const, dtype=torch.float32, device=device) + pg_costs_tensor[t]
+                )
+
+        reg_loss = self.reg_weight * self._deadband_quadratic(
+            pg_costs_tensor,
+            self.aux_cost_reg_deadband,
+        )
+        return self.rho_dual_pg * obj_dual_pg + reg_loss
     
     def iter_with_surrogate_nn(self, num_epochs: int = 10, batch_size: int = 4):
         """
-        BCD迭代：神经网络更新三时段耦合代理约束参数
-        使用loss_function_differentiable进行训练，mini-batch梯度累积模式
+        BCD迭代：主代理网络训练。
+        这里只更新 alpha/beta/gamma/delta/c_x，不包含 c_pg。
         """
         if not TORCH_AVAILABLE:
             return
@@ -2868,11 +2901,6 @@ class SubproblemSurrogateTrainer:
                 lr=3e-5,
                 weight_decay=1e-4,
             )
-            self._surr_pg_cost_optimizer = optim.Adam(
-                self.surrogate_net.pg_cost_net.parameters(),
-                lr=self.pg_cost_surr_lr,
-                weight_decay=1e-4,
-            )
             self._surr_scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
                 self._surr_optimizer, T_0=max(num_epochs, 1), T_mult=1)
 
@@ -2882,7 +2910,6 @@ class SubproblemSurrogateTrainer:
             epoch_loss = 0.0
             self._surr_optimizer.zero_grad()
             self._surr_cost_optimizer.zero_grad()
-            self._surr_pg_cost_optimizer.zero_grad()
             batch_count = 0
 
             for sample_id in range(self.n_samples):
@@ -2895,7 +2922,7 @@ class SubproblemSurrogateTrainer:
                 features_tensor = torch.tensor(features, dtype=torch.float32, device=self.device).unsqueeze(0)
 
                 # V3前向传播：输出 (alphas, betas, gammas, deltas, c_x, c_pg)
-                alphas_out, betas_out, gammas_out, deltas_out, costs_out, pg_costs_out = self.surrogate_net(features_tensor)
+                alphas_out, betas_out, gammas_out, deltas_out, costs_out = self.surrogate_net.forward_main(features_tensor)
                 nc = self.num_coupling_constraints
                 alphas_tensor = alphas_out.squeeze(0)[:nc]   # (num_coupling_constraints,)
                 betas_tensor = betas_out.squeeze(0)[:nc]
@@ -2904,14 +2931,11 @@ class SubproblemSurrogateTrainer:
                     deltas_out.squeeze(0)[:nc]
                 )
                 costs_tensor = costs_out.squeeze(0)[:self.T]  # (T,)
-                pg_costs_tensor = self._gate_pg_cost_tensor(
-                    pg_costs_out.squeeze(0)[:self.T]
-                )
 
-                # 计算loss（V3版本，传入5个参数）+ scaled backward
+                # 主 loss 不再包含 c_pg 对应项
                 loss = self.loss_function_differentiable(
                     sample_id, alphas_tensor, betas_tensor, gammas_tensor, deltas_tensor,
-                    costs_tensor, pg_costs_tensor, self.device
+                    costs_tensor, self.device
                 )
                 (loss / actual_batch_size).backward()
                 epoch_loss += loss.detach().cpu().item()
@@ -2928,32 +2952,105 @@ class SubproblemSurrogateTrainer:
                     (1 - self.cost_ema_alpha) * self.cost_values[sample_id]
                     + self.cost_ema_alpha * new_costs
                 )
-                new_pg_costs = pg_costs_tensor.detach().cpu().numpy()
-                self.pg_cost_values[sample_id] = (
-                    (1 - self.pg_cost_ema_alpha) * self.pg_cost_values[sample_id]
-                    + self.pg_cost_ema_alpha * new_pg_costs
-                )
 
                 # batch 满或 epoch 结束：clip + step
                 if batch_count == batch_size or sample_id == self.n_samples - 1:
                     torch.nn.utils.clip_grad_norm_(self.surrogate_net.parameters(), max_norm=1.0)
                     self._surr_optimizer.step()
                     self._surr_cost_optimizer.step()
-                    if self._pg_costs_active():
-                        self._surr_pg_cost_optimizer.step()
                     self._surr_optimizer.zero_grad()
                     self._surr_cost_optimizer.zero_grad()
-                    self._surr_pg_cost_optimizer.zero_grad()
                     batch_count = 0
 
             self._surr_scheduler.step()
 
             if epoch == 0 or epoch == num_epochs - 1:
-                print(f"  [NN] epoch {epoch+1}/{num_epochs}, avg_loss = {epoch_loss/self.n_samples:.6f}", flush=True)
+                print(f"  [NN-main] epoch {epoch+1}/{num_epochs}, avg_loss = {epoch_loss/self.n_samples:.6f}", flush=True)
 
         # 记录最终 epoch loss 供 logger 使用
         if self.n_samples > 0:
             self._last_surr_nn_loss = epoch_loss / self.n_samples
+
+    def iter_with_c_pg_nn(self, num_epochs: int = 10, batch_size: int = 4):
+        """
+        BCD迭代：c_pg 单独训练器。
+        仅更新 pg_cost_net，并使用独立 loss。
+        """
+        if not TORCH_AVAILABLE or not self._pg_costs_active():
+            self._last_pg_cost_nn_loss = None
+            return
+
+        optimizer_persist_after = 5
+        rebuild = (self.iter_number < optimizer_persist_after)
+        if rebuild or not hasattr(self, '_surr_pg_cost_optimizer') or self._surr_pg_cost_optimizer is None:
+            self._surr_pg_cost_optimizer = optim.Adam(
+                self.surrogate_net.pg_cost_net.parameters(),
+                lr=self.pg_cost_surr_lr,
+                weight_decay=1e-4,
+            )
+            self._surr_pg_cost_scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
+                self._surr_pg_cost_optimizer, T_0=max(num_epochs, 1), T_mult=1)
+
+        self.surrogate_net.train()
+        self._set_c_pg_training_mode(True)
+        try:
+            for epoch in range(num_epochs):
+                epoch_loss = 0.0
+                self._surr_pg_cost_optimizer.zero_grad()
+                batch_count = 0
+
+                for sample_id in range(self.n_samples):
+                    batch_start = (sample_id // batch_size) * batch_size
+                    actual_batch_size = min(batch_size, self.n_samples - batch_start)
+
+                    features = self._extract_features(sample_id)
+                    features_tensor = torch.tensor(
+                        features,
+                        dtype=torch.float32,
+                        device=self.device,
+                    ).unsqueeze(0)
+
+                    pg_costs_out = self.surrogate_net.forward_pg_cost(features_tensor)
+                    pg_costs_tensor = self._gate_pg_cost_tensor(
+                        pg_costs_out.squeeze(0)[:self.T]
+                    )
+
+                    loss = self.loss_function_c_pg_differentiable(
+                        sample_id,
+                        pg_costs_tensor,
+                        self.device,
+                    )
+                    (loss / actual_batch_size).backward()
+                    epoch_loss += loss.detach().cpu().item()
+                    batch_count += 1
+
+                    new_pg_costs = pg_costs_tensor.detach().cpu().numpy()
+                    self.pg_cost_values[sample_id] = (
+                        (1 - self.pg_cost_ema_alpha) * self.pg_cost_values[sample_id]
+                        + self.pg_cost_ema_alpha * new_pg_costs
+                    )
+
+                    if batch_count == batch_size or sample_id == self.n_samples - 1:
+                        torch.nn.utils.clip_grad_norm_(
+                            self.surrogate_net.pg_cost_net.parameters(),
+                            max_norm=1.0,
+                        )
+                        self._surr_pg_cost_optimizer.step()
+                        self._surr_pg_cost_optimizer.zero_grad()
+                        batch_count = 0
+
+                self._surr_pg_cost_scheduler.step()
+
+                if epoch == 0 or epoch == num_epochs - 1:
+                    print(
+                        f"  [NN-c_pg] epoch {epoch+1}/{num_epochs}, avg_loss = {epoch_loss/self.n_samples:.6f}",
+                        flush=True,
+                    )
+
+            if self.n_samples > 0:
+                self._last_pg_cost_nn_loss = epoch_loss / self.n_samples
+        finally:
+            self._set_c_pg_training_mode(False)
 
     def cal_viol_components(self) -> Tuple[float, float, float, float, float, float]:
         """
@@ -3224,8 +3321,9 @@ class SubproblemSurrogateTrainer:
                     self.lambda_inherent[sample_id] = lambda_inherent_sol
                     self.mu[sample_id] = self._apply_mu_lower_bound_policy(mu_sol, lb_mu)
             
-            # 3. 神经网络更新代理约束参数（V3：自动输出4个参数）
+            # 3. 神经网络更新代理约束参数
             self.iter_with_surrogate_nn(num_epochs=nn_epochs)
+            self.iter_with_c_pg_nn(num_epochs=nn_epochs)
 
             # 计算违反量（NN更新后）
             obj_primal, obj_dual_pg, obj_dual_x, obj_dual_coc, obj_dual, obj_opt = self.cal_viol_components()
@@ -3329,7 +3427,8 @@ class SubproblemSurrogateTrainer:
         features_tensor = torch.tensor(features, dtype=torch.float32, device=self.device).unsqueeze(0)
 
         with torch.no_grad():
-            alphas, betas, gammas, deltas, costs, pg_costs = self.surrogate_net(features_tensor)
+            alphas, betas, gammas, deltas, costs = self.surrogate_net.forward_main(features_tensor)
+            pg_costs = self.surrogate_net.forward_pg_cost(features_tensor)
             deltas = self._postprocess_delta_tensor(deltas.squeeze(0)).unsqueeze(0)
 
         return (alphas.squeeze(0).cpu().numpy(),

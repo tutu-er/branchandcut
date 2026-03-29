@@ -21,6 +21,33 @@ from src.mti118_data_loader import (
     load_case118_ppc_with_mti_limits,
 )
 
+# 顶部集中配置区：active-set 采样参数统一在这里调整
+CASE_NAME = "case3lite"   # "case3" / "case3lite" / "case30" / "case118"
+HORIZON = 24
+MAX_SAMPLES = 100
+TARGET_SAMPLES = 100      # None 表示只按 MAX_SAMPLES 控制
+ALPHA = 0.70
+DELTA = 0.05
+EPSILON = 0.10
+T_DELTA = 1.0
+PARALLEL = False
+N_WORKERS = 4
+GUROBI_THREADS = 2
+VERBOSE_SOLVER = False
+OUTPUT_PATH = None
+
+# case118 专用配置
+CASE118_MARKET = "DA"
+CASE118_AGGREGATE_THERMAL_BY_BUS = True
+CASE118_MAX_DAYS = None
+CASE118_MAX_SAMPLES = None
+CASE118_PERTURB_REPEATS = 0
+CASE118_SCALE_LOW = 0.95
+CASE118_SCALE_HIGH = 1.05
+CASE118_SEED = 42
+CASE118_ALPHA = 0.75
+CASE118_DELTA = 0.15
+CASE118_EPSILON = 0.15
 
 def perturb_sample(sample: dict, scale_low: float, scale_high: float, seed: int) -> dict:
     rng = np.random.default_rng(seed)
@@ -248,78 +275,74 @@ def run_case118(
 
 
 def main() -> None:
-    case_name = "case3lite"
-    max_samples = 100
-    target_samples = 100  # e.g. 50 means keep sampling until 50 solved samples are learned
-
-    if case_name == "case3":
+    if CASE_NAME == "case3":
         output_path = run_case3(
-            horizon=24,
-            max_samples=max_samples,
-            target_samples=target_samples,
-            alpha=0.70,
-            delta=0.05,
-            epsilon=0.10,
-            t_delta=1.0,
-            parallel=False,
-            n_workers=4,
-            gurobi_threads=2,
-            verbose_solver=False,
-            output=None,
+            horizon=HORIZON,
+            max_samples=MAX_SAMPLES,
+            target_samples=TARGET_SAMPLES,
+            alpha=ALPHA,
+            delta=DELTA,
+            epsilon=EPSILON,
+            t_delta=T_DELTA,
+            parallel=PARALLEL,
+            n_workers=N_WORKERS,
+            gurobi_threads=GUROBI_THREADS,
+            verbose_solver=VERBOSE_SOLVER,
+            output=OUTPUT_PATH,
         )
-    elif case_name == "case3lite":
+    elif CASE_NAME == "case3lite":
         output_path = run_case3lite(
-            horizon=24,
-            max_samples=max_samples,
-            target_samples=target_samples,
-            alpha=0.70,
-            delta=0.05,
-            epsilon=0.10,
-            t_delta=1.0,
-            parallel=False,
-            n_workers=4,
-            gurobi_threads=2,
-            verbose_solver=False,
-            output=None,
+            horizon=HORIZON,
+            max_samples=MAX_SAMPLES,
+            target_samples=TARGET_SAMPLES,
+            alpha=ALPHA,
+            delta=DELTA,
+            epsilon=EPSILON,
+            t_delta=T_DELTA,
+            parallel=PARALLEL,
+            n_workers=N_WORKERS,
+            gurobi_threads=GUROBI_THREADS,
+            verbose_solver=VERBOSE_SOLVER,
+            output=OUTPUT_PATH,
         )
-    elif case_name == "case30":
+    elif CASE_NAME == "case30":
         output_path = run_case30(
-            horizon=24,
-            max_samples=max_samples,
-            target_samples=target_samples,
-            alpha=0.70,
-            delta=0.05,
-            epsilon=0.10,
-            t_delta=1.0,
-            parallel=False,
-            n_workers=4,
-            gurobi_threads=2,
-            verbose_solver=False,
-            output=None,
+            horizon=HORIZON,
+            max_samples=MAX_SAMPLES,
+            target_samples=TARGET_SAMPLES,
+            alpha=ALPHA,
+            delta=DELTA,
+            epsilon=EPSILON,
+            t_delta=T_DELTA,
+            parallel=PARALLEL,
+            n_workers=N_WORKERS,
+            gurobi_threads=GUROBI_THREADS,
+            verbose_solver=VERBOSE_SOLVER,
+            output=OUTPUT_PATH,
         )
-    elif case_name == "case118":
+    elif CASE_NAME == "case118":
         output_path = run_case118(
-            market="DA",
-            horizon=24,
-            aggregate_thermal_by_bus=True,
-            max_days=None,
-            max_samples=None,
-            perturb_repeats=0,
-            scale_low=0.95,
-            scale_high=1.05,
-            seed=42,
-            alpha=0.75,
-            delta=0.15,
-            epsilon=0.15,
-            t_delta=1.0,
-            parallel=False,
-            n_workers=4,
-            gurobi_threads=2,
-            verbose_solver=False,
-            output=None,
+            market=CASE118_MARKET,
+            horizon=HORIZON,
+            aggregate_thermal_by_bus=CASE118_AGGREGATE_THERMAL_BY_BUS,
+            max_days=CASE118_MAX_DAYS,
+            max_samples=CASE118_MAX_SAMPLES,
+            perturb_repeats=CASE118_PERTURB_REPEATS,
+            scale_low=CASE118_SCALE_LOW,
+            scale_high=CASE118_SCALE_HIGH,
+            seed=CASE118_SEED,
+            alpha=CASE118_ALPHA,
+            delta=CASE118_DELTA,
+            epsilon=CASE118_EPSILON,
+            t_delta=T_DELTA,
+            parallel=PARALLEL,
+            n_workers=N_WORKERS,
+            gurobi_threads=GUROBI_THREADS,
+            verbose_solver=VERBOSE_SOLVER,
+            output=OUTPUT_PATH,
         )
     else:
-        raise ValueError(f"Unsupported case_name: {case_name}")
+        raise ValueError(f"Unsupported case_name: {CASE_NAME}")
 
     print(f"saved to: {output_path}", flush=True)
 
