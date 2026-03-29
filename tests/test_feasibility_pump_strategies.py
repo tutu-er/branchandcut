@@ -293,3 +293,81 @@ def test_select_pool_restart_candidate_prefers_free_variable_difference():
     assert candidate is not None
     assert np.array_equal(candidate[trusted_mask], x_reference[trusted_mask])
     assert np.sum(candidate[~trusted_mask] != x_reference[~trusted_mask]) >= 1
+
+
+def test_select_stable_surrogate_screen_constraints_picks_only_consensus_rows(monkeypatch):
+    sample = {
+        'load_data': np.full((1, 3), 10.0, dtype=float),
+        'renewable_data': np.zeros((1, 3), dtype=float),
+        'sample_id': 0,
+    }
+    monkeypatch.setattr(fp, 'build_surrogate_constraint_expression', _build_surrogate_constraint_expression)
+    monkeypatch.setattr(
+        fp,
+        '_resolve_surrogate_constraint_layout',
+        lambda trainer, sample_arg, T, n_constraints: ([0, 0], [(0,), (0,)]),
+    )
+
+    class _StableTrainer(_DummyTrainer):
+        def get_surrogate_params(self, pd_data, lambda_val, renewable_data=None):
+            alphas = np.array([1.0, 1.0], dtype=float)
+            betas = np.array([0.0, 0.0], dtype=float)
+            gammas = np.array([0.0, 0.0], dtype=float)
+            deltas = np.array([1.10, 0.20], dtype=float)
+            costs = np.zeros(self.T, dtype=float)
+            pg_costs = np.zeros(self.T, dtype=float)
+            return alphas, betas, gammas, deltas, costs, pg_costs
+
+    trainers = {0: _StableTrainer(0, active_set_data=[sample], horizon=3)}
+    x_lp = np.array([[0.95, 0.1, 0.0]], dtype=float)
+    x_surr_lp = np.array([[1.0, 0.0, 0.0]], dtype=float)
+    x_init_k = np.array([[1, 0, 0]], dtype=int)
+    x_init_k_m = np.array([[[1, 0, 0], [1, 0, 0]]], dtype=int)
+
+    selected = fp._select_stable_surrogate_screen_constraints(
+        sample,
+        trainers,
+        lambda_val=np.array([0.0, 0.0, 0.0], dtype=float),
+        x_LP=x_lp,
+        x_surr_lp=x_surr_lp,
+        x_init_k=x_init_k,
+        x_init_k_m=x_init_k_m,
+        max_constraints_per_unit=2,
+        min_support_ratio=0.8,
+        max_normalized_violation=0.05,
+        min_mean_margin=0.02,
+    )
+
+    assert len(selected) == 1
+    assert selected[0]['unit_id'] == 0
+    assert selected[0]['constraint_index'] == 0
+
+
+def test_filter_named_commitment_candidates_by_surrogate_screen_rejects_violations(monkeypatch):
+    monkeypatch.setattr(fp, 'build_surrogate_constraint_expression', _build_surrogate_constraint_expression)
+    candidate_specs = [
+        ('all_off', np.array([[0, 0, 0]], dtype=int)),
+        ('turn_on', np.array([[1, 0, 0]], dtype=int)),
+    ]
+    surrogate_rows = [
+        {
+            'unit_id': 0,
+            'constraint_index': 0,
+            'timestep': 0,
+            'offsets': (0,),
+            'alpha': 1.0,
+            'beta': 0.0,
+            'gamma': 0.0,
+            'delta': 0.2,
+        }
+    ]
+
+    kept, rejected = fp._filter_named_commitment_candidates_by_surrogate_screen(
+        candidate_specs,
+        surrogate_rows,
+        normalized_violation_tol=0.02,
+    )
+
+    assert [name for name, _candidate in kept] == ['all_off']
+    assert len(rejected) == 1
+    assert rejected[0][0] == 'turn_on'

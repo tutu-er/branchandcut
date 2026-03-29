@@ -95,6 +95,7 @@ class ParallelSubproblemSurrogateTrainer(SubproblemSurrogateTrainer):
         pg_cost_scale_multiplier: float = 1.2,
         pg_cost_lr: float = 2e-5,
         pg_cost_surr_lr: float = 5e-5,
+        pg_cost_reg_deadband: float = 0.25,
         device=None,
         n_workers: int = 4,
     ):
@@ -117,6 +118,7 @@ class ParallelSubproblemSurrogateTrainer(SubproblemSurrogateTrainer):
             pg_cost_scale_multiplier=pg_cost_scale_multiplier,
             pg_cost_lr=pg_cost_lr,
             pg_cost_surr_lr=pg_cost_surr_lr,
+            pg_cost_reg_deadband=pg_cost_reg_deadband,
             device=device,
         )
         self.n_workers = min(n_workers, self.n_samples)

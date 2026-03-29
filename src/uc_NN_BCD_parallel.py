@@ -229,6 +229,18 @@ class ParallelAgent_NN_BCD(Agent_NN_BCD):
                 print("[ParallelBCD] ⚠ 部分Dual块失败，继续迭代", flush=True)
 
             # ── 3. NN 块（串行，theta/zeta 神经网络更新） ────────────
+            obj_primal, obj_dual, obj_opt = self.cal_viol(union_analysis=union_analysis)
+            EPS12 = 1e-12
+            obj_primal = obj_primal if abs(obj_primal) >= EPS12 else 0.0
+            obj_dual   = obj_dual   if abs(obj_dual)   >= EPS12 else 0.0
+            obj_opt    = obj_opt    if abs(obj_opt)    >= EPS12 else 0.0
+
+            print(
+                f"[ParallelBCD] obj_primal={obj_primal:.6f}, "
+                f"obj_dual={obj_dual:.6f}, obj_opt={obj_opt:.6f}",
+                flush=True,
+            )
+
             if TORCH_AVAILABLE and hasattr(self, 'device'):
                 self._refresh_iter_tensor_cache()
      

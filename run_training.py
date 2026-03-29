@@ -61,23 +61,23 @@ if not check_and_install_dependencies():
 #   'sparse'    - 稀疏支持集发现 → sparse BCD 训练
 #   'both'      - BCD 训练 → surrogate 训练 → 联合 BCD 训练
 #
-MODE = 'surrogate'
+MODE = 'both'
 ENABLE_SPARSE_SUPPORTS = False
 RUN_FP = True
 
 # 顶部集中配置区：训练相关参数统一在这里调整
 CASE_NAME = 'case3lite'      # 'case3' / 'case3lite' / 'case14' / 'case30' / 'case39' / 'case118'
-MAX_SAMPLES = 30             # None = 使用全部样本
+MAX_SAMPLES = 20            # None = 使用全部样本
 T_DELTA = 1.0
 DUAL_EPOCHS = 200
 DUAL_BATCH_SIZE = 8
-MAX_ITER = 200
-DUAL_DECAY_ROUND = 50
+MAX_ITER = 500
+DUAL_DECAY_ROUND = 25
 NN_EPOCHS = 15
 UNIT_IDS = None              # None = 所有机组；或如 [0, 1, 2]
 FP_TEST_SAMPLES = 3
-N_WORKERS_BCD = 1
-N_WORKERS_SUBPROBLEM = 1
+N_WORKERS_BCD = 4
+N_WORKERS_SUBPROBLEM = 4
 JOINT_MAX_ITER = 10
 JOINT_NN_EPOCHS = 5
 JOINT_SURR_NN_EPOCHS = 5
@@ -101,20 +101,21 @@ BCD_MAX_THETA_CONSTRAINTS_PER_TIME_SLOT = 20
 BCD_GAMMA_BASE = 1e-3
 BCD_MU_DUAL_FLOOR_INIT = 0.1
 BCD_ITA_DUAL_FLOOR_INIT = 0.1
-SUBPROBLEM_RHO_PRIMAL_INIT = 1e-4
+SUBPROBLEM_RHO_PRIMAL_INIT = 1e-3
 SUBPROBLEM_RHO_DUAL_INIT = 1e-3
 SUBPROBLEM_RHO_DUAL_PG_INIT = 1e-3
 SUBPROBLEM_RHO_DUAL_X_INIT = 1e-3
-SUBPROBLEM_RHO_DUAL_COC_INIT = 1e-3
+SUBPROBLEM_RHO_DUAL_COC_INIT = 1
 SUBPROBLEM_RHO_OPT_INIT = 1e-3
 SUBPROBLEM_GAMMA_BASE = 1e-3
-SUBPROBLEM_MU_DUAL_FLOOR_INIT = 0.1
-SUBPROBLEM_MU_DUAL_FLOOR_INDIVIDUAL_ROUND = 10
-SUBPROBLEM_MU_DUAL_FLOOR_DECAY_ROUND = 50
-SUBPROBLEM_PG_COST_START_ROUND = 3
-SUBPROBLEM_PG_COST_SCALE_MULTIPLIER = 1.2
-SUBPROBLEM_PG_COST_LR = 2e-5
-SUBPROBLEM_PG_COST_SURR_LR = 5e-5
+SUBPROBLEM_MU_DUAL_FLOOR_INIT = 1
+SUBPROBLEM_MU_DUAL_FLOOR_INDIVIDUAL_ROUND = round(MAX_ITER/10)
+SUBPROBLEM_MU_DUAL_FLOOR_DECAY_ROUND = round(MAX_ITER/2)
+SUBPROBLEM_PG_COST_START_ROUND = round(MAX_ITER/10)
+SUBPROBLEM_PG_COST_SCALE_MULTIPLIER = 3
+SUBPROBLEM_PG_COST_LR = 2e-4
+SUBPROBLEM_PG_COST_SURR_LR = 5e-4
+SUBPROBLEM_PG_COST_REG_DEADBAND = 0.25
 
 # ──────────────────────── 导入 ────────────────────────
 
@@ -266,7 +267,8 @@ def run_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS,
                   pg_cost_start_round: int = 3,
                   pg_cost_scale_multiplier: float = 1.2,
                   pg_cost_lr: float = 2e-5,
-                  pg_cost_surr_lr: float = 5e-5):
+                  pg_cost_surr_lr: float = 5e-5,
+                  pg_cost_reg_deadband: float = 0.25):
     """V3 代理约束训练（样本级并行），返回 (dual_predictor, trainers)。"""
     import os
     from pypower.ext2int import ext2int
@@ -317,6 +319,7 @@ def run_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS,
                 pg_cost_scale_multiplier=pg_cost_scale_multiplier,
                 pg_cost_lr=pg_cost_lr,
                 pg_cost_surr_lr=pg_cost_surr_lr,
+                pg_cost_reg_deadband=pg_cost_reg_deadband,
             )
         else:
             log(f"  机组 {g} ({i+1}/{len(unit_ids)}) — 样本级并行 n_workers={n_workers}")
@@ -338,6 +341,7 @@ def run_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS,
                 pg_cost_scale_multiplier=pg_cost_scale_multiplier,
                 pg_cost_lr=pg_cost_lr,
                 pg_cost_surr_lr=pg_cost_surr_lr,
+                pg_cost_reg_deadband=pg_cost_reg_deadband,
                 n_workers=n_workers,
             )
         if logger is not None:
@@ -715,6 +719,7 @@ def main():
     SUBPROBLEM_PG_COST_SCALE_MULTIPLIER_VALUE = SUBPROBLEM_PG_COST_SCALE_MULTIPLIER
     SUBPROBLEM_PG_COST_LR_VALUE = SUBPROBLEM_PG_COST_LR
     SUBPROBLEM_PG_COST_SURR_LR_VALUE = SUBPROBLEM_PG_COST_SURR_LR
+    SUBPROBLEM_PG_COST_REG_DEADBAND_VALUE = SUBPROBLEM_PG_COST_REG_DEADBAND
 
     # 创建训练指标收集器
     logger = TrainingLogger()
@@ -851,6 +856,7 @@ def main():
                 pg_cost_scale_multiplier=SUBPROBLEM_PG_COST_SCALE_MULTIPLIER_VALUE,
                 pg_cost_lr=SUBPROBLEM_PG_COST_LR_VALUE,
                 pg_cost_surr_lr=SUBPROBLEM_PG_COST_SURR_LR_VALUE,
+                pg_cost_reg_deadband=SUBPROBLEM_PG_COST_REG_DEADBAND_VALUE,
             )
             print_surrogate_results(trainers, all_samples)
 
@@ -1013,6 +1019,7 @@ def main():
                     pg_cost_scale_multiplier=SUBPROBLEM_PG_COST_SCALE_MULTIPLIER_VALUE,
                     pg_cost_lr=SUBPROBLEM_PG_COST_LR_VALUE,
                     pg_cost_surr_lr=SUBPROBLEM_PG_COST_SURR_LR_VALUE,
+                    pg_cost_reg_deadband=SUBPROBLEM_PG_COST_REG_DEADBAND_VALUE,
                 )
             print_surrogate_results(trainers, all_samples)
 

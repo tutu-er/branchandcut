@@ -2864,6 +2864,16 @@ class Agent_NN_BCD:
             # 3. 刷新迭代级张量缓存（整批转换，避免 loss 内逐张量创建）
             if TORCH_AVAILABLE and hasattr(self, 'device'):
                 self._refresh_iter_tensor_cache()
+            obj_primal_pre, obj_dual_pre, obj_opt_pre = self.cal_viol(union_analysis=union_analysis)
+            EPS_PRE = 1e-12
+            obj_primal_pre = obj_primal_pre if abs(obj_primal_pre) >= EPS_PRE else 0.0
+            obj_dual_pre = obj_dual_pre if abs(obj_dual_pre) >= EPS_PRE else 0.0
+            obj_opt_pre = obj_opt_pre if abs(obj_opt_pre) >= EPS_PRE else 0.0
+            print(
+                f"[BCD] obj_primal={obj_primal_pre:.6f}, "
+                f"obj_dual={obj_dual_pre:.6f}, obj_opt={obj_opt_pre:.6f}",
+                flush=True,
+            )
 
             # 4. 使用神经网络更新theta和zeta
             theta_values_new, zeta_values_new = self.iter_with_theta_zeta_neural_network(union_analysis=union_analysis, num_epochs=nn_epochs)

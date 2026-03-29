@@ -67,7 +67,7 @@ if not check_and_install_dependencies_safe():
 #   'bcd'       - 加载 BCD 神经网络模型并报告参数统�?
 #   'both'      - 联合加载 BCD + surrogate，以全体代理约束评估（需同时配置下面两个路径�?
 #
-MODE      = 'surrogate'
+MODE      = 'both'
 RUN_FP    = True       # surrogate / both 模式：是否运行可行性泵测试
 CASE_NAME = 'case3lite'   # 'case3' / 'case3lite' / 'case14' / 'case30' / 'case39' / 'case118'
 SURROGATE_CONSTRAINT_STRATEGY = 'all_templates_sign4'  # 'auto' / 'sensitive' / 'all' / 'all_templates_sign4' / 'all_single_time'
@@ -83,7 +83,7 @@ BCD_MAX_THETA_CONSTRAINTS_PER_TIME_SLOT = 10
 BCD_GAMMA_BASE = 1e-2
 
 # surrogate / both 模式：已训练 surrogate 模型目录（训练时输出的带时间戳路径）
-MODEL_DIR = 'result/surrogate_models/subproblem_models_case3lite_20260329_151459'
+MODEL_DIR = 'result/surrogate_models/subproblem_models_case3lite_20260329_165256'
 
 # bcd / both 模式：已训练 BCD 模型 .pth 文件路径
 # BCD_MODEL_PATH = 'result/bcd_models/bcd_model_case30_20260322_150043.pth'
@@ -104,6 +104,14 @@ FP_MAX_UNIT_COMBINATION_CANDIDATES = 12
 FP_MAX_NEARBY_COMMITMENT_HOT_STARTS = 4
 FP_NEARBY_COMMITMENT_POOL_SIZE = 12
 FP_PARALLEL_STARTS = 2
+FP_SURROGATE_SCREEN_MODE = 'robust'   # 'none' / 'robust'
+FP_SURROGATE_SCREEN_MAX_CONSTRAINTS_PER_UNIT = 3
+FP_SURROGATE_SCREEN_MIN_SUPPORT_RATIO = 0.85
+FP_SURROGATE_SCREEN_MAX_NORMALIZED_VIOLATION = 0.05
+FP_SURROGATE_SCREEN_MIN_MEAN_MARGIN = 0.02
+FP_SURROGATE_SCREEN_CANDIDATE_VIOLATION_TOL = 0.02
+FP_SURROGATE_SCREEN_SOFT_PENALTY = 25.0
+FP_PROJECTION_OBJECTIVE_TAU = 'adaptive'
 USE_CASE3LITE_CUSTOM_FP = True
 CASE3LITE_CUSTOM_FP_MAX_GLOBAL_COMBINATIONS = 24
 CASE3LITE_CUSTOM_FP_PLOT_DIR = 'result/figures_case3lite_custom_fp'
@@ -185,6 +193,45 @@ if MODE in ('surrogate', 'both'):
 def log(msg: str) -> None:
     ts = datetime.now().strftime("%H:%M:%S")
     print(f"[{ts}] {msg}", flush=True)
+
+
+def _log_solution_similarity_summary(
+    lhs_name: str,
+    lhs_list: list[np.ndarray],
+    rhs_name: str,
+    rhs_list: list[np.ndarray],
+    tol: float = 1e-8,
+) -> None:
+    """Summarize whether two groups of commitment matrices are genuinely different."""
+    n = min(len(lhs_list), len(rhs_list))
+    if n == 0:
+        return
+
+    exact_same = 0
+    rounded_same = 0
+    l1_diffs = []
+    max_diffs = []
+    for lhs, rhs in zip(lhs_list[:n], rhs_list[:n]):
+        lhs_arr = np.asarray(lhs, dtype=float)
+        rhs_arr = np.asarray(rhs, dtype=float)
+        diff = np.abs(lhs_arr - rhs_arr)
+        l1_diffs.append(float(np.sum(diff)))
+        max_diffs.append(float(np.max(diff)))
+        if np.all(diff <= tol):
+            exact_same += 1
+        if np.array_equal((lhs_arr >= 0.5).astype(int), (rhs_arr >= 0.5).astype(int)):
+            rounded_same += 1
+
+    log(
+        f"{lhs_name} vs {rhs_name}: exact_same={exact_same}/{n}, "
+        f"rounded_same={rounded_same}/{n}, "
+        f"mean_l1={float(np.mean(l1_diffs)):.4f}, max_abs={float(np.max(max_diffs)):.4e}"
+    )
+    if exact_same == n:
+        log(
+            f"警告: {lhs_name} 与 {rhs_name} 在当前样本上完全相同。"
+            f"这通常表示附加约束/惩罚没有实际改变 LP 解。"
+        )
 
 
 def _resolve_surrogate_display_layout(trainer, sample: dict | None, n_constraints: int):
@@ -719,6 +766,51 @@ def plot_fp_results(fp_results: list, fig_dir: Path, case_name: str) -> None:
 
     fig.tight_layout()
     _save_fig(fig, fig_dir / f'{case_name}_fp_results', 'FP 测试结果')
+
+
+def plot_fp_screening_comparison(screening_records: list, fig_dir: Path, case_name: str) -> None:
+    """Compare baseline FP candidate counts with robust-surrogate-screen counts."""
+    if not MPL_AVAILABLE or not screening_records:
+        return
+
+    _apply_style()
+    sample_ids = [record['sample_index'] for record in screening_records]
+    hot_before = [record['hot_starts_before'] for record in screening_records]
+    hot_after = [record['hot_starts_after'] for record in screening_records]
+    pool_before = [record['x_pool_before'] for record in screening_records]
+    pool_after = [record['x_pool_after'] for record in screening_records]
+    n_constraints = [record['n_constraints'] for record in screening_records]
+
+    x = np.arange(len(screening_records))
+    width = 0.34
+
+    fig, axes = plt.subplots(3, 1, figsize=(10, 8), sharex=True)
+    fig.suptitle(
+        f'FP Commitment Screening Comparison  [{case_name}]',
+        fontsize=12, fontweight='bold'
+    )
+
+    axes[0].bar(x - width / 2, hot_before, width=width, color='#9ECAE1', label='Baseline')
+    axes[0].bar(x + width / 2, hot_after, width=width, color='#3182BD', label='Robust surrogate screen')
+    axes[0].set_ylabel('Hot starts')
+    axes[0].legend(loc='upper right', framealpha=0.85)
+
+    axes[1].bar(x - width / 2, pool_before, width=width, color='#FDD0A2', label='Baseline')
+    axes[1].bar(x + width / 2, pool_after, width=width, color='#E6550D', label='Robust surrogate screen')
+    axes[1].set_ylabel('Pool size')
+    axes[1].legend(loc='upper right', framealpha=0.85)
+
+    axes[2].plot(x, n_constraints, marker='o', color='#31A354', linewidth=1.8)
+    axes[2].set_ylabel('Selected rows')
+    axes[2].set_xlabel('Sample Index')
+    axes[2].set_xticks(x)
+    axes[2].set_xticklabels([f'#{idx}' for idx in sample_ids], fontsize=8)
+
+    for ax in axes:
+        ax.grid(axis='x', alpha=0.0)
+
+    fig.tight_layout()
+    _save_fig(fig, fig_dir / f'{case_name}_fp_screening_comparison', 'FP 筛选对比')
 
 
 def plot_bcd_analysis(agent, fig_dir: Path, case_name: str) -> None:
@@ -1315,6 +1407,12 @@ def run_lp_compare_test(ppc, all_samples: list, dual_predictor, trainers: dict,
                                            != x_true_list[i].astype(int)))
                                 for i in range(len(x_LP_plain_list))])
         log(f"LP 评估完成: 平均 Hamming 距离 = {mean_hamming:.1f} bits")
+        _log_solution_similarity_summary(
+            "Standard LP",
+            x_LP_plain_list,
+            "Surrogate LP",
+            x_LP_surr_list,
+        )
         print("=" * 70)
         plot_lp_vs_true(x_LP_plain_list, x_true_list, fig_dir, CASE_NAME)
         if first_plot_payload is not None:
@@ -1331,7 +1429,8 @@ def run_lp_compare_test(ppc, all_samples: list, dual_predictor, trainers: dict,
 
 def run_fp_test(ppc, all_samples: list, dual_predictor, trainers: dict,
                 T_DELTA: float, n_test: int, agent=None,
-                scenario_bank: list | None = None) -> list:
+                scenario_bank: list | None = None,
+                fig_dir: Path | None = None) -> list:
     """对多个样本运行可行性泵并汇总结果。"""
     test_n = min(n_test, len(all_samples))
     print("\n" + "=" * 70)
@@ -1339,6 +1438,7 @@ def run_fp_test(ppc, all_samples: list, dual_predictor, trainers: dict,
     print("=" * 70)
 
     results = []
+    screening_records = []
     if scenario_bank is None:
         scenario_bank = all_samples
     custom_fp_plot_dir = None
@@ -1367,7 +1467,7 @@ def run_fp_test(ppc, all_samples: list, dual_predictor, trainers: dict,
                     verbose=True,
                 )
             else:
-                x_result, success = recover_integer_solution(
+                x_result, success, fp_details = recover_integer_solution(
                     sample, trainers, dual_predictor, ppc, T_DELTA,
                     agent=agent,
                     max_fp_iter=FP_MAX_ITER,
@@ -1379,8 +1479,37 @@ def run_fp_test(ppc, all_samples: list, dual_predictor, trainers: dict,
                     nearby_commitment_pool_size=FP_NEARBY_COMMITMENT_POOL_SIZE,
                     parallel_fp_starts=FP_PARALLEL_STARTS,
                     scenario_bank=scenario_bank,
+                    surrogate_screen_mode=FP_SURROGATE_SCREEN_MODE,
+                    surrogate_screen_max_constraints_per_unit=FP_SURROGATE_SCREEN_MAX_CONSTRAINTS_PER_UNIT,
+                    surrogate_screen_min_support_ratio=FP_SURROGATE_SCREEN_MIN_SUPPORT_RATIO,
+                    surrogate_screen_max_normalized_violation=FP_SURROGATE_SCREEN_MAX_NORMALIZED_VIOLATION,
+                    surrogate_screen_min_mean_margin=FP_SURROGATE_SCREEN_MIN_MEAN_MARGIN,
+                    surrogate_screen_candidate_violation_tol=FP_SURROGATE_SCREEN_CANDIDATE_VIOLATION_TOL,
+                    surrogate_screen_soft_penalty=FP_SURROGATE_SCREEN_SOFT_PENALTY,
+                    projection_objective_tau=FP_PROJECTION_OBJECTIVE_TAU,
+                    return_details=True,
                     verbose=True,
                 )
+                screen_summary = fp_details.get('surrogate_screen_summary', {})
+                if screen_summary:
+                    screening_records.append(
+                        {
+                            'sample_index': i,
+                            'hot_starts_before': int(screen_summary.get('hot_starts_before', 0)),
+                            'hot_starts_after': int(screen_summary.get('hot_starts_after', 0)),
+                            'x_pool_before': int(screen_summary.get('x_pool_before', 0)),
+                            'x_pool_after': int(screen_summary.get('x_pool_after', 0)),
+                            'n_constraints': int(screen_summary.get('n_constraints', 0)),
+                        }
+                    )
+                    log(
+                        "    FP筛选对比: "
+                        f"hot_starts {screen_summary.get('hot_starts_before', 0)} -> {screen_summary.get('hot_starts_after', 0)}, "
+                        f"x_pool {screen_summary.get('x_pool_before', 0)} -> {screen_summary.get('x_pool_after', 0)}, "
+                        f"stable_rows={screen_summary.get('n_constraints', 0)}, "
+                        f"soft_penalty={fp_details.get('surrogate_screen_soft_penalty', 0.0):.2f}, "
+                        f"tau={fp_details.get('projection_objective_tau', 'adaptive')}"
+                    )
         except Exception as e:
             log(f"    异常: {e}")
             import traceback
@@ -1396,6 +1525,8 @@ def run_fp_test(ppc, all_samples: list, dual_predictor, trainers: dict,
     print("\n" + "=" * 70)
     log(f"可行性泵完成: {n_success}/{test_n} 样本找到可行解")
     print("=" * 70)
+    if fig_dir is not None and screening_records:
+        plot_fp_screening_comparison(screening_records, fig_dir, CASE_NAME)
     return results
 
 
@@ -1407,6 +1538,7 @@ def test_surrogate(ppc, all_samples: list, T_DELTA: float,
     print("\n" + "=" * 70)
     log(f"加载 surrogate 模型: {model_dir}")
     print("=" * 70)
+    log("说明: surrogate 模式分析 `Standard LP` 与 `Surrogate LP`，并可选运行 FP 恢复整数解。")
 
     if not Path(model_dir).exists():
         log(f"错误: 模型目录不存在: {model_dir}")
@@ -1441,7 +1573,7 @@ def test_surrogate(ppc, all_samples: list, T_DELTA: float,
     if RUN_FP:
         fp_results = run_fp_test(
             ppc, all_samples, dual_predictor, trainers, T_DELTA, TEST_SAMPLES,
-            scenario_bank=scenario_bank,
+            scenario_bank=scenario_bank, fig_dir=fig_dir,
         )
         plot_fp_results(fp_results, fig_dir, CASE_NAME)
 
@@ -1876,6 +2008,12 @@ def analyse_lp_distance(agent, test_n: int, fig_dir: Path,
         f"{comparison_name}={hamming_surr_arr[:nv].mean():.1f}")
     reduction = (1 - dist_surr_arr[:nv].mean() / max(dist_lp_arr[:nv].mean(), 1e-9)) * 100
     log(f"  {comparison_name} 相对 LP 的 L1 缩减: {reduction:.1f}%")
+    _log_solution_similarity_summary(
+        "Standard LP",
+        x_lp_list,
+        comparison_name,
+        x_surr_list,
+    )
     print("-" * 60)
 
     plot_lp_surrogate_comparison(
@@ -1902,6 +2040,7 @@ def test_bcd(ppc, data_file: Path, bcd_model_path: str,
     print("\n" + "=" * 70)
     log(f"加载 BCD 模型: {bcd_model_path}")
     print("=" * 70)
+    log("说明: bcd 模式只分析 `Standard LP` 与 `BCD LP`，不加载 surrogate 模型，也不运行 FP 恢复整数解。")
 
     agent = _load_bcd_agent(
         ppc,
@@ -2016,7 +2155,7 @@ def test_both(ppc, data_file: Path, all_samples: list, T_DELTA: float,
         log("── Step 4/4  以全体代理约束运行可行性泵")
         fp_results = run_fp_test(
             ppc, all_samples, dual_predictor, trainers, T_DELTA, test_samples,
-            agent=agent, scenario_bank=scenario_bank,
+            agent=agent, scenario_bank=scenario_bank, fig_dir=fig_dir,
         )
         plot_fp_results(fp_results, fig_dir, CASE_NAME)
     else:

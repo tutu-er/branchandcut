@@ -24,8 +24,10 @@ try:
         _compute_hot_start_support_reference,
         _compute_vote_majority,
         _extract_commitment_from_sample,
-        _repair_min_up_down_heuristic,
+        _repair_commitment_logic_heuristic,
         _score_hot_start_candidate,
+        _sanitize_named_commitment_candidates,
+        check_commitment_logic_feasibility,
         check_uc_feasibility,
         collect_integer_solutions,
         identify_trusted_mask,
@@ -42,8 +44,10 @@ except ImportError:
         _compute_hot_start_support_reference,
         _compute_vote_majority,
         _extract_commitment_from_sample,
-        _repair_min_up_down_heuristic,
+        _repair_commitment_logic_heuristic,
         _score_hot_start_candidate,
+        _sanitize_named_commitment_candidates,
+        check_commitment_logic_feasibility,
         check_uc_feasibility,
         collect_integer_solutions,
         identify_trusted_mask,
@@ -154,6 +158,76 @@ def _finalize_unit_options(
     return deduped
 
 
+def _sanitize_case3lite_unit_options(
+    options: List[dict],
+    ppc: dict,
+    T_delta: float,
+    unit_id: int,
+    fallback_rows: Optional[List[Tuple[str, np.ndarray]]] = None,
+) -> List[dict]:
+    best_by_key: Dict[tuple, dict] = {}
+    unit_ids = np.asarray([unit_id], dtype=int)
+
+    def _consume(option_items: List[dict]) -> None:
+        for option in sorted(option_items, key=lambda item: item["score"], reverse=True):
+            repaired_row = _repair_commitment_logic_heuristic(
+                np.asarray(option["row"], dtype=int),
+                T_delta,
+                ppc=ppc,
+                unit_ids=unit_ids,
+            )
+            is_valid, _reason = check_commitment_logic_feasibility(
+                repaired_row,
+                ppc,
+                T_delta,
+                unit_ids=unit_ids,
+            )
+            if not is_valid:
+                continue
+
+            key = tuple(np.asarray(repaired_row, dtype=int).tolist())
+            if key in best_by_key:
+                continue
+            sanitized = dict(option)
+            sanitized["row"] = np.asarray(repaired_row, dtype=int)
+            best_by_key[key] = sanitized
+
+    _consume(list(options))
+    if best_by_key or not fallback_rows:
+        return list(best_by_key.values())
+
+    fallback_options = [
+        {
+            "name": str(name),
+            "row": np.asarray(row, dtype=int),
+            "score": -1e6 - idx,
+        }
+        for idx, (name, row) in enumerate(fallback_rows)
+    ]
+    _consume(fallback_options)
+    return list(best_by_key.values())
+
+
+def _repair_and_validate_case3lite_candidate(
+    candidate: np.ndarray,
+    ppc: dict,
+    T_delta: float,
+) -> Optional[np.ndarray]:
+    repaired = _repair_commitment_logic_heuristic(
+        np.asarray(candidate, dtype=int),
+        T_delta,
+        ppc=ppc,
+    )
+    is_valid, _reason = check_commitment_logic_feasibility(
+        repaired,
+        ppc,
+        T_delta,
+    )
+    if not is_valid:
+        return None
+    return np.asarray(repaired, dtype=int)
+
+
 def _build_g0_options(
     g: int,
     T: int,
@@ -190,7 +264,7 @@ def _build_g0_options(
         for idx in range(nearby_rows.shape[0]):
             candidates.append((f"nearby_{idx + 1}", nearby_rows[idx], 0.0))
 
-    for name, row, bonus in _unique_binary_rows([(n, r) for n, r, _b in candidates]):
+    for name, row in _unique_binary_rows([(n, r) for n, r, _b in candidates]):
         row_bonus = next(b for n, _r, b in candidates if n == name)
         score = _score_unit_option(
             row,
@@ -387,6 +461,8 @@ def _build_g2_options(
 
 def _build_case3lite_unit_options(
     sample: dict,
+    ppc: dict,
+    T_delta: float,
     x_lp: np.ndarray,
     x_surr_lp: np.ndarray,
     x_init_k: np.ndarray,
@@ -455,6 +531,22 @@ def _build_case3lite_unit_options(
                 nearby_rows,
                 load_profile,
             )
+        fallback_rows = [
+            ("unit_lp_fallback", x_init_k[g]),
+            ("lp_round_fallback", round_to_integer(x_lp[g])),
+            ("surrogate_round_fallback", round_to_integer(x_surr_lp[g])),
+            ("vote_fallback", vote_majority[g]),
+            ("all_off_fallback", np.zeros(T, dtype=int)),
+            ("all_on_fallback", np.ones(T, dtype=int)),
+        ]
+        options = _sanitize_case3lite_unit_options(
+            options,
+            ppc,
+            T_delta,
+            g,
+            fallback_rows=fallback_rows,
+        )
+        options = _finalize_unit_options(options, max_options=max(1, len(options)))
         unit_options.append(options)
         trusted_mask[g] = trusted_row
 
@@ -463,6 +555,7 @@ def _build_case3lite_unit_options(
 
 def _build_case3lite_global_combinations(
     unit_options: List[List[dict]],
+    ppc: dict,
     x_lp: np.ndarray,
     x_surr_lp: np.ndarray,
     x_init_k: np.ndarray,
@@ -486,7 +579,9 @@ def _build_case3lite_global_combinations(
     for combo_index, option_tuple in enumerate(itertools.product(*unit_options), start=1):
         rows = [np.asarray(item["row"], dtype=int) for item in option_tuple]
         candidate = np.stack(rows, axis=0)
-        repaired = _repair_min_up_down_heuristic(candidate, T_delta)
+        repaired = _repair_and_validate_case3lite_candidate(candidate, ppc, T_delta)
+        if repaired is None:
+            continue
         key = _candidate_key(repaired)
         if key in seen:
             continue
@@ -520,6 +615,30 @@ def _build_case3lite_global_combinations(
             }
         )
 
+    if not combos:
+        fallback_specs = [
+            ("unit_lp_fallback_combo", np.asarray(x_init_k, dtype=int)),
+            ("joint_lp_fallback_combo", round_to_integer(x_lp)),
+            ("surrogate_lp_fallback_combo", round_to_integer(x_surr_lp)),
+        ]
+        fallback_candidates, _rejected_fallbacks = _sanitize_named_commitment_candidates(
+            fallback_specs,
+            ppc,
+            T_delta,
+        )
+        for combo_index, (name, candidate) in enumerate(fallback_candidates, start=1):
+            combos.append(
+                {
+                    "id": combo_index,
+                    "candidate": np.asarray(candidate, dtype=int),
+                    "score": -1e6 - combo_index,
+                    "weight": 0.0,
+                    "unit_choice_names": [name] * candidate.shape[0],
+                    "unit_choice_weights": [0.0] * candidate.shape[0],
+                    "unit_option_scores": [0.0] * candidate.shape[0],
+                }
+            )
+
     combos.sort(key=lambda item: item["score"], reverse=True)
     combos = combos[: max(1, int(max_global_combinations))]
     weights = _softmax_weights([item["score"] for item in combos], temperature=4.0)
@@ -529,11 +648,13 @@ def _build_case3lite_global_combinations(
 
 
 def _build_case3lite_x_pool(
+    ppc: dict,
+    T_delta: float,
     x_init_k: np.ndarray,
     x_init_k_m: np.ndarray,
     global_combinations: List[dict],
     nearby_commitment_candidates: Optional[List[Tuple[str, np.ndarray]]],
-) -> np.ndarray:
+) -> Optional[np.ndarray]:
     x_pool_list: List[np.ndarray] = [np.asarray(x_init_k, dtype=int)]
     if x_init_k_m.ndim == 3 and x_init_k_m.shape[1] > 0:
         x_pool_list.extend(list(np.asarray(x_init_k_m, dtype=int).transpose(1, 0, 2)))
@@ -544,13 +665,21 @@ def _build_case3lite_x_pool(
     unique: List[np.ndarray] = []
     seen = set()
     for candidate in x_pool_list:
-        key = _candidate_key(candidate)
+        candidate_int = _repair_and_validate_case3lite_candidate(candidate, ppc, T_delta)
+        if candidate_int is None:
+            continue
+        key = _candidate_key(candidate_int)
         if key in seen:
             continue
         seen.add(key)
-        unique.append(np.asarray(candidate, dtype=int))
+        unique.append(candidate_int)
 
-    return np.stack(unique, axis=0)
+    if not unique:
+        base_candidate = _repair_and_validate_case3lite_candidate(x_init_k, ppc, T_delta)
+        if base_candidate is not None:
+            unique.append(base_candidate)
+
+    return np.stack(unique, axis=0) if unique else None
 
 
 def _print_unit_option_weights(unit_options: List[List[dict]]) -> None:
@@ -637,6 +766,49 @@ def _plot_unit_options(
     _save_fig(fig, plot_dir / f"{sample_tag}_unit_candidates")
 
 
+def _plot_final_feasible_unit_combination(
+    unit_options: List[List[dict]],
+    final_solution: Optional[np.ndarray],
+    plot_dir: Path,
+    sample_tag: str,
+) -> None:
+    if not MPL_AVAILABLE or final_solution is None:
+        return
+
+    final_arr = np.asarray(final_solution, dtype=int)
+    n_units = final_arr.shape[0]
+    fig, axes = plt.subplots(n_units, 1, figsize=(12, 2.2 * n_units), squeeze=False)
+    fig.suptitle(
+        f"Case3lite custom FP final feasible unit combination [{sample_tag}]",
+        fontsize=12,
+        fontweight="bold",
+    )
+
+    for g in range(n_units):
+        ax = axes[g, 0]
+        row = final_arr[g][np.newaxis, :]
+        im = ax.imshow(row, aspect="auto", cmap="Blues", vmin=0, vmax=1)
+
+        matched_name = "final_feasible"
+        for option in unit_options[g]:
+            option_row = np.asarray(option["row"], dtype=int)
+            if option_row.shape == final_arr[g].shape and np.array_equal(option_row, final_arr[g]):
+                matched_name = f"{option['name']}  w={option.get('weight', 0.0):.2f}"
+                break
+        else:
+            matched_name = "fp_adjusted_final"
+
+        ax.set_yticks([0])
+        ax.set_yticklabels([matched_name], fontsize=8)
+        ax.set_ylabel(f"G{g}")
+        if g == n_units - 1:
+            ax.set_xlabel("Time period")
+        fig.colorbar(im, ax=ax, fraction=0.020, pad=0.02)
+
+    fig.tight_layout()
+    _save_fig(fig, plot_dir / f"{sample_tag}_final_feasible_unit_combination")
+
+
 def _plot_global_combinations(
     global_combinations: List[dict],
     final_solution: Optional[np.ndarray],
@@ -647,7 +819,7 @@ def _plot_global_combinations(
     if not MPL_AVAILABLE or not global_combinations:
         return
 
-    top_k = min(4, len(global_combinations))
+    top_k = min(8, len(global_combinations))
     panels: List[Tuple[str, np.ndarray]] = []
     for rank, combo in enumerate(global_combinations[:top_k], start=1):
         title = f"combo{rank} w={combo.get('weight', 0.0):.2f}"
@@ -657,18 +829,54 @@ def _plot_global_combinations(
     if reference_solution is not None:
         panels.append(("reference", np.asarray(reference_solution, dtype=int)))
 
-    fig, axes = plt.subplots(1, len(panels), figsize=(3.4 * len(panels), 4.2), squeeze=False)
+    fig, axes = plt.subplots(len(panels), 1, figsize=(12, 2.8 * len(panels)), squeeze=False)
     fig.suptitle(f"Case3lite custom FP combinations [{sample_tag}]", fontsize=12, fontweight="bold")
-    for ax, (title, data) in zip(axes[0], panels):
+    for ax, (title, data) in zip(axes[:, 0], panels):
         im = ax.imshow(data, aspect="auto", cmap="Blues", vmin=0, vmax=1)
         ax.set_title(title, fontsize=10)
         ax.set_yticks(range(data.shape[0]))
         ax.set_yticklabels([f"G{g}" for g in range(data.shape[0])], fontsize=8)
         ax.set_xlabel("Time period")
-        fig.colorbar(im, ax=ax, fraction=0.045, pad=0.03)
+        fig.colorbar(im, ax=ax, fraction=0.020, pad=0.02)
 
     fig.tight_layout()
     _save_fig(fig, plot_dir / f"{sample_tag}_global_combinations")
+
+
+def _plot_lp_surrogate_comparison(
+    x_lp: np.ndarray,
+    x_surr_lp: np.ndarray,
+    x_init_k: np.ndarray,
+    final_solution: Optional[np.ndarray],
+    reference_solution: Optional[np.ndarray],
+    plot_dir: Path,
+    sample_tag: str,
+) -> None:
+    if not MPL_AVAILABLE:
+        return
+
+    panels: List[Tuple[str, np.ndarray, str]] = [
+        ("joint_lp", np.asarray(x_lp, dtype=float), "viridis"),
+        ("surrogate_lp", np.asarray(x_surr_lp, dtype=float), "viridis"),
+        ("surrogate_round", np.asarray(x_init_k, dtype=int), "Blues"),
+    ]
+    if final_solution is not None:
+        panels.append(("final_feasible", np.asarray(final_solution, dtype=int), "Blues"))
+    if reference_solution is not None:
+        panels.append(("reference", np.asarray(reference_solution, dtype=int), "Blues"))
+
+    fig, axes = plt.subplots(len(panels), 1, figsize=(12, 2.8 * len(panels)), squeeze=False)
+    fig.suptitle(f"Case3lite custom FP LP vs surrogate [{sample_tag}]", fontsize=12, fontweight="bold")
+    for ax, (title, data, cmap) in zip(axes[:, 0], panels):
+        im = ax.imshow(data, aspect="auto", cmap=cmap, vmin=0, vmax=1)
+        ax.set_title(title, fontsize=10)
+        ax.set_yticks(range(data.shape[0]))
+        ax.set_yticklabels([f"G{g}" for g in range(data.shape[0])], fontsize=8)
+        ax.set_xlabel("Time period")
+        fig.colorbar(im, ax=ax, fraction=0.020, pad=0.02)
+
+    fig.tight_layout()
+    _save_fig(fig, plot_dir / f"{sample_tag}_lp_surrogate_comparison")
 
 
 def recover_integer_solution_case3lite(
@@ -750,11 +958,24 @@ def recover_integer_solution_case3lite(
         candidate_pool_size=12,
         rng=rng,
     )
+    nearby_commitment_candidates, _rejected_nearby_candidates = _sanitize_named_commitment_candidates(
+        nearby_commitment_candidates,
+        ppc,
+        T_delta,
+    )
+    if verbose and _rejected_nearby_candidates:
+        print(
+            f"Case3lite custom FP: filtered {len(_rejected_nearby_candidates)} "
+            f"structurally infeasible nearby commitments",
+            flush=True,
+        )
 
     if verbose:
         print("Case3lite custom FP: Step 4/6 build role-based unit options", flush=True)
     unit_options, trusted_mask, support_reference = _build_case3lite_unit_options(
         sample,
+        ppc,
+        T_delta,
         x_lp,
         x_surr_lp,
         x_init_k,
@@ -768,6 +989,7 @@ def recover_integer_solution_case3lite(
         print("Case3lite custom FP: Step 5/6 compose global combinations", flush=True)
     global_combinations = _build_case3lite_global_combinations(
         unit_options,
+        ppc,
         x_lp,
         x_surr_lp,
         x_init_k,
@@ -781,6 +1003,8 @@ def recover_integer_solution_case3lite(
     _print_global_combo_weights(global_combinations)
 
     x_pool = _build_case3lite_x_pool(
+        ppc,
+        T_delta,
         x_init_k,
         x_init_k_m,
         global_combinations,
@@ -831,8 +1055,23 @@ def recover_integer_solution_case3lite(
     if plot_dir is not None:
         plot_dir_path = Path(plot_dir)
         _plot_unit_options(unit_options, plot_dir_path, sample_tag)
+        _plot_final_feasible_unit_combination(
+            unit_options,
+            final_solution,
+            plot_dir_path,
+            sample_tag,
+        )
         _plot_global_combinations(
             global_combinations,
+            final_solution,
+            reference_solution,
+            plot_dir_path,
+            sample_tag,
+        )
+        _plot_lp_surrogate_comparison(
+            x_lp,
+            x_surr_lp,
+            x_init_k,
             final_solution,
             reference_solution,
             plot_dir_path,

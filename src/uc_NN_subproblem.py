@@ -1524,6 +1524,7 @@ class SubproblemSurrogateTrainer:
                  pg_cost_scale_multiplier: float = 1.2,
                  pg_cost_lr: float = 2e-5,
                  pg_cost_surr_lr: float = 5e-5,
+                 pg_cost_reg_deadband: float = 0.25,
                  device=None):
         """
         初始化单机组子问题代理约束训练器 - V3三时段版本
@@ -1559,6 +1560,7 @@ class SubproblemSurrogateTrainer:
         self.template_rhs_reg_deadband = 0.25
         self.coeff_reg_deadband = 0.35
         self.aux_cost_reg_deadband = 0.1
+        self.pg_cost_reg_deadband = max(float(pg_cost_reg_deadband), 0.0)
         self.requested_max_constraints = max_constraints
         self.max_constraints = max_constraints  # V3新增
         
@@ -1796,7 +1798,8 @@ class SubproblemSurrogateTrainer:
         )
         print(
             f"  - c_pg_start_round={self.pg_cost_start_round}, "
-            f"c_pg_lr={self.pg_cost_lr:.2e}, c_pg_surr_lr={self.pg_cost_surr_lr:.2e}",
+            f"c_pg_lr={self.pg_cost_lr:.2e}, c_pg_surr_lr={self.pg_cost_surr_lr:.2e}, "
+            f"c_pg_deadband={self.pg_cost_reg_deadband:.4f}",
             flush=True,
         )
 
@@ -2875,7 +2878,7 @@ class SubproblemSurrogateTrainer:
 
         reg_loss = self.reg_weight * self._deadband_quadratic(
             pg_costs_tensor,
-            self.aux_cost_reg_deadband,
+            self.pg_cost_reg_deadband,
         )
         return self.rho_dual_pg * obj_dual_pg + reg_loss
     
@@ -3556,6 +3559,7 @@ class SubproblemSurrogateTrainer:
                 'pg_cost_scale_multiplier': self.pg_cost_scale_multiplier,
                 'pg_cost_lr': self.pg_cost_lr,
                 'pg_cost_surr_lr': self.pg_cost_surr_lr,
+                'pg_cost_reg_deadband': self.pg_cost_reg_deadband,
                 'template_rhs_jitter_scale': self.template_rhs_jitter_scale,
                 'template_rhs_reg_deadband': self.template_rhs_reg_deadband,
                 'coeff_reg_deadband': self.coeff_reg_deadband,
@@ -3617,6 +3621,10 @@ class SubproblemSurrogateTrainer:
             )
             self.pg_cost_lr = state.get('pg_cost_lr', self.pg_cost_lr)
             self.pg_cost_surr_lr = state.get('pg_cost_surr_lr', self.pg_cost_surr_lr)
+            self.pg_cost_reg_deadband = state.get(
+                'pg_cost_reg_deadband',
+                self.pg_cost_reg_deadband,
+            )
             self.template_rhs_jitter_scale = state.get(
                 'template_rhs_jitter_scale',
                 self.template_rhs_jitter_scale,
@@ -3710,6 +3718,7 @@ def train_subproblem_surrogate_from_data(ppc, active_set_data: List[Dict], unit_
                                           pg_cost_scale_multiplier: float = 1.2,
                                           pg_cost_lr: float = 2e-5,
                                           pg_cost_surr_lr: float = 5e-5,
+                                          pg_cost_reg_deadband: float = 0.25,
                                           save_path: str = None, device=None) -> SubproblemSurrogateTrainer:
     """
     训练单机组子问题代理约束
@@ -3746,6 +3755,7 @@ def train_subproblem_surrogate_from_data(ppc, active_set_data: List[Dict], unit_
         pg_cost_scale_multiplier=pg_cost_scale_multiplier,
         pg_cost_lr=pg_cost_lr,
         pg_cost_surr_lr=pg_cost_surr_lr,
+        pg_cost_reg_deadband=pg_cost_reg_deadband,
         device=device
     )
     
@@ -3772,6 +3782,7 @@ def train_all_subproblem_surrogates(ppc, active_set_data: List[Dict], T_delta: f
                                       pg_cost_scale_multiplier: float = 1.2,
                                       pg_cost_lr: float = 2e-5,
                                       pg_cost_surr_lr: float = 5e-5,
+                                      pg_cost_reg_deadband: float = 0.25,
                                       save_dir: str = None, device=None) -> Dict[int, SubproblemSurrogateTrainer]:
     """
     训练所有机组的子问题代理约束
@@ -3818,6 +3829,7 @@ def train_all_subproblem_surrogates(ppc, active_set_data: List[Dict], T_delta: f
             pg_cost_scale_multiplier=pg_cost_scale_multiplier,
             pg_cost_lr=pg_cost_lr,
             pg_cost_surr_lr=pg_cost_surr_lr,
+            pg_cost_reg_deadband=pg_cost_reg_deadband,
             device=device
         )
         

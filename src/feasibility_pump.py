@@ -242,7 +242,11 @@ def _resolve_surrogate_constraint_layout(
 ) -> Tuple[List[int], List[tuple[int, ...]]]:
     timesteps = _resolve_surrogate_constraint_timesteps(trainer, sample, T, n_constraints)
     sample_id = _resolve_surrogate_sample_id(trainer, sample)
-    offsets = resolve_constraint_offsets_from_trainer(trainer, sample_id, len(timesteps))
+    try:
+        offsets = resolve_constraint_offsets_from_trainer(trainer, sample_id, len(timesteps))
+    except TypeError:
+        offsets = resolve_constraint_offsets_from_trainer(trainer, sample_id)
+    offsets = list(offsets)
     if len(offsets) < len(timesteps):
         default_offsets = (
             SURROGATE_SINGLE_TIME_OFFSETS
@@ -255,38 +259,399 @@ def _resolve_surrogate_constraint_layout(
     return timesteps, offsets[:len(timesteps)]
 
 
-def _repair_min_up_down_heuristic(x_int: np.ndarray, T_delta: float) -> np.ndarray:
-    """Apply a light minimum up/down time repair to a binary schedule."""
-    x_repaired = np.asarray(x_int, dtype=int).copy()
-    ng, T = x_repaired.shape
-    Ton = min(int(4 * T_delta), T - 1)
-    Toff = min(int(4 * T_delta), T - 1)
+def _evaluate_surrogate_constraint_row(
+    x_row: np.ndarray,
+    timestep: int,
+    offsets: tuple[int, ...],
+    alpha: float,
+    beta: float,
+    gamma: float,
+    rhs: float,
+    horizon: int,
+) -> dict:
+    """Evaluate one surrogate row on a unit commitment vector."""
+    x_arr = np.asarray(x_row, dtype=float).reshape(-1)
+    lhs = float(
+        build_surrogate_constraint_expression(
+            x_arr,
+            int(timestep),
+            tuple(offsets),
+            float(alpha),
+            float(beta),
+            float(gamma),
+            int(horizon),
+        )
+    )
+    violation = max(0.0, lhs - float(rhs))
+    coef_scale = max(abs(float(alpha)) + abs(float(beta)) + abs(float(gamma)), 1.0)
+    return {
+        'lhs': lhs,
+        'rhs': float(rhs),
+        'violation': float(violation),
+        'margin': float(rhs - lhs),
+        'normalized_violation': float(violation / coef_scale),
+        'normalized_margin': float((rhs - lhs) / coef_scale),
+        'coef_scale': float(coef_scale),
+    }
 
-    if T <= 1:
-        return x_repaired
 
+def _build_surrogate_screen_reference_rows(
+    x_LP: np.ndarray,
+    x_surr_lp: np.ndarray,
+    x_init_k: np.ndarray,
+    x_init_k_m: np.ndarray,
+    nearby_commitment_candidates: Optional[List[Tuple[str, np.ndarray]]] = None,
+) -> Dict[int, List[Tuple[str, np.ndarray]]]:
+    """Collect diverse per-unit reference rows used to select stable surrogate rows."""
+    x_lp_arr = np.asarray(x_LP, dtype=float)
+    x_surr_arr = np.asarray(x_surr_lp, dtype=float)
+    x_init_arr = np.asarray(x_init_k, dtype=int)
+    ng = x_init_arr.shape[0]
+
+    references: Dict[int, List[Tuple[str, np.ndarray]]] = {g: [] for g in range(ng)}
     for g in range(ng):
+        references[g].extend([
+            ('joint_lp', np.asarray(x_lp_arr[g], dtype=float)),
+            ('joint_lp_round', np.asarray(round_to_integer(x_lp_arr[g]), dtype=int)),
+            ('surrogate_lp', np.asarray(x_surr_arr[g], dtype=float)),
+            ('surrogate_lp_round', np.asarray(round_to_integer(x_surr_arr[g]), dtype=int)),
+            ('subproblem_round', np.asarray(x_init_arr[g], dtype=int)),
+        ])
+
+    x_init_k_m_arr = np.asarray(x_init_k_m)
+    if x_init_k_m_arr.ndim == 3 and x_init_k_m_arr.shape[1] > 0:
+        for m in range(x_init_k_m_arr.shape[1]):
+            for g in range(ng):
+                references[g].append(
+                    (f'perturb_{m + 1}', np.asarray(x_init_k_m_arr[g, m, :], dtype=int))
+                )
+
+    if nearby_commitment_candidates:
+        for idx, (_name, candidate) in enumerate(nearby_commitment_candidates, start=1):
+            candidate_arr = np.asarray(candidate, dtype=int)
+            if candidate_arr.ndim != 2 or candidate_arr.shape[0] != ng:
+                continue
+            for g in range(ng):
+                references[g].append((f'nearby_{idx}', candidate_arr[g]))
+
+    deduped: Dict[int, List[Tuple[str, np.ndarray]]] = {}
+    for g, rows in references.items():
+        seen = set()
+        kept: List[Tuple[str, np.ndarray]] = []
+        for name, row in rows:
+            row_arr = np.asarray(row, dtype=float).reshape(-1)
+            key = tuple(np.round(row_arr, 6).tolist())
+            if key in seen:
+                continue
+            seen.add(key)
+            kept.append((str(name), row_arr))
+        deduped[g] = kept
+    return deduped
+
+
+def _select_stable_surrogate_screen_constraints(
+    scenario_input: np.ndarray | dict,
+    trainers: Dict[int, 'SubproblemSurrogateTrainer'],
+    lambda_val,
+    x_LP: np.ndarray,
+    x_surr_lp: np.ndarray,
+    x_init_k: np.ndarray,
+    x_init_k_m: np.ndarray,
+    nearby_commitment_candidates: Optional[List[Tuple[str, np.ndarray]]] = None,
+    max_constraints_per_unit: int = 3,
+    min_support_ratio: float = 0.85,
+    max_normalized_violation: float = 0.05,
+    min_mean_margin: float = 0.02,
+) -> List[dict]:
+    """Pick surrogate rows that remain satisfied across diverse local references."""
+    sample = _coerce_scenario_sample(scenario_input)
+    pd_matrix = get_sample_net_load(sample)
+    ng, T = np.asarray(x_init_k).shape
+    reference_rows = _build_surrogate_screen_reference_rows(
+        x_LP,
+        x_surr_lp,
+        x_init_k,
+        x_init_k_m,
+        nearby_commitment_candidates=nearby_commitment_candidates,
+    )
+
+    selected: List[dict] = []
+    for g in range(ng):
+        trainer = trainers.get(g)
+        if trainer is None:
+            continue
+
+        lambda_unit = _extract_unit_lambda(
+            lambda_val,
+            T,
+            unit_id=g,
+            trainer=trainer,
+        )
+        alphas, betas, gammas, deltas, _costs, _pg_costs = trainer.get_surrogate_params(
+            sample if isinstance(sample, dict) else pd_matrix,
+            lambda_unit,
+        )
+        timestep_map, offset_map = _resolve_surrogate_constraint_layout(
+            trainer,
+            sample if isinstance(sample, dict) else None,
+            T,
+            len(alphas),
+        )
+
+        unit_candidates: List[dict] = []
+        refs = reference_rows.get(g, [])
+        if not refs:
+            continue
+
+        for k, t_k in enumerate(timestep_map):
+            a = float(alphas[k])
+            b = float(betas[k])
+            c = float(gammas[k])
+            rhs = float(deltas[k])
+            if abs(a) <= 1e-10 and abs(b) <= 1e-10 and abs(c) <= 1e-10:
+                continue
+
+            metrics = [
+                _evaluate_surrogate_constraint_row(
+                    row,
+                    t_k,
+                    tuple(offset_map[k]),
+                    a,
+                    b,
+                    c,
+                    rhs,
+                    T,
+                )
+                for _name, row in refs
+            ]
+            support_ratio = float(np.mean([
+                metric['normalized_violation'] <= max_normalized_violation
+                for metric in metrics
+            ]))
+            mean_margin = float(np.mean([metric['normalized_margin'] for metric in metrics]))
+            min_margin = float(np.min([metric['normalized_margin'] for metric in metrics]))
+            max_violation = float(np.max([metric['normalized_violation'] for metric in metrics]))
+            if (
+                support_ratio < float(min_support_ratio)
+                or max_violation > float(max_normalized_violation)
+                or mean_margin < float(min_mean_margin)
+            ):
+                continue
+
+            score = float(
+                2.5 * support_ratio
+                + 0.8 * mean_margin
+                + 0.4 * min_margin
+                - 1.5 * max_violation
+            )
+            unit_candidates.append(
+                {
+                    'unit_id': int(g),
+                    'constraint_index': int(k),
+                    'timestep': int(t_k),
+                    'offsets': tuple(offset_map[k]),
+                    'alpha': a,
+                    'beta': b,
+                    'gamma': c,
+                    'delta': rhs,
+                    'coef_scale': float(max(abs(a) + abs(b) + abs(c), 1.0)),
+                    'support_ratio': support_ratio,
+                    'mean_normalized_margin': mean_margin,
+                    'min_normalized_margin': min_margin,
+                    'max_normalized_violation': max_violation,
+                    'reference_count': int(len(metrics)),
+                    'score': score,
+                }
+            )
+
+        unit_candidates.sort(key=lambda row: row['score'], reverse=True)
+        selected.extend(unit_candidates[: max(0, int(max_constraints_per_unit))])
+
+    selected.sort(key=lambda row: (row['unit_id'], -row['score'], row['constraint_index']))
+    return selected
+
+
+def _filter_named_commitment_candidates_by_surrogate_screen(
+    candidate_specs: List[Tuple[str, np.ndarray]],
+    surrogate_screen_constraints: Optional[List[dict]],
+    normalized_violation_tol: float = 0.02,
+) -> Tuple[List[Tuple[str, np.ndarray]], List[Tuple[str, str]]]:
+    """Filter full commitment candidates by a selected stable surrogate-row subset."""
+    if not surrogate_screen_constraints:
+        return list(candidate_specs), []
+
+    kept: List[Tuple[str, np.ndarray]] = []
+    rejected: List[Tuple[str, str]] = []
+    seen = set()
+    for name, candidate in candidate_specs:
+        candidate_arr = np.asarray(candidate, dtype=int)
+        if candidate_arr.ndim != 2:
+            rejected.append((str(name), 'candidate is not a 2D commitment matrix'))
+            continue
+
+        violations = []
+        for row in surrogate_screen_constraints:
+            g = int(row['unit_id'])
+            if g < 0 or g >= candidate_arr.shape[0]:
+                continue
+            metric = _evaluate_surrogate_constraint_row(
+                candidate_arr[g],
+                int(row['timestep']),
+                tuple(row['offsets']),
+                float(row['alpha']),
+                float(row['beta']),
+                float(row['gamma']),
+                float(row['delta']),
+                candidate_arr.shape[1],
+            )
+            if metric['normalized_violation'] > float(normalized_violation_tol):
+                violations.append(
+                    f"G{g}/k{int(row['constraint_index'])}:nv={metric['normalized_violation']:.3f}"
+                )
+
+        if violations:
+            rejected.append((str(name), ', '.join(violations[:3])))
+            continue
+
+        key = _candidate_key(candidate_arr)
+        if key in seen:
+            continue
+        seen.add(key)
+        kept.append((str(name), candidate_arr))
+
+    return kept, rejected
+
+
+def _finalize_recover_integer_solution_result(
+    x_result: Optional[np.ndarray],
+    success: bool,
+    details: dict,
+    return_details: bool,
+):
+    if return_details:
+        return x_result, success, details
+    return x_result, success
+
+
+def _estimate_commitment_primal_objective(
+    x_commitment: np.ndarray,
+    ppc: dict,
+    pd_data: np.ndarray,
+    T_delta: float,
+) -> float:
+    """Estimate the original UC objective scale for adaptive FP tau selection."""
+    ppc_int = ext2int(ppc)
+    gen = np.asarray(ppc_int['gen'], dtype=float)
+    gencost = np.asarray(ppc_int['gencost'], dtype=float)
+    x_arr = np.asarray(x_commitment, dtype=float)
+    ng, T = x_arr.shape
+    load_sum = np.sum(np.asarray(pd_data, dtype=float), axis=0)
+
+    pmin = gen[:, PMIN]
+    pmax = gen[:, PMAX]
+    linear_pg_cost = gencost[:, -2] / T_delta
+    linear_x_cost = gencost[:, -1] / T_delta
+    start_cost = gencost[:, 1]
+    shut_cost = gencost[:, 2]
+
+    total_cost = 0.0
+    for t in range(T):
+        x_t = np.clip(x_arr[:, t], 0.0, 1.0)
+        online_mask = x_t > 1e-6
+        if not np.any(online_mask):
+            online_mask = np.ones(ng, dtype=bool)
+            x_t = np.ones(ng, dtype=float)
+
+        pg_guess = pmin * x_t
+        residual = float(load_sum[t] - np.sum(pg_guess))
+        headroom = np.maximum(pmax * x_t - pg_guess, 0.0)
+        total_headroom = float(np.sum(headroom[online_mask]))
+        if residual > 0.0 and total_headroom > 1e-9:
+            pg_guess += residual * headroom / total_headroom
+        pg_guess = np.clip(pg_guess, 0.0, pmax * x_t)
+
+        supply = float(np.sum(pg_guess))
+        if supply < float(load_sum[t]):
+            deficit = float(load_sum[t] - supply)
+            support = np.maximum(pmax - pg_guess, 0.0)
+            support_sum = float(np.sum(support))
+            if support_sum > 1e-9:
+                pg_guess += deficit * support / support_sum
+                pg_guess = np.clip(pg_guess, 0.0, pmax)
+
+        total_cost += float(np.sum(linear_pg_cost * pg_guess + linear_x_cost * x_t))
+
+    if T >= 2:
+        x_prev = np.clip(x_arr[:, :-1], 0.0, 1.0)
+        x_next = np.clip(x_arr[:, 1:], 0.0, 1.0)
+        total_cost += float(np.sum(start_cost[:, None] * np.maximum(x_next - x_prev, 0.0)))
+        total_cost += float(np.sum(shut_cost[:, None] * np.maximum(x_prev - x_next, 0.0)))
+
+    return max(float(total_cost), 1.0)
+
+
+def _repair_commitment_logic_heuristic(
+    x_int: np.ndarray,
+    T_delta: float,
+    ppc: Optional[dict] = None,
+    unit_ids: Optional[np.ndarray] = None,
+) -> np.ndarray:
+    """Apply a light repair so a binary commitment better respects min up/down logic."""
+    x_arr = np.asarray(x_int, dtype=int)
+    was_vector = x_arr.ndim == 1
+    if was_vector:
+        x_arr = x_arr[np.newaxis, :]
+
+    x_repaired = x_arr.copy()
+    ng, T = x_repaired.shape
+    if T <= 1:
+        return x_repaired[0] if was_vector else x_repaired
+
+    if ppc is not None:
+        full_ng = ext2int(ppc)['gen'].shape[0]
+        if unit_ids is None:
+            if ng != full_ng:
+                raise ValueError("unit_ids must be provided when repairing a subset of units")
+            local_unit_ids = np.arange(ng, dtype=int)
+        else:
+            local_unit_ids = np.asarray(unit_ids, dtype=int).reshape(-1)
+            if local_unit_ids.size != ng:
+                raise ValueError("unit_ids length must match the number of repaired commitment rows")
+        min_up_steps, min_down_steps = _get_min_up_down_time_steps(ppc, full_ng, T_delta, T)
+        ton_steps = min_up_steps[local_unit_ids]
+        toff_steps = min_down_steps[local_unit_ids]
+    else:
+        default_steps = min(max(int(4 * T_delta), 1), max(T - 1, 0))
+        ton_steps = np.full(ng, default_steps, dtype=int)
+        toff_steps = np.full(ng, default_steps, dtype=int)
+
+    for local_g in range(ng):
+        Ton = int(ton_steps[local_g])
+        Toff = int(toff_steps[local_g])
         changed = True
         while changed:
             changed = False
 
-            # 启动后必须至少持�?Ton 个时段开�?
             for t in range(T - 1):
-                if x_repaired[g, t] == 0 and x_repaired[g, t + 1] == 1:
+                if x_repaired[local_g, t] == 0 and x_repaired[local_g, t + 1] == 1:
                     end = min(T, t + 1 + Ton)
-                    if np.any(x_repaired[g, t + 1:end] == 0):
-                        x_repaired[g, t + 1:end] = 1
+                    if np.any(x_repaired[local_g, t + 1:end] == 0):
+                        x_repaired[local_g, t + 1:end] = 1
                         changed = True
 
-            # 关机后必须至少持�?Toff 个时段停�?
             for t in range(T - 1):
-                if x_repaired[g, t] == 1 and x_repaired[g, t + 1] == 0:
+                if x_repaired[local_g, t] == 1 and x_repaired[local_g, t + 1] == 0:
                     end = min(T, t + 1 + Toff)
-                    if np.any(x_repaired[g, t + 1:end] == 1):
-                        x_repaired[g, t + 1:end] = 0
+                    if np.any(x_repaired[local_g, t + 1:end] == 1):
+                        x_repaired[local_g, t + 1:end] = 0
                         changed = True
 
-    return x_repaired
+    return x_repaired[0] if was_vector else x_repaired
+
+
+def _repair_min_up_down_heuristic(x_int: np.ndarray, T_delta: float) -> np.ndarray:
+    """Backward-compatible wrapper for the generic commitment-logic repair."""
+    return _repair_commitment_logic_heuristic(x_int, T_delta)
 
 
 def _temporal_neighbor_average(x: np.ndarray, radius: int = 1) -> np.ndarray:
@@ -1104,6 +1469,9 @@ def _run_fp_hot_start_task(
     pd_data: np.ndarray,
     T_delta: float,
     x_pool: Optional[np.ndarray],
+    surrogate_screen_constraints: Optional[List[dict]],
+    surrogate_screen_soft_penalty: float,
+    projection_objective_tau,
     max_iter: int,
     stall_perturbation_mode: str,
     stall_flip_fraction: float,
@@ -1118,6 +1486,9 @@ def _run_fp_hot_start_task(
         pd_data,
         T_delta,
         x_pool=x_pool,
+        surrogate_screen_constraints=surrogate_screen_constraints,
+        surrogate_screen_soft_penalty=surrogate_screen_soft_penalty,
+        projection_objective_tau=projection_objective_tau,
         max_iter=max_iter,
         stall_perturbation_mode=stall_perturbation_mode,
         stall_flip_fraction=stall_flip_fraction,
@@ -2093,6 +2464,95 @@ def _get_min_up_down_time_steps(ppc: dict, ng: int, T_delta: float, horizon: int
     return min_up, min_down
 
 
+def check_commitment_logic_feasibility(
+    x_int: np.ndarray,
+    ppc: dict,
+    T_delta: float,
+    unit_ids: Optional[np.ndarray] = None,
+    tol: float = 1e-6,
+) -> Tuple[bool, str]:
+    """Check binary on/off logic only: binary domain and minimum up/down time."""
+    x_arr = np.asarray(x_int, dtype=float)
+    if x_arr.ndim == 1:
+        x_arr = x_arr[np.newaxis, :]
+
+    ng_local, T = x_arr.shape
+    if T == 0:
+        return False, "commitment horizon is empty"
+
+    rounded = np.rint(x_arr)
+    if np.any(np.abs(x_arr - rounded) > tol):
+        return False, "commitment contains non-binary values"
+
+    x_bin = rounded.astype(int)
+    if np.any((x_bin != 0) & (x_bin != 1)):
+        return False, "commitment contains values outside {0, 1}"
+
+    full_ng = ext2int(ppc)['gen'].shape[0]
+    if unit_ids is None:
+        if ng_local != full_ng:
+            return False, "unit_ids are required when checking a subset of units"
+        local_unit_ids = np.arange(ng_local, dtype=int)
+    else:
+        local_unit_ids = np.asarray(unit_ids, dtype=int).reshape(-1)
+        if local_unit_ids.size != ng_local:
+            return False, "unit_ids length does not match the checked commitment rows"
+        if np.any(local_unit_ids < 0) or np.any(local_unit_ids >= full_ng):
+            return False, "unit_ids are out of range"
+
+    min_up_steps, min_down_steps = _get_min_up_down_time_steps(ppc, full_ng, T_delta, T)
+
+    for local_idx, unit_id in enumerate(local_unit_ids):
+        row = x_bin[local_idx]
+        for tau in range(1, int(min_up_steps[unit_id]) + 1):
+            for t1 in range(T - tau):
+                if row[t1 + 1] - row[t1] > row[t1 + tau] + tol:
+                    return False, f"最小开机时间违反: 机组{unit_id}, t1={t1}, tau={tau}"
+        for tau in range(1, int(min_down_steps[unit_id]) + 1):
+            for t1 in range(T - tau):
+                if -row[t1 + 1] + row[t1] > 1 - row[t1 + tau] + tol:
+                    return False, f"最小关机时间违反: 机组{unit_id}, t1={t1}, tau={tau}"
+
+    return True, "逻辑可行"
+
+
+def _sanitize_named_commitment_candidates(
+    candidate_specs: List[Tuple[str, np.ndarray]],
+    ppc: dict,
+    T_delta: float,
+    unit_ids: Optional[np.ndarray] = None,
+) -> Tuple[List[Tuple[str, np.ndarray]], List[Tuple[str, str]]]:
+    """Repair, validate, and deduplicate commitment candidates before they enter search pools."""
+    sanitized: List[Tuple[str, np.ndarray]] = []
+    rejected: List[Tuple[str, str]] = []
+    seen = set()
+
+    for name, candidate in candidate_specs:
+        repaired = _repair_commitment_logic_heuristic(
+            candidate,
+            T_delta,
+            ppc=ppc,
+            unit_ids=unit_ids,
+        )
+        is_valid, reason = check_commitment_logic_feasibility(
+            repaired,
+            ppc,
+            T_delta,
+            unit_ids=unit_ids,
+        )
+        if not is_valid:
+            rejected.append((str(name), reason))
+            continue
+
+        key = _candidate_key(repaired)
+        if key in seen:
+            continue
+        seen.add(key)
+        sanitized.append((str(name), np.asarray(repaired, dtype=int)))
+
+    return sanitized, rejected
+
+
 def check_uc_feasibility(
     x_int: np.ndarray,
     ppc: dict,
@@ -2122,18 +2582,14 @@ def check_uc_feasibility(
     ng, T = x_int.shape
     Pd_sum = np.sum(pd_data, axis=0)
 
-    min_up_steps, min_down_steps = _get_min_up_down_time_steps(ppc, ng, T_delta, T)
-
-    # 检�?：最小开关机时间（代数）
-    for g in range(ng):
-        for tau in range(1, min_up_steps[g] + 1):
-            for t1 in range(T - tau):
-                if x_int[g, t1+1] - x_int[g, t1] > x_int[g, t1+tau] + tol:
-                    return False, f"最小开机时间违�? 机组{g}, t1={t1}, tau={tau}"
-        for tau in range(1, min_down_steps[g] + 1):
-            for t1 in range(T - tau):
-                if -x_int[g, t1+1] + x_int[g, t1] > 1 - x_int[g, t1+tau] + tol:
-                    return False, f"最小关机时间违�? 机组{g}, t1={t1}, tau={tau}"
+    logic_feasible, logic_reason = check_commitment_logic_feasibility(
+        x_int,
+        ppc,
+        T_delta,
+        tol=tol,
+    )
+    if not logic_feasible:
+        return False, logic_reason
 
     # 检�?：功率平�?+ 爬坡（LP 软可行性）
     model = gp.Model('uc_feasibility_check')
@@ -2209,6 +2665,9 @@ def run_feasibility_pump(
     pd_data: np.ndarray,
     T_delta: float,
     x_pool: Optional[np.ndarray] = None,
+    surrogate_screen_constraints: Optional[List[dict]] = None,
+    surrogate_screen_soft_penalty: float = 25.0,
+    projection_objective_tau = 'adaptive',
     max_iter: int = 50,
     stall_perturbation_mode: str = 'pool_then_flip',
     stall_flip_fraction: float = 0.10,
@@ -2240,6 +2699,7 @@ def run_feasibility_pump(
 
     ppc_int = ext2int(ppc)
     gen = ppc_int['gen']
+    gencost = ppc_int['gencost']
     ng, T = x_curr.shape
     Pd_sum = np.sum(pd_data, axis=0)
 
@@ -2247,6 +2707,8 @@ def run_feasibility_pump(
     Rd = 0.4 * gen[:, PMAX] / T_delta
     Ru_co = 0.3 * gen[:, PMAX]
     Rd_co = 0.3 * gen[:, PMAX]
+    start_cost = gencost[:, 1]
+    shut_cost = gencost[:, 2]
     Ton = min(int(4 * T_delta), T - 1)
     Toff = min(int(4 * T_delta), T - 1)
 
@@ -2268,6 +2730,12 @@ def run_feasibility_pump(
 
     history: List[tuple] = []
     no_improve_count = 0
+    adaptive_tau_reference_obj = _estimate_commitment_primal_objective(
+        x_curr,
+        ppc,
+        pd_data,
+        T_delta,
+    )
 
     x_curr = x_curr.copy()
 
@@ -2286,6 +2754,8 @@ def run_feasibility_pump(
         pg = model.addVars(ng, T, lb=0, name='pg')
         x = model.addVars(ng, T, lb=0, ub=1, name='x')
         d = model.addVars(ng, T, lb=0, name='d')   # |x - x_curr| 辅助变量
+        cpower = model.addVars(ng, T, lb=0, name='cpower')
+        coc = model.addVars(ng, max(T - 1, 0), lb=0, name='coc')
 
         # 功率平衡
         for t in range(T):
@@ -2307,6 +2777,40 @@ def run_feasibility_pump(
                         )
                     )
 
+        surrogate_screen_slacks = []
+        if surrogate_screen_constraints:
+            for row in surrogate_screen_constraints:
+                g = int(row['unit_id'])
+                if g < 0 or g >= ng:
+                    continue
+                slack_var = model.addVar(lb=0, name=(
+                    f"fp_screen_surr_slack_g{g}_k{int(row['constraint_index'])}_iter{iteration}"
+                ))
+                expr = (
+                    build_surrogate_constraint_expression(
+                        {t: x[g, t] for t in range(T)},
+                        int(row['timestep']),
+                        tuple(row['offsets']),
+                        float(row['alpha']),
+                        float(row['beta']),
+                        float(row['gamma']),
+                        T,
+                    ) - float(row['delta'])
+                )
+                model.addConstr(
+                    expr <= slack_var,
+                    name=(
+                        f"fp_screen_surr_g{g}_k{int(row['constraint_index'])}_"
+                        f"iter{iteration}"
+                    ),
+                )
+                surrogate_screen_slacks.append(
+                    (
+                        slack_var,
+                        float(max(row.get('coef_scale', 1.0), 1e-6)),
+                    )
+                )
+
         for g in range(ng):
             # 发电上下�?
             for t in range(T):
@@ -2321,6 +2825,12 @@ def run_feasibility_pump(
                 model.addConstr(
                     pg[g, t-1] - pg[g, t] <= Rd[g] * x[g, t] + Rd_co[g] * (1 - x[g, t])
                 )
+                model.addConstr(
+                    coc[g, t-1] >= float(start_cost[g]) * (x[g, t] - x[g, t-1])
+                )
+                model.addConstr(
+                    coc[g, t-1] >= float(shut_cost[g]) * (x[g, t-1] - x[g, t])
+                )
 
             # 最小开关机时间
             for tau in range(1, Ton + 1):
@@ -2332,6 +2842,10 @@ def run_feasibility_pump(
 
             # 每个变量�?L1 距离约束 or 固定可信变量
             for t in range(T):
+                model.addConstr(
+                    cpower[g, t] >= gencost[g, -2] / T_delta * pg[g, t]
+                                   + gencost[g, -1] / T_delta * x[g, t]
+                )
                 x_ref = float(x_curr[g, t])
                 if trusted_mask[g, t]:
                     model.addConstr(x[g, t] == x_ref)
@@ -2352,6 +2866,20 @@ def run_feasibility_pump(
                     model.addConstr(flow_expr <= limit)
                     model.addConstr(flow_expr >= -limit)
 
+        tau_setting = projection_objective_tau
+        if isinstance(tau_setting, str):
+            tau_mode = tau_setting.strip().lower()
+            if tau_mode in ('adaptive', 'auto', ''):
+                tau_used = 1.0 / max(float(adaptive_tau_reference_obj), 1.0)
+            elif tau_mode in ('none', 'off', 'false', '0'):
+                tau_used = 0.0
+            else:
+                tau_used = float(tau_setting)
+        elif tau_setting is None:
+            tau_used = 1.0 / max(float(adaptive_tau_reference_obj), 1.0)
+        else:
+            tau_used = float(tau_setting)
+
         # 目标：最小化 L1 距离（仅对非可信变量�?
         obj = gp.quicksum(
             d[g, t]
@@ -2359,6 +2887,15 @@ def run_feasibility_pump(
             for t in range(T)
             if not trusted_mask[g, t]
         )
+        if surrogate_screen_slacks:
+            obj += float(surrogate_screen_soft_penalty) * gp.quicksum(
+                slack_var / scale for slack_var, scale in surrogate_screen_slacks
+            )
+        if abs(float(tau_used)) > 1e-12:
+            obj += float(tau_used) * (
+                gp.quicksum(cpower[g, t] for g in range(ng) for t in range(T))
+                + gp.quicksum(coc[g, t] for g in range(ng) for t in range(max(T - 1, 0)))
+            )
         model.setObjective(obj, GRB.MINIMIZE)
         model.optimize()
 
@@ -2368,15 +2905,34 @@ def run_feasibility_pump(
             break
 
         x_LP_proj = np.array([[x[g, t].X for t in range(T)] for g in range(ng)])
+        primal_obj_value = (
+            float(np.sum([[cpower[g, t].X for t in range(T)] for g in range(ng)]))
+            + float(np.sum([[coc[g, t].X for t in range(max(T - 1, 0))] for g in range(ng)]))
+        )
+        adaptive_tau_reference_obj = max(primal_obj_value, 1.0)
 
         # 四舍五入得到新整数点，强制保持可信变�?
         x_next = round_to_integer(x_LP_proj)
         x_next[trusted_mask] = x_curr[trusted_mask]
 
         if verbose:
-            l1_dist = float(model.ObjVal)
+            l1_dist = float(np.sum(np.abs(x_LP_proj[~trusted_mask] - x_curr[~trusted_mask])))
+            soft_penalty = 0.0
+            if surrogate_screen_slacks:
+                soft_penalty = float(surrogate_screen_soft_penalty) * float(np.sum([
+                    float(slack_var.X) / scale for slack_var, scale in surrogate_screen_slacks
+                ]))
+            primal_cost_term = 0.0
+            if abs(float(tau_used)) > 1e-12:
+                primal_cost_term = float(tau_used) * primal_obj_value
             changed = int(np.sum(x_next != x_curr))
-            print(f"  FP iter {iteration}: L1 projection={l1_dist:.3f}, changed_bits={changed}", flush=True)
+            print(
+                f"  FP iter {iteration}: L1 projection={l1_dist:.3f}, "
+                f"soft_penalty={soft_penalty:.3f}, "
+                f"tau={tau_used:.4g}, tau_cost={primal_cost_term:.3f}, "
+                f"obj_ref={adaptive_tau_reference_obj:.3f}, changed_bits={changed}",
+                flush=True,
+            )
 
         # 振荡检测（最近历史中出现过相同点�?
         x_key = tuple(x_next.flatten())
@@ -2447,7 +3003,16 @@ def recover_integer_solution(
     nearby_commitment_pool_size: int = 12,
     parallel_fp_starts: int = 1,
     scenario_bank: Optional[List[dict]] = None,
-) -> Tuple[Optional[np.ndarray], bool]:
+    surrogate_screen_mode: str = 'robust',
+    surrogate_screen_max_constraints_per_unit: int = 3,
+    surrogate_screen_min_support_ratio: float = 0.85,
+    surrogate_screen_max_normalized_violation: float = 0.05,
+    surrogate_screen_min_mean_margin: float = 0.02,
+    surrogate_screen_candidate_violation_tol: float = 0.02,
+    surrogate_screen_soft_penalty: float = 25.0,
+    projection_objective_tau = 'adaptive',
+    return_details: bool = False,
+):
     """
     顶层接口：从 LP 松弛解恢�?UC 整数可行解�?
 
@@ -2562,11 +3127,62 @@ def recover_integer_solution(
         candidate_pool_size=nearby_commitment_pool_size,
         rng=rng,
     )
+    nearby_commitment_candidates, rejected_nearby_candidates = _sanitize_named_commitment_candidates(
+        nearby_commitment_candidates,
+        ppc,
+        T_delta,
+    )
     if verbose:
         print(
             f"  Nearby historical commitment hot starts: {len(nearby_commitment_candidates)}",
             flush=True,
         )
+        if rejected_nearby_candidates:
+            print(
+                f"  Filtered {len(rejected_nearby_candidates)} nearby commitments before pooling",
+                flush=True,
+            )
+
+    surrogate_screen_constraints: List[dict] = []
+    surrogate_screen_summary = {
+        'mode': str(surrogate_screen_mode),
+        'hot_starts_before': 0,
+        'hot_starts_after': 0,
+        'x_pool_before': 0,
+        'x_pool_after': 0,
+        'n_constraints': 0,
+        'constraints_per_unit': {},
+        'hot_start_retained_names': [],
+        'hot_start_rejected': [],
+        'x_pool_rejected': [],
+    }
+    if str(surrogate_screen_mode).strip().lower() not in ('none', 'off', 'false', '0'):
+        surrogate_screen_constraints = _select_stable_surrogate_screen_constraints(
+            scenario_input,
+            trainers,
+            lambda_val,
+            x_LP,
+            x_surr_lp,
+            x_init_k,
+            x_init_k_m,
+            nearby_commitment_candidates=nearby_commitment_candidates,
+            max_constraints_per_unit=surrogate_screen_max_constraints_per_unit,
+            min_support_ratio=surrogate_screen_min_support_ratio,
+            max_normalized_violation=surrogate_screen_max_normalized_violation,
+            min_mean_margin=surrogate_screen_min_mean_margin,
+        )
+        per_unit_counts: Dict[int, int] = {}
+        for row in surrogate_screen_constraints:
+            per_unit_counts[int(row['unit_id'])] = per_unit_counts.get(int(row['unit_id']), 0) + 1
+        surrogate_screen_summary['n_constraints'] = int(len(surrogate_screen_constraints))
+        surrogate_screen_summary['constraints_per_unit'] = per_unit_counts
+        if verbose:
+            print(
+                "Step 4.5: stable surrogate screen "
+                f"selected {len(surrogate_screen_constraints)} rows "
+                f"({per_unit_counts if per_unit_counts else 'no rows'})",
+                flush=True,
+            )
     if use_hot_start:
         hot_start_candidates = _rank_hot_start_candidates(
             _build_hot_start_candidates(
@@ -2594,19 +3210,109 @@ def recover_integer_solution(
             ("surrogate_lp_round", _repair_min_up_down_heuristic(x_init_k, T_delta), -1.0),
         ]
 
-    # 构建整数解池：子问题整数�?+ 扰动�?+ 热启动候选，�?FP 投影阶段使用
-    x_pool_list = [x_init_k]
-    x_pool_list.extend(list(x_init_k_m.transpose(1, 0, 2)))
-    x_pool_list.extend([x_start for _, x_start, _ in hot_start_candidates])
+    sanitized_hot_start_specs, rejected_hot_start_specs = _sanitize_named_commitment_candidates(
+        [(name, x_start) for name, x_start, _score in hot_start_candidates],
+        ppc,
+        T_delta,
+    )
+    score_by_name = {str(name): float(score) for name, _x_start, score in hot_start_candidates}
+    hot_start_candidates = [
+        (name, x_start, score_by_name.get(name, 0.0))
+        for name, x_start in sanitized_hot_start_specs
+    ]
+    if verbose and rejected_hot_start_specs:
+        print(
+            f"  Filtered {len(rejected_hot_start_specs)} structurally infeasible hot starts before FP",
+            flush=True,
+        )
+    surrogate_screen_summary['hot_starts_before'] = int(len(hot_start_candidates))
+    if surrogate_screen_constraints and hot_start_candidates:
+        filtered_hot_start_specs, rejected_surrogate_hot_starts = _filter_named_commitment_candidates_by_surrogate_screen(
+            [(name, x_start) for name, x_start, _score in hot_start_candidates],
+            surrogate_screen_constraints,
+            normalized_violation_tol=surrogate_screen_candidate_violation_tol,
+        )
+        score_by_name = {str(name): float(score) for name, _x_start, score in hot_start_candidates}
+        hot_start_candidates = [
+            (name, x_start, score_by_name.get(name, 0.0))
+            for name, x_start in filtered_hot_start_specs
+        ]
+        surrogate_screen_summary['hot_start_retained_names'] = [name for name, _x in filtered_hot_start_specs]
+        surrogate_screen_summary['hot_start_rejected'] = list(rejected_surrogate_hot_starts)
+        if verbose and rejected_surrogate_hot_starts:
+            print(
+                f"  Stable surrogate screen removed {len(rejected_surrogate_hot_starts)} hot starts",
+                flush=True,
+            )
+    if not hot_start_candidates:
+        fallback_hot_start_specs, _fallback_hot_start_rejections = _sanitize_named_commitment_candidates(
+            [
+                ("lp_round_fallback", x_init),
+                ("surrogate_round_fallback", x_init_k),
+            ],
+            ppc,
+            T_delta,
+        )
+        hot_start_candidates = [
+            (name, x_start, -1e6 - idx)
+            for idx, (name, x_start) in enumerate(fallback_hot_start_specs)
+        ]
+    surrogate_screen_summary['hot_starts_after'] = int(len(hot_start_candidates))
 
-    x_pool_unique: List[np.ndarray] = []
-    x_pool_seen = set()
-    for x_candidate in x_pool_list:
-        key = _candidate_key(x_candidate)
-        if key not in x_pool_seen:
-            x_pool_seen.add(key)
-            x_pool_unique.append(np.asarray(x_candidate, dtype=int))
-    x_pool = np.stack(x_pool_unique, axis=0)
+    # 构建整数解池：子问题整数�?+ 扰动�?+ 热启动候选，�?FP 投影阶段使用
+    x_pool_specs: List[Tuple[str, np.ndarray]] = [("subproblem_base", x_init_k)]
+    x_pool_specs.extend(
+        (f"subproblem_perturb_{m + 1}", x_init_k_m[:, m, :])
+        for m in range(x_init_k_m.shape[1])
+    )
+    x_pool_specs.extend((name, x_start) for name, x_start, _score in hot_start_candidates)
+    sanitized_x_pool_specs, rejected_x_pool_specs = _sanitize_named_commitment_candidates(
+        x_pool_specs,
+        ppc,
+        T_delta,
+    )
+    surrogate_screen_summary['x_pool_before'] = int(len(sanitized_x_pool_specs))
+    if surrogate_screen_constraints and sanitized_x_pool_specs:
+        sanitized_x_pool_specs, rejected_surrogate_x_pool_specs = _filter_named_commitment_candidates_by_surrogate_screen(
+            sanitized_x_pool_specs,
+            surrogate_screen_constraints,
+            normalized_violation_tol=surrogate_screen_candidate_violation_tol,
+        )
+        surrogate_screen_summary['x_pool_rejected'] = list(rejected_surrogate_x_pool_specs)
+        if verbose and rejected_surrogate_x_pool_specs:
+            print(
+                f"  Stable surrogate screen removed {len(rejected_surrogate_x_pool_specs)} pool candidates",
+                flush=True,
+            )
+    x_pool = (
+        np.stack([x_candidate for _name, x_candidate in sanitized_x_pool_specs], axis=0)
+        if sanitized_x_pool_specs
+        else None
+    )
+    if not hot_start_candidates and x_pool is not None and x_pool.shape[0] > 0:
+        hot_start_candidates = [("pool_fallback", np.asarray(x_pool[0], dtype=int), -1e6)]
+    if verbose and rejected_x_pool_specs:
+        print(
+            f"  Filtered {len(rejected_x_pool_specs)} structurally infeasible pool candidates",
+            flush=True,
+        )
+    surrogate_screen_summary['x_pool_after'] = int(
+        0 if x_pool is None else int(x_pool.shape[0])
+    )
+
+    recovery_details = {
+        'x_lp': np.asarray(x_LP, dtype=float),
+        'x_surr_lp': np.asarray(x_surr_lp, dtype=float),
+        'x_init': np.asarray(x_init, dtype=int),
+        'x_init_k': np.asarray(x_init_k, dtype=int),
+        'x_init_k_m': np.asarray(x_init_k_m, dtype=int),
+        'trusted_mask': np.asarray(trusted_mask, dtype=bool),
+        'nearby_commitment_candidates': list(nearby_commitment_candidates),
+        'surrogate_screen_constraints': surrogate_screen_constraints,
+        'surrogate_screen_summary': surrogate_screen_summary,
+        'surrogate_screen_soft_penalty': float(surrogate_screen_soft_penalty),
+        'projection_objective_tau': projection_objective_tau,
+    }
 
     if verbose:
         print("Step 5: 运行可行性泵热启动...", flush=True)
@@ -2614,13 +3320,21 @@ def recover_integer_solution(
             print(f"  热启动候选{idx}: {name}, score={score:.2f}", flush=True)
 
     parallel_warm_result = None
+    selected_hot_start_name = None
     pending_fp_starts: List[Tuple[int, str, np.ndarray, float]] = []
     for idx, (name, x_start, score) in enumerate(hot_start_candidates, start=1):
         start_feas, _reason = check_uc_feasibility(x_start, ppc, pd_data, T_delta)
         if start_feas:
             if verbose:
                 print(f"  Hot start {idx}: {name} is already feasible; skip FP", flush=True)
-            return x_start, True
+            recovery_details['selected_hot_start'] = name
+            recovery_details['x_result'] = np.asarray(x_start, dtype=int)
+            return _finalize_recover_integer_solution_result(
+                np.asarray(x_start, dtype=int),
+                True,
+                recovery_details,
+                return_details,
+            )
         pending_fp_starts.append((idx, name, x_start, score))
 
     requested_parallel_count = min(max(1, int(parallel_fp_starts)), len(pending_fp_starts))
@@ -2646,6 +3360,9 @@ def recover_integer_solution(
                     pd_data,
                     T_delta,
                     x_pool,
+                    surrogate_screen_constraints,
+                    surrogate_screen_soft_penalty,
+                    projection_objective_tau,
                     max_fp_iter,
                     stall_perturbation_mode,
                     stall_flip_fraction,
@@ -2668,7 +3385,14 @@ def recover_integer_solution(
                     status = "success" if task_success else "no_feasible_solution"
                     print(f"  Parallel FP hot start {task_idx}: {name} -> {status}", flush=True)
                 if task_success:
-                    return task_result, True
+                    recovery_details['selected_hot_start'] = name
+                    recovery_details['x_result'] = np.asarray(task_result, dtype=int)
+                    return _finalize_recover_integer_solution_result(
+                        np.asarray(task_result, dtype=int),
+                        True,
+                        recovery_details,
+                        return_details,
+                    )
 
             if pending_fp_starts:
                 first_parallel_idx = pending_fp_starts[0][0]
@@ -2685,17 +3409,28 @@ def recover_integer_solution(
     success = False
 
     for idx, (name, x_start, _score) in enumerate(hot_start_candidates, start=1):
+        selected_hot_start_name = name
         start_feas, _reason = check_uc_feasibility(x_start, ppc, pd_data, T_delta)
         if start_feas:
             if verbose:
                 print(f"  Hot start {idx}: {name} is already feasible; skip FP", flush=True)
-            return x_start, True
+            recovery_details['selected_hot_start'] = name
+            recovery_details['x_result'] = np.asarray(x_start, dtype=int)
+            return _finalize_recover_integer_solution_result(
+                np.asarray(x_start, dtype=int),
+                True,
+                recovery_details,
+                return_details,
+            )
 
         if verbose:
             print(f"  Run FP hot start {idx}/{len(hot_start_candidates)}: {name}", flush=True)
         x_result, success = run_feasibility_pump(
             x_start, trusted_mask, ppc, pd_data, T_delta,
             x_pool=x_pool,
+            surrogate_screen_constraints=surrogate_screen_constraints,
+            surrogate_screen_soft_penalty=surrogate_screen_soft_penalty,
+            projection_objective_tau=projection_objective_tau,
             max_iter=max_fp_iter,
             stall_perturbation_mode=stall_perturbation_mode,
             stall_flip_fraction=stall_flip_fraction,
@@ -2709,6 +3444,13 @@ def recover_integer_solution(
         status_str = "FP finished: feasible solution found" if success else "FP finished: no feasible solution"
         print(status_str, flush=True)
 
-    return x_result, success
+    recovery_details['selected_hot_start'] = selected_hot_start_name
+    recovery_details['x_result'] = None if x_result is None else np.asarray(x_result, dtype=int)
+    return _finalize_recover_integer_solution_result(
+        x_result,
+        success,
+        recovery_details,
+        return_details,
+    )
 
 
