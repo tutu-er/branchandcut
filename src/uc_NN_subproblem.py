@@ -1460,9 +1460,13 @@ class SubproblemSurrogateTrainer:
         self.rho_opt = float(rho_opt_init)
         self.gamma_base = float(gamma_base)
         self.gamma = self.gamma_base
+        self.gamma_dual_component_scale = 3.0
         self.rho_max = 10.0
         self.reg_weight = 1e-4   # alpha/beta/gamma L2 正则化权重
         self.mu_lower_bound = float(mu_lower_bound_init)
+        self.rho_dual_pg = float(rho_dual_init)
+        self.rho_dual_x = float(rho_dual_init)
+        self.rho_dual_coc = float(rho_dual_init)
         self.mu_individual_lower_bound_round = max(int(mu_individual_lower_bound_round), 0)
         self.mu_group_lower_bound_round = max(
             int(mu_group_lower_bound_round),
@@ -1477,6 +1481,7 @@ class SubproblemSurrogateTrainer:
         self.iter_number = 0
         self.x_cost_scale = 1.0
         self.pg_cost_scale = 1.0
+        self._sync_rho_dual_summary()
         
         # 初始化原始变量和对偶变量存储
         self.pg = np.zeros((self.n_samples, self.T))
@@ -1648,6 +1653,13 @@ class SubproblemSurrogateTrainer:
 
     def _pg_costs_active(self) -> bool:
         return self.iter_number >= self.pg_cost_start_round
+
+    def _sync_rho_dual_summary(self) -> None:
+        self.rho_dual = float(np.mean([
+            self.rho_dual_pg,
+            self.rho_dual_x,
+            self.rho_dual_coc,
+        ]))
 
     def _uses_template_rhs_bases(self) -> bool:
         return self.constraint_generation_strategy == CONSTRAINT_STRATEGY_ALL_TEMPLATES_RHS3
@@ -2226,7 +2238,9 @@ class SubproblemSurrogateTrainer:
 
         # lambda_cpower 由驻点条件固定为 1，不需要作为变量
 
-        obj_dual = 0
+        obj_dual_pg = 0
+        obj_dual_x = 0
+        obj_dual_coc = 0
         obj_opt  = 0
 
         # ===== obj_dual：KKT 驻点条件 =====
@@ -2245,13 +2259,12 @@ class SubproblemSurrogateTrainer:
             abs_v = model.addVar(lb=0, name=f'abs_pg_{t}')
             model.addConstr(abs_v >= expr,  name=f'abs_pg_pos_{t}')
             model.addConstr(abs_v >= -expr, name=f'abs_pg_neg_{t}')
-            obj_dual += abs_v
+            obj_dual_pg += abs_v
 
         # -- x[t] 驻点：  b + Pmin*lam_pg_lower[t] - Pmax*lam_pg_upper[t]
         #                  + ramp_co_terms + min_on/off_terms + start/shut_terms
         #                  + coupling_surrogate_terms + lam_x_upper[t] - lam_x_lower[t] = 0
         
-        obj_dual_test = 0
         for t in range(self.T):
             expr = b + (costs[t] if costs is not None else 0)
             expr += Pmin * lam_pg_lower[t]
@@ -2309,8 +2322,7 @@ class SubproblemSurrogateTrainer:
             abs_v = model.addVar(lb=0, name=f'abs_x_{t}')
             model.addConstr(abs_v >= expr,  name=f'abs_x_pos_{t}')
             model.addConstr(abs_v >= -expr, name=f'abs_x_neg_{t}')
-            obj_dual += abs_v
-            obj_dual_test += abs_v
+            obj_dual_x += abs_v
 
         # -- coc[t] 驻点：  1 - lam_start_cost[t] - lam_shut_cost[t] - lam_coc_nonneg[t] = 0
         for t in range(self.T - 1):
@@ -2318,7 +2330,9 @@ class SubproblemSurrogateTrainer:
             abs_v = model.addVar(lb=0, name=f'abs_coc_{t}')
             model.addConstr(abs_v >= expr,  name=f'abs_coc_pos_{t}')
             model.addConstr(abs_v >= -expr, name=f'abs_coc_neg_{t}')
-            obj_dual += abs_v
+            obj_dual_coc += abs_v
+
+        obj_dual = obj_dual_pg + obj_dual_x + obj_dual_coc
 
         # ===== obj_opt：互补松弛条件（约束违反量 × 对偶变量）=====
 
@@ -2401,7 +2415,10 @@ class SubproblemSurrogateTrainer:
 
         # ===== 设置目标函数并求解 =====
         model.setObjective(
-            self.rho_dual * obj_dual + self.rho_opt * obj_opt,
+            self.rho_dual_pg * obj_dual_pg
+            + self.rho_dual_x * obj_dual_x
+            + self.rho_dual_coc * obj_dual_coc
+            + self.rho_opt * obj_opt,
             GRB.MINIMIZE
         )
         model.optimize()
@@ -2429,6 +2446,9 @@ class SubproblemSurrogateTrainer:
 
             if sample_id <= 2:
                 print(f"  dual_block sample={sample_id}: "
+                      f"obj_dual_pg={obj_dual_pg.getValue():.4f}, "
+                      f"obj_dual_x={obj_dual_x.getValue():.4f}, "
+                      f"obj_dual_coc={obj_dual_coc.getValue():.4f}, "
                       f"obj_dual={obj_dual.getValue():.4f}, "
                       f"obj_opt={obj_opt.getValue() if hasattr(obj_opt, 'getValue') else obj_opt:.4f}",
                       flush=True)
@@ -2511,8 +2531,8 @@ class SubproblemSurrogateTrainer:
             coupling_abs = torch.abs(coupling_lhs - deltas_tensor[k])
             obj_opt = obj_opt + coupling_abs * mu_vals[k]
         
-        # ========== 计算obj_dual：pg/x[t] KKT驻点条件（完整版） ==========
-        obj_dual = torch.tensor(0.0, device=device, requires_grad=True)
+        # ========== 计算obj_dual：仅保留对 NN 参数有梯度的 pg/x 驻点项 ==========
+        obj_dual_pg = torch.tensor(0.0, device=device, requires_grad=True)
         a_val = float(self.gencost[g, -2] / self.T_delta)
         if lam_inh is not None:
             lam_ru = lam_inh['lambda_ramp_up']
@@ -2527,7 +2547,7 @@ class SubproblemSurrogateTrainer:
                 if t < self.T - 1:
                     pg_const -= float(lam_ru[t])
                     pg_const += float(lam_rd[t])
-                obj_dual = obj_dual + torch.abs(
+                obj_dual_pg = obj_dual_pg + torch.abs(
                     torch.tensor(pg_const, dtype=torch.float32, device=device) + pg_costs_tensor[t]
                 )
 
@@ -2549,6 +2569,7 @@ class SubproblemSurrogateTrainer:
         shut_c  = float(self.gencost[g, 2])
         Ton_l   = min(4, self.T)
         Toff_l  = min(4, self.T)
+        obj_dual_x = torch.tensor(0.0, device=device, requires_grad=True)
         for t in range(self.T):
             # 固有约束贡献（常数部分）
             inherent_const = b_val
@@ -2610,7 +2631,9 @@ class SubproblemSurrogateTrainer:
                 if ts + 2 == t:
                     dual_expr = dual_expr + gammas_tensor[k] * mu_vals[k]
 
-            obj_dual = obj_dual + torch.abs(dual_expr)
+            obj_dual_x = obj_dual_x + torch.abs(dual_expr)
+
+        obj_dual = obj_dual_pg + obj_dual_x
         
         # 死区正则：限制幅值失控，但不给模板附近/小范围波动施加默认回拉。
         reg_loss = self.reg_weight * (
@@ -2639,7 +2662,8 @@ class SubproblemSurrogateTrainer:
 
         # 总损失：三项BCD目标 + 正则化
         loss = (self.rho_primal * obj_primal +
-                self.rho_dual   * obj_dual   +
+                self.rho_dual_pg * obj_dual_pg +
+                self.rho_dual_x * obj_dual_x +
                 self.rho_opt    * obj_opt    +
                 reg_loss)
 
@@ -2754,15 +2778,20 @@ class SubproblemSurrogateTrainer:
         if self.n_samples > 0:
             self._last_surr_nn_loss = epoch_loss / self.n_samples
 
-    def cal_viol(self) -> Tuple[float, float, float]:
+    def cal_viol_components(self) -> Tuple[float, float, float, float, float, float]:
         """
         计算完整KKT违反量（与primal/dual block的目标函数完全对应）
           obj_primal: 所有约束（原问题+代理）的原始可行性违反
+          obj_dual_pg: pg 驻点条件违反
+          obj_dual_x:  x 驻点条件违反
+          obj_dual_coc: coc 驻点条件违反
           obj_dual:   所有决策变量（pg, x, coc）的KKT驻点条件违反
           obj_opt:    所有约束-对偶变量对的互补松弛违反
         """
         obj_primal = 0.0
-        obj_dual   = 0.0
+        obj_dual_pg = 0.0
+        obj_dual_x = 0.0
+        obj_dual_coc = 0.0
         obj_opt    = 0.0
 
         g = self.unit_id
@@ -2879,7 +2908,7 @@ class SubproblemSurrogateTrainer:
                     if t < self.T - 1:
                         pg_stat -= float(lam_ru[t])
                         pg_stat += float(lam_rd[t])
-                    obj_dual += abs(pg_stat)
+                    obj_dual_pg += abs(pg_stat)
 
             # -- x[t] 驻点条件（含固有约束项、代理耦合项和cost项）--
             for t in range(self.T):
@@ -2925,7 +2954,7 @@ class SubproblemSurrogateTrainer:
                         x_stat += betas[k] * mu_vals[k]
                     if ts + 2 == t:
                         x_stat += gammas[k] * mu_vals[k]
-                obj_dual += abs(x_stat)
+                obj_dual_x += abs(x_stat)
 
             # -- coc[t] 驻点条件（与dual block一致）--
             if lam_inh is not None:
@@ -2934,8 +2963,13 @@ class SubproblemSurrogateTrainer:
                 lam_cn  = lam_inh['lambda_coc_nonneg']
                 for t in range(self.T - 1):
                     coc_stat = 1.0 - float(lam_sc[t]) - float(lam_shc[t]) - float(lam_cn[t])
-                    obj_dual += abs(coc_stat)
+                    obj_dual_coc += abs(coc_stat)
 
+        obj_dual = obj_dual_pg + obj_dual_x + obj_dual_coc
+        return obj_primal, obj_dual_pg, obj_dual_x, obj_dual_coc, obj_dual, obj_opt
+
+    def cal_viol(self) -> Tuple[float, float, float]:
+        obj_primal, _, _, _, obj_dual, obj_opt = self.cal_viol_components()
         return obj_primal, obj_dual, obj_opt
     
     def iter(self, max_iter: int = 20, nn_epochs: int = 10):
@@ -2946,6 +2980,7 @@ class SubproblemSurrogateTrainer:
             self.logger = None
         print(f"开始BCD迭代训练 (机组{self.unit_id}, V3三时段耦合约束)...", flush=True)
         gamma = self.gamma_base / (self.n_samples * max(max_iter, 1))
+        gamma_dual = gamma * self.gamma_dual_component_scale
         self.gamma = gamma
         
         for i in range(max_iter):
@@ -2995,20 +3030,37 @@ class SubproblemSurrogateTrainer:
             self.iter_with_surrogate_nn(num_epochs=nn_epochs)
 
             # 计算违反量（NN更新后）
-            obj_primal, obj_dual, obj_opt = self.cal_viol()
+            obj_primal, obj_dual_pg, obj_dual_x, obj_dual_coc, obj_dual, obj_opt = self.cal_viol_components()
             obj_primal = obj_primal if abs(obj_primal) >= 1e-12 else 0.0
+            obj_dual_pg = obj_dual_pg if abs(obj_dual_pg) >= 1e-12 else 0.0
+            obj_dual_x = obj_dual_x if abs(obj_dual_x) >= 1e-12 else 0.0
+            obj_dual_coc = obj_dual_coc if abs(obj_dual_coc) >= 1e-12 else 0.0
             obj_dual   = obj_dual   if abs(obj_dual)   >= 1e-12 else 0.0
             obj_opt    = obj_opt    if abs(obj_opt)    >= 1e-12 else 0.0
 
-            print(f"  obj_primal: {obj_primal:.6f}, obj_dual: {obj_dual:.6f}, obj_opt: {obj_opt:.6f}", flush=True)
+            print(
+                f"  obj_primal: {obj_primal:.6f}, "
+                f"obj_dual_pg: {obj_dual_pg:.6f}, obj_dual_x: {obj_dual_x:.6f}, "
+                f"obj_dual_coc: {obj_dual_coc:.6f}, obj_dual: {obj_dual:.6f}, "
+                f"obj_opt: {obj_opt:.6f}",
+                flush=True,
+            )
 
             # 前3次迭代冻结rho，之后再按累加式更新
             if i >= 3:
                 self.rho_primal = min(self.rho_primal + gamma * obj_primal, self.rho_max)
-                self.rho_dual   = min(self.rho_dual   + gamma * obj_dual,   self.rho_max)
+                self.rho_dual_pg = min(self.rho_dual_pg + gamma_dual * obj_dual_pg, self.rho_max)
+                self.rho_dual_x = min(self.rho_dual_x + gamma_dual * obj_dual_x, self.rho_max)
+                self.rho_dual_coc = min(self.rho_dual_coc + gamma_dual * obj_dual_coc, self.rho_max)
+                self._sync_rho_dual_summary()
                 self.rho_opt    = min(self.rho_opt    + gamma * obj_opt,    self.rho_max)
 
-            print(f"  ρ_primal={self.rho_primal:.4f}, ρ_dual={self.rho_dual:.4f}, ρ_opt={self.rho_opt:.4f}", flush=True)
+            print(
+                f"  ρ_primal={self.rho_primal:.4f}, ρ_dual_pg={self.rho_dual_pg:.4f}, "
+                f"ρ_dual_x={self.rho_dual_x:.4f}, ρ_dual_coc={self.rho_dual_coc:.4f}, "
+                f"ρ_dual={self.rho_dual:.4f}, ρ_opt={self.rho_opt:.4f}",
+                flush=True,
+            )
             print("  " + "-" * 40, flush=True)
 
             # logger 钩子
@@ -3018,6 +3070,12 @@ class SubproblemSurrogateTrainer:
                     unit_id=self.unit_id, iter=i,
                     obj_primal=obj_primal, obj_dual=obj_dual, obj_opt=obj_opt,
                     rho_primal=self.rho_primal, rho_dual=self.rho_dual, rho_opt=self.rho_opt,
+                    obj_dual_pg=obj_dual_pg,
+                    obj_dual_x=obj_dual_x,
+                    obj_dual_coc=obj_dual_coc,
+                    rho_dual_pg=self.rho_dual_pg,
+                    rho_dual_x=self.rho_dual_x,
+                    rho_dual_coc=self.rho_dual_coc,
                     alpha_mean=float(np.mean(self.alpha_values)),
                     beta_mean=float(np.mean(self.beta_values)),
                     gamma_mean=float(np.mean(self.gamma_values)),
@@ -3186,7 +3244,11 @@ class SubproblemSurrogateTrainer:
                 'mu': self.mu,
                 'rho_primal': self.rho_primal,
                 'rho_dual': self.rho_dual,
+                'rho_dual_pg': self.rho_dual_pg,
+                'rho_dual_x': self.rho_dual_x,
+                'rho_dual_coc': self.rho_dual_coc,
                 'rho_opt': self.rho_opt,
+                'gamma_dual_component_scale': self.gamma_dual_component_scale,
                 'num_coupling_constraints': self.num_coupling_constraints,
                 'max_constraints': self.max_constraints,
                 'requested_max_constraints': self.requested_max_constraints,
@@ -3227,8 +3289,15 @@ class SubproblemSurrogateTrainer:
             self.pg_cost_scale = state.get('pg_cost_scale', self.pg_cost_scale)
             self.mu = state['mu']
             self.rho_primal = state['rho_primal']
-            self.rho_dual = state['rho_dual']
+            self.rho_dual_pg = state.get('rho_dual_pg', state.get('rho_dual', self.rho_dual_pg))
+            self.rho_dual_x = state.get('rho_dual_x', state.get('rho_dual', self.rho_dual_x))
+            self.rho_dual_coc = state.get('rho_dual_coc', state.get('rho_dual', self.rho_dual_coc))
+            self._sync_rho_dual_summary()
             self.rho_opt = state['rho_opt']
+            self.gamma_dual_component_scale = state.get(
+                'gamma_dual_component_scale',
+                self.gamma_dual_component_scale,
+            )
             saved_strategy = state.get('constraint_generation_strategy', 'sensitive')
             self.constraint_generation_strategy = normalize_constraint_generation_strategy(saved_strategy)
             self.mu_individual_lower_bound_round = state.get(

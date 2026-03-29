@@ -87,6 +87,12 @@ class TrainingLogger:
         rho_primal: float,
         rho_dual: float,
         rho_opt: float,
+        obj_dual_pg: Optional[float] = None,
+        obj_dual_x: Optional[float] = None,
+        obj_dual_coc: Optional[float] = None,
+        rho_dual_pg: Optional[float] = None,
+        rho_dual_x: Optional[float] = None,
+        rho_dual_coc: Optional[float] = None,
         alpha_mean: Optional[float] = None,
         beta_mean: Optional[float] = None,
         gamma_mean: Optional[float] = None,
@@ -108,6 +114,18 @@ class TrainingLogger:
             "rho_opt": float(rho_opt),
             "timestamp": time.time() - self._start_time,
         }
+        if obj_dual_pg is not None:
+            record["obj_dual_pg"] = float(obj_dual_pg)
+        if obj_dual_x is not None:
+            record["obj_dual_x"] = float(obj_dual_x)
+        if obj_dual_coc is not None:
+            record["obj_dual_coc"] = float(obj_dual_coc)
+        if rho_dual_pg is not None:
+            record["rho_dual_pg"] = float(rho_dual_pg)
+        if rho_dual_x is not None:
+            record["rho_dual_x"] = float(rho_dual_x)
+        if rho_dual_coc is not None:
+            record["rho_dual_coc"] = float(rho_dual_coc)
         if alpha_mean is not None:
             record["alpha_mean"] = float(alpha_mean)
         if beta_mean is not None:

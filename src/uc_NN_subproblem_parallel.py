@@ -130,6 +130,7 @@ class ParallelSubproblemSurrogateTrainer(SubproblemSurrogateTrainer):
 
         EPS = 1e-10
         gamma = self.gamma_base / (self.n_samples * max_iter)
+        gamma_dual = gamma * self.gamma_dual_component_scale
         self.gamma = gamma
 
         for i in range(max_iter):
@@ -222,20 +223,27 @@ class ParallelSubproblemSurrogateTrainer(SubproblemSurrogateTrainer):
             self.iter_with_surrogate_nn(num_epochs=nn_epochs)
 
             # ── 计算并打印违反量 ─────────────────────────────────────
-            obj_primal, obj_dual, obj_opt = self.cal_viol()
+            obj_primal, obj_dual_pg, obj_dual_x, obj_dual_coc, obj_dual, obj_opt = self.cal_viol_components()
             obj_primal = obj_primal if abs(obj_primal) >= 1e-12 else 0.0
+            obj_dual_pg = obj_dual_pg if abs(obj_dual_pg) >= 1e-12 else 0.0
+            obj_dual_x = obj_dual_x if abs(obj_dual_x) >= 1e-12 else 0.0
+            obj_dual_coc = obj_dual_coc if abs(obj_dual_coc) >= 1e-12 else 0.0
             obj_dual   = obj_dual   if abs(obj_dual)   >= 1e-12 else 0.0
             obj_opt    = obj_opt    if abs(obj_opt)    >= 1e-12 else 0.0
 
             print(
                 f"{prefix}   obj_primal={obj_primal:.6f}, "
-                f"obj_dual={obj_dual:.6f}, obj_opt={obj_opt:.6f}",
+                f"obj_dual_pg={obj_dual_pg:.6f}, obj_dual_x={obj_dual_x:.6f}, "
+                f"obj_dual_coc={obj_dual_coc:.6f}, obj_dual={obj_dual:.6f}, obj_opt={obj_opt:.6f}",
                 flush=True,
             )
 
             if i >= 3:
                 self.rho_primal = min(self.rho_primal + gamma * obj_primal, self.rho_max)
-                self.rho_dual   = min(self.rho_dual   + gamma * obj_dual,   self.rho_max)
+                self.rho_dual_pg = min(self.rho_dual_pg + gamma_dual * obj_dual_pg, self.rho_max)
+                self.rho_dual_x = min(self.rho_dual_x + gamma_dual * obj_dual_x, self.rho_max)
+                self.rho_dual_coc = min(self.rho_dual_coc + gamma_dual * obj_dual_coc, self.rho_max)
+                self._sync_rho_dual_summary()
                 self.rho_opt    = min(self.rho_opt    + gamma * obj_opt,    self.rho_max)
             
             print(f"{prefix}   ρ_primal={self.rho_primal:.4f}, ρ_dual={self.rho_dual:.4f}, ρ_opt={self.rho_opt:.4f}", flush=True)
@@ -332,6 +340,9 @@ def _train_unit_worker(args: dict) -> dict:
         'mu':           trainer.mu,
         'rho_primal':   trainer.rho_primal,
         'rho_dual':     trainer.rho_dual,
+        'rho_dual_pg':  trainer.rho_dual_pg,
+        'rho_dual_x':   trainer.rho_dual_x,
+        'rho_dual_coc': trainer.rho_dual_coc,
         'rho_opt':      trainer.rho_opt,
     }
 
