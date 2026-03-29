@@ -69,6 +69,10 @@ THETA_HOT_START_STRATEGY = 'dcpf_relative'   # 'dcpf_relative' / 'gaussian'
 ZETA_HOT_START_STRATEGY = 'zero'             # 'zero' / 'gaussian'
 THETA_GAUSSIAN_STD = 0.01
 ZETA_GAUSSIAN_STD = 0.01
+SUBPROBLEM_PG_COST_START_ROUND = 3
+SUBPROBLEM_PG_COST_SCALE_MULTIPLIER = 1.2
+SUBPROBLEM_PG_COST_LR = 2e-5
+SUBPROBLEM_PG_COST_SURR_LR = 5e-5
 
 # ──────────────────────── 导入 ────────────────────────
 
@@ -202,7 +206,11 @@ def run_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS,
                   DUAL_EPOCHS, DUAL_BATCH_SIZE, MAX_ITER, NN_EPOCHS, save_dir,
                   n_workers: int = 4, logger: 'TrainingLogger | None' = None,
                   constraint_generation_strategy: str = 'sensitive',
-                  subproblem_gamma_base: float = 1e-3):
+                  subproblem_gamma_base: float = 1e-3,
+                  pg_cost_start_round: int = 3,
+                  pg_cost_scale_multiplier: float = 1.2,
+                  pg_cost_lr: float = 2e-5,
+                  pg_cost_surr_lr: float = 5e-5):
     """V3 代理约束训练（样本级并行），返回 (dual_predictor, trainers)。"""
     import os
     from pypower.ext2int import ext2int
@@ -239,6 +247,10 @@ def run_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS,
                 lambda_predictor=dual_predictor,
                 constraint_generation_strategy=constraint_generation_strategy,
                 gamma_base=subproblem_gamma_base,
+                pg_cost_start_round=pg_cost_start_round,
+                pg_cost_scale_multiplier=pg_cost_scale_multiplier,
+                pg_cost_lr=pg_cost_lr,
+                pg_cost_surr_lr=pg_cost_surr_lr,
             )
         else:
             log(f"  机组 {g} ({i+1}/{len(unit_ids)}) — 样本级并行 n_workers={n_workers}")
@@ -247,6 +259,10 @@ def run_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS,
                 lambda_predictor=dual_predictor,
                 constraint_generation_strategy=constraint_generation_strategy,
                 gamma_base=subproblem_gamma_base,
+                pg_cost_start_round=pg_cost_start_round,
+                pg_cost_scale_multiplier=pg_cost_scale_multiplier,
+                pg_cost_lr=pg_cost_lr,
+                pg_cost_surr_lr=pg_cost_surr_lr,
                 n_workers=n_workers,
             )
         if logger is not None:
@@ -651,6 +667,10 @@ def main():
                 DUAL_EPOCHS, DUAL_BATCH_SIZE, MAX_ITER, NN_EPOCHS, save_dir,
                 n_workers=N_WORKERS_SUBPROBLEM, logger=logger,
                 constraint_generation_strategy=CONSTRAINT_GENERATION_STRATEGY,
+                pg_cost_start_round=SUBPROBLEM_PG_COST_START_ROUND,
+                pg_cost_scale_multiplier=SUBPROBLEM_PG_COST_SCALE_MULTIPLIER,
+                pg_cost_lr=SUBPROBLEM_PG_COST_LR,
+                pg_cost_surr_lr=SUBPROBLEM_PG_COST_SURR_LR,
             )
             print_surrogate_results(trainers, all_samples)
 
@@ -741,6 +761,10 @@ def main():
                 DUAL_EPOCHS, DUAL_BATCH_SIZE, MAX_ITER, NN_EPOCHS, save_dir,
                 n_workers=N_WORKERS_SUBPROBLEM, logger=logger,
                 constraint_generation_strategy=CONSTRAINT_GENERATION_STRATEGY,
+                pg_cost_start_round=SUBPROBLEM_PG_COST_START_ROUND,
+                pg_cost_scale_multiplier=SUBPROBLEM_PG_COST_SCALE_MULTIPLIER,
+                pg_cost_lr=SUBPROBLEM_PG_COST_LR,
+                pg_cost_surr_lr=SUBPROBLEM_PG_COST_SURR_LR,
             )
             print_surrogate_results(trainers, all_samples)
 

@@ -1377,6 +1377,10 @@ class SubproblemSurrogateTrainer:
                  mu_lower_bound_init: float = 0.1,
                  mu_individual_lower_bound_round: int = 3,
                  mu_group_lower_bound_round: int = 50,
+                 pg_cost_start_round: int = 3,
+                 pg_cost_scale_multiplier: float = 1.2,
+                 pg_cost_lr: float = 2e-5,
+                 pg_cost_surr_lr: float = 5e-5,
                  device=None):
         """
         初始化单机组子问题代理约束训练器 - V3三时段版本
@@ -1408,6 +1412,10 @@ class SubproblemSurrogateTrainer:
             constraint_generation_strategy
         )
         self.all_mode_group_size = 4 if self.constraint_generation_strategy == CONSTRAINT_STRATEGY_ALL_TEMPLATES_RHS3 else 1
+        self.template_rhs_jitter_scale = 0.4
+        self.template_rhs_reg_deadband = 0.25
+        self.coeff_reg_deadband = 0.35
+        self.aux_cost_reg_deadband = 0.1
         self.requested_max_constraints = max_constraints
         self.max_constraints = max_constraints  # V3新增
         
@@ -1460,6 +1468,10 @@ class SubproblemSurrogateTrainer:
             int(mu_group_lower_bound_round),
             self.mu_individual_lower_bound_round,
         )
+        self.pg_cost_start_round = max(int(pg_cost_start_round), 0)
+        self.pg_cost_scale_multiplier = max(float(pg_cost_scale_multiplier), 1e-6)
+        self.pg_cost_lr = max(float(pg_cost_lr), 1e-8)
+        self.pg_cost_surr_lr = max(float(pg_cost_surr_lr), 1e-8)
         self.cost_ema_alpha = 0.3  # cost_values EMA平滑系数，越小越平滑
         self.pg_cost_ema_alpha = 0.3
         self.iter_number = 0
@@ -1475,6 +1487,7 @@ class SubproblemSurrogateTrainer:
         # 三时段耦合约束，每个样本可能有不同数量的约束（≤max_constraints）
         # 初始化为max_constraints大小
         self.num_coupling_constraints = self.max_constraints
+        self.template_rhs_base_vector = self._build_template_rhs_base_vector(self.num_coupling_constraints)
         self.mu = np.ones((self.n_samples, self.num_coupling_constraints)) * self.mu_lower_bound
 
         # 固有约束的对偶变量（由dual block更新，用于NN loss的完整KKT驻点条件）
@@ -1486,7 +1499,8 @@ class SubproblemSurrogateTrainer:
         # 获取对偶变量λ
         self.lambda_vals = self._get_lambda_values()
         lambda_abs_mean = float(np.mean(np.abs(self.lambda_vals))) if self.lambda_vals.size > 0 else 0.0
-        self.pg_cost_scale = max(lambda_abs_mean / 20.0, 1e-3)
+        base_pg_cost_scale = max(lambda_abs_mean / 20.0, 1e-3)
+        self.pg_cost_scale = base_pg_cost_scale * self.pg_cost_scale_multiplier
         
         # 初始化三时段耦合代理约束参数（占位，后续由NN填充）
         self.alpha_values = np.zeros((self.n_samples, self.num_coupling_constraints))
@@ -1588,6 +1602,8 @@ class SubproblemSurrogateTrainer:
     def _init_neural_network(self):
         """初始化代理约束神经网络 - V3版本"""
         input_dim = len(self._extract_features(0))
+        delta_base = 0.0 if self._uses_template_rhs_bases() else 3.0
+        delta_scale = self.template_rhs_jitter_scale if self._uses_template_rhs_bases() else 2.0
 
         self.surrogate_net = SubproblemSurrogateNet(
             input_dim=input_dim,
@@ -1596,22 +1612,103 @@ class SubproblemSurrogateTrainer:
             hidden_dims=[256, 256],  # 两层残差块
             x_cost_scale=self.x_cost_scale,
             pg_cost_scale=self.pg_cost_scale,
+            delta_base=delta_base,
+            delta_scale=delta_scale,
         ).to(self.device)
 
         # 分离参数组：主优化器管理 backbone + alpha/beta/gamma/delta 头
         aux_params = set(self.surrogate_net.cost_net.parameters()) | set(self.surrogate_net.pg_cost_net.parameters())
         main_params = [p for p in self.surrogate_net.parameters() if p not in aux_params]
         self.optimizer = optim.Adam(main_params, lr=1e-4)
-        # x/pg 调整项头单独优化，学习率更低以稳定辅助成本
+        # x / pg 调整项头拆分优化，便于仅对 c_pg 提高学习率并延迟启用
         self.cost_optimizer = optim.Adam(
-            list(self.surrogate_net.cost_net.parameters()) + list(self.surrogate_net.pg_cost_net.parameters()),
+            self.surrogate_net.cost_net.parameters(),
             lr=1e-5,
+        )
+        self.pg_cost_optimizer = optim.Adam(
+            self.surrogate_net.pg_cost_net.parameters(),
+            lr=self.pg_cost_lr,
         )
 
         print(f"  - 代理约束网络输入维度: {input_dim}", flush=True)
         print(f"  - 约束生成策略: {self.constraint_generation_strategy}", flush=True)
         print(f"  - 最大约束数量: {self.max_constraints}", flush=True)
         print(f"  - x_cost_scale={self.x_cost_scale:.4f}, pg_cost_scale={self.pg_cost_scale:.4f}", flush=True)
+        print(f"  - delta_base={delta_base:.4f}, delta_scale={delta_scale:.4f}", flush=True)
+        print(
+            f"  - coeff_reg_deadband={self.coeff_reg_deadband:.4f}, "
+            f"delta_reg_deadband={self.template_rhs_reg_deadband:.4f}",
+            flush=True,
+        )
+        print(
+            f"  - c_pg_start_round={self.pg_cost_start_round}, "
+            f"c_pg_lr={self.pg_cost_lr:.2e}, c_pg_surr_lr={self.pg_cost_surr_lr:.2e}",
+            flush=True,
+        )
+
+    def _pg_costs_active(self) -> bool:
+        return self.iter_number >= self.pg_cost_start_round
+
+    def _uses_template_rhs_bases(self) -> bool:
+        return self.constraint_generation_strategy == CONSTRAINT_STRATEGY_ALL_TEMPLATES_RHS3
+
+    def _build_all_template_patterns_and_rhs(self) -> tuple[np.ndarray, np.ndarray]:
+        patterns = np.array(
+            [
+                [1.0, 0.0, 1.0],
+                [-1.0, 0.0, 1.0],
+                [1.0, 0.0, -1.0],
+                [-1.0, 0.0, -1.0],
+            ],
+            dtype=float,
+        )
+        # RHS 取各模板在 x in [0,1] 下的最大 lhs，可保证初始 surrogate_viol = 0。
+        rhs = np.array([2.0, 1.0, 1.0, 0.0], dtype=float)
+        return patterns, rhs
+
+    def _build_template_rhs_base_vector(self, size: int) -> np.ndarray:
+        if not self._uses_template_rhs_bases() or size <= 0:
+            return np.zeros(max(size, 0), dtype=float)
+        _, rhs = self._build_all_template_patterns_and_rhs()
+        n_groups = size // self.all_mode_group_size
+        if n_groups <= 0:
+            return np.zeros(size, dtype=float)
+        return np.tile(rhs, n_groups)
+
+    def _postprocess_delta_tensor(self, deltas_tensor: torch.Tensor) -> torch.Tensor:
+        if not self._uses_template_rhs_bases():
+            return deltas_tensor
+        if deltas_tensor.ndim == 2:
+            base = torch.tensor(
+                self.template_rhs_base_vector[:deltas_tensor.shape[1]],
+                dtype=deltas_tensor.dtype,
+                device=deltas_tensor.device,
+            ).unsqueeze(0)
+            return base + deltas_tensor
+        base = torch.tensor(
+            self.template_rhs_base_vector[:deltas_tensor.shape[0]],
+            dtype=deltas_tensor.dtype,
+            device=deltas_tensor.device,
+        )
+        return base + deltas_tensor
+
+    def _deadband_quadratic(
+        self,
+        tensor: torch.Tensor,
+        deadband: float,
+        center: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if deadband <= 0:
+            ref = tensor if center is None else (tensor - center)
+            return torch.sum(ref ** 2)
+        ref = tensor if center is None else (tensor - center)
+        excess = torch.relu(torch.abs(ref) - deadband)
+        return torch.sum(excess ** 2)
+
+    def _gate_pg_cost_tensor(self, pg_costs_tensor: torch.Tensor) -> torch.Tensor:
+        if self._pg_costs_active():
+            return pg_costs_tensor
+        return torch.zeros_like(pg_costs_tensor)
 
     def _generate_initial_values_from_nn(self):
         """用未训练的 SubproblemSurrogateNet forward pass 生成 alpha/beta/gamma/delta 初值。"""
@@ -1627,7 +1724,7 @@ class SubproblemSurrogateTrainer:
         self.alpha_values = alphas.cpu().numpy()
         self.beta_values = betas.cpu().numpy()
         self.gamma_values = gammas.cpu().numpy()
-        self.delta_values = deltas.cpu().numpy()
+        self.delta_values = self._postprocess_delta_tensor(deltas).cpu().numpy()
         self.cost_values = np.zeros((self.n_samples, self.T))  # 强制初值为零，避免未训练NN的随机输出干扰
         self.pg_cost_values = np.zeros((self.n_samples, self.T))
 
@@ -1643,15 +1740,7 @@ class SubproblemSurrogateTrainer:
         if self.constraint_generation_strategy != CONSTRAINT_STRATEGY_ALL_TEMPLATES_RHS3 or self.num_coupling_constraints <= 0:
             return
 
-        base_patterns = np.array(
-            [
-                [1.0, 0.0, 1.0],
-                [-1.0, 0.0, 1.0],
-                [1.0, 0.0, -1.0],
-                [-1.0, 0.0, -1.0],
-            ],
-            dtype=float,
-        )
+        base_patterns, base_rhs = self._build_all_template_patterns_and_rhs()
         n_groups = self.num_coupling_constraints // self.all_mode_group_size
         if n_groups <= 0:
             return
@@ -1659,7 +1748,7 @@ class SubproblemSurrogateTrainer:
         self.alpha_values[:] = np.tile(base_patterns[:, 0], n_groups)
         self.beta_values[:] = np.tile(base_patterns[:, 1], n_groups)
         self.gamma_values[:] = np.tile(base_patterns[:, 2], n_groups)
-        self.delta_values[:] = 3.0
+        self.delta_values[:] = np.tile(base_rhs, n_groups)
 
     def _uses_group_mu_lower_bound(self) -> bool:
         return self.constraint_generation_strategy == CONSTRAINT_STRATEGY_ALL_TEMPLATES_RHS3 and self.all_mode_group_size > 1
@@ -2523,12 +2612,30 @@ class SubproblemSurrogateTrainer:
 
             obj_dual = obj_dual + torch.abs(dual_expr)
         
-        # L2 正则化：控制 alpha/beta/gamma/cost 参数大小
-        reg_loss = self.reg_weight * (torch.sum(alphas_tensor ** 2)
-                                      + torch.sum(betas_tensor ** 2)
-                                      + torch.sum(gammas_tensor ** 2)
-                                      + torch.sum(costs_tensor ** 2)
-                                      + torch.sum(pg_costs_tensor ** 2))
+        # 死区正则：限制幅值失控，但不给模板附近/小范围波动施加默认回拉。
+        reg_loss = self.reg_weight * (
+            self._deadband_quadratic(alphas_tensor, self.coeff_reg_deadband)
+            + self._deadband_quadratic(betas_tensor, self.coeff_reg_deadband)
+            + self._deadband_quadratic(gammas_tensor, self.coeff_reg_deadband)
+            + self._deadband_quadratic(costs_tensor, self.aux_cost_reg_deadband)
+            + self._deadband_quadratic(pg_costs_tensor, self.aux_cost_reg_deadband)
+        )
+        if self._uses_template_rhs_bases():
+            delta_base_tensor = torch.tensor(
+                self.template_rhs_base_vector[:deltas_tensor.shape[0]],
+                dtype=deltas_tensor.dtype,
+                device=deltas_tensor.device,
+            )
+            reg_loss = reg_loss + self.reg_weight * self._deadband_quadratic(
+                deltas_tensor,
+                self.template_rhs_reg_deadband,
+                center=delta_base_tensor,
+            )
+        else:
+            reg_loss = reg_loss + self.reg_weight * self._deadband_quadratic(
+                deltas_tensor,
+                self.coeff_reg_deadband,
+            )
 
         # 总损失：三项BCD目标 + 正则化
         loss = (self.rho_primal * obj_primal +
@@ -2556,8 +2663,13 @@ class SubproblemSurrogateTrainer:
             self._surr_optimizer = optim.Adam(
                 main_params, lr=3e-4, weight_decay=1e-4)
             self._surr_cost_optimizer = optim.Adam(
-                list(self.surrogate_net.cost_net.parameters()) + list(self.surrogate_net.pg_cost_net.parameters()),
+                self.surrogate_net.cost_net.parameters(),
                 lr=3e-5,
+                weight_decay=1e-4,
+            )
+            self._surr_pg_cost_optimizer = optim.Adam(
+                self.surrogate_net.pg_cost_net.parameters(),
+                lr=self.pg_cost_surr_lr,
                 weight_decay=1e-4,
             )
             self._surr_scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
@@ -2569,6 +2681,7 @@ class SubproblemSurrogateTrainer:
             epoch_loss = 0.0
             self._surr_optimizer.zero_grad()
             self._surr_cost_optimizer.zero_grad()
+            self._surr_pg_cost_optimizer.zero_grad()
             batch_count = 0
 
             for sample_id in range(self.n_samples):
@@ -2586,9 +2699,13 @@ class SubproblemSurrogateTrainer:
                 alphas_tensor = alphas_out.squeeze(0)[:nc]   # (num_coupling_constraints,)
                 betas_tensor = betas_out.squeeze(0)[:nc]
                 gammas_tensor = gammas_out.squeeze(0)[:nc]
-                deltas_tensor = deltas_out.squeeze(0)[:nc]   # 受控在 delta_base ± delta_scale
+                deltas_tensor = self._postprocess_delta_tensor(
+                    deltas_out.squeeze(0)[:nc]
+                )
                 costs_tensor = costs_out.squeeze(0)[:self.T]  # (T,)
-                pg_costs_tensor = pg_costs_out.squeeze(0)[:self.T]
+                pg_costs_tensor = self._gate_pg_cost_tensor(
+                    pg_costs_out.squeeze(0)[:self.T]
+                )
 
                 # 计算loss（V3版本，传入5个参数）+ scaled backward
                 loss = self.loss_function_differentiable(
@@ -2621,8 +2738,11 @@ class SubproblemSurrogateTrainer:
                     torch.nn.utils.clip_grad_norm_(self.surrogate_net.parameters(), max_norm=1.0)
                     self._surr_optimizer.step()
                     self._surr_cost_optimizer.step()
+                    if self._pg_costs_active():
+                        self._surr_pg_cost_optimizer.step()
                     self._surr_optimizer.zero_grad()
                     self._surr_cost_optimizer.zero_grad()
+                    self._surr_pg_cost_optimizer.zero_grad()
                     batch_count = 0
 
             self._surr_scheduler.step()
@@ -2954,6 +3074,7 @@ class SubproblemSurrogateTrainer:
 
         with torch.no_grad():
             alphas, betas, gammas, deltas, costs, pg_costs = self.surrogate_net(features_tensor)
+            deltas = self._postprocess_delta_tensor(deltas.squeeze(0)).unsqueeze(0)
 
         return (alphas.squeeze(0).cpu().numpy(),
                 betas.squeeze(0).cpu().numpy(),
@@ -3060,6 +3181,8 @@ class SubproblemSurrogateTrainer:
                 'delta_values': self.delta_values,
                 'cost_values': self.cost_values,
                 'pg_cost_values': self.pg_cost_values,
+                'x_cost_scale': self.x_cost_scale,
+                'pg_cost_scale': self.pg_cost_scale,
                 'mu': self.mu,
                 'rho_primal': self.rho_primal,
                 'rho_dual': self.rho_dual,
@@ -3070,6 +3193,14 @@ class SubproblemSurrogateTrainer:
                 'constraint_generation_strategy': self.constraint_generation_strategy,
                 'mu_individual_lower_bound_round': self.mu_individual_lower_bound_round,
                 'mu_group_lower_bound_round': self.mu_group_lower_bound_round,
+                'pg_cost_start_round': self.pg_cost_start_round,
+                'pg_cost_scale_multiplier': self.pg_cost_scale_multiplier,
+                'pg_cost_lr': self.pg_cost_lr,
+                'pg_cost_surr_lr': self.pg_cost_surr_lr,
+                'template_rhs_jitter_scale': self.template_rhs_jitter_scale,
+                'template_rhs_reg_deadband': self.template_rhs_reg_deadband,
+                'coeff_reg_deadband': self.coeff_reg_deadband,
+                'aux_cost_reg_deadband': self.aux_cost_reg_deadband,
                 'lambda_inherent': self.lambda_inherent,
             }
             
@@ -3092,6 +3223,8 @@ class SubproblemSurrogateTrainer:
             self.delta_values = state.get('delta_values', np.full_like(self.gamma_values, 3.0))
             self.cost_values = state.get('cost_values', np.zeros((self.n_samples, self.T)))
             self.pg_cost_values = state.get('pg_cost_values', np.zeros((self.n_samples, self.T)))
+            self.x_cost_scale = state.get('x_cost_scale', self.x_cost_scale)
+            self.pg_cost_scale = state.get('pg_cost_scale', self.pg_cost_scale)
             self.mu = state['mu']
             self.rho_primal = state['rho_primal']
             self.rho_dual = state['rho_dual']
@@ -3106,9 +3239,37 @@ class SubproblemSurrogateTrainer:
                 state.get('mu_group_lower_bound_round', self.mu_group_lower_bound_round),
                 self.mu_individual_lower_bound_round,
             )
+            self.pg_cost_start_round = state.get('pg_cost_start_round', self.pg_cost_start_round)
+            self.pg_cost_scale_multiplier = state.get(
+                'pg_cost_scale_multiplier',
+                self.pg_cost_scale_multiplier,
+            )
+            self.pg_cost_lr = state.get('pg_cost_lr', self.pg_cost_lr)
+            self.pg_cost_surr_lr = state.get('pg_cost_surr_lr', self.pg_cost_surr_lr)
+            self.template_rhs_jitter_scale = state.get(
+                'template_rhs_jitter_scale',
+                self.template_rhs_jitter_scale,
+            )
+            self.template_rhs_reg_deadband = state.get(
+                'template_rhs_reg_deadband',
+                self.template_rhs_reg_deadband,
+            )
+            self.coeff_reg_deadband = state.get('coeff_reg_deadband', self.coeff_reg_deadband)
+            self.aux_cost_reg_deadband = state.get(
+                'aux_cost_reg_deadband',
+                self.aux_cost_reg_deadband,
+            )
+            self.surrogate_net.x_cost_scale = self.x_cost_scale
+            self.surrogate_net.pg_cost_scale = self.pg_cost_scale
+            if self._uses_template_rhs_bases():
+                self.surrogate_net.delta_base = 0.0
+                self.surrogate_net.delta_scale = self.template_rhs_jitter_scale
+            for param_group in self.pg_cost_optimizer.param_groups:
+                param_group['lr'] = self.pg_cost_lr
             self.requested_max_constraints = state.get('requested_max_constraints', self.requested_max_constraints)
             self.max_constraints = state.get('max_constraints', self.max_constraints)
             self.num_coupling_constraints = state.get('num_coupling_constraints', self.num_coupling_constraints)
+            self.template_rhs_base_vector = self._build_template_rhs_base_vector(self.num_coupling_constraints)
             if 'lambda_inherent' in state:
                 self.lambda_inherent = state['lambda_inherent']
             print(f"✓ V3三时段耦合代理约束模型已加载: {filepath}", flush=True)
@@ -3171,6 +3332,10 @@ def train_subproblem_surrogate_from_data(ppc, active_set_data: List[Dict], unit_
                                           constraint_generation_strategy: str = "sensitive",
                                           mu_individual_lower_bound_round: int = 3,
                                           mu_group_lower_bound_round: int = 50,
+                                          pg_cost_start_round: int = 3,
+                                          pg_cost_scale_multiplier: float = 1.2,
+                                          pg_cost_lr: float = 2e-5,
+                                          pg_cost_surr_lr: float = 5e-5,
                                           save_path: str = None, device=None) -> SubproblemSurrogateTrainer:
     """
     训练单机组子问题代理约束
@@ -3200,6 +3365,10 @@ def train_subproblem_surrogate_from_data(ppc, active_set_data: List[Dict], unit_
         constraint_generation_strategy=constraint_generation_strategy,
         mu_individual_lower_bound_round=mu_individual_lower_bound_round,
         mu_group_lower_bound_round=mu_group_lower_bound_round,
+        pg_cost_start_round=pg_cost_start_round,
+        pg_cost_scale_multiplier=pg_cost_scale_multiplier,
+        pg_cost_lr=pg_cost_lr,
+        pg_cost_surr_lr=pg_cost_surr_lr,
         device=device
     )
     
@@ -3219,6 +3388,10 @@ def train_all_subproblem_surrogates(ppc, active_set_data: List[Dict], T_delta: f
                                       constraint_generation_strategy: str = "sensitive",
                                       mu_individual_lower_bound_round: int = 3,
                                       mu_group_lower_bound_round: int = 50,
+                                      pg_cost_start_round: int = 3,
+                                      pg_cost_scale_multiplier: float = 1.2,
+                                      pg_cost_lr: float = 2e-5,
+                                      pg_cost_surr_lr: float = 5e-5,
                                       save_dir: str = None, device=None) -> Dict[int, SubproblemSurrogateTrainer]:
     """
     训练所有机组的子问题代理约束
@@ -3258,6 +3431,10 @@ def train_all_subproblem_surrogates(ppc, active_set_data: List[Dict], T_delta: f
             constraint_generation_strategy=constraint_generation_strategy,
             mu_individual_lower_bound_round=mu_individual_lower_bound_round,
             mu_group_lower_bound_round=mu_group_lower_bound_round,
+            pg_cost_start_round=pg_cost_start_round,
+            pg_cost_scale_multiplier=pg_cost_scale_multiplier,
+            pg_cost_lr=pg_cost_lr,
+            pg_cost_surr_lr=pg_cost_surr_lr,
             device=device
         )
         

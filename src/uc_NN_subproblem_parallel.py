@@ -88,6 +88,10 @@ class ParallelSubproblemSurrogateTrainer(SubproblemSurrogateTrainer):
         mu_lower_bound_init: float = 0.1,
         mu_individual_lower_bound_round: int = 3,
         mu_group_lower_bound_round: int = 50,
+        pg_cost_start_round: int = 3,
+        pg_cost_scale_multiplier: float = 1.2,
+        pg_cost_lr: float = 2e-5,
+        pg_cost_surr_lr: float = 5e-5,
         device=None,
         n_workers: int = 4,
     ):
@@ -103,6 +107,10 @@ class ParallelSubproblemSurrogateTrainer(SubproblemSurrogateTrainer):
             mu_lower_bound_init=mu_lower_bound_init,
             mu_individual_lower_bound_round=mu_individual_lower_bound_round,
             mu_group_lower_bound_round=mu_group_lower_bound_round,
+            pg_cost_start_round=pg_cost_start_round,
+            pg_cost_scale_multiplier=pg_cost_scale_multiplier,
+            pg_cost_lr=pg_cost_lr,
+            pg_cost_surr_lr=pg_cost_surr_lr,
             device=device,
         )
         self.n_workers = min(n_workers, self.n_samples)

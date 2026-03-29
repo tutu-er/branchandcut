@@ -84,6 +84,10 @@ SUBPROBLEM_GAMMA_BASE = 1e-3
 SUBPROBLEM_MU_DUAL_FLOOR_INIT = 0.1
 SUBPROBLEM_MU_DUAL_FLOOR_INDIVIDUAL_ROUND = 10
 SUBPROBLEM_MU_DUAL_FLOOR_DECAY_ROUND = 50
+SUBPROBLEM_PG_COST_START_ROUND = 3
+SUBPROBLEM_PG_COST_SCALE_MULTIPLIER = 1.2
+SUBPROBLEM_PG_COST_LR = 2e-5
+SUBPROBLEM_PG_COST_SURR_LR = 5e-5
 
 # ──────────────────────── 导入 ────────────────────────
 
@@ -228,7 +232,11 @@ def run_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS,
                   subproblem_gamma_base: float = 1e-3,
                   mu_lower_bound_init: float = 0.1,
                   mu_individual_lower_bound_round: int = 3,
-                  mu_group_lower_bound_round: int = 50):
+                  mu_group_lower_bound_round: int = 50,
+                  pg_cost_start_round: int = 3,
+                  pg_cost_scale_multiplier: float = 1.2,
+                  pg_cost_lr: float = 2e-5,
+                  pg_cost_surr_lr: float = 5e-5):
     """V3 代理约束训练（样本级并行），返回 (dual_predictor, trainers)。"""
     import os
     from pypower.ext2int import ext2int
@@ -272,6 +280,10 @@ def run_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS,
                 mu_lower_bound_init=mu_lower_bound_init,
                 mu_individual_lower_bound_round=mu_individual_lower_bound_round,
                 mu_group_lower_bound_round=mu_group_lower_bound_round,
+                pg_cost_start_round=pg_cost_start_round,
+                pg_cost_scale_multiplier=pg_cost_scale_multiplier,
+                pg_cost_lr=pg_cost_lr,
+                pg_cost_surr_lr=pg_cost_surr_lr,
             )
         else:
             log(f"  机组 {g} ({i+1}/{len(unit_ids)}) — 样本级并行 n_workers={n_workers}")
@@ -286,6 +298,10 @@ def run_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS,
                 mu_lower_bound_init=mu_lower_bound_init,
                 mu_individual_lower_bound_round=mu_individual_lower_bound_round,
                 mu_group_lower_bound_round=mu_group_lower_bound_round,
+                pg_cost_start_round=pg_cost_start_round,
+                pg_cost_scale_multiplier=pg_cost_scale_multiplier,
+                pg_cost_lr=pg_cost_lr,
+                pg_cost_surr_lr=pg_cost_surr_lr,
                 n_workers=n_workers,
             )
         if logger is not None:
@@ -664,6 +680,10 @@ def main():
     SUBPROBLEM_MU_DUAL_FLOOR_INIT_VALUE = SUBPROBLEM_MU_DUAL_FLOOR_INIT
     SUBPROBLEM_MU_DUAL_FLOOR_INDIVIDUAL_ROUND_VALUE = SUBPROBLEM_MU_DUAL_FLOOR_INDIVIDUAL_ROUND
     SUBPROBLEM_MU_DUAL_FLOOR_DECAY_ROUND_VALUE = SUBPROBLEM_MU_DUAL_FLOOR_DECAY_ROUND
+    SUBPROBLEM_PG_COST_START_ROUND_VALUE = SUBPROBLEM_PG_COST_START_ROUND
+    SUBPROBLEM_PG_COST_SCALE_MULTIPLIER_VALUE = SUBPROBLEM_PG_COST_SCALE_MULTIPLIER
+    SUBPROBLEM_PG_COST_LR_VALUE = SUBPROBLEM_PG_COST_LR
+    SUBPROBLEM_PG_COST_SURR_LR_VALUE = SUBPROBLEM_PG_COST_SURR_LR
     FP_TEST_SAMPLES = 3             # feasibility_pump 模式：测试样本数
     N_WORKERS_BCD   = 1             # 样本级并行线程数；1 = 串行（BCD 建议先用串行），>1 = 线程并行
     N_WORKERS_SUBPROBLEM = 1             # 样本级并行线程数；1 = 串行（BCD 建议先用串行），>1 = 线程并行
@@ -806,6 +826,10 @@ def main():
                 mu_lower_bound_init=SUBPROBLEM_MU_DUAL_FLOOR_INIT_VALUE,
                 mu_individual_lower_bound_round=SUBPROBLEM_MU_DUAL_FLOOR_INDIVIDUAL_ROUND_VALUE,
                 mu_group_lower_bound_round=SUBPROBLEM_MU_DUAL_FLOOR_DECAY_ROUND_VALUE,
+                pg_cost_start_round=SUBPROBLEM_PG_COST_START_ROUND_VALUE,
+                pg_cost_scale_multiplier=SUBPROBLEM_PG_COST_SCALE_MULTIPLIER_VALUE,
+                pg_cost_lr=SUBPROBLEM_PG_COST_LR_VALUE,
+                pg_cost_surr_lr=SUBPROBLEM_PG_COST_SURR_LR_VALUE,
             )
             print_surrogate_results(trainers, all_samples)
 
@@ -961,6 +985,10 @@ def main():
                     mu_lower_bound_init=SUBPROBLEM_MU_DUAL_FLOOR_INIT_VALUE,
                     mu_individual_lower_bound_round=SUBPROBLEM_MU_DUAL_FLOOR_INDIVIDUAL_ROUND_VALUE,
                     mu_group_lower_bound_round=SUBPROBLEM_MU_DUAL_FLOOR_DECAY_ROUND_VALUE,
+                    pg_cost_start_round=SUBPROBLEM_PG_COST_START_ROUND_VALUE,
+                    pg_cost_scale_multiplier=SUBPROBLEM_PG_COST_SCALE_MULTIPLIER_VALUE,
+                    pg_cost_lr=SUBPROBLEM_PG_COST_LR_VALUE,
+                    pg_cost_surr_lr=SUBPROBLEM_PG_COST_SURR_LR_VALUE,
                 )
             print_surrogate_results(trainers, all_samples)
 
