@@ -57,6 +57,12 @@ class TrainingLogger:
         rho_primal: float,
         rho_dual: float,
         rho_opt: float,
+        obj_dual_pg: Optional[float] = None,
+        obj_dual_x: Optional[float] = None,
+        obj_dual_coc: Optional[float] = None,
+        rho_dual_pg: Optional[float] = None,
+        rho_dual_x: Optional[float] = None,
+        rho_dual_coc: Optional[float] = None,
         nn_loss: Optional[float] = None,
     ) -> None:
         """记录 BCD 阶段单次迭代指标。"""
@@ -70,6 +76,18 @@ class TrainingLogger:
             "rho_opt": float(rho_opt),
             "timestamp": time.time() - self._start_time,
         }
+        if obj_dual_pg is not None:
+            record["obj_dual_pg"] = float(obj_dual_pg)
+        if obj_dual_x is not None:
+            record["obj_dual_x"] = float(obj_dual_x)
+        if obj_dual_coc is not None:
+            record["obj_dual_coc"] = float(obj_dual_coc)
+        if rho_dual_pg is not None:
+            record["rho_dual_pg"] = float(rho_dual_pg)
+        if rho_dual_x is not None:
+            record["rho_dual_x"] = float(rho_dual_x)
+        if rho_dual_coc is not None:
+            record["rho_dual_coc"] = float(rho_dual_coc)
         if nn_loss is not None:
             record["nn_loss"] = float(nn_loss)
         self.metrics["bcd"].append(record)

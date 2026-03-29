@@ -459,6 +459,9 @@ class Agent_NN_BCD:
         enable_dropout_during_nn_training: bool = True,
         rho_primal_init: float = 1e-2,
         rho_dual_init: float = 1e-2,
+        rho_dual_pg_init: float | None = None,
+        rho_dual_x_init: float | None = None,
+        rho_dual_coc_init: float | None = None,
         rho_opt_init: float = 1e-2,
         gamma_base: float = 1e-2,
         mu_dual_floor_init: float = 0.1,
@@ -491,9 +494,9 @@ class Agent_NN_BCD:
         
         # BCD迭代参数
         self.rho_primal = float(rho_primal_init)
-        self.rho_dual = float(rho_dual_init)
         self.rho_opt = float(rho_opt_init)
         self.gamma_base = float(gamma_base)   # gamma 缩放基准
+        self.gamma_dual_component_scale = 3.0
         self.rho_max = 10.0     # rho 上限
         self.theta_reg_weight = 1e-4   # theta L1 正则化权重（[-1, 1] 死区外生效）
         self.zeta_reg_weight = 1e-4    # zeta L1 正则化权重（[-1, 1] 死区外生效）
@@ -532,6 +535,13 @@ class Agent_NN_BCD:
         self.theta_gaussian_std = float(theta_gaussian_std)
         self.zeta_gaussian_std = float(zeta_gaussian_std)
         self.enable_dropout_during_nn_training = bool(enable_dropout_during_nn_training)
+        rho_dual_pg_base = rho_dual_init if rho_dual_pg_init is None else rho_dual_pg_init
+        rho_dual_x_base = rho_dual_init if rho_dual_x_init is None else rho_dual_x_init
+        rho_dual_coc_base = rho_dual_init if rho_dual_coc_init is None else rho_dual_coc_init
+        self.rho_dual_pg = float(rho_dual_pg_base)
+        self.rho_dual_x = float(rho_dual_x_base)
+        self.rho_dual_coc = float(rho_dual_coc_base)
+        self._sync_rho_dual_summary()
         
         # 初始化theta和zeta变量字典
         self.theta_vars = {}
@@ -567,6 +577,23 @@ class Agent_NN_BCD:
             self.device = None
             # 回退：用随机初始化填充占位值
         self._apply_hot_start_initial_values(self._current_union_analysis)
+
+    def _sync_rho_dual_summary(self) -> None:
+        self.rho_dual = float(np.mean([
+            self.rho_dual_pg,
+            self.rho_dual_x,
+            self.rho_dual_coc,
+        ]))
+
+    def _get_regularization_scale(self) -> float:
+        min_rho = min(
+            self.rho_primal,
+            self.rho_dual_pg,
+            self.rho_dual_x,
+            self.rho_dual_coc,
+            self.rho_opt,
+        )
+        return float(np.sqrt(max(min_rho, 0.0)))
 
     def _solve_lp_with_fixed_x(self, Pd: np.ndarray, x_vals: np.ndarray):
         """以固定 x 矩阵构建纯 LP，求解后返回连续变量解和对偶变量字典。
@@ -2496,7 +2523,9 @@ class Agent_NN_BCD:
         start_cost = self.gencost[:, 1]
         shut_cost = self.gencost[:, 2]
         
-        obj_dual = 0
+        obj_dual_pg = 0
+        obj_dual_x = 0
+        obj_dual_coc = 0
         obj_opt = 0
                 
         # pg变量的对偶约束
@@ -2522,7 +2551,7 @@ class Agent_NN_BCD:
                 dual_expr_pg_abs = model.addVar(lb=0, name=f'dual_expr_abs_pg_{g}_{t}')
                 model.addConstr(dual_expr_pg_abs >= dual_expr, name=f'dual_expr_abs_pg_pos_{g}_{t}')
                 model.addConstr(dual_expr_pg_abs >= -dual_expr, name=f'dual_expr_abs_pg_neg_{g}_{t}')
-                obj_dual += dual_expr_pg_abs
+                obj_dual_pg += dual_expr_pg_abs
         
         # x变量的对偶约束
         for g in range(self.ng):
@@ -2579,7 +2608,7 @@ class Agent_NN_BCD:
                 dual_expr_x_abs = model.addVar(lb=0, name=f'dual_expr_abs_x_{g}_{t}')
                 model.addConstr(dual_expr_x_abs >= dual_expr, name=f'dual_expr_abs_x_pos_{g}_{t}')
                 model.addConstr(dual_expr_x_abs >= -dual_expr, name=f'dual_expr_abs_x_neg_{g}_{t}')
-                obj_dual += dual_expr_x_abs
+                obj_dual_x += dual_expr_x_abs
 
         # cpower变量的对偶约束
         for g in range(self.ng):
@@ -2597,7 +2626,9 @@ class Agent_NN_BCD:
                 dual_expr_coc_abs = model.addVar(lb=0, name=f'dual_expr_abs_coc_{g}_{t}')
                 model.addConstr(dual_expr_coc_abs >= dual_expr, name=f'dual_expr_abs_coc_pos_{g}_{t}')
                 model.addConstr(dual_expr_coc_abs >= -dual_expr, name=f'dual_expr_abs_coc_neg_{g}_{t}')
-                obj_dual += dual_expr_coc_abs
+                obj_dual_coc += dual_expr_coc_abs
+
+        obj_dual = obj_dual_pg + obj_dual_x + obj_dual_coc
 
         # 原问题约束违反量
         for t in range(self.T):
@@ -2684,7 +2715,14 @@ class Agent_NN_BCD:
             obj_opt += obj_opt_para
    
         # 设置目标函数
-        total_objective = self.rho_dual * obj_dual + self.rho_opt * obj_opt + penal_mu + penal_ita
+        total_objective = (
+            self.rho_dual_pg * obj_dual_pg
+            + self.rho_dual_x * obj_dual_x
+            + self.rho_dual_coc * obj_dual_coc
+            + self.rho_opt * obj_opt
+            + penal_mu
+            + penal_ita
+        )
         model.setObjective(total_objective, GRB.MINIMIZE)
 
         self._apply_fast_gurobi_tolerances(model, mip=True)
@@ -2717,7 +2755,11 @@ class Agent_NN_BCD:
             
             if sample_id <= 2:
                 print(
-                    f"dual_block, sample_id: {sample_id}, obj_dual: {obj_dual.getValue()}, obj_opt: {obj_opt.getValue()}",
+                    f"dual_block, sample_id: {sample_id}, "
+                    f"obj_dual_pg: {obj_dual_pg.getValue()}, "
+                    f"obj_dual_x: {obj_dual_x.getValue()}, "
+                    f"obj_dual_coc: {obj_dual_coc.getValue()}, "
+                    f"obj_dual: {obj_dual.getValue()}, obj_opt: {obj_opt.getValue()}",
                     flush=True,
                 )
             
@@ -2752,9 +2794,15 @@ class Agent_NN_BCD:
             epoch_total_loss = 0.0
             epoch_component_sums = {
                 'obj_primal': None,
+                'obj_dual_pg': None,
+                'obj_dual_x': None,
+                'obj_dual_coc': None,
                 'obj_dual': None,
                 'obj_opt': None,
                 'primal_term': None,
+                'dual_pg_term': None,
+                'dual_x_term': None,
+                'dual_coc_term': None,
                 'dual_term': None,
                 'opt_term': None,
                 'reg_term': None,
@@ -2820,6 +2868,9 @@ class Agent_NN_BCD:
                 print(
                     f"[NN-theta/zeta] epoch {epoch+1}/{num_epochs}, avg_loss = {avg_loss:.6f}, "
                     f"avg_terms(primal={avg_components['primal_term']:.6f}, "
+                    f"dual_pg={avg_components['dual_pg_term']:.6f}, "
+                    f"dual_x={avg_components['dual_x_term']:.6f}, "
+                    f"dual_coc={avg_components['dual_coc_term']:.6f}, "
                     f"dual={avg_components['dual_term']:.6f}, "
                     f"opt={avg_components['opt_term']:.6f}, "
                     f"reg={avg_components['reg_term']:.6f})",
@@ -2911,18 +2962,35 @@ class Agent_NN_BCD:
             # 3. 刷新迭代级张量缓存（整批转换，避免 loss 内逐张量创建）
             if TORCH_AVAILABLE and hasattr(self, 'device'):
                 self._refresh_iter_tensor_cache()
-            obj_primal_pre, obj_dual_pre, obj_opt_pre = self.cal_viol(union_analysis=union_analysis)
+            (
+                obj_primal_pre,
+                obj_dual_pg_pre,
+                obj_dual_x_pre,
+                obj_dual_coc_pre,
+                obj_dual_pre,
+                obj_opt_pre,
+            ) = self.cal_viol_components(union_analysis=union_analysis)
             EPS_PRE = 1e-12
             obj_primal_pre = obj_primal_pre if abs(obj_primal_pre) >= EPS_PRE else 0.0
+            obj_dual_pg_pre = obj_dual_pg_pre if abs(obj_dual_pg_pre) >= EPS_PRE else 0.0
+            obj_dual_x_pre = obj_dual_x_pre if abs(obj_dual_x_pre) >= EPS_PRE else 0.0
+            obj_dual_coc_pre = obj_dual_coc_pre if abs(obj_dual_coc_pre) >= EPS_PRE else 0.0
             obj_dual_pre = obj_dual_pre if abs(obj_dual_pre) >= EPS_PRE else 0.0
             obj_opt_pre = obj_opt_pre if abs(obj_opt_pre) >= EPS_PRE else 0.0
             print(
                 f"[BCD] obj_primal={obj_primal_pre:.6f}, "
-                f"obj_dual={obj_dual_pre:.6f}, obj_opt={obj_opt_pre:.6f}",
+                f"obj_dual_pg={obj_dual_pg_pre:.6f}, obj_dual_x={obj_dual_x_pre:.6f}, "
+                f"obj_dual_coc={obj_dual_coc_pre:.6f}, obj_dual={obj_dual_pre:.6f}, "
+                f"obj_opt={obj_opt_pre:.6f}",
                 flush=True,
             )
 
             # 4. 使用神经网络更新theta和zeta
+            print(
+                f"[BCD][NN-loss] obj_primal={obj_primal_pre:.6f}, "
+                f"obj_dual_x={obj_dual_x_pre:.6f}, obj_opt={obj_opt_pre:.6f}",
+                flush=True,
+            )
             theta_values_new, zeta_values_new = self.iter_with_theta_zeta_neural_network(union_analysis=union_analysis, num_epochs=nn_epochs)
             if theta_values_new is None or zeta_values_new is None:
                 print("❌ Theta/Zeta神经网络更新失败，终止迭代", flush=True)
@@ -2935,19 +3003,44 @@ class Agent_NN_BCD:
             print(f"✅ 迭代 {i+1}/{max_iter} 成功", flush=True)
             
             # 计算违反量（参考uc_dfsm_bcd.py）
-            obj_primal, obj_dual, obj_opt = self.cal_viol(union_analysis=union_analysis)
+            (
+                obj_primal,
+                obj_dual_pg,
+                obj_dual_x,
+                obj_dual_coc,
+                obj_dual,
+                obj_opt,
+            ) = self.cal_viol_components(union_analysis=union_analysis)
             
             # 简单数值过滤：绝对值过小的值设为0
             EPS = 1e-12
             obj_primal = obj_primal if abs(obj_primal) >= EPS else 0.0
+            obj_dual_pg = obj_dual_pg if abs(obj_dual_pg) >= EPS else 0.0
+            obj_dual_x = obj_dual_x if abs(obj_dual_x) >= EPS else 0.0
+            obj_dual_coc = obj_dual_coc if abs(obj_dual_coc) >= EPS else 0.0
             obj_dual = obj_dual if abs(obj_dual) >= EPS else 0.0
             obj_opt = obj_opt if abs(obj_opt) >= EPS else 0.0
             
-            print(f'obj_primal:{obj_primal}, obj_dual:{obj_dual}, obj_opt:{obj_opt}', flush=True)
+            print(
+                f"obj_primal:{obj_primal}, obj_dual_pg:{obj_dual_pg}, "
+                f"obj_dual_x:{obj_dual_x}, obj_dual_coc:{obj_dual_coc}, "
+                f"obj_dual:{obj_dual}, obj_opt:{obj_opt}",
+                flush=True,
+            )
             self.rho_primal = min(self.rho_primal + gamma * obj_primal, self.rho_max)
-            self.rho_dual = min(self.rho_dual + gamma * obj_dual, self.rho_max)
+            gamma_dual = gamma * self.gamma_dual_component_scale
+            self.rho_dual_pg = min(self.rho_dual_pg + gamma_dual * obj_dual_pg, self.rho_max)
+            self.rho_dual_x = min(self.rho_dual_x + gamma_dual * obj_dual_x, self.rho_max)
+            self.rho_dual_coc = min(self.rho_dual_coc + gamma_dual * obj_dual_coc, self.rho_max)
+            self._sync_rho_dual_summary()
             self.rho_opt = min(self.rho_opt + gamma * obj_opt, self.rho_max)
-            print(f"当前惩罚参数: ρ_primal={self.rho_primal}, ρ_dual={self.rho_dual}, ρ_opt={self.rho_opt}", flush=True)
+            print(
+                f"当前惩罚参数: ρ_primal={self.rho_primal}, "
+                f"ρ_dual_pg={self.rho_dual_pg}, ρ_dual_x={self.rho_dual_x}, "
+                f"ρ_dual_coc={self.rho_dual_coc}, ρ_dual={self.rho_dual}, "
+                f"ρ_opt={self.rho_opt}",
+                flush=True,
+            )
             print("--------------------------------", flush=True)
 
             # logger 钩子
@@ -2956,6 +3049,12 @@ class Agent_NN_BCD:
                 self.logger.log_bcd_iter(
                     iter=i, obj_primal=obj_primal, obj_dual=obj_dual, obj_opt=obj_opt,
                     rho_primal=self.rho_primal, rho_dual=self.rho_dual, rho_opt=self.rho_opt,
+                    obj_dual_pg=obj_dual_pg,
+                    obj_dual_x=obj_dual_x,
+                    obj_dual_coc=obj_dual_coc,
+                    rho_dual_pg=self.rho_dual_pg,
+                    rho_dual_x=self.rho_dual_x,
+                    rho_dual_coc=self.rho_dual_coc,
                     nn_loss=nn_loss,
                 )
                 self.logger.snapshot('bcd', i, x=self.x[0], pg=self.pg[0], lambda_=self.lambda_[0])
@@ -2964,17 +3063,21 @@ class Agent_NN_BCD:
         
         return self.theta_values_list, self.zeta_values_list
 
-    def cal_viol(self, union_analysis=None):
+    def cal_viol_components(self, union_analysis=None):
         """
-        计算约束违反量（参考uc_dfsm_bcd.py）
-        返回obj_primal, obj_dual, obj_opt
+        计算约束违反量，并拆分 dual 违反量为 pg/x/coc 三部分。
+
+        Returns:
+            obj_primal, obj_dual_pg, obj_dual_x, obj_dual_coc, obj_dual, obj_opt
         """
         if union_analysis is None:
             union_analysis = self._current_union_analysis
         
         obj_primal = 0
+        obj_dual_pg = 0
+        obj_dual_x = 0
+        obj_dual_coc = 0
         obj_opt = 0
-        obj_dual = 0
         
         # 预计算常量
         Ton = min(4, self.T)
@@ -3145,7 +3248,7 @@ class Agent_NN_BCD:
                     if sample_id < len(self.ita):
                         obj_opt += abs_violation * abs(self.ita[sample_id, unit_id, time_slot])
             
-            # === 对偶约束的违反量 obj_dual（参考 uc_dfsm_bcd.cal_viol） ===
+            # === 对偶约束的违反量 obj_dual（拆分为 pg/x/coc 三部分） ===
             # pg 变量的对偶约束
             if sample_id < len(self.lambda_):
                 for g in range(self.ng):
@@ -3176,7 +3279,7 @@ class Agent_NN_BCD:
                         ))
 
                         # 对偶约束：梯度 = 0
-                        obj_dual += abs(dual_expr)
+                        obj_dual_pg += abs(dual_expr)
 
                 # x 变量的对偶约束
                 for g in range(self.ng):
@@ -3238,14 +3341,7 @@ class Agent_NN_BCD:
                             dual_expr += _zeta_val * self.ita[sample_id, g, t]
 
                         # 对偶约束：梯度 = 0
-                        obj_dual += abs(dual_expr)
-                
-                #cpower变量的对偶约束
-                for g in range(self.ng):
-                    for t in range(self.T):
-                        dual_expr = 1
-                        dual_expr -= self.lambda_[sample_id]['lambda_cpower'][g, t]
-                        obj_dual += abs(dual_expr)
+                        obj_dual_x += abs(dual_expr)
 
                 #coc变量的对偶约束
                 for g in range(self.ng):
@@ -3254,8 +3350,19 @@ class Agent_NN_BCD:
                         dual_expr -= self.lambda_[sample_id]['lambda_start_cost'][g, t]
                         dual_expr -= self.lambda_[sample_id]['lambda_shut_cost'][g, t]
                         dual_expr -= self.lambda_[sample_id]['lambda_coc_nonneg'][g, t]
-                        obj_dual += abs(dual_expr)
+                        obj_dual_coc += abs(dual_expr)
 
+        obj_dual = obj_dual_pg + obj_dual_x + obj_dual_coc
+        return obj_primal, obj_dual_pg, obj_dual_x, obj_dual_coc, obj_dual, obj_opt
+
+    def cal_viol(self, union_analysis=None):
+        """
+        计算约束违反量（参考uc_dfsm_bcd.py）
+        返回obj_primal, obj_dual, obj_opt
+        """
+        obj_primal, _, _, _, obj_dual, obj_opt = self.cal_viol_components(
+            union_analysis=union_analysis
+        )
         return obj_primal, obj_dual, obj_opt
     
     def loss_function_differentiable(self, sample_id, theta_tensor, zeta_tensor,
@@ -3360,7 +3467,9 @@ class Agent_NN_BCD:
 
         obj_primal = torch.tensor(0.0, device=device, requires_grad=True)
         obj_opt = torch.tensor(0.0, device=device, requires_grad=True)
-        obj_dual = torch.tensor(0.0, device=device, requires_grad=True)
+        obj_dual_pg = torch.tensor(0.0, device=device, requires_grad=True)
+        obj_dual_x = torch.tensor(0.0, device=device, requires_grad=True)
+        obj_dual_coc = torch.tensor(0.0, device=device, requires_grad=True)
 
         # 预缓存常量张量（避免循环内 torch.tensor 分配）
         _one = self._const_one
@@ -3393,7 +3502,7 @@ class Agent_NN_BCD:
             obj_primal = obj_primal + torch.relu(violation)
             obj_opt = obj_opt + torch.abs(violation) * ita[unit_id, time_slot]
 
-        # 计算X对偶约束损失
+        # theta/zeta 仅影响 x 驻点条件，因此可微 dual loss 只包含 obj_dual_x。
         for g in range(self.ng):
             for t in range(self.T):
                 dual_expr = gencost_fixed[g] * lambda_cpower[g, t]
@@ -3443,16 +3552,23 @@ class Agent_NN_BCD:
                 for zeta_idx in self._dual_zeta_lookup.get((g, t), []):
                     dual_expr = dual_expr + zeta_tensor[zeta_idx] * ita[g, t]
 
-                obj_dual = obj_dual + torch.abs(dual_expr)
+                obj_dual_x = obj_dual_x + torch.abs(dual_expr)
         
         # L1 正则化：[-1, 1] 死区内不惩罚，仅惩罚超出死区的幅值
         theta_deadzone_excess = torch.clamp(torch.abs(theta_tensor) - 1.0, min=0.0)
         zeta_deadzone_excess = torch.clamp(torch.abs(zeta_tensor) - 1.0, min=0.0)
-        reg_loss = (self.theta_reg_weight * torch.sum(theta_deadzone_excess)
-                    + self.zeta_reg_weight * torch.sum(zeta_deadzone_excess))
+        reg_base = (
+            self.theta_reg_weight * torch.sum(theta_deadzone_excess)
+            + self.zeta_reg_weight * torch.sum(zeta_deadzone_excess)
+        )
+        reg_loss = reg_base * self._get_regularization_scale()
 
+        obj_dual = obj_dual_pg + obj_dual_x + obj_dual_coc
         primal_term = obj_primal * self.rho_primal
-        dual_term = obj_dual * self.rho_dual
+        dual_pg_term = obj_dual_pg * self.rho_dual_pg
+        dual_x_term = obj_dual_x * self.rho_dual_x
+        dual_coc_term = obj_dual_coc * self.rho_dual_coc
+        dual_term = dual_pg_term + dual_x_term + dual_coc_term
         opt_term = obj_opt * self.rho_opt
         loss = primal_term + dual_term + opt_term + reg_loss
 
@@ -3461,9 +3577,15 @@ class Agent_NN_BCD:
 
         components = {
             'obj_primal': obj_primal.detach(),
+            'obj_dual_pg': obj_dual_pg.detach(),
+            'obj_dual_x': obj_dual_x.detach(),
+            'obj_dual_coc': obj_dual_coc.detach(),
             'obj_dual': obj_dual.detach(),
             'obj_opt': obj_opt.detach(),
             'primal_term': primal_term.detach(),
+            'dual_pg_term': dual_pg_term.detach(),
+            'dual_x_term': dual_x_term.detach(),
+            'dual_coc_term': dual_coc_term.detach(),
             'dual_term': dual_term.detach(),
             'opt_term': opt_term.detach(),
             'reg_term': reg_loss.detach(),
@@ -4508,6 +4630,13 @@ class Agent_NN_BCD:
             "lambda_": self.lambda_,
             "mu": self.mu,
             "ita": self.ita,
+            "rho_primal": self.rho_primal,
+            "rho_dual": self.rho_dual,
+            "rho_dual_pg": self.rho_dual_pg,
+            "rho_dual_x": self.rho_dual_x,
+            "rho_dual_coc": self.rho_dual_coc,
+            "rho_opt": self.rho_opt,
+            "gamma_dual_component_scale": self.gamma_dual_component_scale,
         }
         
         torch.save(state, filepath)
@@ -4544,7 +4673,12 @@ class Agent_NN_BCD:
                 layers.append(nn_local.Dropout(0.1))
         return nn_local.Sequential(*layers)
 
-    def load_model_parameters(self, filepath: str, map_location: str = "cpu") -> None:
+    def load_model_parameters(
+        self,
+        filepath: str,
+        map_location: str = "cpu",
+        restore_rho_state: bool = True,
+    ) -> None:
         """从文件加载神经网络模型参数（theta_net, zeta_net 和优化器状态）。
 
         与 _init_neural_network 不同，此方法直接从 checkpoint 的 state_dict
@@ -4608,6 +4742,19 @@ class Agent_NN_BCD:
             self.mu = state["mu"]
         if "ita" in state:
             self.ita = state["ita"]
+        if restore_rho_state:
+            if "rho_primal" in state:
+                self.rho_primal = state["rho_primal"]
+            self.rho_dual_pg = state.get("rho_dual_pg", state.get("rho_dual", self.rho_dual_pg))
+            self.rho_dual_x = state.get("rho_dual_x", state.get("rho_dual", self.rho_dual_x))
+            self.rho_dual_coc = state.get("rho_dual_coc", state.get("rho_dual", self.rho_dual_coc))
+            self._sync_rho_dual_summary()
+            if "rho_opt" in state:
+                self.rho_opt = state["rho_opt"]
+        self.gamma_dual_component_scale = state.get(
+            "gamma_dual_component_scale",
+            self.gamma_dual_component_scale,
+        )
 
         self.refresh_theta_zeta_values_from_networks()
 

@@ -78,7 +78,11 @@ THETA_GAUSSIAN_STD = 0.01
 ZETA_GAUSSIAN_STD = 0.01
 BCD_RHO_PRIMAL_INIT = 1e-2
 BCD_RHO_DUAL_INIT = 1e-2
+BCD_RHO_DUAL_PG_INIT = 1e-2
+BCD_RHO_DUAL_X_INIT = 1e-2
+BCD_RHO_DUAL_COC_INIT = 1e-2
 BCD_RHO_OPT_INIT = 1e-2
+BCD_RESTORE_RHO_FROM_CHECKPOINT = False
 BCD_MAX_THETA_CONSTRAINTS_PER_TIME_SLOT = 10
 BCD_GAMMA_BASE = 1e-2
 
@@ -1649,6 +1653,8 @@ def _load_bcd_agent(ppc, data_file: Path, bcd_model_path: str,
         f"lambda_init={BCD_LAMBDA_INIT_STRATEGY}, "
         f"max_theta_per_t={BCD_MAX_THETA_CONSTRAINTS_PER_TIME_SLOT}, "
         f"rho=({BCD_RHO_PRIMAL_INIT}, {BCD_RHO_DUAL_INIT}, {BCD_RHO_OPT_INIT}), "
+        f"rho_dual_components=({BCD_RHO_DUAL_PG_INIT}, {BCD_RHO_DUAL_X_INIT}, {BCD_RHO_DUAL_COC_INIT}), "
+        f"restore_rho={BCD_RESTORE_RHO_FROM_CHECKPOINT}, "
         f"gamma_base={BCD_GAMMA_BASE}"
     )
 
@@ -1664,10 +1670,16 @@ def _load_bcd_agent(ppc, data_file: Path, bcd_model_path: str,
         zeta_gaussian_std=ZETA_GAUSSIAN_STD,
         rho_primal_init=BCD_RHO_PRIMAL_INIT,
         rho_dual_init=BCD_RHO_DUAL_INIT,
+        rho_dual_pg_init=BCD_RHO_DUAL_PG_INIT,
+        rho_dual_x_init=BCD_RHO_DUAL_X_INIT,
+        rho_dual_coc_init=BCD_RHO_DUAL_COC_INIT,
         rho_opt_init=BCD_RHO_OPT_INIT,
         gamma_base=BCD_GAMMA_BASE,
     )
-    agent.load_model_parameters(str(model_path))
+    agent.load_model_parameters(
+        str(model_path),
+        restore_rho_state=BCD_RESTORE_RHO_FROM_CHECKPOINT,
+    )
     log("BCD 模型加载成功")
     return agent
 

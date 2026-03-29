@@ -73,7 +73,7 @@ DUAL_EPOCHS = 200
 DUAL_BATCH_SIZE = 8
 MAX_ITER = 500
 DUAL_DECAY_ROUND = 25
-NN_EPOCHS = 15
+NN_EPOCHS = 5
 UNIT_IDS = None              # None = 所有机组；或如 [0, 1, 2]
 FP_TEST_SAMPLES = 3
 N_WORKERS_BCD = 4
@@ -97,14 +97,18 @@ ZETA_GAUSSIAN_STD = 0.01
 BCD_ENABLE_DROPOUT_DURING_NN_TRAINING = True
 BCD_RHO_PRIMAL_INIT = 1e-3
 BCD_RHO_DUAL_INIT = 1e-3
+BCD_RHO_DUAL_PG_INIT = 1
+BCD_RHO_DUAL_X_INIT = 1e-3
+BCD_RHO_DUAL_COC_INIT = 1
 BCD_RHO_OPT_INIT = 1e-3
+BCD_RESTORE_RHO_FROM_CHECKPOINT = False
 BCD_MAX_THETA_CONSTRAINTS_PER_TIME_SLOT = 20
 BCD_GAMMA_BASE = 1e-3
 BCD_MU_DUAL_FLOOR_INIT = 0.1
 BCD_ITA_DUAL_FLOOR_INIT = 0.1
 SUBPROBLEM_RHO_PRIMAL_INIT = 1e-3
 SUBPROBLEM_RHO_DUAL_INIT = 1e-3
-SUBPROBLEM_RHO_DUAL_PG_INIT = 1e-3
+SUBPROBLEM_RHO_DUAL_PG_INIT = 1
 SUBPROBLEM_RHO_DUAL_X_INIT = 1e-3
 SUBPROBLEM_RHO_DUAL_COC_INIT = 1
 SUBPROBLEM_RHO_OPT_INIT = 1e-3
@@ -429,6 +433,9 @@ def run_bcd(ppc, all_samples: list, T_DELTA, MAX_ITER, bcd_model_dir,
             enable_dropout_during_nn_training: bool = True,
             rho_primal_init: float = 1e-2,
             rho_dual_init: float = 1e-2,
+            rho_dual_pg_init: float | None = None,
+            rho_dual_x_init: float | None = None,
+            rho_dual_coc_init: float | None = None,
             rho_opt_init: float = 1e-2,
             gamma_base: float = 1e-2,
             mu_dual_floor_init: float = 0.1,
@@ -440,6 +447,13 @@ def run_bcd(ppc, all_samples: list, T_DELTA, MAX_ITER, bcd_model_dir,
         f"theta热启动={theta_hot_start_strategy}, "
         f"zeta热启动={zeta_hot_start_strategy}, "
         f"nn_dropout={'on' if enable_dropout_during_nn_training else 'off'}"
+    )
+    log(
+        f"rho_init: primal={rho_primal_init}, dual={rho_dual_init}, "
+        f"dual_pg={rho_dual_pg_init if rho_dual_pg_init is not None else rho_dual_init}, "
+        f"dual_x={rho_dual_x_init if rho_dual_x_init is not None else rho_dual_init}, "
+        f"dual_coc={rho_dual_coc_init if rho_dual_coc_init is not None else rho_dual_init}, "
+        f"opt={rho_opt_init}"
     )
 
     print("\n" + "=" * 70)
@@ -469,6 +483,9 @@ def run_bcd(ppc, all_samples: list, T_DELTA, MAX_ITER, bcd_model_dir,
             enable_dropout_during_nn_training=enable_dropout_during_nn_training,
             rho_primal_init=rho_primal_init,
             rho_dual_init=rho_dual_init,
+            rho_dual_pg_init=rho_dual_pg_init,
+            rho_dual_x_init=rho_dual_x_init,
+            rho_dual_coc_init=rho_dual_coc_init,
             rho_opt_init=rho_opt_init,
             gamma_base=gamma_base,
             mu_dual_floor_init=mu_dual_floor_init,
@@ -489,6 +506,9 @@ def run_bcd(ppc, all_samples: list, T_DELTA, MAX_ITER, bcd_model_dir,
             enable_dropout_during_nn_training=enable_dropout_during_nn_training,
             rho_primal_init=rho_primal_init,
             rho_dual_init=rho_dual_init,
+            rho_dual_pg_init=rho_dual_pg_init,
+            rho_dual_x_init=rho_dual_x_init,
+            rho_dual_coc_init=rho_dual_coc_init,
             rho_opt_init=rho_opt_init,
             gamma_base=gamma_base,
             mu_dual_floor_init=mu_dual_floor_init,
@@ -573,6 +593,9 @@ def run_sparse_bcd(ppc, all_samples: list, T_DELTA, MAX_ITER, bcd_model_dir,
                    enable_dropout_during_nn_training: bool = True,
                    rho_primal_init: float = 1e-2,
                    rho_dual_init: float = 1e-2,
+                   rho_dual_pg_init: float | None = None,
+                   rho_dual_x_init: float | None = None,
+                   rho_dual_coc_init: float | None = None,
                    rho_opt_init: float = 1e-2,
                    gamma_base: float = 1e-2,
                    mu_dual_floor_init: float = 0.1,
@@ -602,6 +625,9 @@ def run_sparse_bcd(ppc, all_samples: list, T_DELTA, MAX_ITER, bcd_model_dir,
         enable_dropout_during_nn_training=enable_dropout_during_nn_training,
         rho_primal_init=rho_primal_init,
         rho_dual_init=rho_dual_init,
+        rho_dual_pg_init=rho_dual_pg_init,
+        rho_dual_x_init=rho_dual_x_init,
+        rho_dual_coc_init=rho_dual_coc_init,
         rho_opt_init=rho_opt_init,
         gamma_base=gamma_base,
         mu_dual_floor_init=mu_dual_floor_init,
@@ -643,6 +669,9 @@ def run_sparse_bcd(ppc, all_samples: list, T_DELTA, MAX_ITER, bcd_model_dir,
         enable_dropout_during_nn_training=enable_dropout_during_nn_training,
         rho_primal_init=rho_primal_init,
         rho_dual_init=rho_dual_init,
+        rho_dual_pg_init=rho_dual_pg_init,
+        rho_dual_x_init=rho_dual_x_init,
+        rho_dual_coc_init=rho_dual_coc_init,
         rho_opt_init=rho_opt_init,
         gamma_base=gamma_base,
         mu_dual_floor_init=mu_dual_floor_init,
@@ -709,6 +738,9 @@ def main():
     BCD_LAMBDA_INIT_STRATEGY_VALUE = BCD_LAMBDA_INIT_STRATEGY
     BCD_RHO_PRIMAL_INIT_VALUE = BCD_RHO_PRIMAL_INIT
     BCD_RHO_DUAL_INIT_VALUE = BCD_RHO_DUAL_INIT
+    BCD_RHO_DUAL_PG_INIT_VALUE = BCD_RHO_DUAL_PG_INIT
+    BCD_RHO_DUAL_X_INIT_VALUE = BCD_RHO_DUAL_X_INIT
+    BCD_RHO_DUAL_COC_INIT_VALUE = BCD_RHO_DUAL_COC_INIT
     BCD_RHO_OPT_INIT_VALUE = BCD_RHO_OPT_INIT
     BCD_MAX_THETA_CONSTRAINTS_PER_TIME_SLOT_VALUE = BCD_MAX_THETA_CONSTRAINTS_PER_TIME_SLOT
     BCD_GAMMA_BASE_VALUE = BCD_GAMMA_BASE
@@ -791,6 +823,9 @@ def main():
                     enable_dropout_during_nn_training=BCD_ENABLE_DROPOUT_DURING_NN_TRAINING_VALUE,
                     rho_primal_init=BCD_RHO_PRIMAL_INIT_VALUE,
                     rho_dual_init=BCD_RHO_DUAL_INIT_VALUE,
+                    rho_dual_pg_init=BCD_RHO_DUAL_PG_INIT_VALUE,
+                    rho_dual_x_init=BCD_RHO_DUAL_X_INIT_VALUE,
+                    rho_dual_coc_init=BCD_RHO_DUAL_COC_INIT_VALUE,
                     rho_opt_init=BCD_RHO_OPT_INIT_VALUE,
                     gamma_base=BCD_GAMMA_BASE_VALUE,
                     mu_dual_floor_init=BCD_MU_DUAL_FLOOR_INIT_VALUE,
@@ -830,6 +865,9 @@ def main():
                 zeta_gaussian_std=ZETA_WARM_START_GAUSSIAN_STD,
                 rho_primal_init=BCD_RHO_PRIMAL_INIT_VALUE,
                 rho_dual_init=BCD_RHO_DUAL_INIT_VALUE,
+                rho_dual_pg_init=BCD_RHO_DUAL_PG_INIT_VALUE,
+                rho_dual_x_init=BCD_RHO_DUAL_X_INIT_VALUE,
+                rho_dual_coc_init=BCD_RHO_DUAL_COC_INIT_VALUE,
                 rho_opt_init=BCD_RHO_OPT_INIT_VALUE,
                 gamma_base=BCD_GAMMA_BASE_VALUE,
                 mu_dual_floor_init=BCD_MU_DUAL_FLOOR_INIT_VALUE,
@@ -898,6 +936,9 @@ def main():
                     enable_dropout_during_nn_training=BCD_ENABLE_DROPOUT_DURING_NN_TRAINING_VALUE,
                     rho_primal_init=BCD_RHO_PRIMAL_INIT_VALUE,
                     rho_dual_init=BCD_RHO_DUAL_INIT_VALUE,
+                    rho_dual_pg_init=BCD_RHO_DUAL_PG_INIT_VALUE,
+                    rho_dual_x_init=BCD_RHO_DUAL_X_INIT_VALUE,
+                    rho_dual_coc_init=BCD_RHO_DUAL_COC_INIT_VALUE,
                     rho_opt_init=BCD_RHO_OPT_INIT_VALUE,
                     gamma_base=BCD_GAMMA_BASE_VALUE,
                     mu_dual_floor_init=BCD_MU_DUAL_FLOOR_INIT_VALUE,
@@ -933,6 +974,9 @@ def main():
                         enable_dropout_during_nn_training=BCD_ENABLE_DROPOUT_DURING_NN_TRAINING_VALUE,
                         rho_primal_init=BCD_RHO_PRIMAL_INIT_VALUE,
                         rho_dual_init=BCD_RHO_DUAL_INIT_VALUE,
+                        rho_dual_pg_init=BCD_RHO_DUAL_PG_INIT_VALUE,
+                        rho_dual_x_init=BCD_RHO_DUAL_X_INIT_VALUE,
+                        rho_dual_coc_init=BCD_RHO_DUAL_COC_INIT_VALUE,
                         rho_opt_init=BCD_RHO_OPT_INIT_VALUE,
                         gamma_base=BCD_GAMMA_BASE_VALUE,
                         mu_dual_floor_init=BCD_MU_DUAL_FLOOR_INIT_VALUE,
@@ -948,6 +992,9 @@ def main():
                         enable_dropout_during_nn_training=BCD_ENABLE_DROPOUT_DURING_NN_TRAINING_VALUE,
                         rho_primal_init=BCD_RHO_PRIMAL_INIT_VALUE,
                         rho_dual_init=BCD_RHO_DUAL_INIT_VALUE,
+                        rho_dual_pg_init=BCD_RHO_DUAL_PG_INIT_VALUE,
+                        rho_dual_x_init=BCD_RHO_DUAL_X_INIT_VALUE,
+                        rho_dual_coc_init=BCD_RHO_DUAL_COC_INIT_VALUE,
                         rho_opt_init=BCD_RHO_OPT_INIT_VALUE,
                         gamma_base=BCD_GAMMA_BASE_VALUE,
                         mu_dual_floor_init=BCD_MU_DUAL_FLOOR_INIT_VALUE,
@@ -961,13 +1008,19 @@ def main():
                         enable_dropout_during_nn_training=BCD_ENABLE_DROPOUT_DURING_NN_TRAINING_VALUE,
                         rho_primal_init=BCD_RHO_PRIMAL_INIT_VALUE,
                         rho_dual_init=BCD_RHO_DUAL_INIT_VALUE,
+                        rho_dual_pg_init=BCD_RHO_DUAL_PG_INIT_VALUE,
+                        rho_dual_x_init=BCD_RHO_DUAL_X_INIT_VALUE,
+                        rho_dual_coc_init=BCD_RHO_DUAL_COC_INIT_VALUE,
                         rho_opt_init=BCD_RHO_OPT_INIT_VALUE,
                         gamma_base=BCD_GAMMA_BASE_VALUE,
                         mu_dual_floor_init=BCD_MU_DUAL_FLOOR_INIT_VALUE,
                         ita_dual_floor_init=BCD_ITA_DUAL_FLOOR_INIT_VALUE,
                         n_workers=N_WORKERS_BCD,
                     )
-                agent.load_model_parameters(str(bcd_path))
+                agent.load_model_parameters(
+                    str(bcd_path),
+                    restore_rho_state=BCD_RESTORE_RHO_FROM_CHECKPOINT,
+                )
                 log("BCD 模型加载成功，跳过训练")
             else:
                 agent = run_bcd(
@@ -992,6 +1045,9 @@ def main():
                     enable_dropout_during_nn_training=BCD_ENABLE_DROPOUT_DURING_NN_TRAINING_VALUE,
                     rho_primal_init=BCD_RHO_PRIMAL_INIT_VALUE,
                     rho_dual_init=BCD_RHO_DUAL_INIT_VALUE,
+                    rho_dual_pg_init=BCD_RHO_DUAL_PG_INIT_VALUE,
+                    rho_dual_x_init=BCD_RHO_DUAL_X_INIT_VALUE,
+                    rho_dual_coc_init=BCD_RHO_DUAL_COC_INIT_VALUE,
                     rho_opt_init=BCD_RHO_OPT_INIT_VALUE,
                     gamma_base=BCD_GAMMA_BASE_VALUE,
                     mu_dual_floor_init=BCD_MU_DUAL_FLOOR_INIT_VALUE,
