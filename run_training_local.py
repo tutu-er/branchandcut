@@ -64,7 +64,7 @@ if not check_and_install_dependencies():
 MODE   = 'both'
 ENABLE_SPARSE_SUPPORTS = False
 RUN_FP = True        # True → 训练后运行 feasibility_pump 测试（bcd/sparse 模式不支持）
-SURROGATE_CONSTRAINT_STRATEGY = 'sensitive'  # 'sensitive' / 'all' / 'all_templates_rhs3'
+SURROGATE_CONSTRAINT_STRATEGY = 'sensitive'  # 'sensitive' / 'all' / 'all_templates_sign4' / 'all_single_time'
 THETA_HOT_START_STRATEGY = 'dcpf_relative'   # 'dcpf_relative' / 'gaussian'
 ZETA_HOT_START_STRATEGY = 'zero'             # 'zero' / 'gaussian'
 THETA_GAUSSIAN_STD = 0.01

@@ -33,6 +33,39 @@ if 'pypower' not in sys.modules:
 
 dummy_subproblem_mod = types.ModuleType('src.uc_NN_subproblem')
 dummy_subproblem_mod.SubproblemSurrogateTrainer = object
+dummy_subproblem_mod.CONSTRAINT_STRATEGY_ALL = 'all'
+dummy_subproblem_mod.CONSTRAINT_STRATEGY_ALL_SINGLE_TIME = 'all_single_time'
+dummy_subproblem_mod.CONSTRAINT_STRATEGY_ALL_TEMPLATES_SIGN4 = 'all_templates_sign4'
+dummy_subproblem_mod.SURROGATE_SINGLE_TIME_OFFSETS = (0,)
+dummy_subproblem_mod.SURROGATE_TRIPLE_WINDOW_OFFSETS = (0, 1, 2)
+dummy_subproblem_mod.normalize_constraint_generation_strategy = (
+    lambda strategy: (
+        'all_templates_sign4'
+        if str(strategy).strip().lower() == 'all_templates_rhs3'
+        else str(strategy).strip().lower()
+    )
+)
+def _resolve_constraint_offsets_from_trainer(trainer, sample_id, n_constraints):
+    offsets = getattr(trainer, 'surrogate_constraint_offsets', None)
+    if (
+        sample_id is not None
+        and isinstance(offsets, list)
+        and 0 <= sample_id < len(offsets)
+    ):
+        return list(offsets[sample_id])[:n_constraints]
+    default = (0,) if getattr(trainer, 'constraint_generation_strategy', '') == 'all_single_time' else (0, 1, 2)
+    return [default] * n_constraints
+dummy_subproblem_mod.resolve_constraint_offsets_from_trainer = _resolve_constraint_offsets_from_trainer
+def _build_surrogate_constraint_expression(x_values, timestep, offsets, alpha_value, beta_value, gamma_value, horizon):
+    expr = 0.0
+    if 0 in offsets and 0 <= timestep < horizon:
+        expr += alpha_value * x_values[timestep]
+    if 1 in offsets and 0 <= timestep + 1 < horizon:
+        expr += beta_value * x_values[timestep + 1]
+    if 2 in offsets and 0 <= timestep + 2 < horizon:
+        expr += gamma_value * x_values[timestep + 2]
+    return expr
+dummy_subproblem_mod.build_surrogate_constraint_expression = _build_surrogate_constraint_expression
 sys.modules.setdefault('src.uc_NN_subproblem', dummy_subproblem_mod)
 sys.modules.setdefault('uc_NN_subproblem', dummy_subproblem_mod)
 
@@ -52,11 +85,32 @@ from src import feasibility_pump as fp
 
 
 class _DummyTrainer:
-    def __init__(self, unit_id, active_set_data, horizon=3):
+    def __init__(
+        self,
+        unit_id,
+        active_set_data,
+        horizon=3,
+        constraint_generation_strategy='all',
+        sensitive_timesteps=None,
+        all_mode_group_size=4,
+    ):
         self.unit_id = unit_id
         self.active_set_data = active_set_data
         self.T = horizon
         self.generator_injection_sensitivity = np.array([[0.2, 0.6]], dtype=float)
+        self.constraint_generation_strategy = constraint_generation_strategy
+        self.sensitive_timesteps = (
+            sensitive_timesteps
+            if sensitive_timesteps is not None
+            else [list(range(max(horizon - 2, 0))) for _ in active_set_data]
+        )
+        default_offsets = [(0,)] * horizon if constraint_generation_strategy == 'all_single_time' else None
+        self.surrogate_constraint_offsets = (
+            [default_offsets.copy() for _ in active_set_data]
+            if default_offsets is not None
+            else [[(0, 1, 2)] * len(timesteps) for timesteps in self.sensitive_timesteps]
+        )
+        self.all_mode_group_size = all_mode_group_size
 
     def get_surrogate_params(self, pd_data, lambda_val, renewable_data=None):
         sample = fp._coerce_scenario_sample(pd_data)
@@ -69,7 +123,8 @@ class _DummyTrainer:
         gammas = np.array([base + 0.4, base + 0.5], dtype=float)
         deltas = np.array([base + 0.6, base + 0.7], dtype=float)
         costs = np.zeros(self.T, dtype=float)
-        return alphas, betas, gammas, deltas, costs
+        pg_costs = np.zeros(self.T, dtype=float)
+        return alphas, betas, gammas, deltas, costs, pg_costs
 
 
 class _DummyLambdaPredictor:
@@ -109,6 +164,48 @@ def test_extract_unit_lambda_projects_global_duals_with_dcpf():
     np.testing.assert_allclose(lambda_unit, expected)
 
 
+def test_resolve_surrogate_constraint_timesteps_all():
+    trainer = _DummyTrainer(0, active_set_data=[{}], horizon=5, constraint_generation_strategy='all')
+    resolved = fp._resolve_surrogate_constraint_timesteps(trainer, {'sample_id': 0}, T=5, n_constraints=3)
+    assert resolved == [0, 1, 2]
+
+
+def test_resolve_surrogate_constraint_timesteps_all_templates_sign4():
+    trainer = _DummyTrainer(
+        0,
+        active_set_data=[{}],
+        horizon=5,
+        constraint_generation_strategy='all_templates_sign4',
+        all_mode_group_size=4,
+    )
+    resolved = fp._resolve_surrogate_constraint_timesteps(trainer, {'sample_id': 0}, T=5, n_constraints=12)
+    assert resolved == [0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2]
+
+
+def test_resolve_surrogate_constraint_timesteps_all_single_time():
+    trainer = _DummyTrainer(
+        0,
+        active_set_data=[{}],
+        horizon=5,
+        constraint_generation_strategy='all_single_time',
+        sensitive_timesteps=[list(range(5))],
+    )
+    resolved = fp._resolve_surrogate_constraint_timesteps(trainer, {'sample_id': 0}, T=5, n_constraints=5)
+    assert resolved == [0, 1, 2, 3, 4]
+
+
+def test_resolve_surrogate_constraint_timesteps_sensitive_uses_sample_id():
+    trainer = _DummyTrainer(
+        0,
+        active_set_data=[{}, {}],
+        horizon=6,
+        constraint_generation_strategy='sensitive',
+        sensitive_timesteps=[[0, 2], [1, 3]],
+    )
+    resolved = fp._resolve_surrogate_constraint_timesteps(trainer, {'sample_id': 1}, T=6, n_constraints=2)
+    assert resolved == [1, 3]
+
+
 def test_collect_integer_solutions_combines_all_strategies(monkeypatch):
     active_set_data = [
         {
@@ -130,9 +227,19 @@ def test_collect_integer_solutions_combines_all_strategies(monkeypatch):
     }
     lambda_predictor = _DummyLambdaPredictor()
 
-    def _fake_unit_lp(_trainer, _lambda_val, alphas, betas, gammas, deltas):
+    def _fake_unit_lp(
+        _trainer,
+        _lambda_val,
+        alphas,
+        betas,
+        gammas,
+        deltas,
+        costs=None,
+        pg_costs=None,
+        scenario_sample=None,
+    ):
         score = float(np.sum(alphas + betas + gammas - deltas))
-        return np.array(
+        x_sol = np.array(
             [
                 0.9 if score >= 0 else 0.1,
                 0.8 if np.mean(deltas) >= np.mean(alphas) else 0.2,
@@ -140,6 +247,7 @@ def test_collect_integer_solutions_combines_all_strategies(monkeypatch):
             ],
             dtype=float,
         )
+        return x_sol, 2, {'status_name': 'OPTIMAL'}
 
     monkeypatch.setattr(fp, '_solve_unit_LP_with_surrogate', _fake_unit_lp)
 

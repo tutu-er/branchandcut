@@ -21,9 +21,29 @@ from pypower.idx_gen import GEN_BUS, PMIN, PMAX
 from pypower.idx_brch import RATE_A, BR_STATUS
 
 try:
-    from uc_NN_subproblem import SubproblemSurrogateTrainer
+    from uc_NN_subproblem import (
+        SubproblemSurrogateTrainer,
+        CONSTRAINT_STRATEGY_ALL,
+        CONSTRAINT_STRATEGY_ALL_SINGLE_TIME,
+        CONSTRAINT_STRATEGY_ALL_TEMPLATES_SIGN4,
+        SURROGATE_SINGLE_TIME_OFFSETS,
+        SURROGATE_TRIPLE_WINDOW_OFFSETS,
+        build_surrogate_constraint_expression,
+        normalize_constraint_generation_strategy,
+        resolve_constraint_offsets_from_trainer,
+    )
 except ImportError:
-    from src.uc_NN_subproblem import SubproblemSurrogateTrainer
+    from src.uc_NN_subproblem import (
+        SubproblemSurrogateTrainer,
+        CONSTRAINT_STRATEGY_ALL,
+        CONSTRAINT_STRATEGY_ALL_SINGLE_TIME,
+        CONSTRAINT_STRATEGY_ALL_TEMPLATES_SIGN4,
+        SURROGATE_SINGLE_TIME_OFFSETS,
+        SURROGATE_TRIPLE_WINDOW_OFFSETS,
+        build_surrogate_constraint_expression,
+        normalize_constraint_generation_strategy,
+        resolve_constraint_offsets_from_trainer,
+    )
 try:
     from sparse_surrogate_mining import (
         SparseSurrogateLibrary,
@@ -145,6 +165,94 @@ def _extract_unit_lambda(
         return arr[idx].astype(float, copy=True)
 
     raise ValueError(f"Unsupported lambda_val shape: {arr.shape}")
+
+
+def _resolve_surrogate_sample_id(
+    trainer: Optional['SubproblemSurrogateTrainer'],
+    sample: Optional[dict],
+) -> Optional[int]:
+    """Resolve the dataset sample id used by sensitive surrogate constraints."""
+    if trainer is None or not isinstance(sample, dict):
+        return None
+
+    candidate = sample.get('sample_id', sample.get('source_sample_id'))
+    if candidate is None:
+        return None
+
+    try:
+        sample_id = int(candidate)
+    except (TypeError, ValueError):
+        return None
+
+    sensitive_timesteps = getattr(trainer, 'sensitive_timesteps', None)
+    if not isinstance(sensitive_timesteps, list):
+        return None
+    if 0 <= sample_id < len(sensitive_timesteps):
+        return sample_id
+    return None
+
+
+def _resolve_surrogate_constraint_timesteps(
+    trainer: Optional['SubproblemSurrogateTrainer'],
+    sample: Optional[dict],
+    T: int,
+    n_constraints: int,
+) -> List[int]:
+    """Map surrogate parameter indices to the intended 3-period windows."""
+    if n_constraints <= 0 or T < 3:
+        return []
+
+    T_triples = T - 2
+    strategy = normalize_constraint_generation_strategy(
+        getattr(trainer, 'constraint_generation_strategy', 'sensitive') or 'sensitive'
+    )
+
+    if strategy == CONSTRAINT_STRATEGY_ALL_SINGLE_TIME:
+        return [min(k, T - 1) for k in range(n_constraints)]
+
+    if strategy == CONSTRAINT_STRATEGY_ALL:
+        return [k % T_triples for k in range(n_constraints)]
+
+    if strategy == CONSTRAINT_STRATEGY_ALL_TEMPLATES_SIGN4:
+        group_size = max(int(getattr(trainer, 'all_mode_group_size', 4) or 4), 1)
+        return [min(k // group_size, T_triples - 1) for k in range(n_constraints)]
+
+    sample_id = _resolve_surrogate_sample_id(trainer, sample)
+    if sample_id is None:
+        raise ValueError(
+            "Sensitive surrogate constraints require a resolvable sample_id/source_sample_id "
+            "to preserve the training-time timestep mapping."
+        )
+
+    sensitive_timesteps = getattr(trainer, 'sensitive_timesteps', [])
+    resolved = list(sensitive_timesteps[sample_id])
+    if len(resolved) < n_constraints:
+        raise ValueError(
+            f"Sample {sample_id} only has {len(resolved)} sensitive timesteps, "
+            f"but {n_constraints} surrogate constraints were requested."
+        )
+    return resolved[:n_constraints]
+
+
+def _resolve_surrogate_constraint_layout(
+    trainer: Optional['SubproblemSurrogateTrainer'],
+    sample: Optional[dict],
+    T: int,
+    n_constraints: int,
+) -> Tuple[List[int], List[tuple[int, ...]]]:
+    timesteps = _resolve_surrogate_constraint_timesteps(trainer, sample, T, n_constraints)
+    sample_id = _resolve_surrogate_sample_id(trainer, sample)
+    offsets = resolve_constraint_offsets_from_trainer(trainer, sample_id, len(timesteps))
+    if len(offsets) < len(timesteps):
+        default_offsets = (
+            SURROGATE_SINGLE_TIME_OFFSETS
+            if normalize_constraint_generation_strategy(
+                getattr(trainer, 'constraint_generation_strategy', 'sensitive') or 'sensitive'
+            ) == CONSTRAINT_STRATEGY_ALL_SINGLE_TIME
+            else SURROGATE_TRIPLE_WINDOW_OFFSETS
+        )
+        offsets = offsets + [default_offsets] * (len(timesteps) - len(offsets))
+    return timesteps, offsets[:len(timesteps)]
 
 
 def _repair_min_up_down_heuristic(x_int: np.ndarray, T_delta: float) -> np.ndarray:
@@ -515,6 +623,8 @@ def _generate_load_perturbed_scenarios(
             'load_data': perturbed_load,
             'renewable_data': renewable_data.copy(),
         }
+        if 'sample_id' in base_sample:
+            candidate['source_sample_id'] = base_sample['sample_id']
         candidates.append(normalize_sample_arrays(candidate))
 
     return candidates
@@ -534,9 +644,11 @@ def _build_surrogate_parameter_candidates(
     similar_scenario_pool_size: int = 10,
     n_load_perturbations: int = 0,
     load_perturbation_scale: float = 0.03,
-) -> List[Tuple[str, np.ndarray, np.ndarray, np.ndarray, np.ndarray]]:
+) -> List[Tuple[str, dict, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]]:
     """Build multiple surrogate parameter sets from direct/randomized and scenario-based strategies."""
-    parameter_sets: List[Tuple[str, np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = []
+    parameter_sets: List[
+        Tuple[str, dict, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]
+    ] = []
 
     base_lambda_unit = _extract_unit_lambda(
         base_lambda,
@@ -544,8 +656,11 @@ def _build_surrogate_parameter_candidates(
         unit_id=trainer.unit_id,
         trainer=trainer,
     )
-    alphas, betas, gammas, deltas, *_ = trainer.get_surrogate_params(base_sample, base_lambda_unit)
-    parameter_sets.append(("base", alphas, betas, gammas, deltas))
+    alphas, betas, gammas, deltas, costs, pg_costs = trainer.get_surrogate_params(
+        base_sample,
+        base_lambda_unit,
+    )
+    parameter_sets.append(("base", base_sample, alphas, betas, gammas, deltas, costs, pg_costs))
 
     for idx in range(n_param_perturbations):
         alphas_m, betas_m, gammas_m, deltas_m = _perturb_surrogate_outputs(
@@ -557,7 +672,9 @@ def _build_surrogate_parameter_candidates(
             perturb_std=perturb_std,
             neighborhood_weight=neighborhood_weight,
         )
-        parameter_sets.append((f"direct_randomized_{idx}", alphas_m, betas_m, gammas_m, deltas_m))
+        parameter_sets.append(
+            (f"direct_randomized_{idx}", base_sample, alphas_m, betas_m, gammas_m, deltas_m, costs, pg_costs)
+        )
 
     scenario_bank = _get_scenario_bank(trainers)
     similar_scenarios = _find_similar_scenarios(
@@ -575,8 +692,13 @@ def _build_surrogate_parameter_candidates(
             unit_id=trainer.unit_id,
             trainer=trainer,
         )
-        alpha_s, beta_s, gamma_s, delta_s, *_ = trainer.get_surrogate_params(scenario, lambda_sim_unit)
-        parameter_sets.append((f"similar_scenario_{idx}", alpha_s, beta_s, gamma_s, delta_s))
+        alpha_s, beta_s, gamma_s, delta_s, costs_s, pg_costs_s = trainer.get_surrogate_params(
+            scenario,
+            lambda_sim_unit,
+        )
+        parameter_sets.append(
+            (f"similar_scenario_{idx}", scenario, alpha_s, beta_s, gamma_s, delta_s, costs_s, pg_costs_s)
+        )
 
     perturbed_scenarios = _generate_load_perturbed_scenarios(
         base_sample=base_sample,
@@ -592,8 +714,13 @@ def _build_surrogate_parameter_candidates(
             unit_id=trainer.unit_id,
             trainer=trainer,
         )
-        alpha_p, beta_p, gamma_p, delta_p, *_ = trainer.get_surrogate_params(scenario, lambda_pert_unit)
-        parameter_sets.append((f"load_perturbed_{idx}", alpha_p, beta_p, gamma_p, delta_p))
+        alpha_p, beta_p, gamma_p, delta_p, costs_p, pg_costs_p = trainer.get_surrogate_params(
+            scenario,
+            lambda_pert_unit,
+        )
+        parameter_sets.append(
+            (f"load_perturbed_{idx}", scenario, alpha_p, beta_p, gamma_p, delta_p, costs_p, pg_costs_p)
+        )
 
     return parameter_sets
 
@@ -1008,7 +1135,9 @@ def _add_surrogate_constraints(
     gammas: np.ndarray,
     deltas: np.ndarray,
     T: int,
-    prefix: str = ''
+    prefix: str = '',
+    trainer: Optional['SubproblemSurrogateTrainer'] = None,
+    sample: Optional[dict] = None,
 ) -> None:
     """
     �?Gurobi 模型添加 V3 三时段代理约束�?
@@ -1026,15 +1155,25 @@ def _add_surrogate_constraints(
         T: 时段总数
         prefix: 约束命名前缀（用于区分不同机组）
     """
-    T_triples = max(1, T - 2)
-    for k in range(len(alphas)):
-        t_k  = k % T_triples
-        t_k1 = min(t_k + 1, T - 1)
-        t_k2 = min(t_k + 2, T - 1)
+    timestep_map, offset_map = _resolve_surrogate_constraint_layout(
+        trainer,
+        sample,
+        T,
+        len(alphas),
+    )
+    for k, t_k in enumerate(timestep_map):
         a, b, c, r = float(alphas[k]), float(betas[k]), float(gammas[k]), float(deltas[k])
         if abs(a) > 1e-10 or abs(b) > 1e-10 or abs(c) > 1e-10:
             model.addConstr(
-                a * x_vars[t_k] + b * x_vars[t_k1] + c * x_vars[t_k2] <= r,
+                build_surrogate_constraint_expression(
+                    x_vars,
+                    t_k,
+                    offset_map[k],
+                    a,
+                    b,
+                    c,
+                    T,
+                ) <= r,
                 name=f'{prefix}surr_{k}'
             )
 
@@ -1086,8 +1225,12 @@ def _solve_unit_LP_with_surrogate(
     alphas: np.ndarray,
     betas: np.ndarray,
     gammas: np.ndarray,
-    deltas: np.ndarray
-) -> np.ndarray:
+    deltas: np.ndarray,
+    costs: Optional[np.ndarray] = None,
+    pg_costs: Optional[np.ndarray] = None,
+    scenario_sample: Optional[dict] = None,
+    surrogate_soft_penalty: float = 1e8,
+) -> Tuple[np.ndarray, int, dict]:
     """
     求解单机组子问题 LP（使�?V3 三时段代理约束）�?
 
@@ -1097,67 +1240,181 @@ def _solve_unit_LP_with_surrogate(
         alphas, betas, gammas, deltas: V3 代理约束参数，各 shape (max_constraints,)
 
     Returns:
-        x_LP: (T,) LP 松弛解；若不可行返回零向�?
+        x_LP: (T,) LP 松弛解；若求解失败返回 NaN 向量
+        status: Gurobi 状态码
+        details: 求解诊断信息
     """
     g = trainer.unit_id
     T = trainer.T
     lambda_unit = _extract_unit_lambda(lambda_val, T, unit_id=g, trainer=trainer)
-
-    model = gp.Model('unit_lp_surrogate')
-    model.Params.OutputFlag = 0
-
-    pg = model.addVars(T, lb=0, name='pg')
-    x = model.addVars(T, lb=0, ub=1, name='x')
-    cpower = model.addVars(T, lb=0, name='cpower')
-
-    # 发电上下�?
-    for t in range(T):
-        model.addConstr(pg[t] >= trainer.gen[g, PMIN] * x[t])
-        model.addConstr(pg[t] <= trainer.gen[g, PMAX] * x[t])
-
-    # 爬坡约束（与 UnitCommitmentModel 一致）
-    Ru = 0.4 * trainer.gen[g, PMAX] / trainer.T_delta
-    Rd = 0.4 * trainer.gen[g, PMAX] / trainer.T_delta
-    Ru_co = 0.3 * trainer.gen[g, PMAX]
-    Rd_co = 0.3 * trainer.gen[g, PMAX]
-    for t in range(1, T):
-        model.addConstr(pg[t] - pg[t-1] <= Ru * x[t-1] + Ru_co * (1 - x[t-1]))
-        model.addConstr(pg[t-1] - pg[t] <= Rd * x[t] + Rd_co * (1 - x[t]))
-
-    # 最小开关机时间：优先读取算例真实 min_up/min_down，缺失时回退到默认值
-    ppc_ref = getattr(trainer, 'ppc_raw', getattr(trainer, 'ppc', {'gen': trainer.gen}))
-    min_up_steps, min_down_steps = _get_min_up_down_time_steps(
-        ppc_ref, trainer.ng, trainer.T_delta, T,
+    timestep_map, offset_map = _resolve_surrogate_constraint_layout(
+        trainer,
+        scenario_sample,
+        T,
+        len(alphas),
     )
-    Ton = int(min_up_steps[g])
-    Toff = int(min_down_steps[g])
-    for tau in range(1, Ton + 1):
-        for t1 in range(T - tau):
-            model.addConstr(x[t1+1] - x[t1] <= x[t1+tau])
-    for tau in range(1, Toff + 1):
-        for t1 in range(T - tau):
-            model.addConstr(-x[t1+1] + x[t1] <= 1 - x[t1+tau])
 
-    # 发电成本（线性化�?
-    for t in range(T):
-        model.addConstr(
-            cpower[t] >= trainer.gencost[g, -2] / trainer.T_delta * pg[t]
-                       + trainer.gencost[g, -1] / trainer.T_delta * x[t]
+    def _solve_once(use_soft_surrogate: bool) -> Tuple[np.ndarray, int, dict]:
+        model = gp.Model('unit_lp_surrogate')
+        model.Params.OutputFlag = 0
+        model.Params.DualReductions = 0
+
+        pg = model.addVars(T, lb=0, name='pg')
+        x = model.addVars(T, lb=0, ub=1, name='x')
+        cpower = model.addVars(T, lb=0, name='cpower')
+
+        for t in range(T):
+            model.addConstr(pg[t] >= trainer.gen[g, PMIN] * x[t])
+            model.addConstr(pg[t] <= trainer.gen[g, PMAX] * x[t])
+
+        Ru = 0.4 * trainer.gen[g, PMAX] / trainer.T_delta
+        Rd = 0.4 * trainer.gen[g, PMAX] / trainer.T_delta
+        Ru_co = 0.3 * trainer.gen[g, PMAX]
+        Rd_co = 0.3 * trainer.gen[g, PMAX]
+        for t in range(1, T):
+            model.addConstr(pg[t] - pg[t-1] <= Ru * x[t-1] + Ru_co * (1 - x[t-1]))
+            model.addConstr(pg[t-1] - pg[t] <= Rd * x[t] + Rd_co * (1 - x[t]))
+
+        ppc_ref = getattr(trainer, 'ppc_raw', getattr(trainer, 'ppc', {'gen': trainer.gen}))
+        min_up_steps, min_down_steps = _get_min_up_down_time_steps(
+            ppc_ref, trainer.ng, trainer.T_delta, T,
         )
+        Ton = int(min_up_steps[g])
+        Toff = int(min_down_steps[g])
+        for tau in range(1, Ton + 1):
+            for t1 in range(T - tau):
+                model.addConstr(x[t1+1] - x[t1] <= x[t1+tau])
+        for tau in range(1, Toff + 1):
+            for t1 in range(T - tau):
+                model.addConstr(-x[t1+1] + x[t1] <= 1 - x[t1+tau])
 
-    # V3 三时段代理约�?
-    x_dict = {t: x[t] for t in range(T)}
-    _add_surrogate_constraints(model, x_dict, alphas, betas, gammas, deltas, T)
+        for t in range(T):
+            model.addConstr(
+                cpower[t] >= trainer.gencost[g, -2] / trainer.T_delta * pg[t]
+                           + trainer.gencost[g, -1] / trainer.T_delta * x[t]
+            )
 
-    # 目标：最小化成本 - 拉格朗日对偶项
-    obj = gp.quicksum(cpower[t] for t in range(T))
-    obj -= gp.quicksum(float(lambda_unit[t]) * pg[t] for t in range(T))
-    model.setObjective(obj, GRB.MINIMIZE)
-    model.optimize()
+        surrogate_slacks = []
+        surrogate_rows = []
+        for k, t_k in enumerate(timestep_map):
+            a = float(alphas[k])
+            b = float(betas[k])
+            c = float(gammas[k])
+            r = float(deltas[k])
+            if abs(a) <= 1e-10 and abs(b) <= 1e-10 and abs(c) <= 1e-10:
+                continue
+            expr = build_surrogate_constraint_expression(
+                x,
+                t_k,
+                offset_map[k],
+                a,
+                b,
+                c,
+                T,
+            ) - r
+            slack_var = None
+            if use_soft_surrogate:
+                slack_var = model.addVar(lb=0, name=f'surr_slack_{k}')
+                model.addConstr(expr <= slack_var, name=f'surr_{k}')
+                surrogate_slacks.append(slack_var)
+            else:
+                model.addConstr(expr <= 0.0, name=f'surr_{k}')
+            surrogate_rows.append({
+                'k': int(k),
+                'timestep': int(t_k),
+                'offsets': tuple(offset_map[k]),
+                'alpha': a,
+                'beta': b,
+                'gamma': c,
+                'delta': r,
+                'slack_var': slack_var,
+            })
 
-    if model.status == GRB.OPTIMAL:
-        return np.array([x[t].X for t in range(T)])
-    return np.zeros(T)
+        obj = gp.quicksum(cpower[t] for t in range(T))
+        if costs is not None:
+            obj += gp.quicksum(float(costs[t]) * x[t] for t in range(min(T, len(costs))))
+        if pg_costs is not None:
+            obj += gp.quicksum(float(pg_costs[t]) * pg[t] for t in range(min(T, len(pg_costs))))
+        obj -= gp.quicksum(float(lambda_unit[t]) * pg[t] for t in range(T))
+        if surrogate_slacks:
+            obj += float(surrogate_soft_penalty) * gp.quicksum(surrogate_slacks)
+        model.setObjective(obj, GRB.MINIMIZE)
+        model.optimize()
+
+        details = {
+            'status': int(model.status),
+            'status_name': _gurobi_status_name(model.status),
+            'used_soft_surrogate': bool(use_soft_surrogate),
+            'surrogate_soft_penalty': float(surrogate_soft_penalty) if use_soft_surrogate else None,
+            'n_surrogate_constraints': int(len(surrogate_rows)),
+        }
+
+        if model.status == GRB.OPTIMAL:
+            x_sol = np.array([x[t].X for t in range(T)], dtype=float)
+            pg_sol = np.array([pg[t].X for t in range(T)], dtype=float)
+            details['objective_value'] = float(model.ObjVal)
+            details['x_solution'] = x_sol.copy()
+            details['pg_solution'] = pg_sol.copy()
+
+            surrogate_violations = []
+            violation_sum = 0.0
+            violation_max = 0.0
+            slack_sum = 0.0
+            slack_max = 0.0
+            for row in surrogate_rows:
+                lhs = build_surrogate_constraint_expression(
+                    x_sol,
+                    row['timestep'],
+                    row['offsets'],
+                    row['alpha'],
+                    row['beta'],
+                    row['gamma'],
+                    T,
+                )
+                violation = max(0.0, lhs - row['delta'])
+                slack_val = float(row['slack_var'].X) if row['slack_var'] is not None else 0.0
+                violation_sum += violation
+                violation_max = max(violation_max, violation)
+                slack_sum += slack_val
+                slack_max = max(slack_max, slack_val)
+                surrogate_violations.append({
+                    'k': row['k'],
+                    'timestep': row['timestep'],
+                    'offsets': row['offsets'],
+                    'lhs': float(lhs),
+                    'rhs': float(row['delta']),
+                    'violation': float(violation),
+                    'slack': float(slack_val),
+                    'alpha': float(row['alpha']),
+                    'beta': float(row['beta']),
+                    'gamma': float(row['gamma']),
+                })
+            details['surrogate_violation_sum'] = float(violation_sum)
+            details['surrogate_violation_max'] = float(violation_max)
+            details['surrogate_slack_sum'] = float(slack_sum)
+            details['surrogate_slack_max'] = float(slack_max)
+            details['surrogate_violations'] = surrogate_violations
+            return x_sol, int(model.status), details
+
+        return np.full(T, np.nan, dtype=float), int(model.status), details
+
+    x_hard, status_hard, details_hard = _solve_once(use_soft_surrogate=False)
+    details_hard['hard_status'] = int(status_hard)
+    details_hard['hard_status_name'] = _gurobi_status_name(status_hard)
+    details_hard['fallback_triggered'] = False
+    if status_hard == GRB.OPTIMAL:
+        return x_hard, status_hard, details_hard
+
+    if status_hard in (GRB.INFEASIBLE, GRB.INF_OR_UNBD):
+        x_soft, status_soft, details_soft = _solve_once(use_soft_surrogate=True)
+        details_soft['hard_status'] = int(status_hard)
+        details_soft['hard_status_name'] = _gurobi_status_name(status_hard)
+        details_soft['soft_status'] = int(status_soft)
+        details_soft['soft_status_name'] = _gurobi_status_name(status_soft)
+        details_soft['fallback_triggered'] = True
+        return x_soft, status_soft, details_soft
+
+    return x_hard, status_hard, details_hard
 
 
 # ========================== Step 2：收集多组整数解 ==========================
@@ -1206,7 +1463,7 @@ def collect_integer_solutions(
     T = pd_matrix.shape[1]
     n_candidates = n_perturbations + n_similar_scenarios + n_load_perturbations
 
-    x_surr_lp = np.zeros((ng, T))
+    x_surr_lp = np.full((ng, T), np.nan, dtype=float)
     x_init_k = np.zeros((ng, T), dtype=int)
     x_init_k_m = np.zeros((ng, n_candidates, T), dtype=int)
 
@@ -1227,19 +1484,59 @@ def collect_integer_solutions(
             n_load_perturbations=n_load_perturbations,
             load_perturbation_scale=load_perturbation_scale,
         )
-        _base_name, alphas, betas, gammas, deltas = param_candidates[0]
+        _base_name, base_scenario, alphas, betas, gammas, deltas, costs, pg_costs = param_candidates[0]
 
         # 原始子问�?LP
-        x_LP_k = _solve_unit_LP_with_surrogate(trainer, lambda_val, alphas, betas, gammas, deltas)
+        x_LP_k, status_k, details_k = _solve_unit_LP_with_surrogate(
+            trainer,
+            lambda_val,
+            alphas,
+            betas,
+            gammas,
+            deltas,
+            costs=costs,
+            pg_costs=pg_costs,
+            scenario_sample=base_scenario,
+        )
+        if status_k != GRB.OPTIMAL:
+            raise RuntimeError(
+                f"unit {g} surrogate LP failed: status={_gurobi_status_name(status_k)}, "
+                f"fallback_triggered={details_k.get('fallback_triggered', False)}"
+            )
         x_surr_lp[g] = x_LP_k
         x_init_k[g] = round_to_integer(x_LP_k)
 
         # Solve additional unit LPs from perturbed / retrieved surrogate parameters.
-        for m, (_name, alphas_m, betas_m, gammas_m, deltas_m) in enumerate(param_candidates[1:]):
-            x_LP_m = _solve_unit_LP_with_surrogate(
-                trainer, lambda_val, alphas_m, betas_m, gammas_m, deltas_m
+        for m, (
+            _name,
+            scenario_m,
+            alphas_m,
+            betas_m,
+            gammas_m,
+            deltas_m,
+            costs_m,
+            pg_costs_m,
+        ) in enumerate(param_candidates[1:]):
+            x_LP_m, status_m, details_m = _solve_unit_LP_with_surrogate(
+                trainer,
+                lambda_val,
+                alphas_m,
+                betas_m,
+                gammas_m,
+                deltas_m,
+                costs=costs_m,
+                pg_costs=pg_costs_m,
+                scenario_sample=scenario_m,
             )
-            x_init_k_m[g, m] = round_to_integer(x_LP_m)
+            if status_m == GRB.OPTIMAL:
+                x_init_k_m[g, m] = round_to_integer(x_LP_m)
+            else:
+                print(
+                    f"  Warning: unit {g} perturbed surrogate LP failed "
+                    f"(status={_gurobi_status_name(status_m)}); reuse base candidate",
+                    flush=True,
+                )
+                x_init_k_m[g, m] = x_init_k[g]
 
     return x_surr_lp, x_init_k, x_init_k_m
 
@@ -1288,6 +1585,29 @@ def identify_trusted_mask(
 # ========================== Step 6 辅助：全局 LP 松弛 ==========================
 
 DEFAULT_SURROGATE_PENALTY = 1e8
+DEFAULT_UNIT_SURROGATE_SOFT_PENALTY = 1e8
+
+
+def _gurobi_status_name(status: Optional[int]) -> str:
+    status_map = {
+        GRB.LOADED: 'LOADED',
+        GRB.OPTIMAL: 'OPTIMAL',
+        GRB.INFEASIBLE: 'INFEASIBLE',
+        GRB.INF_OR_UNBD: 'INF_OR_UNBD',
+        GRB.UNBOUNDED: 'UNBOUNDED',
+        GRB.CUTOFF: 'CUTOFF',
+        GRB.ITERATION_LIMIT: 'ITERATION_LIMIT',
+        GRB.NODE_LIMIT: 'NODE_LIMIT',
+        GRB.TIME_LIMIT: 'TIME_LIMIT',
+        GRB.SOLUTION_LIMIT: 'SOLUTION_LIMIT',
+        GRB.INTERRUPTED: 'INTERRUPTED',
+        GRB.NUMERIC: 'NUMERIC',
+        GRB.SUBOPTIMAL: 'SUBOPTIMAL',
+        GRB.USER_OBJ_LIMIT: 'USER_OBJ_LIMIT',
+    }
+    if status is None:
+        return 'UNKNOWN'
+    return status_map.get(int(status), f'STATUS_{int(status)}')
 
 
 def _build_surrogate_relaxation_stages() -> List[dict]:
@@ -1366,7 +1686,6 @@ def solve_global_LP_relaxation(
     start_cost = gencost[:, 1]   # gencost �?1 列：启动成本
     shut_cost  = gencost[:, 2]   # gencost �?2 列：关机成本
 
-    T_triples = max(1, T - 2)       # 预计算三时段约束索引范围
     last_status = None
     stages = _build_surrogate_relaxation_stages()
 
@@ -1434,6 +1753,7 @@ def solve_global_LP_relaxation(
         coc = model.addVars(ng, T - 1, lb=0, name='coc')
         subproblem_slacks: list = []
         bcd_slacks: list = []
+        aux_obj = gp.LinExpr()
 
         for t in range(T):
             model.addConstr(
@@ -1484,20 +1804,33 @@ def solve_global_LP_relaxation(
                     unit_id=g,
                     trainer=trainers[g],
                 )
-                alphas, betas, gammas, deltas, *_ = trainers[g].get_surrogate_params(
+                alphas, betas, gammas, deltas, costs, pg_costs = trainers[g].get_surrogate_params(
                     sample if sample is not None else pd_matrix, lambda_unit
                 )
-                for k in range(len(alphas)):
-                    t_k = k % T_triples
-                    t_k1 = min(t_k + 1, T - 1)
-                    t_k2 = min(t_k + 2, T - 1)
+                aux_obj += gp.quicksum(float(costs[t]) * x[g, t] for t in range(min(T, len(costs))))
+                aux_obj += gp.quicksum(float(pg_costs[t]) * pg[g, t] for t in range(min(T, len(pg_costs))))
+                timestep_map, offset_map = _resolve_surrogate_constraint_layout(
+                    trainers[g],
+                    sample,
+                    T,
+                    len(alphas),
+                )
+                for k, t_k in enumerate(timestep_map):
                     a = float(alphas[k])
                     b = float(betas[k])
                     c = float(gammas[k])
                     r = float(deltas[k])
                     if abs(a) <= 1e-10 and abs(b) <= 1e-10 and abs(c) <= 1e-10:
                         continue
-                    expr = a * x[g, t_k] + b * x[g, t_k1] + c * x[g, t_k2] - r
+                    expr = build_surrogate_constraint_expression(
+                        {t: x[g, t] for t in range(T)},
+                        t_k,
+                        offset_map[k],
+                        a,
+                        b,
+                        c,
+                        T,
+                    ) - r
                     if stage['hard_subproblem']:
                         model.addConstr(expr <= 0.0, name=f'g{g}_surr_{k}')
                     else:
@@ -1580,7 +1913,8 @@ def solve_global_LP_relaxation(
         )
 
         obj = (gp.quicksum(cpower[g, t] for g in range(ng) for t in range(T))
-               + gp.quicksum(coc[g, t] for g in range(ng) for t in range(T - 1)))
+               + gp.quicksum(coc[g, t] for g in range(ng) for t in range(T - 1))
+               + aux_obj)
         if subproblem_slacks:
             obj += stage['penalty_subproblem'] * gp.quicksum(subproblem_slacks)
         if bcd_slacks:

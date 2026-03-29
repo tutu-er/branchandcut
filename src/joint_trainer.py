@@ -36,6 +36,11 @@ from pypower.idx_brch import RATE_A
 from pypower.makePTDF import makePTDF
 
 from src.uc_NN_BCD import _get_uc_matrix_from_sample
+from src.uc_NN_subproblem import (
+    build_surrogate_constraint_expression,
+    iterate_surrogate_constraint_terms,
+    resolve_constraint_offsets_from_trainer,
+)
 
 
 class JointLPTrainer:
@@ -348,13 +353,24 @@ class JointLPTrainer:
         for g, trainer in self.trainers.items():
             a, b, c, d, *_ = surr_params[g]
             sensitive_t = trainer.sensitive_timesteps[sample_id]
+            constraint_offsets = resolve_constraint_offsets_from_trainer(
+                trainer,
+                sample_id,
+                len(sensitive_t),
+            )
             for k, t_k in enumerate(sensitive_t):
-                if t_k + 2 >= self.T:
-                    continue
-                surr_expr = (float(a[k]) * x[g, t_k]
-                             + float(b[k]) * x[g, t_k + 1]
-                             + float(c[k]) * x[g, t_k + 2]
-                             - float(d[k]))
+                surr_expr = (
+                    build_surrogate_constraint_expression(
+                        {t: x[g, t] for t in range(self.T)},
+                        t_k,
+                        constraint_offsets[k],
+                        float(a[k]),
+                        float(b[k]),
+                        float(c[k]),
+                        self.T,
+                    )
+                    - float(d[k])
+                )
                 # primal: 单侧违反
                 viol = model.addVar(lb=0, name=f'surr_viol_{g}_{k}')
                 model.addConstr(viol >= surr_expr)
@@ -507,18 +523,22 @@ class JointLPTrainer:
         for g_s, trainer in self.trainers.items():
             a, b, c, d, *_ = surr_params[g_s]
             sensitive_t = trainer.sensitive_timesteps[sample_id]
+            constraint_offsets = resolve_constraint_offsets_from_trainer(
+                trainer,
+                sample_id,
+                len(sensitive_t),
+            )
             for k, t_k in enumerate(sensitive_t):
-                if t_k + 2 >= self.T:
-                    continue
-                # a[k]*x[g_s, t_k]
-                surr_x_contrib.setdefault((g_s, t_k), []).append(
-                    (float(a[k]), lambda_surr_var[g_s][k]))
-                # b[k]*x[g_s, t_k+1]
-                surr_x_contrib.setdefault((g_s, t_k + 1), []).append(
-                    (float(b[k]), lambda_surr_var[g_s][k]))
-                # c[k]*x[g_s, t_k+2]
-                surr_x_contrib.setdefault((g_s, t_k + 2), []).append(
-                    (float(c[k]), lambda_surr_var[g_s][k]))
+                for time_idx, coeff in iterate_surrogate_constraint_terms(
+                    t_k,
+                    constraint_offsets[k],
+                    float(a[k]),
+                    float(b[k]),
+                    float(c[k]),
+                    self.T,
+                ):
+                    surr_x_contrib.setdefault((g_s, time_idx), []).append(
+                        (float(coeff), lambda_surr_var[g_s][k]))
 
         for g in range(self.ng):
             for t in range(self.T):
@@ -691,13 +711,24 @@ class JointLPTrainer:
         for g_s, trainer in self.trainers.items():
             a, b, c, d, *_ = surr_params[g_s]
             sensitive_t = trainer.sensitive_timesteps[sample_id]
+            constraint_offsets = resolve_constraint_offsets_from_trainer(
+                trainer,
+                sample_id,
+                len(sensitive_t),
+            )
             for k, t_k in enumerate(sensitive_t):
-                if t_k + 2 >= self.T:
-                    continue
-                surr_val = (float(a[k]) * x_arr[g_s, t_k]
-                            + float(b[k]) * x_arr[g_s, t_k + 1]
-                            + float(c[k]) * x_arr[g_s, t_k + 2]
-                            - float(d[k]))
+                surr_val = (
+                    build_surrogate_constraint_expression(
+                        x_arr[g_s],
+                        t_k,
+                        constraint_offsets[k],
+                        float(a[k]),
+                        float(b[k]),
+                        float(c[k]),
+                        self.T,
+                    )
+                    - float(d[k])
+                )
                 abs_surr_val = abs(surr_val)
                 if abs_surr_val > 1e-10:
                     obj_opt += abs_surr_val * lambda_surr_var[g_s][k]
@@ -892,13 +923,24 @@ class JointLPTrainer:
             for g, trainer in self.trainers.items():
                 a, b, c, d, *_ = surr_params[g]
                 sensitive_t = trainer.sensitive_timesteps[s]
+                constraint_offsets = resolve_constraint_offsets_from_trainer(
+                    trainer,
+                    s,
+                    len(sensitive_t),
+                )
                 for k, t_k in enumerate(sensitive_t):
-                    if t_k + 2 >= self.T:
-                        continue
-                    surr_val = (float(a[k]) * x_arr[g, t_k]
-                                + float(b[k]) * x_arr[g, t_k + 1]
-                                + float(c[k]) * x_arr[g, t_k + 2]
-                                - float(d[k]))
+                    surr_val = (
+                        build_surrogate_constraint_expression(
+                            x_arr[g],
+                            t_k,
+                            constraint_offsets[k],
+                            float(a[k]),
+                            float(b[k]),
+                            float(c[k]),
+                            self.T,
+                        )
+                        - float(d[k])
+                    )
                     # primal: 单侧违反
                     obj_primal += max(0, surr_val)
                     # opt: 双侧 * |lambda_surr|

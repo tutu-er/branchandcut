@@ -1254,22 +1254,117 @@ class SubproblemSurrogateNet(nn.Module):
 
 
 CONSTRAINT_STRATEGY_ALL = "all"
-CONSTRAINT_STRATEGY_ALL_TEMPLATES_RHS3 = "all_templates_rhs3"
+CONSTRAINT_STRATEGY_ALL_TEMPLATES_SIGN4 = "all_templates_sign4"
+CONSTRAINT_STRATEGY_ALL_SINGLE_TIME = "all_single_time"
+CONSTRAINT_STRATEGY_ALIAS_MAP = {
+    "all_templates_rhs3": CONSTRAINT_STRATEGY_ALL_TEMPLATES_SIGN4,
+}
+SURROGATE_TRIPLE_WINDOW_OFFSETS = (0, 1, 2)
+SURROGATE_SINGLE_TIME_OFFSETS = (0,)
 SUPPORTED_CONSTRAINT_GENERATION_STRATEGIES = {
     "sensitive",
     CONSTRAINT_STRATEGY_ALL,
-    CONSTRAINT_STRATEGY_ALL_TEMPLATES_RHS3,
+    CONSTRAINT_STRATEGY_ALL_TEMPLATES_SIGN4,
+    CONSTRAINT_STRATEGY_ALL_SINGLE_TIME,
 }
 
 
 def normalize_constraint_generation_strategy(strategy: str | None) -> str:
     strategy_norm = "sensitive" if strategy is None else str(strategy).strip().lower()
+    strategy_norm = CONSTRAINT_STRATEGY_ALIAS_MAP.get(strategy_norm, strategy_norm)
     if strategy_norm not in SUPPORTED_CONSTRAINT_GENERATION_STRATEGIES:
         raise ValueError(
             f"Unsupported constraint_generation_strategy: {strategy}. "
             f"Supported: {sorted(SUPPORTED_CONSTRAINT_GENERATION_STRATEGIES)}"
         )
     return strategy_norm
+
+
+def _normalize_constraint_offsets(offsets) -> tuple[int, ...]:
+    normalized = []
+    if offsets is None:
+        return SURROGATE_TRIPLE_WINDOW_OFFSETS
+    for offset in offsets:
+        try:
+            offset_int = int(offset)
+        except (TypeError, ValueError):
+            continue
+        if 0 <= offset_int <= 2 and offset_int not in normalized:
+            normalized.append(offset_int)
+    return tuple(normalized) if normalized else SURROGATE_TRIPLE_WINDOW_OFFSETS
+
+
+def iterate_surrogate_constraint_terms(
+    timestep: int,
+    offsets,
+    alpha_value,
+    beta_value,
+    gamma_value,
+    horizon: int,
+):
+    active_offsets = _normalize_constraint_offsets(offsets)
+    if 0 in active_offsets and 0 <= timestep < horizon:
+        yield timestep, alpha_value
+    if 1 in active_offsets and 0 <= timestep + 1 < horizon:
+        yield timestep + 1, beta_value
+    if 2 in active_offsets and 0 <= timestep + 2 < horizon:
+        yield timestep + 2, gamma_value
+
+
+def build_surrogate_constraint_expression(
+    x_values,
+    timestep: int,
+    offsets,
+    alpha_value,
+    beta_value,
+    gamma_value,
+    horizon: int,
+):
+    expr = 0
+    for time_idx, coeff in iterate_surrogate_constraint_terms(
+        timestep,
+        offsets,
+        alpha_value,
+        beta_value,
+        gamma_value,
+        horizon,
+    ):
+        expr += coeff * x_values[time_idx]
+    return expr
+
+
+def resolve_constraint_offsets_from_trainer(
+    trainer,
+    sample_id: int | None,
+    n_constraints: int,
+):
+    if n_constraints <= 0:
+        return []
+
+    offsets_by_sample = getattr(trainer, 'surrogate_constraint_offsets', None)
+    if (
+        isinstance(offsets_by_sample, list)
+        and sample_id is not None
+        and 0 <= sample_id < len(offsets_by_sample)
+    ):
+        resolved = [
+            _normalize_constraint_offsets(offsets)
+            for offsets in list(offsets_by_sample[sample_id])
+        ]
+        if len(resolved) >= n_constraints:
+            return resolved[:n_constraints]
+
+    strategy = normalize_constraint_generation_strategy(
+        getattr(trainer, 'constraint_generation_strategy', 'sensitive') or 'sensitive'
+    )
+    default_offsets = (
+        SURROGATE_SINGLE_TIME_OFFSETS
+        if strategy == CONSTRAINT_STRATEGY_ALL_SINGLE_TIME
+        else SURROGATE_TRIPLE_WINDOW_OFFSETS
+    )
+    if 'resolved' in locals() and resolved:
+        return resolved + [default_offsets] * (n_constraints - len(resolved))
+    return [default_offsets] * n_constraints
 
 
 def identify_sensitive_timesteps(x_vals, threshold_low=0.1, threshold_high=0.9, max_constraints=20):
@@ -1323,7 +1418,7 @@ def identify_sensitive_timesteps(x_vals, threshold_low=0.1, threshold_high=0.9, 
     return sensitive
 
 
-def select_constraint_timesteps(
+def select_constraint_layout(
     x_vals,
     strategy: str = "sensitive",
     threshold_low: float = 0.1,
@@ -1332,21 +1427,46 @@ def select_constraint_timesteps(
 ):
     strategy_norm = normalize_constraint_generation_strategy(strategy)
     T = len(x_vals)
+    if T <= 0:
+        return [], []
+    if strategy_norm == CONSTRAINT_STRATEGY_ALL_SINGLE_TIME:
+        return list(range(T)), [SURROGATE_SINGLE_TIME_OFFSETS] * T
     if T < 3:
-        return []
-    if strategy_norm == CONSTRAINT_STRATEGY_ALL_TEMPLATES_RHS3:
+        return [], []
+    if strategy_norm == CONSTRAINT_STRATEGY_ALL_TEMPLATES_SIGN4:
         expanded_timesteps = []
+        expanded_offsets = []
         for t in range(T - 2):
             expanded_timesteps.extend([t] * 4)
-        return expanded_timesteps
+            expanded_offsets.extend([SURROGATE_TRIPLE_WINDOW_OFFSETS] * 4)
+        return expanded_timesteps, expanded_offsets
     if strategy_norm == CONSTRAINT_STRATEGY_ALL:
-        return list(range(T - 2))
-    return identify_sensitive_timesteps(
+        timesteps = list(range(T - 2))
+        return timesteps, [SURROGATE_TRIPLE_WINDOW_OFFSETS] * len(timesteps)
+    timesteps = identify_sensitive_timesteps(
         x_vals,
         threshold_low=threshold_low,
         threshold_high=threshold_high,
         max_constraints=max_constraints,
     )
+    return timesteps, [SURROGATE_TRIPLE_WINDOW_OFFSETS] * len(timesteps)
+
+
+def select_constraint_timesteps(
+    x_vals,
+    strategy: str = "sensitive",
+    threshold_low: float = 0.1,
+    threshold_high: float = 0.9,
+    max_constraints: int = 20,
+):
+    timesteps, _ = select_constraint_layout(
+        x_vals,
+        strategy=strategy,
+        threshold_low=threshold_low,
+        threshold_high=threshold_high,
+        max_constraints=max_constraints,
+    )
+    return timesteps
 
 
 class SubproblemSurrogateTrainer:
@@ -1414,7 +1534,7 @@ class SubproblemSurrogateTrainer:
         self.constraint_generation_strategy = normalize_constraint_generation_strategy(
             constraint_generation_strategy
         )
-        self.all_mode_group_size = 4 if self.constraint_generation_strategy == CONSTRAINT_STRATEGY_ALL_TEMPLATES_RHS3 else 1
+        self.all_mode_group_size = 4 if self.constraint_generation_strategy == CONSTRAINT_STRATEGY_ALL_TEMPLATES_SIGN4 else 1
         self.template_rhs_jitter_scale = 0.4
         self.template_rhs_reg_deadband = 0.25
         self.coeff_reg_deadband = 0.35
@@ -1429,8 +1549,10 @@ class SubproblemSurrogateTrainer:
             
         self.ng = self.gen.shape[0]
         self.nb = self.bus.shape[0]
-        if self.constraint_generation_strategy == CONSTRAINT_STRATEGY_ALL_TEMPLATES_RHS3:
+        if self.constraint_generation_strategy == CONSTRAINT_STRATEGY_ALL_TEMPLATES_SIGN4:
             self.max_constraints = max(self.all_mode_group_size * (self.T - 2), 0)
+        elif self.constraint_generation_strategy == CONSTRAINT_STRATEGY_ALL_SINGLE_TIME:
+            self.max_constraints = max(self.T, 0)
         elif self.constraint_generation_strategy == CONSTRAINT_STRATEGY_ALL:
             self.max_constraints = max(self.T - 2, 0)
         else:
@@ -1506,6 +1628,7 @@ class SubproblemSurrogateTrainer:
 
         # 存储每个样本的敏感时段索引
         self.sensitive_timesteps = [[] for _ in range(self.n_samples)]
+        self.surrogate_constraint_offsets = [[] for _ in range(self.n_samples)]
         
         # 获取对偶变量λ
         self.lambda_vals = self._get_lambda_values()
@@ -1668,7 +1791,7 @@ class SubproblemSurrogateTrainer:
         ]))
 
     def _uses_template_rhs_bases(self) -> bool:
-        return self.constraint_generation_strategy == CONSTRAINT_STRATEGY_ALL_TEMPLATES_RHS3
+        return self.constraint_generation_strategy == CONSTRAINT_STRATEGY_ALL_TEMPLATES_SIGN4
 
     def _build_all_template_patterns_and_rhs(self) -> tuple[np.ndarray, np.ndarray]:
         patterns = np.array(
@@ -1680,8 +1803,7 @@ class SubproblemSurrogateTrainer:
             ],
             dtype=float,
         )
-        # RHS 取各模板在 x in [0,1] 下的最大 lhs，可保证初始 surrogate_viol = 0。
-        rhs = np.array([2.0, 1.0, 1.0, 0.0], dtype=float)
+        rhs = np.zeros(4, dtype=float)
         return patterns, rhs
 
     def _build_template_rhs_base_vector(self, size: int) -> np.ndarray:
@@ -1755,7 +1877,7 @@ class SubproblemSurrogateTrainer:
 
     def _apply_initial_surrogate_templates(self):
         """Apply deterministic surrogate templates for expanded all-mode constraints."""
-        if self.constraint_generation_strategy != CONSTRAINT_STRATEGY_ALL_TEMPLATES_RHS3 or self.num_coupling_constraints <= 0:
+        if self.constraint_generation_strategy != CONSTRAINT_STRATEGY_ALL_TEMPLATES_SIGN4 or self.num_coupling_constraints <= 0:
             return
 
         base_patterns, base_rhs = self._build_all_template_patterns_and_rhs()
@@ -1769,7 +1891,14 @@ class SubproblemSurrogateTrainer:
         self.delta_values[:] = np.tile(base_rhs, n_groups)
 
     def _uses_group_mu_lower_bound(self) -> bool:
-        return self.constraint_generation_strategy == CONSTRAINT_STRATEGY_ALL_TEMPLATES_RHS3 and self.all_mode_group_size > 1
+        return self.constraint_generation_strategy == CONSTRAINT_STRATEGY_ALL_TEMPLATES_SIGN4 and self.all_mode_group_size > 1
+
+    def _constraint_offsets_for_sample(self, sample_id: int) -> list[tuple[int, ...]]:
+        return resolve_constraint_offsets_from_trainer(
+            self,
+            sample_id,
+            len(self.sensitive_timesteps[sample_id]),
+        )
 
     def _get_mu_lower_bound_phase(self) -> str:
         if self.iter_number < self.mu_individual_lower_bound_round:
@@ -1918,7 +2047,10 @@ class SubproblemSurrogateTrainer:
                 self.active_set_data[sample_id]['x_true'] = x_init.copy()
 
                 # 识别敏感时段（分数解 → 优先覆盖；全整数 → 按距0.5升序补齐）
-                self.sensitive_timesteps[sample_id] = select_constraint_timesteps(
+                (
+                    self.sensitive_timesteps[sample_id],
+                    self.surrogate_constraint_offsets[sample_id],
+                ) = select_constraint_layout(
                     x_lp,
                     strategy=self.constraint_generation_strategy,
                     threshold_low=0.1, threshold_high=0.9,
@@ -2118,9 +2250,17 @@ class SubproblemSurrogateTrainer:
 
         # --- 代理耦合约束（软约束，按 sensitive_timesteps 索引）---
         sensitive_t = self.sensitive_timesteps[sample_id]
+        constraint_offsets = self._constraint_offsets_for_sample(sample_id)
         for k, t in enumerate(sensitive_t):
-            # sensitive_timesteps 已保证 t+2 < T
-            coupling_lhs = alphas[k] * x[t] + betas[k] * x[t+1] + gammas[k] * x[t+2]
+            coupling_lhs = build_surrogate_constraint_expression(
+                x,
+                t,
+                constraint_offsets[k],
+                alphas[k],
+                betas[k],
+                gammas[k],
+                self.T,
+            )
             model.addConstr(surrogate_viols[k]    >= coupling_lhs - deltas[k], name=f'coupling_viol_{k}')
             model.addConstr(surrogate_abs_vals[k] >= coupling_lhs - deltas[k], name=f'coupling_abs_pos_{k}')
             model.addConstr(surrogate_abs_vals[k] >= deltas[k] - coupling_lhs, name=f'coupling_abs_neg_{k}')
@@ -2314,13 +2454,18 @@ class SubproblemSurrogateTrainer:
 
             # 代理耦合约束对 x[t] 的贡献（按 sensitive_timesteps 索引）
             sensitive_t = self.sensitive_timesteps[sample_id]
+            constraint_offsets = self._constraint_offsets_for_sample(sample_id)
             for k, ts in enumerate(sensitive_t):
-                if ts == t:
-                    expr += alphas[k] * mu[k]
-                if ts + 1 == t:
-                    expr += betas[k] * mu[k]
-                if ts + 2 == t:
-                    expr += gammas[k] * mu[k]
+                for time_idx, coeff in iterate_surrogate_constraint_terms(
+                    ts,
+                    constraint_offsets[k],
+                    alphas[k],
+                    betas[k],
+                    gammas[k],
+                    self.T,
+                ):
+                    if time_idx == t:
+                        expr += coeff * mu[k]
 
             # x 变量界约束（x ∈ [0,1]）
             expr += lam_x_upper[t] - lam_x_lower[t]
@@ -2413,8 +2558,17 @@ class SubproblemSurrogateTrainer:
                 obj_opt += viol * lam_x_upper[t]
 
         # 代理耦合约束（按 sensitive_timesteps 索引）
+        constraint_offsets = self._constraint_offsets_for_sample(sample_id)
         for k, t in enumerate(self.sensitive_timesteps[sample_id]):
-            lhs  = alphas[k] * x_val[t] + betas[k] * x_val[t + 1] + gammas[k] * x_val[t + 2]
+            lhs = build_surrogate_constraint_expression(
+                x_val,
+                t,
+                constraint_offsets[k],
+                alphas[k],
+                betas[k],
+                gammas[k],
+                self.T,
+            )
             viol = abs(lhs - deltas[k])
             if viol > 1e-10:
                 obj_opt += viol * mu[k]
@@ -2520,10 +2674,17 @@ class SubproblemSurrogateTrainer:
         # V3三时段约束违反量（按 sensitive_timesteps 索引）
         obj_primal = torch.tensor(0.0, device=device, requires_grad=True)
         sensitive_t = self.sensitive_timesteps[sample_id]
+        constraint_offsets = self._constraint_offsets_for_sample(sample_id)
         for k, t in enumerate(sensitive_t):
-            coupling_lhs = (alphas_tensor[k] * x_val[t]
-                            + betas_tensor[k] * x_val[t+1]
-                            + gammas_tensor[k] * x_val[t+2])
+            coupling_lhs = build_surrogate_constraint_expression(
+                x_val,
+                t,
+                constraint_offsets[k],
+                alphas_tensor[k],
+                betas_tensor[k],
+                gammas_tensor[k],
+                self.T,
+            )
             coupling_viol = torch.relu(coupling_lhs - deltas_tensor[k])
             obj_primal = obj_primal + coupling_viol
 
@@ -2531,9 +2692,15 @@ class SubproblemSurrogateTrainer:
         # V3互补松弛（按 sensitive_timesteps 索引）
         obj_opt = torch.tensor(0.0, device=device, requires_grad=True)
         for k, t in enumerate(sensitive_t):
-            coupling_lhs = (alphas_tensor[k] * x_val[t]
-                            + betas_tensor[k] * x_val[t+1]
-                            + gammas_tensor[k] * x_val[t+2])
+            coupling_lhs = build_surrogate_constraint_expression(
+                x_val,
+                t,
+                constraint_offsets[k],
+                alphas_tensor[k],
+                betas_tensor[k],
+                gammas_tensor[k],
+                self.T,
+            )
             coupling_abs = torch.abs(coupling_lhs - deltas_tensor[k])
             obj_opt = obj_opt + coupling_abs * mu_vals[k]
         
@@ -2630,12 +2797,16 @@ class SubproblemSurrogateTrainer:
             # 代理耦合约束贡献（含NN参数，可微分；按 sensitive_timesteps 索引）
             dual_expr = torch.tensor(inherent_const, dtype=torch.float32, device=device) + costs_tensor[t]
             for k, ts in enumerate(sensitive_t):
-                if ts == t:
-                    dual_expr = dual_expr + alphas_tensor[k] * mu_vals[k]
-                if ts + 1 == t:
-                    dual_expr = dual_expr + betas_tensor[k] * mu_vals[k]
-                if ts + 2 == t:
-                    dual_expr = dual_expr + gammas_tensor[k] * mu_vals[k]
+                for time_idx, coeff in iterate_surrogate_constraint_terms(
+                    ts,
+                    constraint_offsets[k],
+                    alphas_tensor[k],
+                    betas_tensor[k],
+                    gammas_tensor[k],
+                    self.T,
+                ):
+                    if time_idx == t:
+                        dual_expr = dual_expr + coeff * mu_vals[k]
 
             obj_dual_x = obj_dual_x + torch.abs(dual_expr)
 
@@ -2833,8 +3004,17 @@ class SubproblemSurrogateTrainer:
 
             # -- 代理耦合约束违反（按 sensitive_timesteps 索引）--
             sensitive_t = self.sensitive_timesteps[sample_id]
+            constraint_offsets = self._constraint_offsets_for_sample(sample_id)
             for k, ts in enumerate(sensitive_t):
-                coupling_lhs = alphas[k]*x_val[ts] + betas[k]*x_val[ts+1] + gammas[k]*x_val[ts+2]
+                coupling_lhs = build_surrogate_constraint_expression(
+                    x_val,
+                    ts,
+                    constraint_offsets[k],
+                    alphas[k],
+                    betas[k],
+                    gammas[k],
+                    self.T,
+                )
                 obj_primal += max(0.0, coupling_lhs - deltas[k])
 
             # -- 原问题固有约束违反（与primal block的obj_primal对应）--
@@ -2864,7 +3044,15 @@ class SubproblemSurrogateTrainer:
 
             # -- 代理耦合约束互补松弛（按 sensitive_timesteps 索引）--
             for k, ts in enumerate(sensitive_t):
-                coupling_lhs = alphas[k]*x_val[ts] + betas[k]*x_val[ts+1] + gammas[k]*x_val[ts+2]
+                coupling_lhs = build_surrogate_constraint_expression(
+                    x_val,
+                    ts,
+                    constraint_offsets[k],
+                    alphas[k],
+                    betas[k],
+                    gammas[k],
+                    self.T,
+                )
                 obj_opt += abs(coupling_lhs - deltas[k]) * mu_vals[k]
 
             # -- 原问题固有约束互补松弛 --
@@ -2954,12 +3142,16 @@ class SubproblemSurrogateTrainer:
                 # 代理耦合约束对偶贡献（按 sensitive_timesteps 索引）
                 sensitive_t = self.sensitive_timesteps[sample_id]
                 for k, ts in enumerate(sensitive_t):
-                    if ts == t:
-                        x_stat += alphas[k] * mu_vals[k]
-                    if ts + 1 == t:
-                        x_stat += betas[k] * mu_vals[k]
-                    if ts + 2 == t:
-                        x_stat += gammas[k] * mu_vals[k]
+                    for time_idx, coeff in iterate_surrogate_constraint_terms(
+                        ts,
+                        constraint_offsets[k],
+                        alphas[k],
+                        betas[k],
+                        gammas[k],
+                        self.T,
+                    ):
+                        if time_idx == t:
+                            x_stat += coeff * mu_vals[k]
                 obj_dual_x += abs(x_stat)
 
             # -- coc[t] 驻点条件（与dual block一致）--
@@ -3306,6 +3498,11 @@ class SubproblemSurrogateTrainer:
             )
             saved_strategy = state.get('constraint_generation_strategy', 'sensitive')
             self.constraint_generation_strategy = normalize_constraint_generation_strategy(saved_strategy)
+            self.all_mode_group_size = (
+                4
+                if self.constraint_generation_strategy == CONSTRAINT_STRATEGY_ALL_TEMPLATES_SIGN4
+                else 1
+            )
             self.mu_individual_lower_bound_round = state.get(
                 'mu_individual_lower_bound_round',
                 self.mu_individual_lower_bound_round,

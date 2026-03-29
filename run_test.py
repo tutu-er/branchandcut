@@ -16,6 +16,8 @@ import json
 from datetime import datetime
 from pathlib import Path
 
+from gurobipy import GRB
+
 # ──────────────────────── 依赖检�?────────────────────────
 
 
@@ -65,10 +67,10 @@ if not check_and_install_dependencies_safe():
 #   'bcd'       - 加载 BCD 神经网络模型并报告参数统�?
 #   'both'      - 联合加载 BCD + surrogate，以全体代理约束评估（需同时配置下面两个路径�?
 #
-MODE      = 'bcd'
+MODE      = 'surrogate'
 RUN_FP    = True       # surrogate / both 模式：是否运行可行性泵测试
 CASE_NAME = 'case3lite'   # 'case3' / 'case3lite' / 'case14' / 'case30' / 'case39' / 'case118'
-SURROGATE_CONSTRAINT_STRATEGY = 'all'  # 'auto' / 'sensitive' / 'all'
+SURROGATE_CONSTRAINT_STRATEGY = 'all_templates_sign4'  # 'auto' / 'sensitive' / 'all' / 'all_templates_sign4' / 'all_single_time'
 BCD_LAMBDA_INIT_STRATEGY = 'lp_relaxation'   # 'lp_relaxation' / 'ed_on_x_opt'
 THETA_HOT_START_STRATEGY = 'dcpf_relative'   # 'dcpf_relative' / 'gaussian'
 ZETA_HOT_START_STRATEGY = 'zero'             # 'zero' / 'gaussian'
@@ -81,7 +83,7 @@ BCD_MAX_THETA_CONSTRAINTS_PER_TIME_SLOT = 10
 BCD_GAMMA_BASE = 1e-2
 
 # surrogate / both 模式：已训练 surrogate 模型目录（训练时输出的带时间戳路径）
-MODEL_DIR = 'result/surrogate_models/subproblem_models_case3lite_20260328_112148'
+MODEL_DIR = 'result/surrogate_models/subproblem_models_case3lite_20260329_151459'
 
 # bcd / both 模式：已训练 BCD 模型 .pth 文件路径
 # BCD_MODEL_PATH = 'result/bcd_models/bcd_model_case30_20260322_150043.pth'
@@ -137,7 +139,9 @@ try:
     from uc_NN_subproblem import (
         load_trained_models,
         ActiveSetReader,
+        build_surrogate_constraint_expression,
         normalize_constraint_generation_strategy,
+        resolve_constraint_offsets_from_trainer,
         _load_surrogate_model_metadata,
     )
     from case_registry import get_case_ppc
@@ -162,6 +166,8 @@ if MODE in ('surrogate', 'both'):
             solve_global_LP_relaxation,
             solve_global_LP_relaxation_without_surrogate,
             _solve_unit_LP_with_surrogate,
+            _extract_unit_lambda,
+            _resolve_surrogate_constraint_timesteps,
         )
         from feasibility_pump_case3lite import recover_integer_solution_case3lite
     except ImportError as e:
@@ -174,6 +180,102 @@ if MODE in ('surrogate', 'both'):
 def log(msg: str) -> None:
     ts = datetime.now().strftime("%H:%M:%S")
     print(f"[{ts}] {msg}", flush=True)
+
+
+def _resolve_surrogate_display_layout(trainer, sample: dict | None, n_constraints: int):
+    timestep_map = _resolve_surrogate_constraint_timesteps(
+        trainer,
+        sample,
+        trainer.T,
+        n_constraints,
+    )
+    sample_id = None
+    if isinstance(sample, dict):
+        candidate = sample.get('sample_id', sample.get('source_sample_id'))
+        if candidate is not None:
+            try:
+                sample_id = int(candidate)
+            except (TypeError, ValueError):
+                sample_id = None
+    offset_map = resolve_constraint_offsets_from_trainer(trainer, sample_id, len(timestep_map))
+    return timestep_map, offset_map
+
+
+def _format_surrogate_constraint(a: float, b: float, c: float, timestep: int, offsets, rhs: float) -> str:
+    terms = []
+    if 0 in offsets:
+        terms.append(f"{a:.3f}*x[{timestep}]")
+    if 1 in offsets:
+        terms.append(f"{b:.3f}*x[{timestep + 1}]")
+    if 2 in offsets:
+        terms.append(f"{c:.3f}*x[{timestep + 2}]")
+    lhs_text = " + ".join(terms) if terms else "0"
+    return f"{lhs_text} <= {rhs:.3f}"
+
+
+def _validate_lambda_prediction_shape(lambda_val, ng: int, T: int) -> tuple[str, tuple]:
+    """Validate lambda predictor outputs used by run_test and report their mode."""
+    if isinstance(lambda_val, dict):
+        if 'lambda_pg_electricity_price' in lambda_val:
+            arr = np.asarray(lambda_val['lambda_pg_electricity_price'], dtype=float)
+            if arr.shape == (T, ng):
+                arr = arr.T
+            if arr.shape != (ng, T):
+                raise ValueError(
+                    f"lambda_pg_electricity_price shape mismatch: got {arr.shape}, expected {(ng, T)}"
+                )
+            return 'dict.lambda_pg_electricity_price', tuple(arr.shape)
+        if 'lambda_pg_effective' in lambda_val:
+            arr = np.asarray(lambda_val['lambda_pg_effective'], dtype=float)
+            if arr.shape == (T, ng):
+                arr = arr.T
+            if arr.shape != (ng, T):
+                raise ValueError(
+                    f"lambda_pg_effective shape mismatch: got {arr.shape}, expected {(ng, T)}"
+                )
+            return 'dict.lambda_pg_effective', tuple(arr.shape)
+        if 'lambda_power_balance' in lambda_val:
+            arr = np.asarray(lambda_val['lambda_power_balance'], dtype=float).reshape(-1)
+            if arr.shape != (T,):
+                raise ValueError(
+                    f"lambda_power_balance shape mismatch: got {arr.shape}, expected {(T,)}"
+                )
+            return 'dict.lambda_power_balance', tuple(arr.shape)
+        raise ValueError(f"Unsupported lambda predictor dict keys: {sorted(lambda_val.keys())}")
+
+    arr = np.asarray(lambda_val, dtype=float)
+    if arr.shape == (T,):
+        return 'array.power_balance_only', tuple(arr.shape)
+    if arr.shape == (ng, T):
+        return 'array.per_unit_effective', tuple(arr.shape)
+    if arr.shape == (T, ng):
+        return 'array.per_unit_effective_transposed', tuple(arr.shape)
+    raise ValueError(
+        f"Unsupported lambda predictor output shape {arr.shape}; expected {(T,)}, {(ng, T)}, or dict payload"
+    )
+
+
+def _log_lambda_prediction_summary(
+    dual_predictor,
+    sample: dict,
+    ng: int,
+    T: int,
+    prefix: str,
+) -> None:
+    """Print one-line diagnostics for the current lambda predictor output."""
+    lambda_val = dual_predictor.predict(sample)
+    mode, shape = _validate_lambda_prediction_shape(lambda_val, ng, T)
+    predictor_mode = getattr(dual_predictor, '_legacy_mode', None)
+    arr = np.asarray(lambda_val if not isinstance(lambda_val, dict) else (
+        lambda_val.get('lambda_pg_electricity_price')
+        if 'lambda_pg_electricity_price' in lambda_val
+        else lambda_val.get('lambda_pg_effective', lambda_val.get('lambda_power_balance'))
+    ), dtype=float)
+    log(
+        f"{prefix} lambda predictor: mode={mode}, predictor_legacy_mode={predictor_mode}, "
+        f"shape={shape}, mean={float(np.mean(arr)):.4f}, std={float(np.std(arr)):.4f}, "
+        f"maxabs={float(np.max(np.abs(arr))):.4f}"
+    )
 
 
 def _resolve_requested_surrogate_strategy(
@@ -267,8 +369,9 @@ def load_json_data(data_file: Path) -> list:
 
     log(f"  原始样本数: {len(all_samples)}")
 
-    for sample in all_samples:
+    for idx, sample in enumerate(all_samples):
         normalize_sample_arrays(sample)
+        sample.setdefault('sample_id', idx)
 
     return all_samples
 
@@ -397,7 +500,7 @@ def plot_surrogate_analysis(trainers: dict, all_samples: list,
     coef_info = [
         ('alpha_values', r'$\alpha$ (Coefficient of $x_t$)',     axes[0, 0]),
         ('beta_values',  r'$\beta$ (Coefficient of $x_{t+1}$)',  axes[0, 1]),
-        ('gamma_values', r'$\gamma$ (Coefficient of $x_{t+2}$)', axes[1, 0]),
+        ('gamma_values', r'$\gamma$ (Offset-2 Coefficient)', axes[1, 0]),
         ('delta_values', r'$\delta$ (RHS / Slack)',               axes[1, 1]),
     ]
 
@@ -454,12 +557,19 @@ def plot_surrogate_analysis(trainers: dict, all_samples: list,
             continue
         for s in range(ns):
             x_s = np.asarray(tr.x[s], dtype=float)   # (T,)
+            sample_s = all_samples[s] if s < len(all_samples) else {'sample_id': s}
+            timestep_map, offset_map = _resolve_surrogate_display_layout(tr, sample_s, nc_common)
             for t in range(nc_common):
-                if t + 2 >= tr.T:
-                    break
-                lhs = (tr.alpha_values[s, t] * x_s[t]
-                       + tr.beta_values[s, t] * x_s[t + 1]
-                       + tr.gamma_values[s, t] * x_s[t + 2])
+                ts = timestep_map[t]
+                lhs = build_surrogate_constraint_expression(
+                    x_s,
+                    ts,
+                    offset_map[t],
+                    tr.alpha_values[s, t],
+                    tr.beta_values[s, t],
+                    tr.gamma_values[s, t],
+                    tr.T,
+                )
                 viol_matrix[gi, t] += max(0.0, lhs - tr.delta_values[s, t])
         viol_matrix[gi] /= ns
 
@@ -886,21 +996,70 @@ def print_surrogate_results(trainers: dict, all_samples: list) -> None:
         print(f"  beta_values  shape: {trainer.beta_values.shape}")
         print(f"  gamma_values shape: {trainer.gamma_values.shape}")
         print(f"  delta_values shape: {trainer.delta_values.shape}  (RHS，非负)")
+        print(f"  c_x values    shape: {trainer.cost_values.shape}")
+        print(f"  c_pg values   shape: {trainer.pg_cost_values.shape}")
+        print(
+            f"  c_x stats: mean={float(np.mean(trainer.cost_values)):.4f}, "
+            f"std={float(np.std(trainer.cost_values)):.4f}, "
+            f"maxabs={float(np.max(np.abs(trainer.cost_values))):.4f}"
+        )
+        print(
+            f"  c_pg stats: mean={float(np.mean(trainer.pg_cost_values)):.4f}, "
+            f"std={float(np.std(trainer.pg_cost_values)):.4f}, "
+            f"maxabs={float(np.max(np.abs(trainer.pg_cost_values))):.4f}"
+        )
 
         x0 = trainer.x[0]
-        print(f"  样本0 时序约束示例（最多5条）:")
-        for t in range(min(5, nc)):
-            if t + 2 >= T:
-                break
-            a = trainer.alpha_values[0, t]
-            b = trainer.beta_values[0, t]
-            g = trainer.gamma_values[0, t]
-            d = trainer.delta_values[0, t]
-            lhs = a * x0[t] + b * x0[t + 1] + g * x0[t + 2]
+        sample0 = all_samples[0] if all_samples else {'sample_id': 0}
+        timestep_map, offset_map = _resolve_surrogate_display_layout(trainer, sample0, nc)
+        print(f"  样本0 代理约束示例（最多5条）:")
+        for k in range(min(5, nc)):
+            ts = timestep_map[k]
+            a = trainer.alpha_values[0, k]
+            b = trainer.beta_values[0, k]
+            g = trainer.gamma_values[0, k]
+            d = trainer.delta_values[0, k]
+            lhs = build_surrogate_constraint_expression(
+                x0,
+                ts,
+                offset_map[k],
+                a,
+                b,
+                g,
+                T,
+            )
             viol = max(0.0, lhs - d)
-            print(f"    t={t}: {a:.3f}*x[{t}] + {b:.3f}*x[{t+1}] "
-                  f"+ {g:.3f}*x[{t+2}] <= {d:.3f}  "
+            expr_text = _format_surrogate_constraint(a, b, g, ts, offset_map[k], d)
+            print(f"    k={k}, t={ts}, offsets={tuple(offset_map[k])}: {expr_text}  "
                   f"(lhs={lhs:.3f}, viol={viol:.4f})")
+        if T > 0:
+            cx0 = np.asarray(trainer.cost_values[0], dtype=float)
+            cpg0 = np.asarray(trainer.pg_cost_values[0], dtype=float)
+            preview_len = min(6, T)
+            print(f"  样本0 c_x 前{preview_len}项: {np.array2string(cx0[:preview_len], precision=3)}")
+            print(f"  样本0 c_pg前{preview_len}项: {np.array2string(cpg0[:preview_len], precision=3)}")
+            if all_samples:
+                renewable0 = sample0.get('renewable_data') if isinstance(sample0, dict) else None
+                try:
+                    inf_alpha, inf_beta, inf_gamma, inf_delta, inf_cx, inf_cpg = trainer.get_surrogate_params(
+                        sample0,
+                        np.asarray(trainer.lambda_vals[0], dtype=float),
+                        renewable_data=renewable0,
+                    )
+                    print(
+                        f"  推理c_x 前{preview_len}项: "
+                        f"{np.array2string(np.asarray(inf_cx[:preview_len], dtype=float), precision=3)}"
+                    )
+                    print(
+                        f"  推理c_pg前{preview_len}项: "
+                        f"{np.array2string(np.asarray(inf_cpg[:preview_len], dtype=float), precision=3)}"
+                    )
+                    diff_cx = float(np.max(np.abs(np.asarray(inf_cx, dtype=float) - cx0[:len(inf_cx)])))
+                    diff_cpg = float(np.max(np.abs(np.asarray(inf_cpg, dtype=float) - cpg0[:len(inf_cpg)])))
+                    print(f"  缓存/推理 c_x 最大差值: {diff_cx:.4f}")
+                    print(f"  缓存/推理 c_pg最大差值: {diff_cpg:.4f}")
+                except Exception as exc:
+                    print(f"  推理 c_x/c_pg 预览失败: {exc}")
 
         integrality = float(np.sum(x0 * (1 - x0)))
         print(f"  整数性指标(样本0): {integrality:.6f}  (0=完全整数)")
@@ -940,13 +1099,33 @@ def _build_subproblem_commitment_matrix(
         if not (0 <= unit_idx < ng):
             continue
         try:
-            alphas, betas, gammas, deltas, *_ = trainer.get_surrogate_params(
-                sample, lambda_val, renewable_data=renewable_data,
+            lambda_unit = _extract_unit_lambda(
+                lambda_val,
+                trainer.T,
+                unit_id=unit_idx,
+                trainer=trainer,
             )
-            x_unit = _solve_unit_LP_with_surrogate(
-                trainer, lambda_val, alphas, betas, gammas, deltas,
+            alphas, betas, gammas, deltas, costs, pg_costs = trainer.get_surrogate_params(
+                sample, lambda_unit, renewable_data=renewable_data,
             )
-            x_sub[unit_idx, :min(T, x_unit.shape[0])] = x_unit[:T]
+            x_unit, status_unit, details_unit = _solve_unit_LP_with_surrogate(
+                trainer,
+                lambda_val,
+                alphas,
+                betas,
+                gammas,
+                deltas,
+                costs=costs,
+                pg_costs=pg_costs,
+                scenario_sample=sample,
+            )
+            if status_unit == GRB.OPTIMAL:
+                x_sub[unit_idx, :min(T, x_unit.shape[0])] = x_unit[:T]
+            else:
+                log(
+                    f"  机组 {unit_idx}: surrogate 子问题状态="
+                    f"{details_unit.get('status_name', status_unit)}"
+                )
         except Exception as e:
             log(f"  机组 {unit_idx}: surrogate 子问题求解失败，已跳过 ({e})")
 
@@ -1093,6 +1272,8 @@ def run_lp_compare_test(ppc, all_samples: list, dual_predictor, trainers: dict,
         sample = all_samples[i]
         pd_data = sample['pd_data']
         log(f"  样本 {i + 1}/{test_n}，pd_data shape={pd_data.shape}")
+        if i == 0:
+            _log_lambda_prediction_summary(dual_predictor, sample, ppc['gen'].shape[0], pd_data.shape[1], "LP compare")
 
         try:
             lambda_val = dual_predictor.predict(sample)
@@ -1164,6 +1345,8 @@ def run_fp_test(ppc, all_samples: list, dual_predictor, trainers: dict,
         sample = all_samples[i]
         pd_data = sample['pd_data']
         log(f"  样本 {i + 1}/{test_n}，pd_data shape={pd_data.shape}")
+        if i == 0:
+            _log_lambda_prediction_summary(dual_predictor, sample, ppc['gen'].shape[0], pd_data.shape[1], "FP")
         try:
             if CASE_NAME == 'case3lite' and USE_CASE3LITE_CUSTOM_FP:
                 x_result, success, _details = recover_integer_solution_case3lite(
@@ -1232,6 +1415,10 @@ def test_surrogate(ppc, all_samples: list, T_DELTA: float,
         requested_strategy=constraint_generation_strategy,
     )
 
+    log(
+        f"dual predictor loaded: legacy_mode={getattr(dual_predictor, '_legacy_mode', None)}, "
+        f"output_dim={getattr(dual_predictor, 'output_dim', 'n/a')}"
+    )
     log(f"已加载 {len(trainers)} 个机组的代理约束模型")
     print_surrogate_results(trainers, all_samples[:TEST_SAMPLES])
 
@@ -1785,6 +1972,10 @@ def test_both(ppc, data_file: Path, all_samples: list, T_DELTA: float,
         model_dir=model_dir,
         unit_ids=unit_ids,
         requested_strategy=constraint_generation_strategy,
+    )
+    log(
+        f"dual predictor loaded: legacy_mode={getattr(dual_predictor, '_legacy_mode', None)}, "
+        f"output_dim={getattr(dual_predictor, 'output_dim', 'n/a')}"
     )
     log(f"已加载 {len(trainers)} 个机组的代理约束模型（全体约束）")
     print_surrogate_results(trainers, all_samples[:test_samples])

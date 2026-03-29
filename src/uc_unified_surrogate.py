@@ -38,6 +38,10 @@ try:
 except ImportError:
     from src.feasibility_pump import _add_surrogate_constraints, _build_ptdf_data
 try:
+    from uc_NN_subproblem import build_surrogate_constraint_expression, resolve_constraint_offsets_from_trainer
+except ImportError:
+    from src.uc_NN_subproblem import build_surrogate_constraint_expression, resolve_constraint_offsets_from_trainer
+try:
     from scenario_utils import get_feature_vector_from_sample, get_sample_net_load, normalize_sample_arrays
 except ImportError:
     from src.scenario_utils import get_feature_vector_from_sample, get_sample_net_load, normalize_sample_arrays
@@ -166,8 +170,6 @@ class UnifiedSurrogateManager:
         start_cost = gencost[:, 1]
         shut_cost = gencost[:, 2]
         M_SURR = 1e5
-        T_triples = max(1, T - 2)
-
         model = gp.Model('unified_primal_block')
         model.Params.OutputFlag = 0
 
@@ -251,10 +253,17 @@ class UnifiedSurrogateManager:
             betas = trainer.beta_values[sample_id]
             gammas = trainer.gamma_values[sample_id]
             deltas = trainer.delta_values[sample_id]
+            constraint_timesteps = trainer.sensitive_timesteps[sample_id]
+            constraint_offsets = resolve_constraint_offsets_from_trainer(
+                trainer,
+                sample_id,
+                len(constraint_timesteps),
+            )
+            x_vars = {t: x[g, t] for t in range(T)}
             for k in range(len(alphas)):
-                t_k = k % T_triples
-                t_k1 = min(t_k + 1, T - 1)
-                t_k2 = min(t_k + 2, T - 1)
+                if k >= len(constraint_timesteps):
+                    break
+                t_k = constraint_timesteps[k]
                 a_v = float(alphas[k])
                 b_v = float(betas[k])
                 c_v = float(gammas[k])
@@ -262,7 +271,15 @@ class UnifiedSurrogateManager:
                 if abs(a_v) > 1e-10 or abs(b_v) > 1e-10 or abs(c_v) > 1e-10:
                     slack_k = model.addVar(lb=0, name=f'g{g}_surr_slack_{k}')
                     model.addConstr(
-                        a_v * x[g, t_k] + b_v * x[g, t_k1] + c_v * x[g, t_k2] - r_v <= slack_k,
+                        build_surrogate_constraint_expression(
+                            x_vars,
+                            t_k,
+                            constraint_offsets[k],
+                            a_v,
+                            b_v,
+                            c_v,
+                            T,
+                        ) - r_v <= slack_k,
                         name=f'g{g}_surr_{k}'
                     )
                     surr_slacks.append(slack_k)
@@ -462,7 +479,6 @@ class UnifiedSurrogateManager:
         start_cost = gencost[:, 1]
         shut_cost = gencost[:, 2]
         M_SURR = 1e5
-        T_triples = max(1, T - 2)
 
         model = gp.Model('unified_global_LP')
         model.Params.OutputFlag = 0
@@ -542,10 +558,21 @@ class UnifiedSurrogateManager:
             if g not in surrogate_params:
                 continue
             alphas, betas, gammas, deltas, *_ = surrogate_params[g]
+            trainer = self.trainers.get(g)
+            constraint_timesteps = trainer.sensitive_timesteps[sample_id] if trainer is not None else []
+            constraint_offsets = (
+                resolve_constraint_offsets_from_trainer(
+                    trainer,
+                    sample_id,
+                    len(constraint_timesteps),
+                )
+                if trainer is not None else []
+            )
+            x_vars = {t: x[g, t] for t in range(T)}
             for k in range(len(alphas)):
-                t_k = k % T_triples
-                t_k1 = min(t_k + 1, T - 1)
-                t_k2 = min(t_k + 2, T - 1)
+                if k >= len(constraint_timesteps):
+                    break
+                t_k = constraint_timesteps[k]
                 a_v = float(alphas[k])
                 b_v = float(betas[k])
                 c_v = float(gammas[k])
@@ -553,7 +580,15 @@ class UnifiedSurrogateManager:
                 if abs(a_v) > 1e-10 or abs(b_v) > 1e-10 or abs(c_v) > 1e-10:
                     slack_k = model.addVar(lb=0, name=f'g{g}_surr_slack_{k}')
                     model.addConstr(
-                        a_v * x[g, t_k] + b_v * x[g, t_k1] + c_v * x[g, t_k2] - r_v <= slack_k,
+                        build_surrogate_constraint_expression(
+                            x_vars,
+                            t_k,
+                            constraint_offsets[k],
+                            a_v,
+                            b_v,
+                            c_v,
+                            T,
+                        ) - r_v <= slack_k,
                         name=f'g{g}_surr_{k}'
                     )
                     surr_slacks.append(slack_k)
