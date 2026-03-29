@@ -1372,6 +1372,9 @@ class SubproblemSurrogateTrainer:
                  constraint_generation_strategy: str = "sensitive",
                  rho_primal_init: float = 1e-3,
                  rho_dual_init: float = 1e-3,
+                 rho_dual_pg_init: float | None = None,
+                 rho_dual_x_init: float | None = None,
+                 rho_dual_coc_init: float | None = None,
                  rho_opt_init: float = 1e-3,
                  gamma_base: float = 1e-3,
                  mu_lower_bound_init: float = 0.1,
@@ -1464,9 +1467,12 @@ class SubproblemSurrogateTrainer:
         self.rho_max = 10.0
         self.reg_weight = 1e-4   # alpha/beta/gamma L2 正则化权重
         self.mu_lower_bound = float(mu_lower_bound_init)
-        self.rho_dual_pg = float(rho_dual_init)
-        self.rho_dual_x = float(rho_dual_init)
-        self.rho_dual_coc = float(rho_dual_init)
+        rho_dual_pg_base = rho_dual_init if rho_dual_pg_init is None else rho_dual_pg_init
+        rho_dual_x_base = rho_dual_init if rho_dual_x_init is None else rho_dual_x_init
+        rho_dual_coc_base = rho_dual_init if rho_dual_coc_init is None else rho_dual_coc_init
+        self.rho_dual_pg = float(rho_dual_pg_base)
+        self.rho_dual_x = float(rho_dual_x_base)
+        self.rho_dual_coc = float(rho_dual_coc_base)
         self.mu_individual_lower_bound_round = max(int(mu_individual_lower_bound_round), 0)
         self.mu_group_lower_bound_round = max(
             int(mu_group_lower_bound_round),
@@ -3399,6 +3405,9 @@ def train_subproblem_surrogate_from_data(ppc, active_set_data: List[Dict], unit_
                                           T_delta: float = 1.0, lambda_predictor=None,
                                           max_iter: int = 20, nn_epochs: int = 10,
                                           constraint_generation_strategy: str = "sensitive",
+                                          rho_dual_pg_init: float | None = None,
+                                          rho_dual_x_init: float | None = None,
+                                          rho_dual_coc_init: float | None = None,
                                           mu_individual_lower_bound_round: int = 3,
                                           mu_group_lower_bound_round: int = 50,
                                           pg_cost_start_round: int = 3,
@@ -3432,6 +3441,9 @@ def train_subproblem_surrogate_from_data(ppc, active_set_data: List[Dict], unit_
         ppc, active_set_data, T_delta, unit_id,
         lambda_predictor=lambda_predictor,
         constraint_generation_strategy=constraint_generation_strategy,
+        rho_dual_pg_init=rho_dual_pg_init,
+        rho_dual_x_init=rho_dual_x_init,
+        rho_dual_coc_init=rho_dual_coc_init,
         mu_individual_lower_bound_round=mu_individual_lower_bound_round,
         mu_group_lower_bound_round=mu_group_lower_bound_round,
         pg_cost_start_round=pg_cost_start_round,
@@ -3455,6 +3467,9 @@ def train_all_subproblem_surrogates(ppc, active_set_data: List[Dict], T_delta: f
                                       lambda_predictor=None, unit_ids: List[int] = None,
                                       max_iter: int = 20, nn_epochs: int = 10,
                                       constraint_generation_strategy: str = "sensitive",
+                                      rho_dual_pg_init: float | None = None,
+                                      rho_dual_x_init: float | None = None,
+                                      rho_dual_coc_init: float | None = None,
                                       mu_individual_lower_bound_round: int = 3,
                                       mu_group_lower_bound_round: int = 50,
                                       pg_cost_start_round: int = 3,
@@ -3498,6 +3513,9 @@ def train_all_subproblem_surrogates(ppc, active_set_data: List[Dict], T_delta: f
             ppc, active_set_data, T_delta, g,
             lambda_predictor=lambda_predictor,
             constraint_generation_strategy=constraint_generation_strategy,
+            rho_dual_pg_init=rho_dual_pg_init,
+            rho_dual_x_init=rho_dual_x_init,
+            rho_dual_coc_init=rho_dual_coc_init,
             mu_individual_lower_bound_round=mu_individual_lower_bound_round,
             mu_group_lower_bound_round=mu_group_lower_bound_round,
             pg_cost_start_round=pg_cost_start_round,

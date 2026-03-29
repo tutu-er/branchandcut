@@ -69,6 +69,9 @@ THETA_HOT_START_STRATEGY = 'dcpf_relative'   # 'dcpf_relative' / 'gaussian'
 ZETA_HOT_START_STRATEGY = 'zero'             # 'zero' / 'gaussian'
 THETA_GAUSSIAN_STD = 0.01
 ZETA_GAUSSIAN_STD = 0.01
+SUBPROBLEM_RHO_DUAL_PG_INIT = 1e-3
+SUBPROBLEM_RHO_DUAL_X_INIT = 1e-3
+SUBPROBLEM_RHO_DUAL_COC_INIT = 1e-3
 SUBPROBLEM_PG_COST_START_ROUND = 3
 SUBPROBLEM_PG_COST_SCALE_MULTIPLIER = 1.2
 SUBPROBLEM_PG_COST_LR = 2e-5
@@ -207,6 +210,9 @@ def run_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS,
                   n_workers: int = 4, logger: 'TrainingLogger | None' = None,
                   constraint_generation_strategy: str = 'sensitive',
                   subproblem_gamma_base: float = 1e-3,
+                  rho_dual_pg_init: float | None = None,
+                  rho_dual_x_init: float | None = None,
+                  rho_dual_coc_init: float | None = None,
                   pg_cost_start_round: int = 3,
                   pg_cost_scale_multiplier: float = 1.2,
                   pg_cost_lr: float = 2e-5,
@@ -247,6 +253,9 @@ def run_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS,
                 lambda_predictor=dual_predictor,
                 constraint_generation_strategy=constraint_generation_strategy,
                 gamma_base=subproblem_gamma_base,
+                rho_dual_pg_init=rho_dual_pg_init,
+                rho_dual_x_init=rho_dual_x_init,
+                rho_dual_coc_init=rho_dual_coc_init,
                 pg_cost_start_round=pg_cost_start_round,
                 pg_cost_scale_multiplier=pg_cost_scale_multiplier,
                 pg_cost_lr=pg_cost_lr,
@@ -259,6 +268,9 @@ def run_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS,
                 lambda_predictor=dual_predictor,
                 constraint_generation_strategy=constraint_generation_strategy,
                 gamma_base=subproblem_gamma_base,
+                rho_dual_pg_init=rho_dual_pg_init,
+                rho_dual_x_init=rho_dual_x_init,
+                rho_dual_coc_init=rho_dual_coc_init,
                 pg_cost_start_round=pg_cost_start_round,
                 pg_cost_scale_multiplier=pg_cost_scale_multiplier,
                 pg_cost_lr=pg_cost_lr,
@@ -667,6 +679,9 @@ def main():
                 DUAL_EPOCHS, DUAL_BATCH_SIZE, MAX_ITER, NN_EPOCHS, save_dir,
                 n_workers=N_WORKERS_SUBPROBLEM, logger=logger,
                 constraint_generation_strategy=CONSTRAINT_GENERATION_STRATEGY,
+                rho_dual_pg_init=SUBPROBLEM_RHO_DUAL_PG_INIT,
+                rho_dual_x_init=SUBPROBLEM_RHO_DUAL_X_INIT,
+                rho_dual_coc_init=SUBPROBLEM_RHO_DUAL_COC_INIT,
                 pg_cost_start_round=SUBPROBLEM_PG_COST_START_ROUND,
                 pg_cost_scale_multiplier=SUBPROBLEM_PG_COST_SCALE_MULTIPLIER,
                 pg_cost_lr=SUBPROBLEM_PG_COST_LR,
@@ -761,6 +776,9 @@ def main():
                 DUAL_EPOCHS, DUAL_BATCH_SIZE, MAX_ITER, NN_EPOCHS, save_dir,
                 n_workers=N_WORKERS_SUBPROBLEM, logger=logger,
                 constraint_generation_strategy=CONSTRAINT_GENERATION_STRATEGY,
+                rho_dual_pg_init=SUBPROBLEM_RHO_DUAL_PG_INIT,
+                rho_dual_x_init=SUBPROBLEM_RHO_DUAL_X_INIT,
+                rho_dual_coc_init=SUBPROBLEM_RHO_DUAL_COC_INIT,
                 pg_cost_start_round=SUBPROBLEM_PG_COST_START_ROUND,
                 pg_cost_scale_multiplier=SUBPROBLEM_PG_COST_SCALE_MULTIPLIER,
                 pg_cost_lr=SUBPROBLEM_PG_COST_LR,
