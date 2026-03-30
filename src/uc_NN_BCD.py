@@ -1591,6 +1591,69 @@ class Agent_NN_BCD:
 
         return dict(zeta_lookup)
     
+    def _build_x_dual_stationarity_expr(
+        self,
+        g,
+        t,
+        lambda_cpower,
+        lambda_x_upper,
+        lambda_x_lower,
+        lambda_pg_lower,
+        lambda_pg_upper,
+        lambda_ramp_down,
+        lambda_ramp_up,
+        lambda_min_on,
+        lambda_min_off,
+        lambda_start_cost,
+        lambda_shut_cost,
+        fixed_cost,
+        pmin,
+        pmax,
+        rd_delta,
+        ru_delta,
+        start_cost,
+        shut_cost,
+        Ton,
+        Toff,
+    ):
+        """Source-of-truth for the x-stationarity term used by dual_x."""
+        dual_expr = fixed_cost * lambda_cpower[g, t]
+        dual_expr = dual_expr + lambda_x_upper[g, t] - lambda_x_lower[g, t]
+        dual_expr = dual_expr + pmin * lambda_pg_lower[g, t]
+        dual_expr = dual_expr - pmax * lambda_pg_upper[g, t]
+
+        if t > 0:
+            dual_expr = dual_expr + rd_delta * lambda_ramp_down[g, t - 1]
+        if t < self.T - 1:
+            dual_expr = dual_expr + ru_delta * lambda_ramp_up[g, t]
+
+        for tau in range(1, Ton + 1):
+            for t1 in range(self.T - tau):
+                if t == t1 + 1:
+                    dual_expr = dual_expr + lambda_min_on[g, tau - 1, t1]
+                if t == t1:
+                    dual_expr = dual_expr - lambda_min_on[g, tau - 1, t1]
+                if t == t1 + tau:
+                    dual_expr = dual_expr - lambda_min_on[g, tau - 1, t1]
+
+        for tau in range(1, Toff + 1):
+            for t1 in range(self.T - tau):
+                if t == t1 + 1:
+                    dual_expr = dual_expr - lambda_min_off[g, tau - 1, t1]
+                if t == t1:
+                    dual_expr = dual_expr + lambda_min_off[g, tau - 1, t1]
+                if t == t1 + tau:
+                    dual_expr = dual_expr + lambda_min_off[g, tau - 1, t1]
+
+        if t > 0:
+            dual_expr = dual_expr + start_cost * lambda_start_cost[g, t - 1]
+            dual_expr = dual_expr - shut_cost * lambda_shut_cost[g, t - 1]
+        if t < self.T - 1:
+            dual_expr = dual_expr - start_cost * lambda_start_cost[g, t]
+            dual_expr = dual_expr + shut_cost * lambda_shut_cost[g, t]
+
+        return dual_expr
+
     def _compute_dcpf_constraints_for_fractional_times(self, fractional_variables, lambda_init):
         """计算DCPF约束：per (branch, fractional_time) 构建，每条约束包含多个 generator。"""
         union_constraints = []
@@ -2556,40 +2619,30 @@ class Agent_NN_BCD:
         # x变量的对偶约束
         for g in range(self.ng):
             for t in range(self.T):
-                dual_expr = self.gencost[g, -1] / self.T_delta
-                dual_expr += lambda_x_upper[g, t] - lambda_x_lower[g, t]
-                dual_expr += self.gen[g, PMIN] * lambda_pg_lower[g, t]
-                dual_expr -= self.gen[g, PMAX] * lambda_pg_upper[g, t]
-                
-                if t > 0:
-                    dual_expr += (Rd_co[g] - Rd[g]) * lambda_ramp_down[g, t-1]
-                if t < self.T - 1:
-                    dual_expr += (Ru_co[g] - Ru[g]) * lambda_ramp_up[g, t]
-
-                for tau in range(1, Ton + 1):
-                    for t1 in range(self.T - tau):
-                        if t == t1 + 1:
-                            dual_expr += lambda_min_on[g, tau-1, t1]
-                        if t == t1:
-                            dual_expr -= lambda_min_on[g, tau-1, t1]
-                        if t == t1 + tau:
-                            dual_expr -= lambda_min_on[g, tau-1, t1]
-                            
-                for tau in range(1, Toff + 1):
-                    for t1 in range(self.T - tau):
-                        if t == t1 + 1:
-                            dual_expr -= lambda_min_off[g, tau-1, t1]
-                        if t == t1:
-                            dual_expr += lambda_min_off[g, tau-1, t1]
-                        if t == t1 + tau:
-                            dual_expr += lambda_min_off[g, tau-1, t1]
-
-                if t > 0:
-                    dual_expr += start_cost[g] * lambda_start_cost[g, t-1]
-                    dual_expr -= shut_cost[g] * lambda_shut_cost[g, t-1]
-                if t < self.T - 1:
-                    dual_expr -= start_cost[g] * lambda_start_cost[g, t]
-                    dual_expr += shut_cost[g] * lambda_shut_cost[g, t]
+                dual_expr = self._build_x_dual_stationarity_expr(
+                    g=g,
+                    t=t,
+                    lambda_cpower=lambda_cpower,
+                    lambda_x_upper=lambda_x_upper,
+                    lambda_x_lower=lambda_x_lower,
+                    lambda_pg_lower=lambda_pg_lower,
+                    lambda_pg_upper=lambda_pg_upper,
+                    lambda_ramp_down=lambda_ramp_down,
+                    lambda_ramp_up=lambda_ramp_up,
+                    lambda_min_on=lambda_min_on,
+                    lambda_min_off=lambda_min_off,
+                    lambda_start_cost=lambda_start_cost,
+                    lambda_shut_cost=lambda_shut_cost,
+                    fixed_cost=self.gencost[g, -1] / self.T_delta,
+                    pmin=self.gen[g, PMIN],
+                    pmax=self.gen[g, PMAX],
+                    rd_delta=Rd_co[g] - Rd[g],
+                    ru_delta=Ru_co[g] - Ru[g],
+                    start_cost=start_cost[g],
+                    shut_cost=shut_cost[g],
+                    Ton=Ton,
+                    Toff=Toff,
+                )
 
                 # 添加参数化约束的对偶贡献（theta相关）
                 if self.enable_theta_constraints and union_analysis and 'union_constraints' in union_analysis:
@@ -2794,16 +2847,10 @@ class Agent_NN_BCD:
             epoch_total_loss = 0.0
             epoch_component_sums = {
                 'obj_primal': None,
-                'obj_dual_pg': None,
                 'obj_dual_x': None,
-                'obj_dual_coc': None,
-                'obj_dual': None,
                 'obj_opt': None,
                 'primal_term': None,
-                'dual_pg_term': None,
                 'dual_x_term': None,
-                'dual_coc_term': None,
-                'dual_term': None,
                 'opt_term': None,
                 'reg_term': None,
             }
@@ -2865,17 +2912,22 @@ class Agent_NN_BCD:
                     key: float((value / self.n_samples).cpu().item())
                     for key, value in epoch_component_sums.items()
                 }
+                # print(
+                #     f"[NN-theta/zeta] epoch {epoch+1}/{num_epochs}, avg_loss = {avg_loss:.6f}, "
+                #     f"avg_terms(primal={avg_components['primal_term']:.6f}, "
+                #     f"dual_x={avg_components['dual_x_term']:.6f}, "
+                #     f"opt={avg_components['opt_term']:.6f}, "
+                #     f"reg={avg_components['reg_term']:.6f})",
+                #     flush=True,
+                # )
                 print(
                     f"[NN-theta/zeta] epoch {epoch+1}/{num_epochs}, avg_loss = {avg_loss:.6f}, "
-                    f"avg_terms(primal={avg_components['primal_term']:.6f}, "
-                    f"dual_pg={avg_components['dual_pg_term']:.6f}, "
-                    f"dual_x={avg_components['dual_x_term']:.6f}, "
-                    f"dual_coc={avg_components['dual_coc_term']:.6f}, "
-                    f"dual={avg_components['dual_term']:.6f}, "
-                    f"opt={avg_components['opt_term']:.6f}, "
-                    f"reg={avg_components['reg_term']:.6f})",
+                    f"obj_primal={avg_components['obj_primal']:.6f}, "
+                    f"obj_dual_x={avg_components['obj_dual_x']:.6f}, "
+                    f"obj_opt={avg_components['obj_opt']:.6f}, "
+                    f"reg={avg_components['reg_term']:.6f}",
                     flush=True,
-                )
+                )                
                 self._last_nn_loss_breakdown = {
                     'avg_loss': avg_loss,
                     **avg_components,
@@ -3229,6 +3281,8 @@ class Agent_NN_BCD:
                     obj_primal += max(0, violation)
                     if branch_id < self.nl and sample_id < len(self.mu):
                         obj_opt += abs_violation * abs(self.mu[sample_id, branch_id, time_slot])
+                    else:
+                        obj_opt += abs_violation * getattr(self, 'dual_para_bound', 0.1)
             
             if self.enable_zeta_constraints and union_analysis and 'union_zeta_constraints' in union_analysis and sample_zeta is not None:
                 union_zeta_constraints = union_analysis['union_zeta_constraints']
@@ -3285,49 +3339,42 @@ class Agent_NN_BCD:
                 for g in range(self.ng):
                     for t in range(self.T):
                         # 基础项：固定成本 * lambda_cpower
-                        dual_expr = self.gencost[g, -1] / self.T_delta * self.lambda_[sample_id]['lambda_cpower'][g, t]
+                        dual_expr = self._build_x_dual_stationarity_expr(
+                            g=g,
+                            t=t,
+                            lambda_cpower=self.lambda_[sample_id]['lambda_cpower'],
+                            lambda_x_upper=self.lambda_[sample_id]['lambda_x_upper'],
+                            lambda_x_lower=self.lambda_[sample_id]['lambda_x_lower'],
+                            lambda_pg_lower=self.lambda_[sample_id]['lambda_pg_lower'],
+                            lambda_pg_upper=self.lambda_[sample_id]['lambda_pg_upper'],
+                            lambda_ramp_down=self.lambda_[sample_id]['lambda_ramp_down'],
+                            lambda_ramp_up=self.lambda_[sample_id]['lambda_ramp_up'],
+                            lambda_min_on=self.lambda_[sample_id]['lambda_min_on'],
+                            lambda_min_off=self.lambda_[sample_id]['lambda_min_off'],
+                            lambda_start_cost=self.lambda_[sample_id]['lambda_start_cost'],
+                            lambda_shut_cost=self.lambda_[sample_id]['lambda_shut_cost'],
+                            fixed_cost=self.gencost[g, -1] / self.T_delta,
+                            pmin=self.gen[g, PMIN],
+                            pmax=self.gen[g, PMAX],
+                            rd_delta=Rd_co[g] - Rd[g],
+                            ru_delta=Ru_co[g] - Ru[g],
+                            start_cost=start_cost[g],
+                            shut_cost=shut_cost[g],
+                            Ton=Ton,
+                            Toff=Toff,
+                        )
 
                         # x 上下界约束贡献
-                        dual_expr += self.lambda_[sample_id]['lambda_x_upper'][g, t]
-                        dual_expr -= self.lambda_[sample_id]['lambda_x_lower'][g, t]
 
                         # 发电上下限约束贡献
-                        dual_expr += self.gen[g, PMIN] * self.lambda_[sample_id]['lambda_pg_lower'][g, t]
-                        dual_expr -= self.gen[g, PMAX] * self.lambda_[sample_id]['lambda_pg_upper'][g, t]
 
                         # 爬坡约束贡献
-                        if t > 0:
-                            dual_expr += (Rd_co[g] - Rd[g]) * self.lambda_[sample_id]['lambda_ramp_down'][g, t-1]
-                        if t < self.T - 1:
-                            dual_expr += (Ru_co[g] - Ru[g]) * self.lambda_[sample_id]['lambda_ramp_up'][g, t]
 
                         # 最小开机时间约束贡献（直接索引，O(Ton) 替代 O(Ton*T)）
-                        for tau in range(1, Ton + 1):
-                            lmon = self.lambda_[sample_id]['lambda_min_on'][g, tau - 1]
-                            if 0 < t <= self.T - tau:     # t1 = t-1
-                                dual_expr += lmon[t - 1]
-                            if t < self.T - tau:          # t1 = t
-                                dual_expr -= lmon[t]
-                            if tau <= t < self.T:         # t1 = t-tau
-                                dual_expr -= lmon[t - tau]
 
                         # 最小关机时间约束贡献（直接索引，O(Toff) 替代 O(Toff*T)）
-                        for tau in range(1, Toff + 1):
-                            lmoff = self.lambda_[sample_id]['lambda_min_off'][g, tau - 1]
-                            if 0 < t <= self.T - tau:     # t1 = t-1
-                                dual_expr -= lmoff[t - 1]
-                            if t < self.T - tau:          # t1 = t
-                                dual_expr += lmoff[t]
-                            if tau <= t < self.T:         # t1 = t-tau
-                                dual_expr += lmoff[t - tau]
 
                         # 启停成本约束贡献
-                        if t > 0:
-                            dual_expr += start_cost[g] * self.lambda_[sample_id]['lambda_start_cost'][g, t-1]
-                            dual_expr -= shut_cost[g] * self.lambda_[sample_id]['lambda_shut_cost'][g, t-1]
-                        if t < self.T - 1:
-                            dual_expr -= start_cost[g] * self.lambda_[sample_id]['lambda_start_cost'][g, t]
-                            dual_expr += shut_cost[g] * self.lambda_[sample_id]['lambda_shut_cost'][g, t]
 
                         # theta 相关的对偶约束贡献（O(1) 查找，表在循环外预建）
                         for _branch_id, _anchor_time, _theta_val in theta_lookup.get((g, t), []):
@@ -3467,9 +3514,7 @@ class Agent_NN_BCD:
 
         obj_primal = torch.tensor(0.0, device=device, requires_grad=True)
         obj_opt = torch.tensor(0.0, device=device, requires_grad=True)
-        obj_dual_pg = torch.tensor(0.0, device=device, requires_grad=True)
         obj_dual_x = torch.tensor(0.0, device=device, requires_grad=True)
-        obj_dual_coc = torch.tensor(0.0, device=device, requires_grad=True)
 
         # 预缓存常量张量（避免循环内 torch.tensor 分配）
         _one = self._const_one
@@ -3505,40 +3550,30 @@ class Agent_NN_BCD:
         # theta/zeta 仅影响 x 驻点条件，因此可微 dual loss 只包含 obj_dual_x。
         for g in range(self.ng):
             for t in range(self.T):
-                dual_expr = gencost_fixed[g] * lambda_cpower[g, t]
-                dual_expr = dual_expr + lambda_x_upper[g, t] - lambda_x_lower[g, t]
-                dual_expr = dual_expr + gen_PMIN[g] * lambda_pg_lower[g, t]
-                dual_expr = dual_expr - gen_PMAX[g] * lambda_pg_upper[g, t]
-
-                if t > 0:
-                    dual_expr = dual_expr + (Rd_co[g] - Rd[g]) * lambda_ramp_down[g, t-1]
-                if t < self.T - 1:
-                    dual_expr = dual_expr + (Ru_co[g] - Ru[g]) * lambda_ramp_up[g, t]
-
-                for tau in range(1, Ton + 1):
-                    for t1 in range(self.T - tau):
-                        if t == t1 + 1:
-                            dual_expr = dual_expr + lambda_min_on[g, tau-1, t1]
-                        if t == t1:
-                            dual_expr = dual_expr - lambda_min_on[g, tau-1, t1]
-                        if t == t1 + tau:
-                            dual_expr = dual_expr - lambda_min_on[g, tau-1, t1]
-
-                for tau in range(1, Toff + 1):
-                    for t1 in range(self.T - tau):
-                        if t == t1 + 1:
-                            dual_expr = dual_expr - lambda_min_off[g, tau-1, t1]
-                        if t == t1:
-                            dual_expr = dual_expr + lambda_min_off[g, tau-1, t1]
-                        if t == t1 + tau:
-                            dual_expr = dual_expr + lambda_min_off[g, tau-1, t1]
-
-                if t > 0:
-                    dual_expr = dual_expr + start_cost[g] * lambda_start_cost[g, t-1]
-                    dual_expr = dual_expr - shut_cost[g] * lambda_shut_cost[g, t-1]
-                if t < self.T - 1:
-                    dual_expr = dual_expr - start_cost[g] * lambda_start_cost[g, t]
-                    dual_expr = dual_expr + shut_cost[g] * lambda_shut_cost[g, t]
+                dual_expr = self._build_x_dual_stationarity_expr(
+                    g=g,
+                    t=t,
+                    lambda_cpower=lambda_cpower,
+                    lambda_x_upper=lambda_x_upper,
+                    lambda_x_lower=lambda_x_lower,
+                    lambda_pg_lower=lambda_pg_lower,
+                    lambda_pg_upper=lambda_pg_upper,
+                    lambda_ramp_down=lambda_ramp_down,
+                    lambda_ramp_up=lambda_ramp_up,
+                    lambda_min_on=lambda_min_on,
+                    lambda_min_off=lambda_min_off,
+                    lambda_start_cost=lambda_start_cost,
+                    lambda_shut_cost=lambda_shut_cost,
+                    fixed_cost=gencost_fixed[g],
+                    pmin=gen_PMIN[g],
+                    pmax=gen_PMAX[g],
+                    rd_delta=Rd_co[g] - Rd[g],
+                    ru_delta=Ru_co[g] - Ru[g],
+                    start_cost=start_cost[g],
+                    shut_cost=shut_cost[g],
+                    Ton=Ton,
+                    Toff=Toff,
+                )
 
                 # 参数化约束的对偶贡献（theta相关）——使用查找表，O(1) 替代全量扫描
                 for theta_idx, branch_id, anchor_time in self._dual_theta_lookup.get((g, t), []):
@@ -3563,30 +3598,20 @@ class Agent_NN_BCD:
         )
         reg_loss = reg_base * self._get_regularization_scale()
 
-        obj_dual = obj_dual_pg + obj_dual_x + obj_dual_coc
         primal_term = obj_primal * self.rho_primal
-        dual_pg_term = obj_dual_pg * self.rho_dual_pg
         dual_x_term = obj_dual_x * self.rho_dual_x
-        dual_coc_term = obj_dual_coc * self.rho_dual_coc
-        dual_term = dual_pg_term + dual_x_term + dual_coc_term
         opt_term = obj_opt * self.rho_opt
-        loss = primal_term + dual_term + opt_term + reg_loss
+        loss = primal_term + dual_x_term + opt_term + reg_loss
 
         if not return_components:
             return loss
 
         components = {
             'obj_primal': obj_primal.detach(),
-            'obj_dual_pg': obj_dual_pg.detach(),
             'obj_dual_x': obj_dual_x.detach(),
-            'obj_dual_coc': obj_dual_coc.detach(),
-            'obj_dual': obj_dual.detach(),
             'obj_opt': obj_opt.detach(),
             'primal_term': primal_term.detach(),
-            'dual_pg_term': dual_pg_term.detach(),
             'dual_x_term': dual_x_term.detach(),
-            'dual_coc_term': dual_coc_term.detach(),
-            'dual_term': dual_term.detach(),
             'opt_term': opt_term.detach(),
             'reg_term': reg_loss.detach(),
         }
