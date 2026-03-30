@@ -73,6 +73,19 @@ def _load_demo_ppc(case_name: str):
         raise ValueError(f"Unknown case_name: {case_name}") from exc
 
 
+SUPPORTED_NN_BATCH_STRATEGIES = {"full-batch", "mini-batch"}
+
+
+def normalize_nn_batch_strategy(strategy: str | None) -> str:
+    strategy_norm = "full-batch" if strategy is None else str(strategy).strip().lower()
+    if strategy_norm not in SUPPORTED_NN_BATCH_STRATEGIES:
+        raise ValueError(
+            f"Unsupported nn_batch_strategy: {strategy}. "
+            f"Supported: {sorted(SUPPORTED_NN_BATCH_STRATEGIES)}"
+        )
+    return strategy_norm
+
+
 # ========================== 数据加载工具 ==========================
 
 class ActiveSetReader:
@@ -1522,8 +1535,13 @@ class SubproblemSurrogateTrainer:
                  mu_group_lower_bound_round: int = 50,
                  pg_cost_start_round: int = 3,
                  pg_cost_scale_multiplier: float = 1.2,
+                 nn_learning_rate: float = 1e-4,
+                 cost_learning_rate: float = 1e-5,
                  pg_cost_lr: float = 2e-5,
                  pg_cost_surr_lr: float = 5e-5,
+                 nn_batch_strategy: str = "full-batch",
+                 nn_batch_size: int = 4,
+                 nn_shuffle: bool = True,
                  pg_cost_reg_deadband: float = 0.25,
                  device=None):
         """
@@ -1624,8 +1642,13 @@ class SubproblemSurrogateTrainer:
         )
         self.pg_cost_start_round = max(int(pg_cost_start_round), 0)
         self.pg_cost_scale_multiplier = max(float(pg_cost_scale_multiplier), 1e-6)
+        self.nn_learning_rate = max(float(nn_learning_rate), 1e-8)
+        self.cost_learning_rate = max(float(cost_learning_rate), 1e-8)
         self.pg_cost_lr = max(float(pg_cost_lr), 1e-8)
         self.pg_cost_surr_lr = max(float(pg_cost_surr_lr), 1e-8)
+        self.nn_batch_strategy = normalize_nn_batch_strategy(nn_batch_strategy)
+        self.nn_batch_size = max(int(nn_batch_size), 1)
+        self.nn_shuffle = bool(nn_shuffle)
         self.cost_ema_alpha = 0.3  # cost_values EMA平滑系数，越小越平滑
         self.pg_cost_ema_alpha = 0.3
         self.iter_number = 0
@@ -1775,11 +1798,11 @@ class SubproblemSurrogateTrainer:
         # 分离参数组：主优化器管理 backbone + alpha/beta/gamma/delta 头
         aux_params = set(self.surrogate_net.cost_net.parameters()) | set(self.surrogate_net.pg_cost_net.parameters())
         main_params = [p for p in self.surrogate_net.parameters() if p not in aux_params]
-        self.optimizer = optim.Adam(main_params, lr=1e-4)
+        self.optimizer = optim.Adam(main_params, lr=self.nn_learning_rate)
         # x / pg 调整项头拆分优化，便于仅对 c_pg 提高学习率并延迟启用
         self.cost_optimizer = optim.Adam(
             self.surrogate_net.cost_net.parameters(),
-            lr=1e-5,
+            lr=self.cost_learning_rate,
         )
         self.pg_cost_optimizer = optim.Adam(
             self.surrogate_net.pg_cost_net.parameters(),
@@ -1798,6 +1821,7 @@ class SubproblemSurrogateTrainer:
         )
         print(
             f"  - c_pg_start_round={self.pg_cost_start_round}, "
+            f"main_nn_lr={self.nn_learning_rate:.2e}, x_cost_nn_lr={self.cost_learning_rate:.2e}, "
             f"c_pg_lr={self.pg_cost_lr:.2e}, c_pg_surr_lr={self.pg_cost_surr_lr:.2e}, "
             f"c_pg_deadband={self.pg_cost_reg_deadband:.4f}",
             flush=True,
@@ -1880,6 +1904,23 @@ class SubproblemSurrogateTrainer:
         if enabled:
             for param in self.surrogate_net.pg_cost_net.parameters():
                 param.requires_grad_(True)
+
+    def _resolve_nn_batch_config(
+        self,
+        batch_size: int | None = None,
+        batch_strategy: str | None = None,
+        shuffle: bool | None = None,
+    ) -> tuple[str, int, bool]:
+        resolved_batch_strategy = normalize_nn_batch_strategy(
+            self.nn_batch_strategy if batch_strategy is None else batch_strategy
+        )
+        resolved_shuffle = self.nn_shuffle if shuffle is None else bool(shuffle)
+        if resolved_batch_strategy == "full-batch":
+            resolved_batch_size = max(1, self.n_samples)
+        else:
+            base_batch_size = self.nn_batch_size if batch_size is None else int(batch_size)
+            resolved_batch_size = max(1, base_batch_size)
+        return resolved_batch_strategy, resolved_batch_size, resolved_shuffle
 
     def _generate_initial_values_from_nn(self):
         """用未训练的 SubproblemSurrogateNet forward pass 生成 alpha/beta/gamma/delta 初值。"""
@@ -2882,7 +2923,15 @@ class SubproblemSurrogateTrainer:
         )
         return self.rho_dual_pg * obj_dual_pg + reg_loss
     
-    def iter_with_surrogate_nn(self, num_epochs: int = 10, batch_size: int = 4):
+    def iter_with_surrogate_nn(
+        self,
+        num_epochs: int = 10,
+        batch_size: int | None = None,
+        batch_strategy: str | None = None,
+        shuffle: bool | None = None,
+        learning_rate: float | None = None,
+        cost_learning_rate: float | None = None,
+    ):
         """
         BCD迭代：主代理网络训练。
         这里只更新 alpha/beta/gamma/delta/c_x，不包含 c_pg。
@@ -2890,18 +2939,50 @@ class SubproblemSurrogateTrainer:
         if not TORCH_AVAILABLE:
             return
 
+        _, resolved_batch_size, resolved_shuffle = self._resolve_nn_batch_config(
+            batch_size=batch_size,
+            batch_strategy=batch_strategy,
+            shuffle=shuffle,
+        )
+        resolved_learning_rate = (
+            self.nn_learning_rate if learning_rate is None else float(learning_rate)
+        )
+        resolved_cost_learning_rate = (
+            self.cost_learning_rate if cost_learning_rate is None else float(cost_learning_rate)
+        )
+        if resolved_learning_rate <= 0:
+            raise ValueError(f"learning_rate must be positive, got {resolved_learning_rate}")
+        if resolved_cost_learning_rate <= 0:
+            raise ValueError(
+                f"cost_learning_rate must be positive, got {resolved_cost_learning_rate}"
+            )
+
         # 前N轮BCD重建optimizer（适应剧烈变化），之后保持动量
         optimizer_persist_after = 5
         rebuild = (self.iter_number < optimizer_persist_after)
-        if rebuild or not hasattr(self, '_surr_optimizer') or self._surr_optimizer is None:
+        current_main_lr = None
+        if hasattr(self, '_surr_optimizer') and self._surr_optimizer is not None:
+            current_main_lr = self._surr_optimizer.param_groups[0].get('lr')
+        current_cost_lr = None
+        if hasattr(self, '_surr_cost_optimizer') and self._surr_cost_optimizer is not None:
+            current_cost_lr = self._surr_cost_optimizer.param_groups[0].get('lr')
+        if (
+            rebuild
+            or not hasattr(self, '_surr_optimizer')
+            or self._surr_optimizer is None
+            or not hasattr(self, '_surr_cost_optimizer')
+            or self._surr_cost_optimizer is None
+            or current_main_lr != resolved_learning_rate
+            or current_cost_lr != resolved_cost_learning_rate
+        ):
             # 分离 x/pg 辅助成本头参数，主优化器不管理这些低学习率头
             aux_params = set(self.surrogate_net.cost_net.parameters()) | set(self.surrogate_net.pg_cost_net.parameters())
             main_params = [p for p in self.surrogate_net.parameters() if p not in aux_params]
             self._surr_optimizer = optim.Adam(
-                main_params, lr=3e-4, weight_decay=1e-4)
+                main_params, lr=resolved_learning_rate, weight_decay=1e-4)
             self._surr_cost_optimizer = optim.Adam(
                 self.surrogate_net.cost_net.parameters(),
-                lr=3e-5,
+                lr=resolved_cost_learning_rate,
                 weight_decay=1e-4,
             )
             self._surr_scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
@@ -2914,11 +2995,14 @@ class SubproblemSurrogateTrainer:
             self._surr_optimizer.zero_grad()
             self._surr_cost_optimizer.zero_grad()
             batch_count = 0
+            sample_indices = np.arange(self.n_samples, dtype=int)
+            if resolved_shuffle and self.n_samples > 1:
+                np.random.shuffle(sample_indices)
 
-            for sample_id in range(self.n_samples):
+            for sample_pos, sample_id in enumerate(sample_indices):
                 # 计算当前 batch 的实际大小（最后一个 batch 可能不满）
-                batch_start = (sample_id // batch_size) * batch_size
-                actual_batch_size = min(batch_size, self.n_samples - batch_start)
+                batch_start = (sample_pos // resolved_batch_size) * resolved_batch_size
+                actual_batch_size = min(resolved_batch_size, self.n_samples - batch_start)
 
                 # 提取特征: [Pd, λ]
                 features = self._extract_features(sample_id)
@@ -2957,7 +3041,7 @@ class SubproblemSurrogateTrainer:
                 )
 
                 # batch 满或 epoch 结束：clip + step
-                if batch_count == batch_size or sample_id == self.n_samples - 1:
+                if batch_count == resolved_batch_size or sample_pos == self.n_samples - 1:
                     torch.nn.utils.clip_grad_norm_(self.surrogate_net.parameters(), max_norm=1.0)
                     self._surr_optimizer.step()
                     self._surr_cost_optimizer.step()
@@ -2974,7 +3058,14 @@ class SubproblemSurrogateTrainer:
         if self.n_samples > 0:
             self._last_surr_nn_loss = epoch_loss / self.n_samples
 
-    def iter_with_c_pg_nn(self, num_epochs: int = 10, batch_size: int = 4):
+    def iter_with_c_pg_nn(
+        self,
+        num_epochs: int = 10,
+        batch_size: int | None = None,
+        batch_strategy: str | None = None,
+        shuffle: bool | None = None,
+        learning_rate: float | None = None,
+    ):
         """
         BCD迭代：c_pg 单独训练器。
         仅更新 pg_cost_net，并使用独立 loss。
@@ -2983,12 +3074,33 @@ class SubproblemSurrogateTrainer:
             self._last_pg_cost_nn_loss = None
             return
 
+        _, resolved_batch_size, resolved_shuffle = self._resolve_nn_batch_config(
+            batch_size=batch_size,
+            batch_strategy=batch_strategy,
+            shuffle=shuffle,
+        )
+        resolved_learning_rate = (
+            self.pg_cost_surr_lr if learning_rate is None else float(learning_rate)
+        )
+        if resolved_learning_rate <= 0:
+            raise ValueError(
+                f"pg_cost_surr_learning_rate must be positive, got {resolved_learning_rate}"
+            )
+
         optimizer_persist_after = 5
         rebuild = (self.iter_number < optimizer_persist_after)
-        if rebuild or not hasattr(self, '_surr_pg_cost_optimizer') or self._surr_pg_cost_optimizer is None:
+        current_pg_cost_lr = None
+        if hasattr(self, '_surr_pg_cost_optimizer') and self._surr_pg_cost_optimizer is not None:
+            current_pg_cost_lr = self._surr_pg_cost_optimizer.param_groups[0].get('lr')
+        if (
+            rebuild
+            or not hasattr(self, '_surr_pg_cost_optimizer')
+            or self._surr_pg_cost_optimizer is None
+            or current_pg_cost_lr != resolved_learning_rate
+        ):
             self._surr_pg_cost_optimizer = optim.Adam(
                 self.surrogate_net.pg_cost_net.parameters(),
-                lr=self.pg_cost_surr_lr,
+                lr=resolved_learning_rate,
                 weight_decay=1e-4,
             )
             self._surr_pg_cost_scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
@@ -3001,10 +3113,13 @@ class SubproblemSurrogateTrainer:
                 epoch_loss = 0.0
                 self._surr_pg_cost_optimizer.zero_grad()
                 batch_count = 0
+                sample_indices = np.arange(self.n_samples, dtype=int)
+                if resolved_shuffle and self.n_samples > 1:
+                    np.random.shuffle(sample_indices)
 
-                for sample_id in range(self.n_samples):
-                    batch_start = (sample_id // batch_size) * batch_size
-                    actual_batch_size = min(batch_size, self.n_samples - batch_start)
+                for sample_pos, sample_id in enumerate(sample_indices):
+                    batch_start = (sample_pos // resolved_batch_size) * resolved_batch_size
+                    actual_batch_size = min(resolved_batch_size, self.n_samples - batch_start)
 
                     features = self._extract_features(sample_id)
                     features_tensor = torch.tensor(
@@ -3033,7 +3148,7 @@ class SubproblemSurrogateTrainer:
                         + self.pg_cost_ema_alpha * new_pg_costs
                     )
 
-                    if batch_count == batch_size or sample_id == self.n_samples - 1:
+                    if batch_count == resolved_batch_size or sample_pos == self.n_samples - 1:
                         torch.nn.utils.clip_grad_norm_(
                             self.surrogate_net.pg_cost_net.parameters(),
                             max_norm=1.0,
@@ -3270,7 +3385,17 @@ class SubproblemSurrogateTrainer:
         obj_primal, _, _, _, obj_dual, obj_opt = self.cal_viol_components()
         return obj_primal, obj_dual, obj_opt
     
-    def iter(self, max_iter: int = 20, nn_epochs: int = 10):
+    def iter(
+        self,
+        max_iter: int = 20,
+        nn_epochs: int = 10,
+        nn_batch_strategy: str | None = None,
+        nn_batch_size: int | None = None,
+        nn_shuffle: bool | None = None,
+        nn_learning_rate: float | None = None,
+        cost_learning_rate: float | None = None,
+        pg_cost_surr_learning_rate: float | None = None,
+    ):
         """
         主BCD迭代循环 - V3三时段耦合约束版本
         """
@@ -3325,8 +3450,21 @@ class SubproblemSurrogateTrainer:
                     self.mu[sample_id] = self._apply_mu_lower_bound_policy(mu_sol, lb_mu)
             
             # 3. 神经网络更新代理约束参数
-            self.iter_with_surrogate_nn(num_epochs=nn_epochs)
-            self.iter_with_c_pg_nn(num_epochs=nn_epochs)
+            self.iter_with_surrogate_nn(
+                num_epochs=nn_epochs,
+                batch_size=nn_batch_size,
+                batch_strategy=nn_batch_strategy,
+                shuffle=nn_shuffle,
+                learning_rate=nn_learning_rate,
+                cost_learning_rate=cost_learning_rate,
+            )
+            self.iter_with_c_pg_nn(
+                num_epochs=nn_epochs,
+                batch_size=nn_batch_size,
+                batch_strategy=nn_batch_strategy,
+                shuffle=nn_shuffle,
+                learning_rate=pg_cost_surr_learning_rate,
+            )
 
             # 计算违反量（NN更新后）
             obj_primal, obj_dual_pg, obj_dual_x, obj_dual_coc, obj_dual, obj_opt = self.cal_viol_components()
@@ -3557,8 +3695,13 @@ class SubproblemSurrogateTrainer:
                 'mu_group_lower_bound_round': self.mu_group_lower_bound_round,
                 'pg_cost_start_round': self.pg_cost_start_round,
                 'pg_cost_scale_multiplier': self.pg_cost_scale_multiplier,
+                'nn_learning_rate': self.nn_learning_rate,
+                'cost_learning_rate': self.cost_learning_rate,
                 'pg_cost_lr': self.pg_cost_lr,
                 'pg_cost_surr_lr': self.pg_cost_surr_lr,
+                'nn_batch_strategy': self.nn_batch_strategy,
+                'nn_batch_size': self.nn_batch_size,
+                'nn_shuffle': self.nn_shuffle,
                 'pg_cost_reg_deadband': self.pg_cost_reg_deadband,
                 'template_rhs_jitter_scale': self.template_rhs_jitter_scale,
                 'template_rhs_reg_deadband': self.template_rhs_reg_deadband,
@@ -3619,8 +3762,15 @@ class SubproblemSurrogateTrainer:
                 'pg_cost_scale_multiplier',
                 self.pg_cost_scale_multiplier,
             )
+            self.nn_learning_rate = state.get('nn_learning_rate', self.nn_learning_rate)
+            self.cost_learning_rate = state.get('cost_learning_rate', self.cost_learning_rate)
             self.pg_cost_lr = state.get('pg_cost_lr', self.pg_cost_lr)
             self.pg_cost_surr_lr = state.get('pg_cost_surr_lr', self.pg_cost_surr_lr)
+            self.nn_batch_strategy = normalize_nn_batch_strategy(
+                state.get('nn_batch_strategy', self.nn_batch_strategy)
+            )
+            self.nn_batch_size = max(int(state.get('nn_batch_size', self.nn_batch_size)), 1)
+            self.nn_shuffle = bool(state.get('nn_shuffle', self.nn_shuffle))
             self.pg_cost_reg_deadband = state.get(
                 'pg_cost_reg_deadband',
                 self.pg_cost_reg_deadband,
@@ -3643,6 +3793,10 @@ class SubproblemSurrogateTrainer:
             if self._uses_template_rhs_bases():
                 self.surrogate_net.delta_base = 0.0
                 self.surrogate_net.delta_scale = self.template_rhs_jitter_scale
+            for param_group in self.optimizer.param_groups:
+                param_group['lr'] = self.nn_learning_rate
+            for param_group in self.cost_optimizer.param_groups:
+                param_group['lr'] = self.cost_learning_rate
             for param_group in self.pg_cost_optimizer.param_groups:
                 param_group['lr'] = self.pg_cost_lr
             self.requested_max_constraints = state.get('requested_max_constraints', self.requested_max_constraints)
@@ -3672,6 +3826,9 @@ def _load_surrogate_model_metadata(filepath: str, device=None) -> dict:
 
 def train_dual_predictor_from_data(ppc, active_set_data: List[Dict], T_delta: float = 1.0,
                                     num_epochs: int = 100, batch_size: int = 8,
+                                    batch_strategy: str = "full-batch",
+                                    shuffle: bool = True,
+                                    learning_rate: float = 1e-3,
                                     save_path: str = None, device=None) -> DualVariablePredictorTrainer:
     """
     训练对偶变量预测器
@@ -3693,10 +3850,25 @@ def train_dual_predictor_from_data(ppc, active_set_data: List[Dict], T_delta: fl
     print("=" * 60, flush=True)
     
     # 创建预测器
-    predictor = DualVariablePredictorTrainer(ppc, active_set_data, T_delta, device)
+    predictor = DualVariablePredictorTrainer(
+        ppc,
+        active_set_data,
+        T_delta,
+        device=device,
+        batch_strategy=batch_strategy,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        learning_rate=learning_rate,
+    )
     
     # 训练
-    predictor.train(num_epochs=num_epochs, batch_size=batch_size)
+    predictor.train(
+        num_epochs=num_epochs,
+        batch_size=batch_size,
+        batch_strategy=batch_strategy,
+        shuffle=shuffle,
+        learning_rate=learning_rate,
+    )
     
     # 保存模型
     if save_path:
@@ -3716,8 +3888,13 @@ def train_subproblem_surrogate_from_data(ppc, active_set_data: List[Dict], unit_
                                           mu_group_lower_bound_round: int = 50,
                                           pg_cost_start_round: int = 3,
                                           pg_cost_scale_multiplier: float = 1.2,
+                                          nn_learning_rate: float = 1e-4,
+                                          cost_learning_rate: float = 1e-5,
                                           pg_cost_lr: float = 2e-5,
                                           pg_cost_surr_lr: float = 5e-5,
+                                          nn_batch_strategy: str = "full-batch",
+                                          nn_batch_size: int = 4,
+                                          nn_shuffle: bool = True,
                                           pg_cost_reg_deadband: float = 0.25,
                                           save_path: str = None, device=None) -> SubproblemSurrogateTrainer:
     """
@@ -3753,14 +3930,28 @@ def train_subproblem_surrogate_from_data(ppc, active_set_data: List[Dict], unit_
         mu_group_lower_bound_round=mu_group_lower_bound_round,
         pg_cost_start_round=pg_cost_start_round,
         pg_cost_scale_multiplier=pg_cost_scale_multiplier,
+        nn_learning_rate=nn_learning_rate,
+        cost_learning_rate=cost_learning_rate,
         pg_cost_lr=pg_cost_lr,
         pg_cost_surr_lr=pg_cost_surr_lr,
+        nn_batch_strategy=nn_batch_strategy,
+        nn_batch_size=nn_batch_size,
+        nn_shuffle=nn_shuffle,
         pg_cost_reg_deadband=pg_cost_reg_deadband,
         device=device
     )
     
     # BCD迭代训练
-    trainer.iter(max_iter=max_iter, nn_epochs=nn_epochs)
+    trainer.iter(
+        max_iter=max_iter,
+        nn_epochs=nn_epochs,
+        nn_batch_strategy=nn_batch_strategy,
+        nn_batch_size=nn_batch_size,
+        nn_shuffle=nn_shuffle,
+        nn_learning_rate=nn_learning_rate,
+        cost_learning_rate=cost_learning_rate,
+        pg_cost_surr_learning_rate=pg_cost_surr_lr,
+    )
     
     # 保存模型
     if save_path:
@@ -3778,12 +3969,17 @@ def train_all_subproblem_surrogates(ppc, active_set_data: List[Dict], T_delta: f
                                       rho_dual_coc_init: float | None = None,
                                       mu_individual_lower_bound_round: int = 3,
                                       mu_group_lower_bound_round: int = 50,
-                                      pg_cost_start_round: int = 3,
-                                      pg_cost_scale_multiplier: float = 1.2,
-                                      pg_cost_lr: float = 2e-5,
-                                      pg_cost_surr_lr: float = 5e-5,
-                                      pg_cost_reg_deadband: float = 0.25,
-                                      save_dir: str = None, device=None) -> Dict[int, SubproblemSurrogateTrainer]:
+                                       pg_cost_start_round: int = 3,
+                                       pg_cost_scale_multiplier: float = 1.2,
+                                       nn_learning_rate: float = 1e-4,
+                                       cost_learning_rate: float = 1e-5,
+                                       pg_cost_lr: float = 2e-5,
+                                       pg_cost_surr_lr: float = 5e-5,
+                                       nn_batch_strategy: str = "full-batch",
+                                       nn_batch_size: int = 4,
+                                       nn_shuffle: bool = True,
+                                       pg_cost_reg_deadband: float = 0.25,
+                                       save_dir: str = None, device=None) -> Dict[int, SubproblemSurrogateTrainer]:
     """
     训练所有机组的子问题代理约束
     
@@ -3827,13 +4023,27 @@ def train_all_subproblem_surrogates(ppc, active_set_data: List[Dict], T_delta: f
             mu_group_lower_bound_round=mu_group_lower_bound_round,
             pg_cost_start_round=pg_cost_start_round,
             pg_cost_scale_multiplier=pg_cost_scale_multiplier,
+            nn_learning_rate=nn_learning_rate,
+            cost_learning_rate=cost_learning_rate,
             pg_cost_lr=pg_cost_lr,
             pg_cost_surr_lr=pg_cost_surr_lr,
+            nn_batch_strategy=nn_batch_strategy,
+            nn_batch_size=nn_batch_size,
+            nn_shuffle=nn_shuffle,
             pg_cost_reg_deadband=pg_cost_reg_deadband,
             device=device
         )
         
-        trainer.iter(max_iter=max_iter, nn_epochs=nn_epochs)
+        trainer.iter(
+            max_iter=max_iter,
+            nn_epochs=nn_epochs,
+            nn_batch_strategy=nn_batch_strategy,
+            nn_batch_size=nn_batch_size,
+            nn_shuffle=nn_shuffle,
+            nn_learning_rate=nn_learning_rate,
+            cost_learning_rate=cost_learning_rate,
+            pg_cost_surr_learning_rate=pg_cost_surr_lr,
+        )
         trainers[g] = trainer
         
         if save_dir:
@@ -3847,8 +4057,19 @@ def train_all_subproblem_surrogates(ppc, active_set_data: List[Dict], T_delta: f
 def train_complete_model(ppc, active_set_data: List[Dict], T_delta: float = 1.0,
                           unit_ids: List[int] = None,
                           dual_epochs: int = 100, dual_batch_size: int = 8,
+                          dual_batch_strategy: str = "full-batch",
+                          dual_shuffle: bool = True,
+                          dual_learning_rate: float = 1e-3,
                           surrogate_max_iter: int = 20, surrogate_nn_epochs: int = 10,
                           constraint_generation_strategy: str = "sensitive",
+                          surrogate_nn_batch_strategy: str = "full-batch",
+                          surrogate_nn_batch_size: int = 4,
+                          surrogate_nn_shuffle: bool = True,
+                          surrogate_nn_learning_rate: float = 1e-4,
+                          surrogate_cost_learning_rate: float = 1e-5,
+                          surrogate_pg_cost_lr: float = 2e-5,
+                          surrogate_pg_cost_surr_lr: float = 5e-5,
+                          surrogate_pg_cost_reg_deadband: float = 0.25,
                           save_dir: str = None, device=None):
     """
     完整的训练流程：先训练对偶预测器，再训练所有机组的代理约束
@@ -3894,7 +4115,11 @@ def train_complete_model(ppc, active_set_data: List[Dict], T_delta: float = 1.0,
     dual_save_path = os.path.join(save_dir, 'dual_predictor.pth') if save_dir else None
     dual_predictor = train_dual_predictor_from_data(
         ppc, active_set_data, T_delta,
-        num_epochs=dual_epochs, batch_size=dual_batch_size,
+        num_epochs=dual_epochs,
+        batch_size=dual_batch_size,
+        batch_strategy=dual_batch_strategy,
+        shuffle=dual_shuffle,
+        learning_rate=dual_learning_rate,
         save_path=dual_save_path, device=device
     )
     
@@ -3908,6 +4133,14 @@ def train_complete_model(ppc, active_set_data: List[Dict], T_delta: float = 1.0,
         lambda_predictor=dual_predictor, unit_ids=unit_ids,
         max_iter=surrogate_max_iter, nn_epochs=surrogate_nn_epochs,
         constraint_generation_strategy=constraint_generation_strategy,
+        nn_batch_strategy=surrogate_nn_batch_strategy,
+        nn_batch_size=surrogate_nn_batch_size,
+        nn_shuffle=surrogate_nn_shuffle,
+        nn_learning_rate=surrogate_nn_learning_rate,
+        cost_learning_rate=surrogate_cost_learning_rate,
+        pg_cost_lr=surrogate_pg_cost_lr,
+        pg_cost_surr_lr=surrogate_pg_cost_surr_lr,
+        pg_cost_reg_deadband=surrogate_pg_cost_reg_deadband,
         save_dir=save_dir, device=device
     )
     
@@ -4863,7 +5096,17 @@ if __name__ == "__main__":
     pass
 
 
-def _dual_predictor_trainer_init(self, ppc, active_set_data, T_delta, device=None):
+def _dual_predictor_trainer_init(
+    self,
+    ppc,
+    active_set_data,
+    T_delta,
+    device=None,
+    batch_strategy: str = "full-batch",
+    batch_size: int = 8,
+    shuffle: bool = True,
+    learning_rate: float = 1e-3,
+):
     self.ppc = ppc
     ppc_int = ext2int(ppc)
     self.baseMVA = ppc_int['baseMVA']
@@ -4892,10 +5135,14 @@ def _dual_predictor_trainer_init(self, ppc, active_set_data, T_delta, device=Non
     self.input_dim = len(get_feature_vector_from_sample(dict(first_sample)))
     self.output_dim = self.ng * self.T
     self._legacy_mode = None
+    self.batch_strategy = normalize_nn_batch_strategy(batch_strategy)
+    self.batch_size = max(int(batch_size), 1)
+    self.shuffle = bool(shuffle)
+    self.learning_rate = max(float(learning_rate), 1e-8)
 
     if TORCH_AVAILABLE:
         self.network = DualVariablePredictorNet(self.input_dim, self.output_dim).to(self.device)
-        self.optimizer = optim.Adam(self.network.parameters(), lr=1e-3)
+        self.optimizer = optim.Adam(self.network.parameters(), lr=self.learning_rate)
 
     self.lambda_targets = self._solve_for_true_dual_variables()
     self.lambda_true = self.lambda_targets
@@ -4935,7 +5182,14 @@ def _dual_predictor_trainer_extract_features(self, sample_id: int) -> np.ndarray
     return get_feature_vector_from_sample(dict(self.active_set_data[sample_id]))
 
 
-def _dual_predictor_trainer_train(self, num_epochs: int = 100, batch_size: int = 8):
+def _dual_predictor_trainer_train(
+    self,
+    num_epochs: int = 100,
+    batch_size: int | None = None,
+    batch_strategy: str | None = None,
+    shuffle: bool | None = None,
+    learning_rate: float | None = None,
+):
     if not TORCH_AVAILABLE:
         print("Warning: PyTorch unavailable", flush=True)
         return
@@ -4945,7 +5199,23 @@ def _dual_predictor_trainer_train(self, num_epochs: int = 100, batch_size: int =
     X_tensor = torch.tensor(X, dtype=torch.float32, device=self.device)
     Y_tensor = torch.tensor(Y, dtype=torch.float32, device=self.device)
     dataset = torch.utils.data.TensorDataset(X_tensor, Y_tensor)
-    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+    resolved_batch_strategy = normalize_nn_batch_strategy(
+        self.batch_strategy if batch_strategy is None else batch_strategy
+    )
+    resolved_shuffle = self.shuffle if shuffle is None else bool(shuffle)
+    resolved_learning_rate = (
+        self.learning_rate if learning_rate is None else max(float(learning_rate), 1e-8)
+    )
+    if resolved_batch_strategy == "full-batch":
+        resolved_batch_size = max(1, self.n_samples)
+    else:
+        resolved_batch_size = max(1, self.batch_size if batch_size is None else int(batch_size))
+    self.optimizer = optim.Adam(self.network.parameters(), lr=resolved_learning_rate)
+    dataloader = DataLoader(
+        dataset,
+        batch_size=resolved_batch_size,
+        shuffle=resolved_shuffle and self.n_samples > 1,
+    )
     criterion = nn.MSELoss()
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(self.optimizer, patience=10, factor=0.5)
     self.network.train()
@@ -5037,12 +5307,22 @@ def _dual_predictor_trainer_save(self, filepath: str):
             state['network_state_dict'] = self.network.state_dict()
             state['optimizer_state_dict'] = self.optimizer.state_dict()
             state['lambda_output_dim'] = self.T if self._legacy_mode == 'power_balance_only' else self.output_dim
+        state['learning_rate'] = getattr(self, 'learning_rate', 1e-3)
+        state['batch_strategy'] = getattr(self, 'batch_strategy', 'full-batch')
+        state['batch_size'] = getattr(self, 'batch_size', 8)
+        state['shuffle'] = getattr(self, 'shuffle', True)
         torch.save(state, filepath)
 
 
 def _dual_predictor_trainer_load(self, filepath: str):
     if TORCH_AVAILABLE:
         state = torch.load(filepath, map_location=self.device)
+        self.learning_rate = max(float(state.get('learning_rate', getattr(self, 'learning_rate', 1e-3))), 1e-8)
+        self.batch_strategy = normalize_nn_batch_strategy(
+            state.get('batch_strategy', getattr(self, 'batch_strategy', 'full-batch'))
+        )
+        self.batch_size = max(int(state.get('batch_size', getattr(self, 'batch_size', 8))), 1)
+        self.shuffle = bool(state.get('shuffle', getattr(self, 'shuffle', True)))
         if 'network_state_dicts' in state:
             self._legacy_mode = 'per_unit_effective'
             self.legacy_networks = [
@@ -5050,7 +5330,7 @@ def _dual_predictor_trainer_load(self, filepath: str):
                 for _ in range(self.ng)
             ]
             self.legacy_optimizers = [
-                optim.Adam(network.parameters(), lr=1e-3)
+                optim.Adam(network.parameters(), lr=self.learning_rate)
                 for network in self.legacy_networks
             ]
             for network, network_state in zip(self.legacy_networks, state['network_state_dicts']):
@@ -5070,14 +5350,14 @@ def _dual_predictor_trainer_load(self, filepath: str):
             elif legacy_dim == self.T + 2 * self.nl * self.T:
                 self._legacy_mode = 'global_dual_payload'
                 self.network = DualVariablePredictorNet(self.input_dim, legacy_dim).to(self.device)
-                self.optimizer = optim.Adam(self.network.parameters(), lr=1e-3)
+                self.optimizer = optim.Adam(self.network.parameters(), lr=self.learning_rate)
                 self.network.load_state_dict(state['network_state_dict'])
                 if 'optimizer_state_dict' in state:
                     self.optimizer.load_state_dict(state['optimizer_state_dict'])
             else:
                 self._legacy_mode = 'power_balance_only'
                 self.network = DualVariablePredictorNet(self.input_dim, self.T).to(self.device)
-                self.optimizer = optim.Adam(self.network.parameters(), lr=1e-3)
+                self.optimizer = optim.Adam(self.network.parameters(), lr=self.learning_rate)
                 self.network.load_state_dict(state['network_state_dict'])
                 if 'optimizer_state_dict' in state:
                     self.optimizer.load_state_dict(state['optimizer_state_dict'])

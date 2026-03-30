@@ -71,6 +71,9 @@ MAX_SAMPLES = 20            # None = 使用全部样本
 T_DELTA = 1.0
 DUAL_EPOCHS = 200
 DUAL_BATCH_SIZE = 8
+DUAL_BATCH_STRATEGY = 'full-batch'   # 'full-batch' / 'mini-batch'
+DUAL_SHUFFLE = True
+DUAL_LR = 5e-4
 MAX_ITER = 500
 DUAL_DECAY_ROUND = 25
 NN_EPOCHS = 5
@@ -95,6 +98,10 @@ ZETA_HOT_START_STRATEGY = 'zero'             # 'zero' / 'gaussian'
 THETA_GAUSSIAN_STD = 0.01
 ZETA_GAUSSIAN_STD = 0.01
 BCD_ENABLE_DROPOUT_DURING_NN_TRAINING = True
+BCD_NN_BATCH_STRATEGY = 'full-batch'   # 'full-batch' / 'mini-batch'
+BCD_NN_BATCH_SIZE = 4
+BCD_NN_SHUFFLE = True
+BCD_NN_LR = 5e-5
 BCD_RHO_PRIMAL_INIT = 1e-3
 BCD_RHO_DUAL_INIT = 1e-3
 BCD_RHO_DUAL_PG_INIT = 1
@@ -116,6 +123,11 @@ SUBPROBLEM_GAMMA_BASE = 1e-3
 SUBPROBLEM_MU_DUAL_FLOOR_INIT = 1
 SUBPROBLEM_MU_DUAL_FLOOR_INDIVIDUAL_ROUND = round(MAX_ITER/10)
 SUBPROBLEM_MU_DUAL_FLOOR_DECAY_ROUND = round(MAX_ITER/2)
+SUBPROBLEM_NN_BATCH_STRATEGY = 'full-batch'   # 'full-batch' / 'mini-batch'
+SUBPROBLEM_NN_BATCH_SIZE = 4
+SUBPROBLEM_NN_SHUFFLE = True
+SUBPROBLEM_NN_LR = 1e-4
+SUBPROBLEM_X_COST_NN_LR = 1e-5
 SUBPROBLEM_PG_COST_START_ROUND = round(MAX_ITER/10)
 SUBPROBLEM_PG_COST_SCALE_MULTIPLIER = 3
 SUBPROBLEM_PG_COST_LR = 2e-4
@@ -258,6 +270,9 @@ def pick_data_file(result_dir: Path, case_name: str) -> Path:
 def run_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS,
                   DUAL_EPOCHS, DUAL_BATCH_SIZE, MAX_ITER, NN_EPOCHS, save_dir,
                   n_workers: int = 4, logger: 'TrainingLogger | None' = None,
+                  dual_batch_strategy: str = 'full-batch',
+                  dual_shuffle: bool = True,
+                  dual_learning_rate: float = 5e-4,
                   constraint_generation_strategy: str = 'sensitive',
                   rho_primal_init: float = 1e-3,
                   rho_dual_init: float = 1e-3,
@@ -269,6 +284,11 @@ def run_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS,
                   mu_lower_bound_init: float = 0.1,
                   mu_individual_lower_bound_round: int = 3,
                   mu_group_lower_bound_round: int = 50,
+                  subproblem_nn_batch_strategy: str = 'full-batch',
+                  subproblem_nn_batch_size: int = 4,
+                  subproblem_nn_shuffle: bool = True,
+                  subproblem_nn_learning_rate: float = 1e-4,
+                  subproblem_cost_learning_rate: float = 1e-5,
                   pg_cost_start_round: int = 3,
                   pg_cost_scale_multiplier: float = 1.2,
                   pg_cost_lr: float = 2e-5,
@@ -288,13 +308,27 @@ def run_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS,
         f"n_workers={n_workers}，dual_epochs={DUAL_EPOCHS}，"
         f"bcd_iter={MAX_ITER}，nn_epochs={NN_EPOCHS}，"
         f"constraint_strategy={constraint_generation_strategy}")
+    log(
+        f"dual_nn: batch_strategy={dual_batch_strategy}, batch_size={DUAL_BATCH_SIZE}, "
+        f"shuffle={dual_shuffle}, lr={dual_learning_rate}"
+    )
+    log(
+        f"subproblem_nn: batch_strategy={subproblem_nn_batch_strategy}, "
+        f"batch_size={subproblem_nn_batch_size}, shuffle={subproblem_nn_shuffle}, "
+        f"main_lr={subproblem_nn_learning_rate}, x_cost_lr={subproblem_cost_learning_rate}, "
+        f"c_pg_surr_lr={pg_cost_surr_lr}"
+    )
     print("=" * 70)
 
     # 步骤 1：对偶变量预测器（串行，NN 训练无需并行化）
     dual_save_path = os.path.join(save_dir, 'dual_predictor.pth') if save_dir else None
     dual_predictor = train_dual_predictor_from_data(
         ppc, all_samples, T_delta=T_DELTA,
-        num_epochs=DUAL_EPOCHS, batch_size=DUAL_BATCH_SIZE,
+        num_epochs=DUAL_EPOCHS,
+        batch_size=DUAL_BATCH_SIZE,
+        batch_strategy=dual_batch_strategy,
+        shuffle=dual_shuffle,
+        learning_rate=dual_learning_rate,
         save_path=dual_save_path,
     )
 
@@ -320,6 +354,11 @@ def run_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS,
                 mu_lower_bound_init=mu_lower_bound_init,
                 mu_individual_lower_bound_round=mu_individual_lower_bound_round,
                 mu_group_lower_bound_round=mu_group_lower_bound_round,
+                nn_batch_strategy=subproblem_nn_batch_strategy,
+                nn_batch_size=subproblem_nn_batch_size,
+                nn_shuffle=subproblem_nn_shuffle,
+                nn_learning_rate=subproblem_nn_learning_rate,
+                cost_learning_rate=subproblem_cost_learning_rate,
                 pg_cost_start_round=pg_cost_start_round,
                 pg_cost_scale_multiplier=pg_cost_scale_multiplier,
                 pg_cost_lr=pg_cost_lr,
@@ -342,6 +381,11 @@ def run_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS,
                 mu_lower_bound_init=mu_lower_bound_init,
                 mu_individual_lower_bound_round=mu_individual_lower_bound_round,
                 mu_group_lower_bound_round=mu_group_lower_bound_round,
+                nn_batch_strategy=subproblem_nn_batch_strategy,
+                nn_batch_size=subproblem_nn_batch_size,
+                nn_shuffle=subproblem_nn_shuffle,
+                nn_learning_rate=subproblem_nn_learning_rate,
+                cost_learning_rate=subproblem_cost_learning_rate,
                 pg_cost_start_round=pg_cost_start_round,
                 pg_cost_scale_multiplier=pg_cost_scale_multiplier,
                 pg_cost_lr=pg_cost_lr,
@@ -351,7 +395,16 @@ def run_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS,
             )
         if logger is not None:
             trainer.logger = logger
-        trainer.iter(max_iter=MAX_ITER, nn_epochs=NN_EPOCHS)
+        trainer.iter(
+            max_iter=MAX_ITER,
+            nn_epochs=NN_EPOCHS,
+            nn_batch_strategy=subproblem_nn_batch_strategy,
+            nn_batch_size=subproblem_nn_batch_size,
+            nn_shuffle=subproblem_nn_shuffle,
+            nn_learning_rate=subproblem_nn_learning_rate,
+            cost_learning_rate=subproblem_cost_learning_rate,
+            pg_cost_surr_learning_rate=pg_cost_surr_lr,
+        )
         trainers[g] = trainer
         if save_dir:
             trainer.save(os.path.join(save_dir, f'surrogate_unit_{g}.pth'))
@@ -439,14 +492,20 @@ def run_bcd(ppc, all_samples: list, T_DELTA, MAX_ITER, bcd_model_dir,
             rho_opt_init: float = 1e-2,
             gamma_base: float = 1e-2,
             mu_dual_floor_init: float = 0.1,
-            ita_dual_floor_init: float = 0.1):
+            ita_dual_floor_init: float = 0.1,
+            nn_batch_strategy: str = 'full-batch',
+            nn_batch_size: int = 4,
+            nn_shuffle: bool = True,
+            nn_learning_rate: float = 5e-5):
     """BCD 主代理训练（样本级并行），返回 ParallelAgent_NN_BCD 实例。"""
     log("模式: BCD 主代理训练（Agent_NN_BCD）")
     log(f"使用 {len(all_samples)} 个样本")
     log(
         f"theta热启动={theta_hot_start_strategy}, "
         f"zeta热启动={zeta_hot_start_strategy}, "
-        f"nn_dropout={'on' if enable_dropout_during_nn_training else 'off'}"
+        f"nn_dropout={'on' if enable_dropout_during_nn_training else 'off'}, "
+        f"nn_batch={nn_batch_strategy}, nn_batch_size={nn_batch_size}, "
+        f"nn_shuffle={nn_shuffle}, nn_lr={nn_learning_rate}"
     )
     log(
         f"rho_init: primal={rho_primal_init}, dual={rho_dual_init}, "
@@ -490,6 +549,10 @@ def run_bcd(ppc, all_samples: list, T_DELTA, MAX_ITER, bcd_model_dir,
             gamma_base=gamma_base,
             mu_dual_floor_init=mu_dual_floor_init,
             ita_dual_floor_init=ita_dual_floor_init,
+            nn_learning_rate=nn_learning_rate,
+            nn_batch_strategy=nn_batch_strategy,
+            nn_batch_size=nn_batch_size,
+            nn_shuffle=nn_shuffle,
         )
     else:
         log(f"使用并行 ParallelAgent_NN_BCD (n_workers={n_workers})")
@@ -513,6 +576,10 @@ def run_bcd(ppc, all_samples: list, T_DELTA, MAX_ITER, bcd_model_dir,
             gamma_base=gamma_base,
             mu_dual_floor_init=mu_dual_floor_init,
             ita_dual_floor_init=ita_dual_floor_init,
+            nn_learning_rate=nn_learning_rate,
+            nn_batch_strategy=nn_batch_strategy,
+            nn_batch_size=nn_batch_size,
+            nn_shuffle=nn_shuffle,
             n_workers=n_workers,
         )
 
@@ -522,7 +589,15 @@ def run_bcd(ppc, all_samples: list, T_DELTA, MAX_ITER, bcd_model_dir,
 
     if logger is not None:
         agent.logger = logger
-    agent.iter(max_iter=MAX_ITER, dual_decay_round=DUAL_DECAY_ROUND, nn_epochs=NN_EPOCHS)
+    agent.iter(
+        max_iter=MAX_ITER,
+        dual_decay_round=DUAL_DECAY_ROUND,
+        nn_epochs=NN_EPOCHS,
+        nn_batch_strategy=nn_batch_strategy,
+        nn_batch_size=nn_batch_size,
+        nn_shuffle=nn_shuffle,
+        nn_learning_rate=nn_learning_rate,
+    )
 
     # 保存模型（含算例名和时间戳）
     suffix = f'_{case_name}_{timestamp}' if timestamp else f'_{case_name}'
@@ -599,7 +674,11 @@ def run_sparse_bcd(ppc, all_samples: list, T_DELTA, MAX_ITER, bcd_model_dir,
                    rho_opt_init: float = 1e-2,
                    gamma_base: float = 1e-2,
                    mu_dual_floor_init: float = 0.1,
-                   ita_dual_floor_init: float = 0.1):
+                   ita_dual_floor_init: float = 0.1,
+                   nn_batch_strategy: str = 'full-batch',
+                   nn_batch_size: int = 4,
+                   nn_shuffle: bool = True,
+                   nn_learning_rate: float = 5e-5):
     """
     sparse 模式：
     1. 用普通 Agent_NN_BCD 初始化，拿到 x_lp/x_true
@@ -632,6 +711,10 @@ def run_sparse_bcd(ppc, all_samples: list, T_DELTA, MAX_ITER, bcd_model_dir,
         gamma_base=gamma_base,
         mu_dual_floor_init=mu_dual_floor_init,
         ita_dual_floor_init=ita_dual_floor_init,
+        nn_learning_rate=nn_learning_rate,
+        nn_batch_strategy=nn_batch_strategy,
+        nn_batch_size=nn_batch_size,
+        nn_shuffle=nn_shuffle,
     )
     sparse_dir = Path(__file__).parent / 'result' / 'sparse_templates'
     discovery_result, template_library = build_sparse_template_library_from_bcd_agent(
@@ -676,6 +759,10 @@ def run_sparse_bcd(ppc, all_samples: list, T_DELTA, MAX_ITER, bcd_model_dir,
         gamma_base=gamma_base,
         mu_dual_floor_init=mu_dual_floor_init,
         ita_dual_floor_init=ita_dual_floor_init,
+        nn_batch_strategy=nn_batch_strategy,
+        nn_batch_size=nn_batch_size,
+        nn_shuffle=nn_shuffle,
+        nn_learning_rate=nn_learning_rate,
     )
 
     return agent, discovery_result, template_library
@@ -735,6 +822,13 @@ def main():
     THETA_WARM_START_GAUSSIAN_STD = THETA_GAUSSIAN_STD
     ZETA_WARM_START_GAUSSIAN_STD = ZETA_GAUSSIAN_STD
     BCD_ENABLE_DROPOUT_DURING_NN_TRAINING_VALUE = BCD_ENABLE_DROPOUT_DURING_NN_TRAINING
+    BCD_NN_BATCH_STRATEGY_VALUE = BCD_NN_BATCH_STRATEGY
+    BCD_NN_BATCH_SIZE_VALUE = BCD_NN_BATCH_SIZE
+    BCD_NN_SHUFFLE_VALUE = BCD_NN_SHUFFLE
+    BCD_NN_LR_VALUE = BCD_NN_LR
+    DUAL_BATCH_STRATEGY_VALUE = DUAL_BATCH_STRATEGY
+    DUAL_SHUFFLE_VALUE = DUAL_SHUFFLE
+    DUAL_LR_VALUE = DUAL_LR
     BCD_LAMBDA_INIT_STRATEGY_VALUE = BCD_LAMBDA_INIT_STRATEGY
     BCD_RHO_PRIMAL_INIT_VALUE = BCD_RHO_PRIMAL_INIT
     BCD_RHO_DUAL_INIT_VALUE = BCD_RHO_DUAL_INIT
@@ -756,6 +850,11 @@ def main():
     SUBPROBLEM_MU_DUAL_FLOOR_INIT_VALUE = SUBPROBLEM_MU_DUAL_FLOOR_INIT
     SUBPROBLEM_MU_DUAL_FLOOR_INDIVIDUAL_ROUND_VALUE = SUBPROBLEM_MU_DUAL_FLOOR_INDIVIDUAL_ROUND
     SUBPROBLEM_MU_DUAL_FLOOR_DECAY_ROUND_VALUE = SUBPROBLEM_MU_DUAL_FLOOR_DECAY_ROUND
+    SUBPROBLEM_NN_BATCH_STRATEGY_VALUE = SUBPROBLEM_NN_BATCH_STRATEGY
+    SUBPROBLEM_NN_BATCH_SIZE_VALUE = SUBPROBLEM_NN_BATCH_SIZE
+    SUBPROBLEM_NN_SHUFFLE_VALUE = SUBPROBLEM_NN_SHUFFLE
+    SUBPROBLEM_NN_LR_VALUE = SUBPROBLEM_NN_LR
+    SUBPROBLEM_X_COST_NN_LR_VALUE = SUBPROBLEM_X_COST_NN_LR
     SUBPROBLEM_PG_COST_START_ROUND_VALUE = SUBPROBLEM_PG_COST_START_ROUND
     SUBPROBLEM_PG_COST_SCALE_MULTIPLIER_VALUE = SUBPROBLEM_PG_COST_SCALE_MULTIPLIER
     SUBPROBLEM_PG_COST_LR_VALUE = SUBPROBLEM_PG_COST_LR
@@ -829,7 +928,11 @@ def main():
                     rho_opt_init=BCD_RHO_OPT_INIT_VALUE,
                     gamma_base=BCD_GAMMA_BASE_VALUE,
                     mu_dual_floor_init=BCD_MU_DUAL_FLOOR_INIT_VALUE,
-                    ita_dual_floor_init=BCD_ITA_DUAL_FLOOR_INIT_VALUE)
+                    ita_dual_floor_init=BCD_ITA_DUAL_FLOOR_INIT_VALUE,
+                    nn_batch_strategy=BCD_NN_BATCH_STRATEGY_VALUE,
+                    nn_batch_size=BCD_NN_BATCH_SIZE_VALUE,
+                    nn_shuffle=BCD_NN_SHUFFLE_VALUE,
+                    nn_learning_rate=BCD_NN_LR_VALUE)
             if RUN_FP:
                 log("警告: bcd 模式不支持 RUN_FP（需要 trainers），请改用 both 模式")
 
@@ -872,6 +975,10 @@ def main():
                 gamma_base=BCD_GAMMA_BASE_VALUE,
                 mu_dual_floor_init=BCD_MU_DUAL_FLOOR_INIT_VALUE,
                 ita_dual_floor_init=BCD_ITA_DUAL_FLOOR_INIT_VALUE,
+                nn_batch_strategy=BCD_NN_BATCH_STRATEGY_VALUE,
+                nn_batch_size=BCD_NN_BATCH_SIZE_VALUE,
+                nn_shuffle=BCD_NN_SHUFFLE_VALUE,
+                nn_learning_rate=BCD_NN_LR_VALUE,
             )
             if RUN_FP:
                 log("警告: sparse 模式暂不支持 RUN_FP（需要 trainers），请改用 both 模式或单独接入模板库")
@@ -889,6 +996,9 @@ def main():
                 ppc, all_samples, T_DELTA, UNIT_IDS,
                 DUAL_EPOCHS, DUAL_BATCH_SIZE, MAX_ITER, NN_EPOCHS, save_dir,
                 n_workers=N_WORKERS_SUBPROBLEM, logger=logger,
+                dual_batch_strategy=DUAL_BATCH_STRATEGY_VALUE,
+                dual_shuffle=DUAL_SHUFFLE_VALUE,
+                dual_learning_rate=DUAL_LR_VALUE,
                 constraint_generation_strategy=CONSTRAINT_GENERATION_STRATEGY,
                 rho_primal_init=SUBPROBLEM_RHO_PRIMAL_INIT_VALUE,
                 rho_dual_init=SUBPROBLEM_RHO_DUAL_INIT_VALUE,
@@ -900,6 +1010,11 @@ def main():
                 mu_lower_bound_init=SUBPROBLEM_MU_DUAL_FLOOR_INIT_VALUE,
                 mu_individual_lower_bound_round=SUBPROBLEM_MU_DUAL_FLOOR_INDIVIDUAL_ROUND_VALUE,
                 mu_group_lower_bound_round=SUBPROBLEM_MU_DUAL_FLOOR_DECAY_ROUND_VALUE,
+                subproblem_nn_batch_strategy=SUBPROBLEM_NN_BATCH_STRATEGY_VALUE,
+                subproblem_nn_batch_size=SUBPROBLEM_NN_BATCH_SIZE_VALUE,
+                subproblem_nn_shuffle=SUBPROBLEM_NN_SHUFFLE_VALUE,
+                subproblem_nn_learning_rate=SUBPROBLEM_NN_LR_VALUE,
+                subproblem_cost_learning_rate=SUBPROBLEM_X_COST_NN_LR_VALUE,
                 pg_cost_start_round=SUBPROBLEM_PG_COST_START_ROUND_VALUE,
                 pg_cost_scale_multiplier=SUBPROBLEM_PG_COST_SCALE_MULTIPLIER_VALUE,
                 pg_cost_lr=SUBPROBLEM_PG_COST_LR_VALUE,
@@ -981,6 +1096,10 @@ def main():
                         gamma_base=BCD_GAMMA_BASE_VALUE,
                         mu_dual_floor_init=BCD_MU_DUAL_FLOOR_INIT_VALUE,
                         ita_dual_floor_init=BCD_ITA_DUAL_FLOOR_INIT_VALUE,
+                        nn_learning_rate=BCD_NN_LR_VALUE,
+                        nn_batch_strategy=BCD_NN_BATCH_STRATEGY_VALUE,
+                        nn_batch_size=BCD_NN_BATCH_SIZE_VALUE,
+                        nn_shuffle=BCD_NN_SHUFFLE_VALUE,
                     )
                 elif N_WORKERS_BCD <= 1:
                     agent = Agent_NN_BCD(
@@ -999,6 +1118,10 @@ def main():
                         gamma_base=BCD_GAMMA_BASE_VALUE,
                         mu_dual_floor_init=BCD_MU_DUAL_FLOOR_INIT_VALUE,
                         ita_dual_floor_init=BCD_ITA_DUAL_FLOOR_INIT_VALUE,
+                        nn_learning_rate=BCD_NN_LR_VALUE,
+                        nn_batch_strategy=BCD_NN_BATCH_STRATEGY_VALUE,
+                        nn_batch_size=BCD_NN_BATCH_SIZE_VALUE,
+                        nn_shuffle=BCD_NN_SHUFFLE_VALUE,
                     )
                 else:
                     agent = ParallelAgent_NN_BCD(
@@ -1015,6 +1138,10 @@ def main():
                         gamma_base=BCD_GAMMA_BASE_VALUE,
                         mu_dual_floor_init=BCD_MU_DUAL_FLOOR_INIT_VALUE,
                         ita_dual_floor_init=BCD_ITA_DUAL_FLOOR_INIT_VALUE,
+                        nn_learning_rate=BCD_NN_LR_VALUE,
+                        nn_batch_strategy=BCD_NN_BATCH_STRATEGY_VALUE,
+                        nn_batch_size=BCD_NN_BATCH_SIZE_VALUE,
+                        nn_shuffle=BCD_NN_SHUFFLE_VALUE,
                         n_workers=N_WORKERS_BCD,
                     )
                 agent.load_model_parameters(
@@ -1052,6 +1179,10 @@ def main():
                     gamma_base=BCD_GAMMA_BASE_VALUE,
                     mu_dual_floor_init=BCD_MU_DUAL_FLOOR_INIT_VALUE,
                     ita_dual_floor_init=BCD_ITA_DUAL_FLOOR_INIT_VALUE,
+                    nn_batch_strategy=BCD_NN_BATCH_STRATEGY_VALUE,
+                    nn_batch_size=BCD_NN_BATCH_SIZE_VALUE,
+                    nn_shuffle=BCD_NN_SHUFFLE_VALUE,
+                    nn_learning_rate=BCD_NN_LR_VALUE,
                 )
 
             # Step 2: 加载 v3 格式样本（subproblem 独立训练，不注入 BCD 对偶变量）
@@ -1075,6 +1206,9 @@ def main():
                     ppc, all_samples, T_DELTA, UNIT_IDS,
                     DUAL_EPOCHS, DUAL_BATCH_SIZE, MAX_ITER, NN_EPOCHS, save_dir,
                     n_workers=N_WORKERS_SUBPROBLEM, logger=logger,
+                    dual_batch_strategy=DUAL_BATCH_STRATEGY_VALUE,
+                    dual_shuffle=DUAL_SHUFFLE_VALUE,
+                    dual_learning_rate=DUAL_LR_VALUE,
                     constraint_generation_strategy=CONSTRAINT_GENERATION_STRATEGY,
                     rho_primal_init=SUBPROBLEM_RHO_PRIMAL_INIT_VALUE,
                     rho_dual_init=SUBPROBLEM_RHO_DUAL_INIT_VALUE,
@@ -1086,6 +1220,11 @@ def main():
                     mu_lower_bound_init=SUBPROBLEM_MU_DUAL_FLOOR_INIT_VALUE,
                     mu_individual_lower_bound_round=SUBPROBLEM_MU_DUAL_FLOOR_INDIVIDUAL_ROUND_VALUE,
                     mu_group_lower_bound_round=SUBPROBLEM_MU_DUAL_FLOOR_DECAY_ROUND_VALUE,
+                    subproblem_nn_batch_strategy=SUBPROBLEM_NN_BATCH_STRATEGY_VALUE,
+                    subproblem_nn_batch_size=SUBPROBLEM_NN_BATCH_SIZE_VALUE,
+                    subproblem_nn_shuffle=SUBPROBLEM_NN_SHUFFLE_VALUE,
+                    subproblem_nn_learning_rate=SUBPROBLEM_NN_LR_VALUE,
+                    subproblem_cost_learning_rate=SUBPROBLEM_X_COST_NN_LR_VALUE,
                     pg_cost_start_round=SUBPROBLEM_PG_COST_START_ROUND_VALUE,
                     pg_cost_scale_multiplier=SUBPROBLEM_PG_COST_SCALE_MULTIPLIER_VALUE,
                     pg_cost_lr=SUBPROBLEM_PG_COST_LR_VALUE,

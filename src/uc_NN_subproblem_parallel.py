@@ -93,8 +93,13 @@ class ParallelSubproblemSurrogateTrainer(SubproblemSurrogateTrainer):
         mu_group_lower_bound_round: int = 50,
         pg_cost_start_round: int = 3,
         pg_cost_scale_multiplier: float = 1.2,
+        nn_learning_rate: float = 1e-4,
+        cost_learning_rate: float = 1e-5,
         pg_cost_lr: float = 2e-5,
         pg_cost_surr_lr: float = 5e-5,
+        nn_batch_strategy: str = "full-batch",
+        nn_batch_size: int = 4,
+        nn_shuffle: bool = True,
         pg_cost_reg_deadband: float = 0.25,
         device=None,
         n_workers: int = 4,
@@ -116,14 +121,29 @@ class ParallelSubproblemSurrogateTrainer(SubproblemSurrogateTrainer):
             mu_group_lower_bound_round=mu_group_lower_bound_round,
             pg_cost_start_round=pg_cost_start_round,
             pg_cost_scale_multiplier=pg_cost_scale_multiplier,
+            nn_learning_rate=nn_learning_rate,
+            cost_learning_rate=cost_learning_rate,
             pg_cost_lr=pg_cost_lr,
             pg_cost_surr_lr=pg_cost_surr_lr,
+            nn_batch_strategy=nn_batch_strategy,
+            nn_batch_size=nn_batch_size,
+            nn_shuffle=nn_shuffle,
             pg_cost_reg_deadband=pg_cost_reg_deadband,
             device=device,
         )
         self.n_workers = min(n_workers, self.n_samples)
 
-    def iter(self, max_iter: int = 20, nn_epochs: int = 10):
+    def iter(
+        self,
+        max_iter: int = 20,
+        nn_epochs: int = 10,
+        nn_batch_strategy: str | None = None,
+        nn_batch_size: int | None = None,
+        nn_shuffle: bool | None = None,
+        nn_learning_rate: float | None = None,
+        cost_learning_rate: float | None = None,
+        pg_cost_surr_learning_rate: float | None = None,
+    ):
         """主 BCD 迭代循环（样本级线程并行版本）。
 
         primal/dual block 内并发提交各样本；结果收集后主线程顺序更新状态。
@@ -228,7 +248,21 @@ class ParallelSubproblemSurrogateTrainer(SubproblemSurrogateTrainer):
                     self.mu[s] = self._apply_mu_lower_bound_policy(mu_sol, lb_mu)
 
             # ── 3. NN block（串行，批次化训练） ──────────────────────
-            self.iter_with_surrogate_nn(num_epochs=nn_epochs)
+            self.iter_with_surrogate_nn(
+                num_epochs=nn_epochs,
+                batch_size=nn_batch_size,
+                batch_strategy=nn_batch_strategy,
+                shuffle=nn_shuffle,
+                learning_rate=nn_learning_rate,
+                cost_learning_rate=cost_learning_rate,
+            )
+            self.iter_with_c_pg_nn(
+                num_epochs=nn_epochs,
+                batch_size=nn_batch_size,
+                batch_strategy=nn_batch_strategy,
+                shuffle=nn_shuffle,
+                learning_rate=pg_cost_surr_learning_rate,
+            )
 
             # ── 计算并打印违反量 ─────────────────────────────────────
             obj_primal, obj_dual_pg, obj_dual_x, obj_dual_coc, obj_dual, obj_opt = self.cal_viol_components()

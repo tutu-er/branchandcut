@@ -87,6 +87,7 @@ sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', line_bufferin
 SUPPORTED_THETA_HOT_START_STRATEGIES = {"dcpf_relative", "gaussian"}
 SUPPORTED_ZETA_HOT_START_STRATEGIES = {"zero", "gaussian"}
 SUPPORTED_LAMBDA_INIT_STRATEGIES = {"lp_relaxation", "ed_on_x_opt"}
+SUPPORTED_NN_BATCH_STRATEGIES = {"full-batch", "mini-batch"}
 
 
 def normalize_theta_hot_start_strategy(strategy: str | None) -> str:
@@ -115,6 +116,16 @@ def normalize_lambda_init_strategy(strategy: str | None) -> str:
         raise ValueError(
             f"Unsupported lambda_init_strategy: {strategy}. "
             f"Supported: {sorted(SUPPORTED_LAMBDA_INIT_STRATEGIES)}"
+        )
+    return strategy_norm
+
+
+def normalize_nn_batch_strategy(strategy: str | None) -> str:
+    strategy_norm = "full-batch" if strategy is None else str(strategy).strip().lower()
+    if strategy_norm not in SUPPORTED_NN_BATCH_STRATEGIES:
+        raise ValueError(
+            f"Unsupported nn_batch_strategy: {strategy}. "
+            f"Supported: {sorted(SUPPORTED_NN_BATCH_STRATEGIES)}"
         )
     return strategy_norm
 
@@ -466,6 +477,10 @@ class Agent_NN_BCD:
         gamma_base: float = 1e-2,
         mu_dual_floor_init: float = 0.1,
         ita_dual_floor_init: float = 0.1,
+        nn_learning_rate: float = 5e-5,
+        nn_batch_strategy: str = "full-batch",
+        nn_batch_size: int = 4,
+        nn_shuffle: bool = True,
     ):
         self.ppc = ppc
         self.ppc_raw = ppc
@@ -535,6 +550,12 @@ class Agent_NN_BCD:
         self.theta_gaussian_std = float(theta_gaussian_std)
         self.zeta_gaussian_std = float(zeta_gaussian_std)
         self.enable_dropout_during_nn_training = bool(enable_dropout_during_nn_training)
+        self.nn_learning_rate = float(nn_learning_rate)
+        if self.nn_learning_rate <= 0:
+            raise ValueError(f"nn_learning_rate must be positive, got {nn_learning_rate}")
+        self.nn_batch_strategy = normalize_nn_batch_strategy(nn_batch_strategy)
+        self.nn_batch_size = max(1, int(nn_batch_size))
+        self.nn_shuffle = bool(nn_shuffle)
         rho_dual_pg_base = rho_dual_init if rho_dual_pg_init is None else rho_dual_pg_init
         rho_dual_x_base = rho_dual_init if rho_dual_x_init is None else rho_dual_x_init
         rho_dual_coc_base = rho_dual_init if rho_dual_coc_init is None else rho_dual_coc_init
@@ -2057,7 +2078,7 @@ class Agent_NN_BCD:
         
         # 创建优化器（只优化theta和zeta网络，mu和ita在loss中通过Gurobi优化）
         all_params = list(self.theta_net.parameters()) + list(self.zeta_net.parameters())
-        self.optimizer = optim.Adam(all_params, lr=1e-4, weight_decay=0.0)
+        self.optimizer = optim.Adam(all_params, lr=self.nn_learning_rate, weight_decay=0.0)
         
         # 保存变量名列表
         self.theta_var_names = list(self.theta_values.keys())
@@ -2821,7 +2842,15 @@ class Agent_NN_BCD:
             print(f"❌ 对偶块模型求解失败，状态: {model.status}", flush=True)
             return None, None, None
     
-    def iter_with_theta_zeta_neural_network(self, union_analysis=None, num_epochs=1, batch_size: int = 4):
+    def iter_with_theta_zeta_neural_network(
+        self,
+        union_analysis=None,
+        num_epochs=1,
+        batch_size: int | None = None,
+        batch_strategy: str | None = None,
+        shuffle: bool | None = None,
+        learning_rate: float | None = None,
+    ):
         """
         使用神经网络更新theta和zeta（参考uc_NN.py的train方法）
         使用loss_function_differentiable进行训练，mini-batch梯度累积模式
@@ -2833,8 +2862,21 @@ class Agent_NN_BCD:
         if union_analysis is None:
             union_analysis = self._current_union_analysis
 
+        resolved_batch_strategy = normalize_nn_batch_strategy(
+            self.nn_batch_strategy if batch_strategy is None else batch_strategy
+        )
+        resolved_shuffle = self.nn_shuffle if shuffle is None else bool(shuffle)
+        resolved_learning_rate = self.nn_learning_rate if learning_rate is None else float(learning_rate)
+        if resolved_learning_rate <= 0:
+            raise ValueError(f"learning_rate must be positive, got {resolved_learning_rate}")
+        if resolved_batch_strategy == "full-batch":
+            resolved_batch_size = max(1, self.n_samples)
+        else:
+            base_batch_size = self.nn_batch_size if batch_size is None else int(batch_size)
+            resolved_batch_size = max(1, base_batch_size)
+
         all_params = list(self.theta_net.parameters()) + list(self.zeta_net.parameters())
-        self.optimizer = optim.Adam(all_params, lr=1e-4, weight_decay=0.0)
+        self.optimizer = optim.Adam(all_params, lr=resolved_learning_rate, weight_decay=0.0)
         if self.enable_dropout_during_nn_training:
             self.theta_net.train()
             self.zeta_net.train()
@@ -2857,10 +2899,13 @@ class Agent_NN_BCD:
             self.optimizer.zero_grad()
             batch_count = 0
             need_epoch_breakdown = self.n_samples > 0 and (epoch == 0 or epoch == num_epochs - 1)
+            sample_indices = np.arange(self.n_samples, dtype=int)
+            if resolved_shuffle and self.n_samples > 1:
+                np.random.shuffle(sample_indices)
 
-            for sample_id in range(self.n_samples):
-                batch_start = (sample_id // batch_size) * batch_size
-                actual_batch_size = min(batch_size, self.n_samples - batch_start)
+            for sample_pos, sample_id in enumerate(sample_indices):
+                batch_start = (sample_pos // resolved_batch_size) * resolved_batch_size
+                actual_batch_size = min(resolved_batch_size, self.n_samples - batch_start)
 
                 # 从缓存取特征（view，无拷贝）
                 features_tensor = self._features_cache[sample_id:sample_id+1]
@@ -2899,7 +2944,7 @@ class Agent_NN_BCD:
                 batch_count += 1
 
                 # batch 满或 epoch 结束：clip + step
-                if batch_count == batch_size or sample_id == self.n_samples - 1:
+                if batch_count == resolved_batch_size or sample_pos == self.n_samples - 1:
                     torch.nn.utils.clip_grad_norm_(self.theta_net.parameters(), max_norm=1.0)
                     torch.nn.utils.clip_grad_norm_(self.zeta_net.parameters(), max_norm=1.0)
                     self.optimizer.step()
@@ -2952,7 +2997,17 @@ class Agent_NN_BCD:
 
         return theta_values_new_list, zeta_values_new_list
     
-    def iter(self, max_iter=20, dual_decay_round=10, nn_epochs=10, union_analysis=None):
+    def iter(
+        self,
+        max_iter=20,
+        dual_decay_round=10,
+        nn_epochs=10,
+        union_analysis=None,
+        nn_batch_strategy: str | None = None,
+        nn_batch_size: int | None = None,
+        nn_shuffle: bool | None = None,
+        nn_learning_rate: float | None = None,
+    ):
         """
         主迭代循环（参考uc_dfsm_bcd.py）
         - 迭代PG块（更新x, pg）
@@ -3043,7 +3098,14 @@ class Agent_NN_BCD:
                 f"obj_dual_x={obj_dual_x_pre:.6f}, obj_opt={obj_opt_pre:.6f}",
                 flush=True,
             )
-            theta_values_new, zeta_values_new = self.iter_with_theta_zeta_neural_network(union_analysis=union_analysis, num_epochs=nn_epochs)
+            theta_values_new, zeta_values_new = self.iter_with_theta_zeta_neural_network(
+                union_analysis=union_analysis,
+                num_epochs=nn_epochs,
+                batch_strategy=nn_batch_strategy,
+                batch_size=nn_batch_size,
+                shuffle=nn_shuffle,
+                learning_rate=nn_learning_rate,
+            )
             if theta_values_new is None or zeta_values_new is None:
                 print("❌ Theta/Zeta神经网络更新失败，终止迭代", flush=True)
                 break
@@ -4747,7 +4809,7 @@ class Agent_NN_BCD:
 
         # 重建优化器
         all_params = list(self.theta_net.parameters()) + list(self.zeta_net.parameters())
-        self.optimizer = optim.Adam(all_params, lr=1e-4, weight_decay=0.0)
+        self.optimizer = optim.Adam(all_params, lr=self.nn_learning_rate, weight_decay=0.0)
         if state.get("optimizer_state_dict") is not None:
             try:
                 self.optimizer.load_state_dict(state["optimizer_state_dict"])

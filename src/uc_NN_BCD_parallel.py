@@ -52,6 +52,10 @@ class ParallelAgent_NN_BCD(Agent_NN_BCD):
         gamma_base: float = 1e-2,
         mu_dual_floor_init: float = 0.1,
         ita_dual_floor_init: float = 0.1,
+        nn_learning_rate: float = 5e-5,
+        nn_batch_strategy: str = "full-batch",
+        nn_batch_size: int = 4,
+        nn_shuffle: bool = True,
         n_workers: int = 4,
     ):
         super().__init__(
@@ -75,6 +79,10 @@ class ParallelAgent_NN_BCD(Agent_NN_BCD):
             gamma_base=gamma_base,
             mu_dual_floor_init=mu_dual_floor_init,
             ita_dual_floor_init=ita_dual_floor_init,
+            nn_learning_rate=nn_learning_rate,
+            nn_batch_strategy=nn_batch_strategy,
+            nn_batch_size=nn_batch_size,
+            nn_shuffle=nn_shuffle,
         )
         self.n_workers = min(n_workers, self.n_samples)
 
@@ -84,6 +92,10 @@ class ParallelAgent_NN_BCD(Agent_NN_BCD):
         dual_decay_round: int = 10,
         nn_epochs: int = 10,
         union_analysis=None,
+        nn_batch_strategy: str | None = None,
+        nn_batch_size: int | None = None,
+        nn_shuffle: bool | None = None,
+        nn_learning_rate: float | None = None,
     ):
         if union_analysis is None:
             union_analysis = self._current_union_analysis
@@ -209,6 +221,10 @@ class ParallelAgent_NN_BCD(Agent_NN_BCD):
             theta_new, zeta_new = self.iter_with_theta_zeta_neural_network(
                 union_analysis=union_analysis,
                 num_epochs=nn_epochs,
+                batch_strategy=nn_batch_strategy,
+                batch_size=nn_batch_size,
+                shuffle=nn_shuffle,
+                learning_rate=nn_learning_rate,
             )
             if theta_new is None or zeta_new is None:
                 print("[ParallelBCD] NN block failed; stop", flush=True)
