@@ -129,6 +129,26 @@ def normalize_nn_batch_strategy(strategy: str | None) -> str:
         )
     return strategy_norm
 
+
+def normalize_nn_hidden_dims(hidden_dims: List[int] | Tuple[int, ...] | None, default_hidden_dims: List[int]) -> List[int]:
+    dims = default_hidden_dims if hidden_dims is None else hidden_dims
+    normalized = [int(dim) for dim in dims]
+    if not normalized or any(dim <= 0 for dim in normalized):
+        raise ValueError(f"nn_hidden_dims must be a non-empty sequence of positive integers, got {hidden_dims}")
+    return normalized
+
+
+def build_mlp_with_dropout(input_dim: int, hidden_dims: List[int], output_dim: int, dropout_p: float = 0.1) -> 'nn.Sequential':
+    layers: List[nn.Module] = []
+    prev_dim = input_dim
+    for hidden_dim in hidden_dims:
+        layers.append(nn.Linear(prev_dim, hidden_dim))
+        layers.append(nn.LeakyReLU(0.01))
+        layers.append(nn.Dropout(dropout_p))
+        prev_dim = hidden_dim
+    layers.append(nn.Linear(prev_dim, output_dim))
+    return nn.Sequential(*layers)
+
 # ========================== ActiveSetReader 和 load_active_set_from_json ==========================
 # 从uc_NN.py复制，保持文件独立性
 
@@ -477,6 +497,7 @@ class Agent_NN_BCD:
         gamma_base: float = 1e-2,
         mu_dual_floor_init: float = 0.1,
         ita_dual_floor_init: float = 0.1,
+        nn_hidden_dims: List[int] | None = None,
         nn_learning_rate: float = 5e-5,
         nn_batch_strategy: str = "full-batch",
         nn_batch_size: int = 4,
@@ -550,6 +571,7 @@ class Agent_NN_BCD:
         self.theta_gaussian_std = float(theta_gaussian_std)
         self.zeta_gaussian_std = float(zeta_gaussian_std)
         self.enable_dropout_during_nn_training = bool(enable_dropout_during_nn_training)
+        self.nn_hidden_dims = normalize_nn_hidden_dims(nn_hidden_dims, [64, 128])
         self.nn_learning_rate = float(nn_learning_rate)
         if self.nn_learning_rate <= 0:
             raise ValueError(f"nn_learning_rate must be positive, got {nn_learning_rate}")
@@ -2050,26 +2072,16 @@ class Agent_NN_BCD:
         self.theta_output_dim = len(self.theta_values)
         self.zeta_output_dim = len(self.zeta_values)
         
-        # 创建theta网络
-        self.theta_net = nn.Sequential(
-            nn.Linear(input_dim, 64),
-            nn.LeakyReLU(0.01),
-            nn.Dropout(0.1),
-            nn.Linear(64, 128),
-            nn.LeakyReLU(0.01),
-            nn.Dropout(0.1),
-            nn.Linear(128, self.theta_output_dim)
+        # 创建theta/zeta网络，隐藏层规模由外部配置控制
+        self.theta_net = build_mlp_with_dropout(
+            input_dim,
+            self.nn_hidden_dims,
+            self.theta_output_dim,
         )
-
-        # 创建zeta网络
-        self.zeta_net = nn.Sequential(
-            nn.Linear(input_dim, 64),
-            nn.LeakyReLU(0.01),
-            nn.Dropout(0.1),
-            nn.Linear(64, 128),
-            nn.LeakyReLU(0.01),
-            nn.Dropout(0.1),
-            nn.Linear(128, self.zeta_output_dim)
+        self.zeta_net = build_mlp_with_dropout(
+            input_dim,
+            self.nn_hidden_dims,
+            self.zeta_output_dim,
         )
         # 移动到设备
         if self.device:
@@ -2093,6 +2105,7 @@ class Agent_NN_BCD:
         print(f"✓ 初始化神经网络:", flush=True)
         print(f"  - 设备: {self.device}", flush=True)
         print(f"  - 输入维度: {input_dim}", flush=True)
+        print(f"  - 隐藏层: {self.nn_hidden_dims}", flush=True)
         print(f"  - theta输出维度: {self.theta_output_dim}", flush=True)
         print(f"  - zeta输出维度: {self.zeta_output_dim}", flush=True)
 
@@ -4713,6 +4726,7 @@ class Agent_NN_BCD:
             "optimizer_state_dict": self.optimizer.state_dict() if hasattr(self, "optimizer") else None,
             "theta_var_names": getattr(self, "theta_var_names", None),
             "zeta_var_names": getattr(self, "zeta_var_names", None),
+            "nn_hidden_dims": getattr(self, "nn_hidden_dims", None),
             "device": str(self.device) if hasattr(self, "device") and self.device is not None else "cpu",
             "lambda_": self.lambda_,
             "mu": self.mu,
@@ -4821,6 +4835,14 @@ class Agent_NN_BCD:
             self.theta_var_names = state["theta_var_names"]
         if state.get("zeta_var_names") is not None:
             self.zeta_var_names = state["zeta_var_names"]
+        self.nn_hidden_dims = normalize_nn_hidden_dims(
+            state.get("nn_hidden_dims"),
+            [
+                module.out_features
+                for module in self.theta_net
+                if isinstance(module, nn.Linear)
+            ][:-1],
+        )
 
         # 恢复对偶变量（向后兼容旧checkpoint）
         if "lambda_" in state:

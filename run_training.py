@@ -98,6 +98,7 @@ ZETA_HOT_START_STRATEGY = 'zero'             # 'zero' / 'gaussian'
 THETA_GAUSSIAN_STD = 0.01
 ZETA_GAUSSIAN_STD = 0.01
 BCD_ENABLE_DROPOUT_DURING_NN_TRAINING = True
+BCD_NN_SIZE = 'medium'   # 'small' / 'medium' / 'large'
 BCD_NN_BATCH_STRATEGY = 'full-batch'   # 'full-batch' / 'mini-batch'
 BCD_NN_BATCH_SIZE = 4
 BCD_NN_SHUFFLE = True
@@ -124,6 +125,7 @@ SUBPROBLEM_MU_DUAL_FLOOR_INIT = 1
 SUBPROBLEM_MU_DUAL_FLOOR_INDIVIDUAL_ROUND = round(MAX_ITER/10)
 SUBPROBLEM_MU_DUAL_FLOOR_DECAY_ROUND = round(MAX_ITER/2)
 SUBPROBLEM_NN_BATCH_STRATEGY = 'full-batch'   # 'full-batch' / 'mini-batch'
+SUBPROBLEM_NN_SIZE = 'medium'   # 'small' / 'medium' / 'large'
 SUBPROBLEM_NN_BATCH_SIZE = 4
 SUBPROBLEM_NN_SHUFFLE = True
 SUBPROBLEM_NN_LR = 1e-4
@@ -186,6 +188,33 @@ if RUN_FP:
 def log(msg):
     ts = datetime.now().strftime("%H:%M:%S")
     print(f"[{ts}] {msg}", flush=True)
+
+
+SUPPORTED_NN_SIZE_OPTIONS = ('small', 'medium', 'large')
+BCD_NN_HIDDEN_DIM_OPTIONS = {
+    'small': [16, 32],
+    'medium': [24, 48],
+    'large': [32, 64],
+}
+SUBPROBLEM_NN_HIDDEN_DIM_OPTIONS = {
+    'small': [64, 64],
+    'medium': [96, 96],
+    'large': [128, 128],
+}
+
+
+def normalize_nn_size_option(size_option: str, label: str) -> str:
+    resolved = str(size_option).strip().lower()
+    if resolved not in SUPPORTED_NN_SIZE_OPTIONS:
+        raise ValueError(
+            f"{label} must be one of {SUPPORTED_NN_SIZE_OPTIONS}, got {size_option!r}"
+        )
+    return resolved
+
+
+def resolve_nn_hidden_dims(size_option: str, dim_options: dict[str, list[int]], label: str) -> tuple[str, list[int]]:
+    resolved_size = normalize_nn_size_option(size_option, label)
+    return resolved_size, list(dim_options[resolved_size])
 
 
 def load_json_data(data_file: Path) -> list:
@@ -273,6 +302,8 @@ def run_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS,
                   dual_batch_strategy: str = 'full-batch',
                   dual_shuffle: bool = True,
                   dual_learning_rate: float = 5e-4,
+                  subproblem_nn_size: str = 'medium',
+                  subproblem_nn_hidden_dims: list[int] | None = None,
                   constraint_generation_strategy: str = 'sensitive',
                   rho_primal_init: float = 1e-3,
                   rho_dual_init: float = 1e-3,
@@ -315,6 +346,7 @@ def run_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS,
     log(
         f"subproblem_nn: batch_strategy={subproblem_nn_batch_strategy}, "
         f"batch_size={subproblem_nn_batch_size}, shuffle={subproblem_nn_shuffle}, "
+        f"size={subproblem_nn_size}, hidden_dims={subproblem_nn_hidden_dims}, "
         f"main_lr={subproblem_nn_learning_rate}, x_cost_lr={subproblem_cost_learning_rate}, "
         f"c_pg_surr_lr={pg_cost_surr_lr}"
     )
@@ -354,6 +386,7 @@ def run_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS,
                 mu_lower_bound_init=mu_lower_bound_init,
                 mu_individual_lower_bound_round=mu_individual_lower_bound_round,
                 mu_group_lower_bound_round=mu_group_lower_bound_round,
+                nn_hidden_dims=subproblem_nn_hidden_dims,
                 nn_batch_strategy=subproblem_nn_batch_strategy,
                 nn_batch_size=subproblem_nn_batch_size,
                 nn_shuffle=subproblem_nn_shuffle,
@@ -381,6 +414,7 @@ def run_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS,
                 mu_lower_bound_init=mu_lower_bound_init,
                 mu_individual_lower_bound_round=mu_individual_lower_bound_round,
                 mu_group_lower_bound_round=mu_group_lower_bound_round,
+                nn_hidden_dims=subproblem_nn_hidden_dims,
                 nn_batch_strategy=subproblem_nn_batch_strategy,
                 nn_batch_size=subproblem_nn_batch_size,
                 nn_shuffle=subproblem_nn_shuffle,
@@ -493,6 +527,8 @@ def run_bcd(ppc, all_samples: list, T_DELTA, MAX_ITER, bcd_model_dir,
             gamma_base: float = 1e-2,
             mu_dual_floor_init: float = 0.1,
             ita_dual_floor_init: float = 0.1,
+            nn_size: str = 'medium',
+            nn_hidden_dims: list[int] | None = None,
             nn_batch_strategy: str = 'full-batch',
             nn_batch_size: int = 4,
             nn_shuffle: bool = True,
@@ -504,6 +540,7 @@ def run_bcd(ppc, all_samples: list, T_DELTA, MAX_ITER, bcd_model_dir,
         f"theta热启动={theta_hot_start_strategy}, "
         f"zeta热启动={zeta_hot_start_strategy}, "
         f"nn_dropout={'on' if enable_dropout_during_nn_training else 'off'}, "
+        f"nn_size={nn_size}, nn_hidden_dims={nn_hidden_dims}, "
         f"nn_batch={nn_batch_strategy}, nn_batch_size={nn_batch_size}, "
         f"nn_shuffle={nn_shuffle}, nn_lr={nn_learning_rate}"
     )
@@ -549,6 +586,7 @@ def run_bcd(ppc, all_samples: list, T_DELTA, MAX_ITER, bcd_model_dir,
             gamma_base=gamma_base,
             mu_dual_floor_init=mu_dual_floor_init,
             ita_dual_floor_init=ita_dual_floor_init,
+            nn_hidden_dims=nn_hidden_dims,
             nn_learning_rate=nn_learning_rate,
             nn_batch_strategy=nn_batch_strategy,
             nn_batch_size=nn_batch_size,
@@ -576,6 +614,7 @@ def run_bcd(ppc, all_samples: list, T_DELTA, MAX_ITER, bcd_model_dir,
             gamma_base=gamma_base,
             mu_dual_floor_init=mu_dual_floor_init,
             ita_dual_floor_init=ita_dual_floor_init,
+            nn_hidden_dims=nn_hidden_dims,
             nn_learning_rate=nn_learning_rate,
             nn_batch_strategy=nn_batch_strategy,
             nn_batch_size=nn_batch_size,
@@ -675,6 +714,8 @@ def run_sparse_bcd(ppc, all_samples: list, T_DELTA, MAX_ITER, bcd_model_dir,
                    gamma_base: float = 1e-2,
                    mu_dual_floor_init: float = 0.1,
                    ita_dual_floor_init: float = 0.1,
+                   nn_size: str = 'medium',
+                   nn_hidden_dims: list[int] | None = None,
                    nn_batch_strategy: str = 'full-batch',
                    nn_batch_size: int = 4,
                    nn_shuffle: bool = True,
@@ -711,6 +752,7 @@ def run_sparse_bcd(ppc, all_samples: list, T_DELTA, MAX_ITER, bcd_model_dir,
         gamma_base=gamma_base,
         mu_dual_floor_init=mu_dual_floor_init,
         ita_dual_floor_init=ita_dual_floor_init,
+        nn_hidden_dims=nn_hidden_dims,
         nn_learning_rate=nn_learning_rate,
         nn_batch_strategy=nn_batch_strategy,
         nn_batch_size=nn_batch_size,
@@ -759,6 +801,8 @@ def run_sparse_bcd(ppc, all_samples: list, T_DELTA, MAX_ITER, bcd_model_dir,
         gamma_base=gamma_base,
         mu_dual_floor_init=mu_dual_floor_init,
         ita_dual_floor_init=ita_dual_floor_init,
+        nn_size=nn_size,
+        nn_hidden_dims=nn_hidden_dims,
         nn_batch_strategy=nn_batch_strategy,
         nn_batch_size=nn_batch_size,
         nn_shuffle=nn_shuffle,
@@ -826,6 +870,11 @@ def main():
     BCD_NN_BATCH_SIZE_VALUE = BCD_NN_BATCH_SIZE
     BCD_NN_SHUFFLE_VALUE = BCD_NN_SHUFFLE
     BCD_NN_LR_VALUE = BCD_NN_LR
+    BCD_NN_SIZE_VALUE, BCD_NN_HIDDEN_DIMS_VALUE = resolve_nn_hidden_dims(
+        BCD_NN_SIZE,
+        BCD_NN_HIDDEN_DIM_OPTIONS,
+        'BCD_NN_SIZE',
+    )
     DUAL_BATCH_STRATEGY_VALUE = DUAL_BATCH_STRATEGY
     DUAL_SHUFFLE_VALUE = DUAL_SHUFFLE
     DUAL_LR_VALUE = DUAL_LR
@@ -854,6 +903,11 @@ def main():
     SUBPROBLEM_NN_BATCH_SIZE_VALUE = SUBPROBLEM_NN_BATCH_SIZE
     SUBPROBLEM_NN_SHUFFLE_VALUE = SUBPROBLEM_NN_SHUFFLE
     SUBPROBLEM_NN_LR_VALUE = SUBPROBLEM_NN_LR
+    SUBPROBLEM_NN_SIZE_VALUE, SUBPROBLEM_NN_HIDDEN_DIMS_VALUE = resolve_nn_hidden_dims(
+        SUBPROBLEM_NN_SIZE,
+        SUBPROBLEM_NN_HIDDEN_DIM_OPTIONS,
+        'SUBPROBLEM_NN_SIZE',
+    )
     SUBPROBLEM_X_COST_NN_LR_VALUE = SUBPROBLEM_X_COST_NN_LR
     SUBPROBLEM_PG_COST_START_ROUND_VALUE = SUBPROBLEM_PG_COST_START_ROUND
     SUBPROBLEM_PG_COST_SCALE_MULTIPLIER_VALUE = SUBPROBLEM_PG_COST_SCALE_MULTIPLIER
@@ -883,6 +937,10 @@ def main():
     n_units = ppc['gen'].shape[0]
     n_buses = ppc['bus'].shape[0]
     log(f"  {n_units} 机组，{n_buses} 节点")
+    log(
+        f"NN size config: BCD={BCD_NN_SIZE_VALUE} {BCD_NN_HIDDEN_DIMS_VALUE}, "
+        f"subproblem={SUBPROBLEM_NN_SIZE_VALUE} {SUBPROBLEM_NN_HIDDEN_DIMS_VALUE}"
+    )
 
     # ── 查找数据文件 ─────────────────────────────────────
     if ACTIVE_SETS_FILE is not None:
@@ -929,6 +987,8 @@ def main():
                     gamma_base=BCD_GAMMA_BASE_VALUE,
                     mu_dual_floor_init=BCD_MU_DUAL_FLOOR_INIT_VALUE,
                     ita_dual_floor_init=BCD_ITA_DUAL_FLOOR_INIT_VALUE,
+                    nn_size=BCD_NN_SIZE_VALUE,
+                    nn_hidden_dims=BCD_NN_HIDDEN_DIMS_VALUE,
                     nn_batch_strategy=BCD_NN_BATCH_STRATEGY_VALUE,
                     nn_batch_size=BCD_NN_BATCH_SIZE_VALUE,
                     nn_shuffle=BCD_NN_SHUFFLE_VALUE,
@@ -975,6 +1035,8 @@ def main():
                 gamma_base=BCD_GAMMA_BASE_VALUE,
                 mu_dual_floor_init=BCD_MU_DUAL_FLOOR_INIT_VALUE,
                 ita_dual_floor_init=BCD_ITA_DUAL_FLOOR_INIT_VALUE,
+                nn_size=BCD_NN_SIZE_VALUE,
+                nn_hidden_dims=BCD_NN_HIDDEN_DIMS_VALUE,
                 nn_batch_strategy=BCD_NN_BATCH_STRATEGY_VALUE,
                 nn_batch_size=BCD_NN_BATCH_SIZE_VALUE,
                 nn_shuffle=BCD_NN_SHUFFLE_VALUE,
@@ -1010,6 +1072,8 @@ def main():
                 mu_lower_bound_init=SUBPROBLEM_MU_DUAL_FLOOR_INIT_VALUE,
                 mu_individual_lower_bound_round=SUBPROBLEM_MU_DUAL_FLOOR_INDIVIDUAL_ROUND_VALUE,
                 mu_group_lower_bound_round=SUBPROBLEM_MU_DUAL_FLOOR_DECAY_ROUND_VALUE,
+                subproblem_nn_size=SUBPROBLEM_NN_SIZE_VALUE,
+                subproblem_nn_hidden_dims=SUBPROBLEM_NN_HIDDEN_DIMS_VALUE,
                 subproblem_nn_batch_strategy=SUBPROBLEM_NN_BATCH_STRATEGY_VALUE,
                 subproblem_nn_batch_size=SUBPROBLEM_NN_BATCH_SIZE_VALUE,
                 subproblem_nn_shuffle=SUBPROBLEM_NN_SHUFFLE_VALUE,
@@ -1058,6 +1122,7 @@ def main():
                     gamma_base=BCD_GAMMA_BASE_VALUE,
                     mu_dual_floor_init=BCD_MU_DUAL_FLOOR_INIT_VALUE,
                     ita_dual_floor_init=BCD_ITA_DUAL_FLOOR_INIT_VALUE,
+                    nn_hidden_dims=BCD_NN_HIDDEN_DIMS_VALUE,
                 )
                 _, sparse_template_library = build_sparse_template_library_from_bcd_agent(
                     _bootstrap_agent,
@@ -1096,6 +1161,7 @@ def main():
                         gamma_base=BCD_GAMMA_BASE_VALUE,
                         mu_dual_floor_init=BCD_MU_DUAL_FLOOR_INIT_VALUE,
                         ita_dual_floor_init=BCD_ITA_DUAL_FLOOR_INIT_VALUE,
+                        nn_hidden_dims=BCD_NN_HIDDEN_DIMS_VALUE,
                         nn_learning_rate=BCD_NN_LR_VALUE,
                         nn_batch_strategy=BCD_NN_BATCH_STRATEGY_VALUE,
                         nn_batch_size=BCD_NN_BATCH_SIZE_VALUE,
@@ -1118,6 +1184,7 @@ def main():
                         gamma_base=BCD_GAMMA_BASE_VALUE,
                         mu_dual_floor_init=BCD_MU_DUAL_FLOOR_INIT_VALUE,
                         ita_dual_floor_init=BCD_ITA_DUAL_FLOOR_INIT_VALUE,
+                        nn_hidden_dims=BCD_NN_HIDDEN_DIMS_VALUE,
                         nn_learning_rate=BCD_NN_LR_VALUE,
                         nn_batch_strategy=BCD_NN_BATCH_STRATEGY_VALUE,
                         nn_batch_size=BCD_NN_BATCH_SIZE_VALUE,
@@ -1138,6 +1205,7 @@ def main():
                         gamma_base=BCD_GAMMA_BASE_VALUE,
                         mu_dual_floor_init=BCD_MU_DUAL_FLOOR_INIT_VALUE,
                         ita_dual_floor_init=BCD_ITA_DUAL_FLOOR_INIT_VALUE,
+                        nn_hidden_dims=BCD_NN_HIDDEN_DIMS_VALUE,
                         nn_learning_rate=BCD_NN_LR_VALUE,
                         nn_batch_strategy=BCD_NN_BATCH_STRATEGY_VALUE,
                         nn_batch_size=BCD_NN_BATCH_SIZE_VALUE,
@@ -1179,6 +1247,8 @@ def main():
                     gamma_base=BCD_GAMMA_BASE_VALUE,
                     mu_dual_floor_init=BCD_MU_DUAL_FLOOR_INIT_VALUE,
                     ita_dual_floor_init=BCD_ITA_DUAL_FLOOR_INIT_VALUE,
+                    nn_size=BCD_NN_SIZE_VALUE,
+                    nn_hidden_dims=BCD_NN_HIDDEN_DIMS_VALUE,
                     nn_batch_strategy=BCD_NN_BATCH_STRATEGY_VALUE,
                     nn_batch_size=BCD_NN_BATCH_SIZE_VALUE,
                     nn_shuffle=BCD_NN_SHUFFLE_VALUE,
@@ -1220,6 +1290,8 @@ def main():
                     mu_lower_bound_init=SUBPROBLEM_MU_DUAL_FLOOR_INIT_VALUE,
                     mu_individual_lower_bound_round=SUBPROBLEM_MU_DUAL_FLOOR_INDIVIDUAL_ROUND_VALUE,
                     mu_group_lower_bound_round=SUBPROBLEM_MU_DUAL_FLOOR_DECAY_ROUND_VALUE,
+                    subproblem_nn_size=SUBPROBLEM_NN_SIZE_VALUE,
+                    subproblem_nn_hidden_dims=SUBPROBLEM_NN_HIDDEN_DIMS_VALUE,
                     subproblem_nn_batch_strategy=SUBPROBLEM_NN_BATCH_STRATEGY_VALUE,
                     subproblem_nn_batch_size=SUBPROBLEM_NN_BATCH_SIZE_VALUE,
                     subproblem_nn_shuffle=SUBPROBLEM_NN_SHUFFLE_VALUE,

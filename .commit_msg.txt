@@ -1,0 +1,17 @@
+Add configurable NN hidden dims, Cursor/Claude CLI agents, and FP recovery module
+
+- Add nn_hidden_dims parameter to BCD and subproblem trainers with
+  small/medium/large presets in run_training.py; refactor hard-coded
+  network layers to build_mlp_with_dropout helper; persist hidden dims
+  in checkpoint save/load for reproducibility
+- Expand agentic_fp_optimizer with Cursor CLI and Claude CLI agent modes
+  and SurrogateModelLoader for unified surrogate model loading
+- Improve FP case3lite: add G1 switch timing bonus for earlier startup
+  bias, widen tau candidate generation for "up" direction, import
+  _estimate_commitment_primal_objective
+- Refactor joint_trainer _forward_surrogate_outputs to tolerate 4/5/6
+  output layouts and add pg_costs support
+- Enhance run_test with commitment distance metrics (L1/Hamming) and
+  ED-based economic cost evaluation
+- Add src/fp_guided_recovery.py: enhanced FP framework with surrogate
+  diagnostics, physics-guided recovery, and solution memory bank

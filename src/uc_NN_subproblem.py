@@ -86,6 +86,14 @@ def normalize_nn_batch_strategy(strategy: str | None) -> str:
     return strategy_norm
 
 
+def normalize_nn_hidden_dims(hidden_dims: List[int] | Tuple[int, ...] | None, default_hidden_dims: List[int]) -> List[int]:
+    dims = default_hidden_dims if hidden_dims is None else hidden_dims
+    normalized = [int(dim) for dim in dims]
+    if not normalized or any(dim <= 0 for dim in normalized):
+        raise ValueError(f"nn_hidden_dims must be a non-empty sequence of positive integers, got {hidden_dims}")
+    return normalized
+
+
 # ========================== 数据加载工具 ==========================
 
 class ActiveSetReader:
@@ -1535,6 +1543,7 @@ class SubproblemSurrogateTrainer:
                  mu_group_lower_bound_round: int = 50,
                  pg_cost_start_round: int = 3,
                  pg_cost_scale_multiplier: float = 1.2,
+                 nn_hidden_dims: List[int] = None,
                  nn_learning_rate: float = 1e-4,
                  cost_learning_rate: float = 1e-5,
                  pg_cost_lr: float = 2e-5,
@@ -1642,6 +1651,7 @@ class SubproblemSurrogateTrainer:
         )
         self.pg_cost_start_round = max(int(pg_cost_start_round), 0)
         self.pg_cost_scale_multiplier = max(float(pg_cost_scale_multiplier), 1e-6)
+        self.nn_hidden_dims = normalize_nn_hidden_dims(nn_hidden_dims, [256, 256])
         self.nn_learning_rate = max(float(nn_learning_rate), 1e-8)
         self.cost_learning_rate = max(float(cost_learning_rate), 1e-8)
         self.pg_cost_lr = max(float(pg_cost_lr), 1e-8)
@@ -1788,7 +1798,7 @@ class SubproblemSurrogateTrainer:
             input_dim=input_dim,
             T=self.T,
             max_constraints=self.max_constraints,
-            hidden_dims=[256, 256],  # 两层残差块
+            hidden_dims=self.nn_hidden_dims,
             x_cost_scale=self.x_cost_scale,
             pg_cost_scale=self.pg_cost_scale,
             delta_base=delta_base,
@@ -1810,6 +1820,7 @@ class SubproblemSurrogateTrainer:
         )
 
         print(f"  - 代理约束网络输入维度: {input_dim}", flush=True)
+        print(f"  - 隐藏层: {self.nn_hidden_dims}", flush=True)
         print(f"  - 约束生成策略: {self.constraint_generation_strategy}", flush=True)
         print(f"  - 最大约束数量: {self.max_constraints}", flush=True)
         print(f"  - x_cost_scale={self.x_cost_scale:.4f}, pg_cost_scale={self.pg_cost_scale:.4f}", flush=True)
@@ -3696,6 +3707,7 @@ class SubproblemSurrogateTrainer:
                 'pg_cost_start_round': self.pg_cost_start_round,
                 'pg_cost_scale_multiplier': self.pg_cost_scale_multiplier,
                 'nn_learning_rate': self.nn_learning_rate,
+                'nn_hidden_dims': self.nn_hidden_dims,
                 'cost_learning_rate': self.cost_learning_rate,
                 'pg_cost_lr': self.pg_cost_lr,
                 'pg_cost_surr_lr': self.pg_cost_surr_lr,
@@ -3721,6 +3733,12 @@ class SubproblemSurrogateTrainer:
         """加载V3模型"""
         if TORCH_AVAILABLE:
             state = torch.load(filepath, map_location=self.device, weights_only=False)
+            saved_hidden_dims = state.get('nn_hidden_dims')
+            if saved_hidden_dims is not None:
+                resolved_hidden_dims = normalize_nn_hidden_dims(saved_hidden_dims, self.nn_hidden_dims)
+                if resolved_hidden_dims != self.nn_hidden_dims:
+                    self.nn_hidden_dims = resolved_hidden_dims
+                    self._init_neural_network()
             self.surrogate_net.load_state_dict(state['surrogate_net_state_dict'], strict=False)
             self.optimizer.load_state_dict(state['optimizer_state_dict'])
             self.alpha_values = state['alpha_values']
@@ -3763,6 +3781,10 @@ class SubproblemSurrogateTrainer:
                 self.pg_cost_scale_multiplier,
             )
             self.nn_learning_rate = state.get('nn_learning_rate', self.nn_learning_rate)
+            self.nn_hidden_dims = normalize_nn_hidden_dims(
+                state.get('nn_hidden_dims'),
+                self.nn_hidden_dims,
+            )
             self.cost_learning_rate = state.get('cost_learning_rate', self.cost_learning_rate)
             self.pg_cost_lr = state.get('pg_cost_lr', self.pg_cost_lr)
             self.pg_cost_surr_lr = state.get('pg_cost_surr_lr', self.pg_cost_surr_lr)
@@ -3821,6 +3843,7 @@ def _load_surrogate_model_metadata(filepath: str, device=None) -> dict:
         'num_coupling_constraints': state.get('num_coupling_constraints'),
         'mu_individual_lower_bound_round': state.get('mu_individual_lower_bound_round'),
         'mu_group_lower_bound_round': state.get('mu_group_lower_bound_round'),
+        'nn_hidden_dims': state.get('nn_hidden_dims'),
     }
 
 
@@ -4225,6 +4248,7 @@ def load_trained_models(ppc, active_set_data: List[Dict], T_delta: float,
             lambda_predictor=dual_predictor,
             max_constraints=trainer_max_constraints,
             constraint_generation_strategy=requested_strategy,
+            nn_hidden_dims=metadata.get('nn_hidden_dims'),
             device=device,
         )
         trainer.load(surrogate_path)

@@ -989,17 +989,55 @@ class JointLPTrainer:
             features = trainer._extract_features(sample_id)
             feat_t = torch.tensor(features, dtype=torch.float32,
                                   device=trainer.device).unsqueeze(0)
-            trainer.surrogate_net.eval()
-            with torch.no_grad():
-                a, b, c, d, e = trainer.surrogate_net(feat_t)
-            trainer.surrogate_net.train()
+            a, b, c, d, costs, pg_costs = self._forward_surrogate_outputs(trainer, feat_t)
             nc = trainer.num_coupling_constraints
             params[g] = (a.cpu().numpy().flatten()[:nc],
                          b.cpu().numpy().flatten()[:nc],
                          c.cpu().numpy().flatten()[:nc],
                          d.cpu().numpy().flatten()[:nc],
-                         e.cpu().numpy().flatten()[:trainer.T])
+                         costs.cpu().numpy().flatten()[:trainer.T],
+                         pg_costs.cpu().numpy().flatten()[:trainer.T])
         return params
+
+    def _forward_surrogate_outputs(self, trainer, feat_t):
+        """Run the surrogate network while tolerating legacy and current output layouts."""
+        costs = None
+        pg_costs = None
+        was_training = trainer.surrogate_net.training
+        trainer.surrogate_net.eval()
+        try:
+            with torch.no_grad():
+                if hasattr(trainer.surrogate_net, 'forward_main'):
+                    a, b, c, d, costs = trainer.surrogate_net.forward_main(feat_t)
+                    if hasattr(trainer.surrogate_net, 'forward_pg_cost'):
+                        pg_costs = trainer.surrogate_net.forward_pg_cost(feat_t)
+                else:
+                    outputs = trainer.surrogate_net(feat_t)
+                    if not isinstance(outputs, (tuple, list)):
+                        raise ValueError(
+                            f"Unexpected surrogate_net output type: {type(outputs).__name__}"
+                        )
+                    if len(outputs) == 6:
+                        a, b, c, d, costs, pg_costs = outputs
+                    elif len(outputs) == 5:
+                        a, b, c, d, costs = outputs
+                    elif len(outputs) == 4:
+                        a, b, c, d = outputs
+                    else:
+                        raise ValueError(
+                            f"Unexpected surrogate_net output count: {len(outputs)}"
+                        )
+
+                if hasattr(trainer, '_postprocess_delta_tensor'):
+                    d = trainer._postprocess_delta_tensor(d)
+        finally:
+            trainer.surrogate_net.train(was_training)
+
+        if costs is None:
+            costs = torch.zeros((feat_t.shape[0], trainer.T), dtype=feat_t.dtype, device=feat_t.device)
+        if pg_costs is None:
+            pg_costs = torch.zeros((feat_t.shape[0], trainer.T), dtype=feat_t.dtype, device=feat_t.device)
+        return a, b, c, d, costs, pg_costs
 
     def _compute_avg_integrality(self) -> float:
         """计算所有样本x的平均整数性指标 sum x*(1-x)。"""

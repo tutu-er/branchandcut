@@ -95,7 +95,7 @@ BCD_MODEL_PATH = 'result/bcd_models/bcd_model_case3lite_20260328_112148.pth'
 
 # 顶部集中配置区：测试相关参数统一在这里调整
 MAX_SAMPLES = None         # None = 使用全部样本
-SAMPLE_RANGE = "0:1"       # 左闭右开；例如 "210:220"
+SAMPLE_RANGE = "4:6"       # 左闭右开；例如 "210:220"
 T_DELTA = 1.0
 UNIT_IDS = None            # None = 所有机组；或如 [0, 1, 2]
 TEST_SAMPLES_DEFAULT = 3
@@ -153,6 +153,7 @@ try:
     import pypower.case30
     import pypower.case39
     import pypower.case118
+    from ed_gurobipy import EconomicDispatchGurobi
     from uc_NN_subproblem import (
         load_trained_models,
         ActiveSetReader,
@@ -1184,6 +1185,78 @@ def _extract_true_solution(sample: dict, shape: tuple) -> np.ndarray:
     return x_true
 
 
+def _compute_commitment_distance_metrics(
+    x_candidate: np.ndarray,
+    x_true: np.ndarray,
+) -> tuple[float, int]:
+    """Return L1 distance and rounded Hamming distance to the reference commitment."""
+    x_arr = np.asarray(x_candidate, dtype=float)
+    x_ref = np.asarray(x_true, dtype=float)
+    if x_arr.shape != x_ref.shape:
+        raise ValueError(
+            f"Commitment shape mismatch: candidate={x_arr.shape}, reference={x_ref.shape}"
+        )
+    l1_distance = float(np.sum(np.abs(x_arr - x_ref)))
+    hamming_distance = int(np.sum(np.round(x_arr).astype(int) != x_ref.astype(int)))
+    return l1_distance, hamming_distance
+
+
+def _evaluate_commitment_economic_cost(
+    ppc,
+    sample: dict,
+    x_commitment: np.ndarray,
+    T_delta: float,
+) -> dict:
+    """Evaluate a fixed commitment with ED and startup/shutdown costs."""
+    pd_data = np.asarray(sample['pd_data'], dtype=float)
+    renewable_data = sample.get('renewable_data') if isinstance(sample, dict) else None
+    x_arr = np.asarray(np.round(x_commitment), dtype=float)
+
+    try:
+        ed = EconomicDispatchGurobi(
+            ppc,
+            pd_data,
+            T_delta,
+            x_arr,
+            renewable_data=renewable_data,
+            verbose=False,
+        )
+        ed.model.optimize()
+    except Exception as exc:
+        return {
+            'success': False,
+            'reason': f'ED exception: {exc}',
+        }
+
+    if ed.model.status != GRB.OPTIMAL:
+        return {
+            'success': False,
+            'reason': f'ED status={ed.model.status}',
+        }
+
+    dispatch_cost = float(ed.model.objVal)
+    startup_cost = 0.0
+    shutdown_cost = 0.0
+    if x_arr.shape[1] >= 2:
+        x_prev = np.clip(x_arr[:, :-1], 0.0, 1.0)
+        x_next = np.clip(x_arr[:, 1:], 0.0, 1.0)
+        startup_cost = float(
+            np.sum(ed.gencost[:, 1][:, None] * np.maximum(x_next - x_prev, 0.0))
+        )
+        shutdown_cost = float(
+            np.sum(ed.gencost[:, 2][:, None] * np.maximum(x_prev - x_next, 0.0))
+        )
+
+    total_cost = dispatch_cost + startup_cost + shutdown_cost
+    return {
+        'success': True,
+        'dispatch_cost': dispatch_cost,
+        'startup_cost': startup_cost,
+        'shutdown_cost': shutdown_cost,
+        'total_cost': float(total_cost),
+    }
+
+
 def _build_subproblem_commitment_matrix(
     sample: dict,
     lambda_val: np.ndarray,
@@ -1574,12 +1647,33 @@ def test_surrogate(ppc, all_samples: list, T_DELTA: float,
     run_lp_compare_test(ppc, all_samples, dual_predictor, trainers,
                         T_DELTA, TEST_SAMPLES, fig_dir)
 
+    fp_results = None
     if RUN_FP:
         fp_results = run_fp_test(
             ppc, all_samples, dual_predictor, trainers, T_DELTA, TEST_SAMPLES,
             scenario_bank=scenario_bank, fig_dir=fig_dir,
         )
         plot_fp_results(fp_results, fig_dir, CASE_NAME)
+        summarize_fp_economicity(
+            ppc,
+            all_samples,
+            fp_results,
+            T_DELTA,
+            fig_dir,
+            CASE_NAME,
+        )
+
+    summarize_lp_surrogate_fp_totals(
+        ppc,
+        all_samples,
+        dual_predictor,
+        trainers,
+        T_DELTA,
+        TEST_SAMPLES,
+        fig_dir,
+        CASE_NAME,
+        fp_results=fp_results,
+    )
 
 
 def _print_bcd_stats(agent) -> None:
@@ -1926,6 +2020,351 @@ def plot_lp_surrogate_bar(
     _save_fig(fig, path, f'LP vs {comparison_name} distance bar')
 
 
+def plot_lp_surrogate_fp_total_bar(
+    total_l1: dict[str, float],
+    total_hamming: dict[str, int],
+    fig_dir: Path,
+    case_name: str,
+) -> None:
+    """Plot total L1 and Hamming distances for LP / surrogate / surrogate+FP."""
+    if not MPL_AVAILABLE:
+        return
+
+    _apply_style()
+    method_names = list(total_l1.keys())
+    l1_values = [float(total_l1[name]) for name in method_names]
+    hamming_values = [float(total_hamming[name]) for name in method_names]
+    colors = ['#2166AC', '#D6604D', '#4DAC26'][:len(method_names)]
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(11, 4.5))
+    fig.suptitle(
+        f'Total Commitment Distance Summary  [{case_name}]',
+        fontsize=12, fontweight='bold', y=1.02,
+    )
+
+    x_pos = np.arange(len(method_names))
+    bars1 = ax1.bar(x_pos, l1_values, color=colors, alpha=0.82, edgecolor='white', linewidth=0.8)
+    ax1.set_xticks(x_pos)
+    ax1.set_xticklabels(method_names)
+    ax1.set_ylabel(r'Total $\|x - x^*\|_1$')
+    ax1.set_title('Total L1 Distance')
+    for bar, val in zip(bars1, l1_values):
+        ax1.text(
+            bar.get_x() + bar.get_width() / 2,
+            bar.get_height() + max(l1_values) * 0.02 if l1_values else 0.0,
+            f'{val:.1f}',
+            ha='center',
+            va='bottom',
+            fontsize=8,
+        )
+
+    bars2 = ax2.bar(x_pos, hamming_values, color=colors, alpha=0.82, edgecolor='white', linewidth=0.8)
+    ax2.set_xticks(x_pos)
+    ax2.set_xticklabels(method_names)
+    ax2.set_ylabel('Total Hamming Distance')
+    ax2.set_title('Total Hamming Distance')
+    for bar, val in zip(bars2, hamming_values):
+        ax2.text(
+            bar.get_x() + bar.get_width() / 2,
+            bar.get_height() + max(hamming_values) * 0.02 if hamming_values else 0.0,
+            f'{val:.0f}',
+            ha='center',
+            va='bottom',
+            fontsize=8,
+        )
+
+    fig.tight_layout()
+    path = fig_dir / f'lp_surrogate_fp_total_distance_{case_name}'
+    _save_fig(fig, path, 'LP / surrogate / FP total distance summary')
+
+
+def plot_fp_economicity_bar(
+    sample_ids: list[int],
+    optimal_costs: np.ndarray,
+    fp_costs: np.ndarray,
+    rel_gaps_pct: np.ndarray,
+    fig_dir: Path,
+    case_name: str,
+) -> None:
+    """Plot per-sample FP economicity against the optimal commitment."""
+    if not MPL_AVAILABLE or len(sample_ids) == 0:
+        return
+
+    _apply_style()
+    x_pos = np.arange(len(sample_ids))
+    bar_w = 0.38
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4.8))
+    fig.suptitle(
+        f'FP Economicity vs Optimal Commitment  [{case_name}]',
+        fontsize=12, fontweight='bold', y=1.02,
+    )
+
+    ax1.bar(x_pos - bar_w / 2, optimal_costs, bar_w, label='Optimal', color='#2166AC')
+    ax1.bar(x_pos + bar_w / 2, fp_costs, bar_w, label='FP', color='#4DAC26')
+    ax1.set_xticks(x_pos)
+    ax1.set_xticklabels([f'S{i}' for i in sample_ids])
+    ax1.set_ylabel('Total Cost')
+    ax1.set_title('Cost Comparison')
+    ax1.legend()
+
+    bars = ax2.bar(x_pos, rel_gaps_pct, color='#D6604D', alpha=0.82, edgecolor='white', linewidth=0.8)
+    ax2.set_xticks(x_pos)
+    ax2.set_xticklabels([f'S{i}' for i in sample_ids])
+    ax2.set_ylabel('Relative Gap (%)')
+    ax2.set_title('FP Cost Gap vs Optimal')
+    for bar, val in zip(bars, rel_gaps_pct):
+        ax2.text(
+            bar.get_x() + bar.get_width() / 2,
+            bar.get_height() + max(rel_gaps_pct) * 0.02 if len(rel_gaps_pct) else 0.0,
+            f'{val:.2f}',
+            ha='center',
+            va='bottom',
+            fontsize=8,
+        )
+
+    fig.tight_layout()
+    path = fig_dir / f'fp_economicity_{case_name}'
+    _save_fig(fig, path, 'FP economicity comparison')
+
+
+def summarize_lp_surrogate_fp_totals(
+    ppc,
+    all_samples: list,
+    dual_predictor,
+    trainers: dict,
+    T_DELTA: float,
+    test_n: int,
+    fig_dir: Path | None,
+    case_name: str,
+    agent=None,
+    fp_results: list | None = None,
+) -> None:
+    """Summarize total L1 / Hamming distances for LP, surrogate LP, and surrogate+FP."""
+    n = min(test_n, len(all_samples))
+    if n <= 0:
+        return
+
+    print("\n" + "=" * 70)
+    log(f"LP / Surrogate / FP 总距离汇总: {n} 个样本")
+    print("=" * 70)
+
+    fp_result_map = {}
+    if fp_results:
+        for sample_idx, success, x_result in fp_results:
+            fp_result_map[int(sample_idx)] = {
+                'success': bool(success),
+                'x': None if x_result is None else np.asarray(x_result, dtype=float),
+            }
+
+    totals_l1 = {
+        'LP': 0.0,
+        'Surrogate': 0.0,
+    }
+    totals_hamming = {
+        'LP': 0,
+        'Surrogate': 0,
+    }
+    fp_totals_l1 = 0.0
+    fp_totals_hamming = 0
+    fp_available = 0
+    fp_success = 0
+    valid_samples = 0
+
+    for i in range(n):
+        sample = all_samples[i]
+        pd_data = sample['pd_data']
+        try:
+            lambda_val = dual_predictor.predict(sample)
+            x_lp = solve_global_LP_relaxation_without_surrogate(ppc, pd_data, T_DELTA)
+            x_surr = solve_global_LP_relaxation(
+                ppc,
+                sample,
+                T_DELTA,
+                trainers,
+                lambda_val,
+                agent=agent,
+            )
+        except Exception as exc:
+            log(f"  样本 {i}: LP / Surrogate 求解失败，跳过 ({exc})")
+            continue
+
+        x_true = _extract_true_solution(sample, x_surr.shape)
+        l1_lp, hamming_lp = _compute_commitment_distance_metrics(x_lp, x_true)
+        l1_surr, hamming_surr = _compute_commitment_distance_metrics(x_surr, x_true)
+        totals_l1['LP'] += l1_lp
+        totals_l1['Surrogate'] += l1_surr
+        totals_hamming['LP'] += hamming_lp
+        totals_hamming['Surrogate'] += hamming_surr
+        valid_samples += 1
+
+        fp_msg = "FP=unavailable"
+        fp_entry = fp_result_map.get(i)
+        if fp_entry is not None and fp_entry['x'] is not None:
+            x_fp = fp_entry['x']
+            if x_fp.shape == x_true.shape:
+                l1_fp, hamming_fp = _compute_commitment_distance_metrics(x_fp, x_true)
+                fp_totals_l1 += l1_fp
+                fp_totals_hamming += hamming_fp
+                fp_available += 1
+                fp_success += int(fp_entry['success'])
+                fp_msg = (
+                    f"FP: L1={l1_fp:.2f}, Hamming={hamming_fp}, "
+                    f"success={fp_entry['success']}"
+                )
+            else:
+                fp_msg = f"FP shape mismatch={x_fp.shape}"
+
+        log(
+            f"  样本 {i}: "
+            f"LP(L1={l1_lp:.2f}, Hamming={hamming_lp}) | "
+            f"Surrogate(L1={l1_surr:.2f}, Hamming={hamming_surr}) | "
+            f"{fp_msg}"
+        )
+
+    if valid_samples == 0:
+        log("没有可用于总距离汇总的有效样本")
+        return
+
+    display_l1 = dict(totals_l1)
+    display_hamming = dict(totals_hamming)
+    if fp_available > 0:
+        display_l1['Surrogate+FP'] = fp_totals_l1
+        display_hamming['Surrogate+FP'] = fp_totals_hamming
+
+    print("\n" + "-" * 70)
+    log(f"总量汇总: valid_samples={valid_samples}/{n}")
+    log(f"  LP:            L1_sum={totals_l1['LP']:.2f}, Hamming_sum={totals_hamming['LP']}")
+    log(
+        f"  Surrogate:     L1_sum={totals_l1['Surrogate']:.2f}, "
+        f"Hamming_sum={totals_hamming['Surrogate']}"
+    )
+    log(
+        f"  Surrogate 相对 LP 改进: "
+        f"L1_sum减少 {totals_l1['LP'] - totals_l1['Surrogate']:.2f}, "
+        f"Hamming_sum减少 {totals_hamming['LP'] - totals_hamming['Surrogate']}"
+    )
+
+    if fp_results is not None:
+        if fp_available > 0:
+            log(
+                f"  Surrogate+FP:  L1_sum={fp_totals_l1:.2f}, Hamming_sum={fp_totals_hamming} "
+                f"(available={fp_available}/{valid_samples}, success={fp_success}/{fp_available})"
+            )
+            log(
+                f"  Surrogate+FP 相对 LP 改进: "
+                f"L1_sum减少 {totals_l1['LP'] - fp_totals_l1:.2f}, "
+                f"Hamming_sum减少 {totals_hamming['LP'] - fp_totals_hamming}"
+            )
+            log(
+                f"  Surrogate+FP 相对 Surrogate 改进: "
+                f"L1_sum减少 {totals_l1['Surrogate'] - fp_totals_l1:.2f}, "
+                f"Hamming_sum减少 {totals_hamming['Surrogate'] - fp_totals_hamming}"
+            )
+        else:
+            log("  Surrogate+FP: 没有可用输出，无法统计总距离")
+    print("-" * 70)
+
+    if fig_dir is not None:
+        plot_lp_surrogate_fp_total_bar(display_l1, display_hamming, fig_dir, case_name)
+
+
+def summarize_fp_economicity(
+    ppc,
+    all_samples: list,
+    fp_results: list | None,
+    T_DELTA: float,
+    fig_dir: Path | None,
+    case_name: str,
+) -> None:
+    """Compare FP commitments with the sample optimal commitments in economic cost."""
+    if not fp_results:
+        return
+
+    print("\n" + "=" * 70)
+    log("FP 经济性评估")
+    print("=" * 70)
+
+    sample_ids: list[int] = []
+    optimal_costs: list[float] = []
+    fp_costs: list[float] = []
+    abs_gaps: list[float] = []
+    rel_gaps_pct: list[float] = []
+    exact_match_count = 0
+
+    for sample_idx, success, x_result in fp_results:
+        if x_result is None:
+            log(f"  样本 {sample_idx}: FP 无输出，跳过经济性评估")
+            continue
+        if not (0 <= int(sample_idx) < len(all_samples)):
+            continue
+
+        sample = all_samples[int(sample_idx)]
+        x_true = _extract_true_solution(sample, np.asarray(x_result, dtype=float).shape)
+        optimal_eval = _evaluate_commitment_economic_cost(ppc, sample, x_true, T_DELTA)
+        fp_eval = _evaluate_commitment_economic_cost(ppc, sample, x_result, T_DELTA)
+
+        if not optimal_eval.get('success', False):
+            log(f"  样本 {sample_idx}: 最优解经济性评估失败 ({optimal_eval.get('reason', 'unknown')})")
+            continue
+        if not fp_eval.get('success', False):
+            log(f"  样本 {sample_idx}: FP 解经济性评估失败 ({fp_eval.get('reason', 'unknown')})")
+            continue
+
+        optimal_cost = float(optimal_eval['total_cost'])
+        fp_cost = float(fp_eval['total_cost'])
+        abs_gap = fp_cost - optimal_cost
+        rel_gap_pct = 100.0 * abs_gap / max(abs(optimal_cost), 1e-9)
+
+        sample_ids.append(int(sample_idx))
+        optimal_costs.append(optimal_cost)
+        fp_costs.append(fp_cost)
+        abs_gaps.append(abs_gap)
+        rel_gaps_pct.append(rel_gap_pct)
+        if abs(abs_gap) <= 1e-6:
+            exact_match_count += 1
+
+        log(
+            f"  样本 {sample_idx}: "
+            f"optimal_cost={optimal_cost:.2f}, fp_cost={fp_cost:.2f}, "
+            f"abs_gap={abs_gap:.2f}, rel_gap={rel_gap_pct:.2f}%, success={success}"
+        )
+
+    if not sample_ids:
+        log("没有可用于 FP 经济性评估的有效样本")
+        return
+
+    optimal_arr = np.asarray(optimal_costs, dtype=float)
+    fp_arr = np.asarray(fp_costs, dtype=float)
+    abs_gap_arr = np.asarray(abs_gaps, dtype=float)
+    rel_gap_arr = np.asarray(rel_gaps_pct, dtype=float)
+
+    print("\n" + "-" * 70)
+    log(f"经济性汇总: evaluated={len(sample_ids)}/{len(fp_results)}")
+    log(f"  Optimal cost mean={float(np.mean(optimal_arr)):.2f}, sum={float(np.sum(optimal_arr)):.2f}")
+    log(f"  FP cost mean={float(np.mean(fp_arr)):.2f}, sum={float(np.sum(fp_arr)):.2f}")
+    log(
+        f"  FP abs gap: mean={float(np.mean(abs_gap_arr)):.2f}, "
+        f"median={float(np.median(abs_gap_arr)):.2f}, max={float(np.max(abs_gap_arr)):.2f}"
+    )
+    log(
+        f"  FP rel gap: mean={float(np.mean(rel_gap_arr)):.2f}%, "
+        f"median={float(np.median(rel_gap_arr)):.2f}%, max={float(np.max(rel_gap_arr)):.2f}%"
+    )
+    log(f"  FP exact optimal count={exact_match_count}/{len(sample_ids)}")
+    print("-" * 70)
+
+    if fig_dir is not None:
+        plot_fp_economicity_bar(
+            sample_ids,
+            optimal_arr,
+            fp_arr,
+            rel_gap_arr,
+            fig_dir,
+            case_name,
+        )
+
+
 def analyse_lp_distance(agent, test_n: int, fig_dir: Path,
                         case_name: str, ppc=None, all_samples=None,
                         dual_predictor=None, trainers=None,
@@ -2170,8 +2609,30 @@ def test_both(ppc, data_file: Path, all_samples: list, T_DELTA: float,
             agent=agent, scenario_bank=scenario_bank, fig_dir=fig_dir,
         )
         plot_fp_results(fp_results, fig_dir, CASE_NAME)
+        summarize_fp_economicity(
+            ppc,
+            all_samples,
+            fp_results,
+            T_DELTA,
+            fig_dir,
+            CASE_NAME,
+        )
     else:
+        fp_results = None
         log("── Step 4/4  跳过可行性泵（RUN_FP=False）")
+
+    summarize_lp_surrogate_fp_totals(
+        ppc,
+        all_samples,
+        dual_predictor,
+        trainers,
+        T_DELTA,
+        test_samples,
+        fig_dir,
+        CASE_NAME,
+        agent=agent,
+        fp_results=fp_results,
+    )
 
 
 # ──────────────────────── 主函数 ────────────────────────

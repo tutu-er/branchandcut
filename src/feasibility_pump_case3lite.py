@@ -22,6 +22,7 @@ try:
         _candidate_key,
         _coerce_scenario_sample,
         _compute_hot_start_support_reference,
+        _estimate_commitment_primal_objective,
         _compute_vote_majority,
         _extract_commitment_from_sample,
         _repair_commitment_logic_heuristic,
@@ -42,6 +43,7 @@ except ImportError:
         _candidate_key,
         _coerce_scenario_sample,
         _compute_hot_start_support_reference,
+        _estimate_commitment_primal_objective,
         _compute_vote_majority,
         _extract_commitment_from_sample,
         _repair_commitment_logic_heuristic,
@@ -98,6 +100,27 @@ def _detect_single_switch_tau(row: np.ndarray) -> Optional[int]:
     if diff_idx.size != 1:
         return None
     return int(diff_idx[0] + 1)
+
+
+def _g1_switch_timing_bonus(
+    row: np.ndarray,
+    direction: str,
+    reference_tau: Optional[int],
+    horizon: int,
+) -> float:
+    """Bias G1 single-switch candidates toward earlier startup when the signal trends upward."""
+    tau = _detect_single_switch_tau(row)
+    if tau is None or reference_tau is None or horizon <= 1:
+        return 0.0
+    if direction != "up":
+        return 0.0
+
+    tau = int(np.clip(tau, 0, horizon))
+    reference_tau = int(np.clip(reference_tau, 0, horizon))
+    normalized_shift = (reference_tau - tau) / max(horizon - 1, 1)
+    early_reward = max(normalized_shift, 0.0)
+    late_penalty = max(-normalized_shift, 0.0)
+    return float(2.4 * early_reward - 0.6 * late_penalty)
 
 
 def _score_unit_option(
@@ -312,22 +335,36 @@ def _build_g1_options(
     crossing = np.where(np.diff(signal >= 0.5) != 0)[0]
     if crossing.size > 0:
         for idx in crossing:
-            tau_candidates.update([int(idx), int(idx + 1), int(idx + 2)])
+            if direction == "up":
+                tau_candidates.update([int(idx - 2), int(idx - 1), int(idx), int(idx + 1), int(idx + 2)])
+            else:
+                tau_candidates.update([int(idx), int(idx + 1), int(idx + 2)])
     else:
         pivot = int(np.argmin(np.abs(signal - 0.5)))
-        tau_candidates.update([pivot, pivot + 1])
+        if direction == "up":
+            tau_candidates.update([pivot - 2, pivot - 1, pivot, pivot + 1])
+        else:
+            tau_candidates.update([pivot, pivot + 1])
 
     direct_rows = [round_to_integer(x_lp), round_to_integer(x_surr_lp), vote_majority, x_init_k]
     if x_init_k_m.ndim == 2 and x_init_k_m.size > 0:
         direct_rows.extend(list(np.asarray(x_init_k_m, dtype=int)))
     if nearby_rows is not None and nearby_rows.size > 0:
         direct_rows.extend(list(np.asarray(nearby_rows, dtype=int)))
+    reference_tau = _detect_single_switch_tau(round_switch)
     for row in direct_rows:
         tau = _detect_single_switch_tau(row)
         if tau is not None:
-            tau_candidates.update([tau - 1, tau, tau + 1])
+            if direction == "up":
+                tau_candidates.update([tau - 2, tau - 1, tau, tau + 1])
+            else:
+                tau_candidates.update([tau - 1, tau, tau + 1])
+            if reference_tau is None:
+                reference_tau = tau
 
     tau_candidates = {int(np.clip(tau, 0, T)) for tau in tau_candidates}
+    if reference_tau is None and tau_candidates:
+        reference_tau = min(tau_candidates) if direction == "up" else max(tau_candidates)
 
     base_rows = [
         ("round_switch", round_switch, 0.6),
@@ -345,7 +382,7 @@ def _build_g1_options(
             trusted_mask,
             support_reference,
             nearby_rows=nearby_rows,
-            bonus=bonus,
+            bonus=bonus + _g1_switch_timing_bonus(row, direction, reference_tau, T),
         )
         _append_scored_option(options, name, row, score)
 
@@ -359,7 +396,7 @@ def _build_g1_options(
             trusted_mask,
             support_reference,
             nearby_rows=nearby_rows,
-            bonus=1.0,
+            bonus=1.0 + _g1_switch_timing_bonus(row, direction, reference_tau, T),
         )
         _append_scored_option(options, f"corrected_single_switch_t{tau}", row, score)
 
@@ -377,7 +414,7 @@ def _build_g1_options(
             hi = min(T, tau + 2)
             trusted_override[lo:hi] = False
 
-    return _finalize_unit_options(options, max_options=5), trusted_override
+    return _finalize_unit_options(options, max_options=6), trusted_override
 
 
 def _build_g2_block_rows(
@@ -556,6 +593,7 @@ def _build_case3lite_unit_options(
 def _build_case3lite_global_combinations(
     unit_options: List[List[dict]],
     ppc: dict,
+    pd_data: np.ndarray,
     x_lp: np.ndarray,
     x_surr_lp: np.ndarray,
     x_init_k: np.ndarray,
@@ -573,6 +611,18 @@ def _build_case3lite_global_combinations(
             [np.asarray(candidate, dtype=int) for _name, candidate in nearby_commitment_candidates],
             axis=0,
         )
+    g1_direction = None
+    g1_reference_tau = None
+    if x_lp.shape[0] >= 2:
+        g1_signal = np.clip(
+            0.45 * np.asarray(x_lp[1], dtype=float)
+            + 0.30 * np.asarray(x_surr_lp[1], dtype=float)
+            + 0.25 * np.asarray(support_reference[1], dtype=float),
+            0.0,
+            1.0,
+        )
+        g1_direction = "up" if float(g1_signal[-1] - g1_signal[0]) >= 0.0 else "down"
+        g1_reference_tau = _detect_single_switch_tau(round_to_integer(g1_signal))
 
     combos: List[dict] = []
     seen = set()
@@ -602,13 +652,26 @@ def _build_case3lite_global_combinations(
             bonus += 1.5
         if repaired.shape[0] >= 2 and _detect_single_switch_tau(repaired[1]) is not None:
             bonus += 0.8
+            bonus += 0.8 * _g1_switch_timing_bonus(
+                repaired[1],
+                g1_direction or "up",
+                g1_reference_tau,
+                repaired.shape[1],
+            )
         combo_score = float(global_match + 0.40 * local_score + bonus)
+        objective_estimate = _estimate_commitment_primal_objective(
+            repaired,
+            ppc,
+            pd_data,
+            T_delta,
+        )
 
         combos.append(
             {
                 "id": combo_index,
                 "candidate": repaired,
                 "score": combo_score,
+                "objective_estimate": float(objective_estimate),
                 "unit_choice_names": [item["name"] for item in option_tuple],
                 "unit_choice_weights": [float(item.get("weight", 0.0)) for item in option_tuple],
                 "unit_option_scores": [float(item["score"]) for item in option_tuple],
@@ -632,6 +695,14 @@ def _build_case3lite_global_combinations(
                     "id": combo_index,
                     "candidate": np.asarray(candidate, dtype=int),
                     "score": -1e6 - combo_index,
+                    "objective_estimate": float(
+                        _estimate_commitment_primal_objective(
+                            candidate,
+                            ppc,
+                            pd_data,
+                            T_delta,
+                        )
+                    ),
                     "weight": 0.0,
                     "unit_choice_names": [name] * candidate.shape[0],
                     "unit_choice_weights": [0.0] * candidate.shape[0],
@@ -703,17 +774,23 @@ def _print_global_combo_weights(global_combinations: List[dict], top_n: int = 8)
                 zip(combo["unit_choice_names"], combo["unit_choice_weights"])
             )
         ]
+        objective_piece = ""
+        if combo.get("objective_estimate") is not None:
+            objective_piece = f" obj≈{float(combo['objective_estimate']):.2f}"
         print(
             f"  #{rank:<2d} combo_weight={combo.get('weight', 0.0):.3f} "
-            f"score={combo['score']:.2f}  {' | '.join(pieces)}",
+            f"score={combo['score']:.2f}{objective_piece}  {' | '.join(pieces)}",
             flush=True,
         )
 
 
 def _print_final_combo_summary(combo: dict) -> None:
     print("Case3lite custom FP final feasible combination:", flush=True)
+    objective_piece = ""
+    if combo.get("objective_estimate") is not None:
+        objective_piece = f" obj≈{float(combo['objective_estimate']):.2f}"
     print(
-        f"  combo_weight={combo.get('weight', 0.0):.3f} score={combo['score']:.2f}",
+        f"  combo_weight={combo.get('weight', 0.0):.3f} score={combo['score']:.2f}{objective_piece}",
         flush=True,
     )
     for g, (name, weight, score) in enumerate(
@@ -990,6 +1067,7 @@ def recover_integer_solution_case3lite(
     global_combinations = _build_case3lite_global_combinations(
         unit_options,
         ppc,
+        pd_matrix,
         x_lp,
         x_surr_lp,
         x_init_k,
@@ -1014,6 +1092,7 @@ def recover_integer_solution_case3lite(
     final_solution = None
     final_success = False
     final_combo = None
+    final_objective_estimate = None
     for rank, combo in enumerate(global_combinations, start=1):
         x_start = np.asarray(combo["candidate"], dtype=int)
         start_feasible, _reason = check_uc_feasibility(x_start, ppc, pd_matrix, T_delta)
@@ -1023,32 +1102,66 @@ def recover_integer_solution_case3lite(
                 f"(weight={combo.get('weight', 0.0):.3f}, score={combo['score']:.2f})",
                 flush=True,
             )
+        candidate_solution = None
+        candidate_success = False
         if start_feasible:
-            final_solution = x_start
-            final_success = True
-            final_combo = combo
-            break
+            candidate_solution = x_start
+            candidate_success = True
+        else:
+            x_result, success = run_feasibility_pump(
+                x_start,
+                trusted_mask,
+                ppc,
+                pd_matrix,
+                T_delta,
+                x_pool=x_pool,
+                max_iter=max_fp_iter,
+                stall_perturbation_mode=stall_perturbation_mode,
+                stall_flip_fraction=stall_flip_fraction,
+                rng=rng,
+                verbose=False,
+            )
+            if success:
+                candidate_solution = np.asarray(x_result, dtype=int)
+                candidate_success = True
 
-        x_result, success = run_feasibility_pump(
-            x_start,
-            trusted_mask,
+        if not candidate_success or candidate_solution is None:
+            continue
+
+        candidate_objective_estimate = _estimate_commitment_primal_objective(
+            candidate_solution,
             ppc,
             pd_matrix,
             T_delta,
-            x_pool=x_pool,
-            max_iter=max_fp_iter,
-            stall_perturbation_mode=stall_perturbation_mode,
-            stall_flip_fraction=stall_flip_fraction,
-            rng=rng,
-            verbose=False,
         )
-        if success:
-            final_solution = x_result
+        if verbose:
+            print(
+                f"    feasible candidate objective≈{candidate_objective_estimate:.2f}",
+                flush=True,
+            )
+
+        combo["final_objective_estimate"] = float(candidate_objective_estimate)
+        if (
+            final_solution is None
+            or final_objective_estimate is None
+            or candidate_objective_estimate < final_objective_estimate - 1e-6
+            or (
+                abs(candidate_objective_estimate - final_objective_estimate) <= 1e-6
+                and combo["score"] > final_combo["score"]
+            )
+        ):
+            final_solution = np.asarray(candidate_solution, dtype=int)
             final_success = True
             final_combo = combo
-            break
+            final_objective_estimate = float(candidate_objective_estimate)
+            if verbose:
+                print(
+                    f"    incumbent updated by combo {rank}: obj≈{final_objective_estimate:.2f}",
+                    flush=True,
+                )
 
     if final_combo is not None:
+        final_combo["objective_estimate"] = float(final_objective_estimate)
         _print_final_combo_summary(final_combo)
 
     reference_solution = _extract_commitment_from_sample(sample, x_lp.shape[0], x_lp.shape[1])
@@ -1089,5 +1202,6 @@ def recover_integer_solution_case3lite(
         "support_reference": support_reference,
         "reference_solution": reference_solution,
         "selected_combo": final_combo,
+        "final_objective_estimate": final_objective_estimate,
     }
     return final_solution, final_success, details
