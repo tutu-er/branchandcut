@@ -1552,6 +1552,11 @@ class SubproblemSurrogateTrainer:
                  nn_batch_size: int = 4,
                  nn_shuffle: bool = True,
                  pg_cost_reg_deadband: float = 0.25,
+                 loss_ratio_primal: float = 1.0,
+                 loss_ratio_dual_pg: float = 1.0,
+                 loss_ratio_dual_x: float = 1.0,
+                 loss_ratio_opt: float = 1.0,
+                 loss_ratio_reg: float = 1.0,
                  device=None):
         """
         初始化单机组子问题代理约束训练器 - V3三时段版本
@@ -1659,6 +1664,11 @@ class SubproblemSurrogateTrainer:
         self.nn_batch_strategy = normalize_nn_batch_strategy(nn_batch_strategy)
         self.nn_batch_size = max(int(nn_batch_size), 1)
         self.nn_shuffle = bool(nn_shuffle)
+        self.loss_ratio_primal = float(loss_ratio_primal)
+        self.loss_ratio_dual_pg = float(loss_ratio_dual_pg)
+        self.loss_ratio_dual_x = float(loss_ratio_dual_x)
+        self.loss_ratio_opt = float(loss_ratio_opt)
+        self.loss_ratio_reg = float(loss_ratio_reg)
         self.cost_ema_alpha = 0.3  # cost_values EMA平滑系数，越小越平滑
         self.pg_cost_ema_alpha = 0.3
         self.iter_number = 0
@@ -2886,10 +2896,10 @@ class SubproblemSurrogateTrainer:
 
         # 总损失：三项BCD目标 + 正则化
         loss = (
-            self.rho_primal * obj_primal
-            + self.rho_dual_x * obj_dual_x
-            + self.rho_opt * obj_opt
-            + reg_loss
+            self.loss_ratio_primal * self.rho_primal * obj_primal
+            + self.loss_ratio_dual_x * self.rho_dual_x * obj_dual_x
+            + self.loss_ratio_opt * self.rho_opt * obj_opt
+            + self.loss_ratio_reg * reg_loss
         )
 
         return loss
@@ -2932,7 +2942,10 @@ class SubproblemSurrogateTrainer:
             pg_costs_tensor,
             self.pg_cost_reg_deadband,
         )
-        return self.rho_dual_pg * obj_dual_pg + reg_loss
+        return (
+            self.loss_ratio_dual_pg * self.rho_dual_pg * obj_dual_pg
+            + self.loss_ratio_reg * reg_loss
+        )
     
     def iter_with_surrogate_nn(
         self,
@@ -3715,6 +3728,11 @@ class SubproblemSurrogateTrainer:
                 'nn_batch_size': self.nn_batch_size,
                 'nn_shuffle': self.nn_shuffle,
                 'pg_cost_reg_deadband': self.pg_cost_reg_deadband,
+                'loss_ratio_primal': self.loss_ratio_primal,
+                'loss_ratio_dual_pg': self.loss_ratio_dual_pg,
+                'loss_ratio_dual_x': self.loss_ratio_dual_x,
+                'loss_ratio_opt': self.loss_ratio_opt,
+                'loss_ratio_reg': self.loss_ratio_reg,
                 'template_rhs_jitter_scale': self.template_rhs_jitter_scale,
                 'template_rhs_reg_deadband': self.template_rhs_reg_deadband,
                 'coeff_reg_deadband': self.coeff_reg_deadband,
@@ -3793,6 +3811,11 @@ class SubproblemSurrogateTrainer:
             )
             self.nn_batch_size = max(int(state.get('nn_batch_size', self.nn_batch_size)), 1)
             self.nn_shuffle = bool(state.get('nn_shuffle', self.nn_shuffle))
+            self.loss_ratio_primal = float(state.get('loss_ratio_primal', self.loss_ratio_primal))
+            self.loss_ratio_dual_pg = float(state.get('loss_ratio_dual_pg', self.loss_ratio_dual_pg))
+            self.loss_ratio_dual_x = float(state.get('loss_ratio_dual_x', self.loss_ratio_dual_x))
+            self.loss_ratio_opt = float(state.get('loss_ratio_opt', self.loss_ratio_opt))
+            self.loss_ratio_reg = float(state.get('loss_ratio_reg', self.loss_ratio_reg))
             self.pg_cost_reg_deadband = state.get(
                 'pg_cost_reg_deadband',
                 self.pg_cost_reg_deadband,
@@ -3907,6 +3930,11 @@ def train_subproblem_surrogate_from_data(ppc, active_set_data: List[Dict], unit_
                                           rho_dual_pg_init: float | None = None,
                                           rho_dual_x_init: float | None = None,
                                           rho_dual_coc_init: float | None = None,
+                                          loss_ratio_primal: float = 1.0,
+                                          loss_ratio_dual_pg: float = 1.0,
+                                          loss_ratio_dual_x: float = 1.0,
+                                          loss_ratio_opt: float = 1.0,
+                                          loss_ratio_reg: float = 1.0,
                                           mu_individual_lower_bound_round: int = 3,
                                           mu_group_lower_bound_round: int = 50,
                                           pg_cost_start_round: int = 3,
@@ -3949,6 +3977,11 @@ def train_subproblem_surrogate_from_data(ppc, active_set_data: List[Dict], unit_
         rho_dual_pg_init=rho_dual_pg_init,
         rho_dual_x_init=rho_dual_x_init,
         rho_dual_coc_init=rho_dual_coc_init,
+        loss_ratio_primal=loss_ratio_primal,
+        loss_ratio_dual_pg=loss_ratio_dual_pg,
+        loss_ratio_dual_x=loss_ratio_dual_x,
+        loss_ratio_opt=loss_ratio_opt,
+        loss_ratio_reg=loss_ratio_reg,
         mu_individual_lower_bound_round=mu_individual_lower_bound_round,
         mu_group_lower_bound_round=mu_group_lower_bound_round,
         pg_cost_start_round=pg_cost_start_round,
@@ -3990,6 +4023,11 @@ def train_all_subproblem_surrogates(ppc, active_set_data: List[Dict], T_delta: f
                                       rho_dual_pg_init: float | None = None,
                                       rho_dual_x_init: float | None = None,
                                       rho_dual_coc_init: float | None = None,
+                                      loss_ratio_primal: float = 1.0,
+                                      loss_ratio_dual_pg: float = 1.0,
+                                      loss_ratio_dual_x: float = 1.0,
+                                      loss_ratio_opt: float = 1.0,
+                                      loss_ratio_reg: float = 1.0,
                                       mu_individual_lower_bound_round: int = 3,
                                       mu_group_lower_bound_round: int = 50,
                                        pg_cost_start_round: int = 3,
@@ -4042,6 +4080,11 @@ def train_all_subproblem_surrogates(ppc, active_set_data: List[Dict], T_delta: f
             rho_dual_pg_init=rho_dual_pg_init,
             rho_dual_x_init=rho_dual_x_init,
             rho_dual_coc_init=rho_dual_coc_init,
+            loss_ratio_primal=loss_ratio_primal,
+            loss_ratio_dual_pg=loss_ratio_dual_pg,
+            loss_ratio_dual_x=loss_ratio_dual_x,
+            loss_ratio_opt=loss_ratio_opt,
+            loss_ratio_reg=loss_ratio_reg,
             mu_individual_lower_bound_round=mu_individual_lower_bound_round,
             mu_group_lower_bound_round=mu_group_lower_bound_round,
             pg_cost_start_round=pg_cost_start_round,
@@ -4093,6 +4136,11 @@ def train_complete_model(ppc, active_set_data: List[Dict], T_delta: float = 1.0,
                           surrogate_pg_cost_lr: float = 2e-5,
                           surrogate_pg_cost_surr_lr: float = 5e-5,
                           surrogate_pg_cost_reg_deadband: float = 0.25,
+                          surrogate_loss_ratio_primal: float = 1.0,
+                          surrogate_loss_ratio_dual_pg: float = 1.0,
+                          surrogate_loss_ratio_dual_x: float = 1.0,
+                          surrogate_loss_ratio_opt: float = 1.0,
+                          surrogate_loss_ratio_reg: float = 1.0,
                           save_dir: str = None, device=None):
     """
     完整的训练流程：先训练对偶预测器，再训练所有机组的代理约束
@@ -4164,6 +4212,11 @@ def train_complete_model(ppc, active_set_data: List[Dict], T_delta: float = 1.0,
         pg_cost_lr=surrogate_pg_cost_lr,
         pg_cost_surr_lr=surrogate_pg_cost_surr_lr,
         pg_cost_reg_deadband=surrogate_pg_cost_reg_deadband,
+        loss_ratio_primal=surrogate_loss_ratio_primal,
+        loss_ratio_dual_pg=surrogate_loss_ratio_dual_pg,
+        loss_ratio_dual_x=surrogate_loss_ratio_dual_x,
+        loss_ratio_opt=surrogate_loss_ratio_opt,
+        loss_ratio_reg=surrogate_loss_ratio_reg,
         save_dir=save_dir, device=device
     )
     
@@ -5070,7 +5123,12 @@ def main():
 def run_training(case_name: str = 'case30', n_samples: int = 20, T: int = 8,
                  unit_ids: List[int] = None, save_dir: str = '../result/subproblem_models',
                  dual_epochs: int = 100, surrogate_max_iter: int = 20,
-                 surrogate_nn_epochs: int = 10):
+                 surrogate_nn_epochs: int = 10,
+                 surrogate_loss_ratio_primal: float = 1.0,
+                 surrogate_loss_ratio_dual_pg: float = 1.0,
+                 surrogate_loss_ratio_dual_x: float = 1.0,
+                 surrogate_loss_ratio_opt: float = 1.0,
+                 surrogate_loss_ratio_reg: float = 1.0):
     """
     便捷的训练入口函数
     
@@ -5083,6 +5141,11 @@ def run_training(case_name: str = 'case30', n_samples: int = 20, T: int = 8,
         dual_epochs: 对偶预测器训练轮数
         surrogate_max_iter: 代理约束BCD迭代次数
         surrogate_nn_epochs: 代理约束NN训练轮数
+        surrogate_loss_ratio_primal: 主代理NN中 obj_primal 的额外倍率
+        surrogate_loss_ratio_dual_pg: pg-cost NN中 obj_dual_pg 的额外倍率
+        surrogate_loss_ratio_dual_x: 主代理NN中 obj_dual_x 的额外倍率
+        surrogate_loss_ratio_opt: 主代理NN中 obj_opt 的额外倍率
+        surrogate_loss_ratio_reg: NN正则项的额外倍率
         
     Returns:
         (dual_predictor, trainers) 元组
@@ -5107,6 +5170,11 @@ def run_training(case_name: str = 'case30', n_samples: int = 20, T: int = 8,
         dual_epochs=dual_epochs,
         surrogate_max_iter=surrogate_max_iter,
         surrogate_nn_epochs=surrogate_nn_epochs,
+        surrogate_loss_ratio_primal=surrogate_loss_ratio_primal,
+        surrogate_loss_ratio_dual_pg=surrogate_loss_ratio_dual_pg,
+        surrogate_loss_ratio_dual_x=surrogate_loss_ratio_dual_x,
+        surrogate_loss_ratio_opt=surrogate_loss_ratio_opt,
+        surrogate_loss_ratio_reg=surrogate_loss_ratio_reg,
         save_dir=save_dir
     )
     

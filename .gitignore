@@ -65,8 +65,12 @@ coverage.xml
 # Claude Code
 .claude/
 
-# Experiment results and outputs
-result/
+# Experiment results and outputs (default: ignore all under result/)
+result/*
+!result/active_set/
+result/active_set/*
+!result/active_set/active_sets_case3lite_T24_n1000_20260403_180137.json
+!result/active_set/README_CASE3LITE_ACTIVE_SET.txt
 logs/
 *.log
 *.gz

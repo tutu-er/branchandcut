@@ -67,7 +67,7 @@ RUN_FP = True
 
 # 顶部集中配置区：训练相关参数统一在这里调整
 CASE_NAME = 'case3lite'      # 'case3' / 'case3lite' / 'case14' / 'case30' / 'case39' / 'case118'
-MAX_SAMPLES = 20            # None = 使用全部样本
+MAX_SAMPLES = 600            # None = 使用全部样本
 T_DELTA = 1.0
 DUAL_EPOCHS = 200
 DUAL_BATCH_SIZE = 8
@@ -85,7 +85,7 @@ JOINT_MAX_ITER = 10
 JOINT_NN_EPOCHS = 5
 JOINT_SURR_NN_EPOCHS = 5
 JOINT_DUAL_DECAY_ROUND = 0
-ACTIVE_SETS_FILE = "result/active_set/active_sets_case3lite_T24_n200_20260328_102856.json"  # None = 自动查找最新
+ACTIVE_SETS_FILE = "result/active_set/active_sets_case3lite_T24_n1000_20260403_180137.json"  # None = 自动查找最新
 BCD_MODEL_FILE = None
 SURROGATE_MODEL_DIR = None
 SPARSE_TOP_K_VARIABLES = 20
@@ -109,6 +109,10 @@ BCD_RHO_DUAL_PG_INIT = 1
 BCD_RHO_DUAL_X_INIT = 1e-3
 BCD_RHO_DUAL_COC_INIT = 1
 BCD_RHO_OPT_INIT = 1e-3
+BCD_LOSS_RATIO_PRIMAL = 1.0
+BCD_LOSS_RATIO_DUAL_X = 1e1
+BCD_LOSS_RATIO_OPT = 1.0
+BCD_LOSS_RATIO_REG = 1.0
 BCD_RESTORE_RHO_FROM_CHECKPOINT = False
 BCD_MAX_THETA_CONSTRAINTS_PER_TIME_SLOT = 20
 BCD_GAMMA_BASE = 1e-3
@@ -120,6 +124,11 @@ SUBPROBLEM_RHO_DUAL_PG_INIT = 1
 SUBPROBLEM_RHO_DUAL_X_INIT = 1e-3
 SUBPROBLEM_RHO_DUAL_COC_INIT = 1
 SUBPROBLEM_RHO_OPT_INIT = 1e-3
+SUBPROBLEM_LOSS_RATIO_PRIMAL = 1.0
+SUBPROBLEM_LOSS_RATIO_DUAL_PG = 1.0
+SUBPROBLEM_LOSS_RATIO_DUAL_X = 1e1
+SUBPROBLEM_LOSS_RATIO_OPT = 1.0
+SUBPROBLEM_LOSS_RATIO_REG = 1.0
 SUBPROBLEM_GAMMA_BASE = 1e-3
 SUBPROBLEM_MU_DUAL_FLOOR_INIT = 1
 SUBPROBLEM_MU_DUAL_FLOOR_INDIVIDUAL_ROUND = round(MAX_ITER/10)
@@ -311,6 +320,11 @@ def run_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS,
                   rho_dual_x_init: float | None = None,
                   rho_dual_coc_init: float | None = None,
                   rho_opt_init: float = 1e-3,
+                  loss_ratio_primal: float = 1.0,
+                  loss_ratio_dual_pg: float = 1.0,
+                  loss_ratio_dual_x: float = 1.0,
+                  loss_ratio_opt: float = 1.0,
+                  loss_ratio_reg: float = 1.0,
                   subproblem_gamma_base: float = 1e-3,
                   mu_lower_bound_init: float = 0.1,
                   mu_individual_lower_bound_round: int = 3,
@@ -350,6 +364,10 @@ def run_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS,
         f"main_lr={subproblem_nn_learning_rate}, x_cost_lr={subproblem_cost_learning_rate}, "
         f"c_pg_surr_lr={pg_cost_surr_lr}"
     )
+    log(
+        f"subproblem_loss_ratio: primal={loss_ratio_primal}, dual_pg={loss_ratio_dual_pg}, "
+        f"dual_x={loss_ratio_dual_x}, opt={loss_ratio_opt}, reg={loss_ratio_reg}"
+    )
     print("=" * 70)
 
     # 步骤 1：对偶变量预测器（串行，NN 训练无需并行化）
@@ -382,6 +400,11 @@ def run_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS,
                 rho_dual_x_init=rho_dual_x_init,
                 rho_dual_coc_init=rho_dual_coc_init,
                 rho_opt_init=rho_opt_init,
+                loss_ratio_primal=loss_ratio_primal,
+                loss_ratio_dual_pg=loss_ratio_dual_pg,
+                loss_ratio_dual_x=loss_ratio_dual_x,
+                loss_ratio_opt=loss_ratio_opt,
+                loss_ratio_reg=loss_ratio_reg,
                 gamma_base=subproblem_gamma_base,
                 mu_lower_bound_init=mu_lower_bound_init,
                 mu_individual_lower_bound_round=mu_individual_lower_bound_round,
@@ -410,6 +433,11 @@ def run_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS,
                 rho_dual_x_init=rho_dual_x_init,
                 rho_dual_coc_init=rho_dual_coc_init,
                 rho_opt_init=rho_opt_init,
+                loss_ratio_primal=loss_ratio_primal,
+                loss_ratio_dual_pg=loss_ratio_dual_pg,
+                loss_ratio_dual_x=loss_ratio_dual_x,
+                loss_ratio_opt=loss_ratio_opt,
+                loss_ratio_reg=loss_ratio_reg,
                 gamma_base=subproblem_gamma_base,
                 mu_lower_bound_init=mu_lower_bound_init,
                 mu_individual_lower_bound_round=mu_individual_lower_bound_round,
@@ -524,6 +552,10 @@ def run_bcd(ppc, all_samples: list, T_DELTA, MAX_ITER, bcd_model_dir,
             rho_dual_x_init: float | None = None,
             rho_dual_coc_init: float | None = None,
             rho_opt_init: float = 1e-2,
+            loss_ratio_primal: float = 1.0,
+            loss_ratio_dual_x: float = 1.0,
+            loss_ratio_opt: float = 1.0,
+            loss_ratio_reg: float = 1.0,
             gamma_base: float = 1e-2,
             mu_dual_floor_init: float = 0.1,
             ita_dual_floor_init: float = 0.1,
@@ -550,6 +582,10 @@ def run_bcd(ppc, all_samples: list, T_DELTA, MAX_ITER, bcd_model_dir,
         f"dual_x={rho_dual_x_init if rho_dual_x_init is not None else rho_dual_init}, "
         f"dual_coc={rho_dual_coc_init if rho_dual_coc_init is not None else rho_dual_init}, "
         f"opt={rho_opt_init}"
+    )
+    log(
+        f"bcd_loss_ratio: primal={loss_ratio_primal}, dual_x={loss_ratio_dual_x}, "
+        f"opt={loss_ratio_opt}, reg={loss_ratio_reg}"
     )
 
     print("\n" + "=" * 70)
@@ -591,6 +627,10 @@ def run_bcd(ppc, all_samples: list, T_DELTA, MAX_ITER, bcd_model_dir,
             nn_batch_strategy=nn_batch_strategy,
             nn_batch_size=nn_batch_size,
             nn_shuffle=nn_shuffle,
+            loss_ratio_primal=loss_ratio_primal,
+            loss_ratio_dual_x=loss_ratio_dual_x,
+            loss_ratio_opt=loss_ratio_opt,
+            loss_ratio_reg=loss_ratio_reg,
         )
     else:
         log(f"使用并行 ParallelAgent_NN_BCD (n_workers={n_workers})")
@@ -619,6 +659,10 @@ def run_bcd(ppc, all_samples: list, T_DELTA, MAX_ITER, bcd_model_dir,
             nn_batch_strategy=nn_batch_strategy,
             nn_batch_size=nn_batch_size,
             nn_shuffle=nn_shuffle,
+            loss_ratio_primal=loss_ratio_primal,
+            loss_ratio_dual_x=loss_ratio_dual_x,
+            loss_ratio_opt=loss_ratio_opt,
+            loss_ratio_reg=loss_ratio_reg,
             n_workers=n_workers,
         )
 
@@ -711,6 +755,10 @@ def run_sparse_bcd(ppc, all_samples: list, T_DELTA, MAX_ITER, bcd_model_dir,
                    rho_dual_x_init: float | None = None,
                    rho_dual_coc_init: float | None = None,
                    rho_opt_init: float = 1e-2,
+                   loss_ratio_primal: float = 1.0,
+                   loss_ratio_dual_x: float = 1.0,
+                   loss_ratio_opt: float = 1.0,
+                   loss_ratio_reg: float = 1.0,
                    gamma_base: float = 1e-2,
                    mu_dual_floor_init: float = 0.1,
                    ita_dual_floor_init: float = 0.1,
@@ -749,6 +797,10 @@ def run_sparse_bcd(ppc, all_samples: list, T_DELTA, MAX_ITER, bcd_model_dir,
         rho_dual_x_init=rho_dual_x_init,
         rho_dual_coc_init=rho_dual_coc_init,
         rho_opt_init=rho_opt_init,
+        loss_ratio_primal=loss_ratio_primal,
+        loss_ratio_dual_x=loss_ratio_dual_x,
+        loss_ratio_opt=loss_ratio_opt,
+        loss_ratio_reg=loss_ratio_reg,
         gamma_base=gamma_base,
         mu_dual_floor_init=mu_dual_floor_init,
         ita_dual_floor_init=ita_dual_floor_init,
@@ -798,6 +850,10 @@ def run_sparse_bcd(ppc, all_samples: list, T_DELTA, MAX_ITER, bcd_model_dir,
         rho_dual_x_init=rho_dual_x_init,
         rho_dual_coc_init=rho_dual_coc_init,
         rho_opt_init=rho_opt_init,
+        loss_ratio_primal=loss_ratio_primal,
+        loss_ratio_dual_x=loss_ratio_dual_x,
+        loss_ratio_opt=loss_ratio_opt,
+        loss_ratio_reg=loss_ratio_reg,
         gamma_base=gamma_base,
         mu_dual_floor_init=mu_dual_floor_init,
         ita_dual_floor_init=ita_dual_floor_init,
@@ -885,6 +941,10 @@ def main():
     BCD_RHO_DUAL_X_INIT_VALUE = BCD_RHO_DUAL_X_INIT
     BCD_RHO_DUAL_COC_INIT_VALUE = BCD_RHO_DUAL_COC_INIT
     BCD_RHO_OPT_INIT_VALUE = BCD_RHO_OPT_INIT
+    BCD_LOSS_RATIO_PRIMAL_VALUE = BCD_LOSS_RATIO_PRIMAL
+    BCD_LOSS_RATIO_DUAL_X_VALUE = BCD_LOSS_RATIO_DUAL_X
+    BCD_LOSS_RATIO_OPT_VALUE = BCD_LOSS_RATIO_OPT
+    BCD_LOSS_RATIO_REG_VALUE = BCD_LOSS_RATIO_REG
     BCD_MAX_THETA_CONSTRAINTS_PER_TIME_SLOT_VALUE = BCD_MAX_THETA_CONSTRAINTS_PER_TIME_SLOT
     BCD_GAMMA_BASE_VALUE = BCD_GAMMA_BASE
     BCD_MU_DUAL_FLOOR_INIT_VALUE = BCD_MU_DUAL_FLOOR_INIT
@@ -895,6 +955,11 @@ def main():
     SUBPROBLEM_RHO_DUAL_X_INIT_VALUE = SUBPROBLEM_RHO_DUAL_X_INIT
     SUBPROBLEM_RHO_DUAL_COC_INIT_VALUE = SUBPROBLEM_RHO_DUAL_COC_INIT
     SUBPROBLEM_RHO_OPT_INIT_VALUE = SUBPROBLEM_RHO_OPT_INIT
+    SUBPROBLEM_LOSS_RATIO_PRIMAL_VALUE = SUBPROBLEM_LOSS_RATIO_PRIMAL
+    SUBPROBLEM_LOSS_RATIO_DUAL_PG_VALUE = SUBPROBLEM_LOSS_RATIO_DUAL_PG
+    SUBPROBLEM_LOSS_RATIO_DUAL_X_VALUE = SUBPROBLEM_LOSS_RATIO_DUAL_X
+    SUBPROBLEM_LOSS_RATIO_OPT_VALUE = SUBPROBLEM_LOSS_RATIO_OPT
+    SUBPROBLEM_LOSS_RATIO_REG_VALUE = SUBPROBLEM_LOSS_RATIO_REG
     SUBPROBLEM_GAMMA_BASE_VALUE = SUBPROBLEM_GAMMA_BASE
     SUBPROBLEM_MU_DUAL_FLOOR_INIT_VALUE = SUBPROBLEM_MU_DUAL_FLOOR_INIT
     SUBPROBLEM_MU_DUAL_FLOOR_INDIVIDUAL_ROUND_VALUE = SUBPROBLEM_MU_DUAL_FLOOR_INDIVIDUAL_ROUND
@@ -941,6 +1006,13 @@ def main():
         f"NN size config: BCD={BCD_NN_SIZE_VALUE} {BCD_NN_HIDDEN_DIMS_VALUE}, "
         f"subproblem={SUBPROBLEM_NN_SIZE_VALUE} {SUBPROBLEM_NN_HIDDEN_DIMS_VALUE}"
     )
+    log(
+        f"Loss ratio config: BCD(primal={BCD_LOSS_RATIO_PRIMAL_VALUE}, dual_x={BCD_LOSS_RATIO_DUAL_X_VALUE}, "
+        f"opt={BCD_LOSS_RATIO_OPT_VALUE}, reg={BCD_LOSS_RATIO_REG_VALUE}); "
+        f"subproblem(primal={SUBPROBLEM_LOSS_RATIO_PRIMAL_VALUE}, dual_pg={SUBPROBLEM_LOSS_RATIO_DUAL_PG_VALUE}, "
+        f"dual_x={SUBPROBLEM_LOSS_RATIO_DUAL_X_VALUE}, opt={SUBPROBLEM_LOSS_RATIO_OPT_VALUE}, "
+        f"reg={SUBPROBLEM_LOSS_RATIO_REG_VALUE})"
+    )
 
     # ── 查找数据文件 ─────────────────────────────────────
     if ACTIVE_SETS_FILE is not None:
@@ -984,6 +1056,10 @@ def main():
                     rho_dual_x_init=BCD_RHO_DUAL_X_INIT_VALUE,
                     rho_dual_coc_init=BCD_RHO_DUAL_COC_INIT_VALUE,
                     rho_opt_init=BCD_RHO_OPT_INIT_VALUE,
+                    loss_ratio_primal=BCD_LOSS_RATIO_PRIMAL_VALUE,
+                    loss_ratio_dual_x=BCD_LOSS_RATIO_DUAL_X_VALUE,
+                    loss_ratio_opt=BCD_LOSS_RATIO_OPT_VALUE,
+                    loss_ratio_reg=BCD_LOSS_RATIO_REG_VALUE,
                     gamma_base=BCD_GAMMA_BASE_VALUE,
                     mu_dual_floor_init=BCD_MU_DUAL_FLOOR_INIT_VALUE,
                     ita_dual_floor_init=BCD_ITA_DUAL_FLOOR_INIT_VALUE,
@@ -1032,6 +1108,10 @@ def main():
                 rho_dual_x_init=BCD_RHO_DUAL_X_INIT_VALUE,
                 rho_dual_coc_init=BCD_RHO_DUAL_COC_INIT_VALUE,
                 rho_opt_init=BCD_RHO_OPT_INIT_VALUE,
+                loss_ratio_primal=BCD_LOSS_RATIO_PRIMAL_VALUE,
+                loss_ratio_dual_x=BCD_LOSS_RATIO_DUAL_X_VALUE,
+                loss_ratio_opt=BCD_LOSS_RATIO_OPT_VALUE,
+                loss_ratio_reg=BCD_LOSS_RATIO_REG_VALUE,
                 gamma_base=BCD_GAMMA_BASE_VALUE,
                 mu_dual_floor_init=BCD_MU_DUAL_FLOOR_INIT_VALUE,
                 ita_dual_floor_init=BCD_ITA_DUAL_FLOOR_INIT_VALUE,
@@ -1068,6 +1148,11 @@ def main():
                 rho_dual_x_init=SUBPROBLEM_RHO_DUAL_X_INIT_VALUE,
                 rho_dual_coc_init=SUBPROBLEM_RHO_DUAL_COC_INIT_VALUE,
                 rho_opt_init=SUBPROBLEM_RHO_OPT_INIT_VALUE,
+                loss_ratio_primal=SUBPROBLEM_LOSS_RATIO_PRIMAL_VALUE,
+                loss_ratio_dual_pg=SUBPROBLEM_LOSS_RATIO_DUAL_PG_VALUE,
+                loss_ratio_dual_x=SUBPROBLEM_LOSS_RATIO_DUAL_X_VALUE,
+                loss_ratio_opt=SUBPROBLEM_LOSS_RATIO_OPT_VALUE,
+                loss_ratio_reg=SUBPROBLEM_LOSS_RATIO_REG_VALUE,
                 subproblem_gamma_base=SUBPROBLEM_GAMMA_BASE_VALUE,
                 mu_lower_bound_init=SUBPROBLEM_MU_DUAL_FLOOR_INIT_VALUE,
                 mu_individual_lower_bound_round=SUBPROBLEM_MU_DUAL_FLOOR_INDIVIDUAL_ROUND_VALUE,
@@ -1119,6 +1204,10 @@ def main():
                     rho_dual_x_init=BCD_RHO_DUAL_X_INIT_VALUE,
                     rho_dual_coc_init=BCD_RHO_DUAL_COC_INIT_VALUE,
                     rho_opt_init=BCD_RHO_OPT_INIT_VALUE,
+                    loss_ratio_primal=BCD_LOSS_RATIO_PRIMAL_VALUE,
+                    loss_ratio_dual_x=BCD_LOSS_RATIO_DUAL_X_VALUE,
+                    loss_ratio_opt=BCD_LOSS_RATIO_OPT_VALUE,
+                    loss_ratio_reg=BCD_LOSS_RATIO_REG_VALUE,
                     gamma_base=BCD_GAMMA_BASE_VALUE,
                     mu_dual_floor_init=BCD_MU_DUAL_FLOOR_INIT_VALUE,
                     ita_dual_floor_init=BCD_ITA_DUAL_FLOOR_INIT_VALUE,
@@ -1158,6 +1247,10 @@ def main():
                         rho_dual_x_init=BCD_RHO_DUAL_X_INIT_VALUE,
                         rho_dual_coc_init=BCD_RHO_DUAL_COC_INIT_VALUE,
                         rho_opt_init=BCD_RHO_OPT_INIT_VALUE,
+                        loss_ratio_primal=BCD_LOSS_RATIO_PRIMAL_VALUE,
+                        loss_ratio_dual_x=BCD_LOSS_RATIO_DUAL_X_VALUE,
+                        loss_ratio_opt=BCD_LOSS_RATIO_OPT_VALUE,
+                        loss_ratio_reg=BCD_LOSS_RATIO_REG_VALUE,
                         gamma_base=BCD_GAMMA_BASE_VALUE,
                         mu_dual_floor_init=BCD_MU_DUAL_FLOOR_INIT_VALUE,
                         ita_dual_floor_init=BCD_ITA_DUAL_FLOOR_INIT_VALUE,
@@ -1181,6 +1274,10 @@ def main():
                         rho_dual_x_init=BCD_RHO_DUAL_X_INIT_VALUE,
                         rho_dual_coc_init=BCD_RHO_DUAL_COC_INIT_VALUE,
                         rho_opt_init=BCD_RHO_OPT_INIT_VALUE,
+                        loss_ratio_primal=BCD_LOSS_RATIO_PRIMAL_VALUE,
+                        loss_ratio_dual_x=BCD_LOSS_RATIO_DUAL_X_VALUE,
+                        loss_ratio_opt=BCD_LOSS_RATIO_OPT_VALUE,
+                        loss_ratio_reg=BCD_LOSS_RATIO_REG_VALUE,
                         gamma_base=BCD_GAMMA_BASE_VALUE,
                         mu_dual_floor_init=BCD_MU_DUAL_FLOOR_INIT_VALUE,
                         ita_dual_floor_init=BCD_ITA_DUAL_FLOOR_INIT_VALUE,
@@ -1202,6 +1299,10 @@ def main():
                         rho_dual_x_init=BCD_RHO_DUAL_X_INIT_VALUE,
                         rho_dual_coc_init=BCD_RHO_DUAL_COC_INIT_VALUE,
                         rho_opt_init=BCD_RHO_OPT_INIT_VALUE,
+                        loss_ratio_primal=BCD_LOSS_RATIO_PRIMAL_VALUE,
+                        loss_ratio_dual_x=BCD_LOSS_RATIO_DUAL_X_VALUE,
+                        loss_ratio_opt=BCD_LOSS_RATIO_OPT_VALUE,
+                        loss_ratio_reg=BCD_LOSS_RATIO_REG_VALUE,
                         gamma_base=BCD_GAMMA_BASE_VALUE,
                         mu_dual_floor_init=BCD_MU_DUAL_FLOOR_INIT_VALUE,
                         ita_dual_floor_init=BCD_ITA_DUAL_FLOOR_INIT_VALUE,
@@ -1244,6 +1345,10 @@ def main():
                     rho_dual_x_init=BCD_RHO_DUAL_X_INIT_VALUE,
                     rho_dual_coc_init=BCD_RHO_DUAL_COC_INIT_VALUE,
                     rho_opt_init=BCD_RHO_OPT_INIT_VALUE,
+                    loss_ratio_primal=BCD_LOSS_RATIO_PRIMAL_VALUE,
+                    loss_ratio_dual_x=BCD_LOSS_RATIO_DUAL_X_VALUE,
+                    loss_ratio_opt=BCD_LOSS_RATIO_OPT_VALUE,
+                    loss_ratio_reg=BCD_LOSS_RATIO_REG_VALUE,
                     gamma_base=BCD_GAMMA_BASE_VALUE,
                     mu_dual_floor_init=BCD_MU_DUAL_FLOOR_INIT_VALUE,
                     ita_dual_floor_init=BCD_ITA_DUAL_FLOOR_INIT_VALUE,
@@ -1286,6 +1391,11 @@ def main():
                     rho_dual_x_init=SUBPROBLEM_RHO_DUAL_X_INIT_VALUE,
                     rho_dual_coc_init=SUBPROBLEM_RHO_DUAL_COC_INIT_VALUE,
                     rho_opt_init=SUBPROBLEM_RHO_OPT_INIT_VALUE,
+                    loss_ratio_primal=SUBPROBLEM_LOSS_RATIO_PRIMAL_VALUE,
+                    loss_ratio_dual_pg=SUBPROBLEM_LOSS_RATIO_DUAL_PG_VALUE,
+                    loss_ratio_dual_x=SUBPROBLEM_LOSS_RATIO_DUAL_X_VALUE,
+                    loss_ratio_opt=SUBPROBLEM_LOSS_RATIO_OPT_VALUE,
+                    loss_ratio_reg=SUBPROBLEM_LOSS_RATIO_REG_VALUE,
                     subproblem_gamma_base=SUBPROBLEM_GAMMA_BASE_VALUE,
                     mu_lower_bound_init=SUBPROBLEM_MU_DUAL_FLOOR_INIT_VALUE,
                     mu_individual_lower_bound_round=SUBPROBLEM_MU_DUAL_FLOOR_INDIVIDUAL_ROUND_VALUE,

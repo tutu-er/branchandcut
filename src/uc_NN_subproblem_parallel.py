@@ -102,6 +102,11 @@ class ParallelSubproblemSurrogateTrainer(SubproblemSurrogateTrainer):
         nn_batch_size: int = 4,
         nn_shuffle: bool = True,
         pg_cost_reg_deadband: float = 0.25,
+        loss_ratio_primal: float = 1.0,
+        loss_ratio_dual_pg: float = 1.0,
+        loss_ratio_dual_x: float = 1.0,
+        loss_ratio_opt: float = 1.0,
+        loss_ratio_reg: float = 1.0,
         device=None,
         n_workers: int = 4,
     ):
@@ -131,6 +136,11 @@ class ParallelSubproblemSurrogateTrainer(SubproblemSurrogateTrainer):
             nn_batch_size=nn_batch_size,
             nn_shuffle=nn_shuffle,
             pg_cost_reg_deadband=pg_cost_reg_deadband,
+            loss_ratio_primal=loss_ratio_primal,
+            loss_ratio_dual_pg=loss_ratio_dual_pg,
+            loss_ratio_dual_x=loss_ratio_dual_x,
+            loss_ratio_opt=loss_ratio_opt,
+            loss_ratio_reg=loss_ratio_reg,
             device=device,
         )
         self.n_workers = min(n_workers, self.n_samples)

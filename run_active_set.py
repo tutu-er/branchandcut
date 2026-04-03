@@ -24,8 +24,8 @@ from src.mti118_data_loader import (
 # 顶部集中配置区：active-set 采样参数统一在这里调整
 CASE_NAME = "case3lite"   # "case3" / "case3lite" / "case30" / "case118"
 HORIZON = 24
-MAX_SAMPLES = 100
-TARGET_SAMPLES = 100      # None 表示只按 MAX_SAMPLES 控制
+MAX_SAMPLES = 1000
+TARGET_SAMPLES = 1000      # None 表示只按 MAX_SAMPLES 控制
 ALPHA = 0.70
 DELTA = 0.05
 EPSILON = 0.10

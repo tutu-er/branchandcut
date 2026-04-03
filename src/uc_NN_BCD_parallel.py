@@ -57,6 +57,10 @@ class ParallelAgent_NN_BCD(Agent_NN_BCD):
         nn_batch_strategy: str = "full-batch",
         nn_batch_size: int = 4,
         nn_shuffle: bool = True,
+        loss_ratio_primal: float = 1.0,
+        loss_ratio_dual_x: float = 1.0,
+        loss_ratio_opt: float = 1.0,
+        loss_ratio_reg: float = 1.0,
         n_workers: int = 4,
     ):
         super().__init__(
@@ -85,6 +89,10 @@ class ParallelAgent_NN_BCD(Agent_NN_BCD):
             nn_batch_strategy=nn_batch_strategy,
             nn_batch_size=nn_batch_size,
             nn_shuffle=nn_shuffle,
+            loss_ratio_primal=loss_ratio_primal,
+            loss_ratio_dual_x=loss_ratio_dual_x,
+            loss_ratio_opt=loss_ratio_opt,
+            loss_ratio_reg=loss_ratio_reg,
         )
         self.n_workers = min(n_workers, self.n_samples)
 

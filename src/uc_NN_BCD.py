@@ -502,6 +502,10 @@ class Agent_NN_BCD:
         nn_batch_strategy: str = "full-batch",
         nn_batch_size: int = 4,
         nn_shuffle: bool = True,
+        loss_ratio_primal: float = 1.0,
+        loss_ratio_dual_x: float = 1.0,
+        loss_ratio_opt: float = 1.0,
+        loss_ratio_reg: float = 1.0,
     ):
         self.ppc = ppc
         self.ppc_raw = ppc
@@ -578,6 +582,10 @@ class Agent_NN_BCD:
         self.nn_batch_strategy = normalize_nn_batch_strategy(nn_batch_strategy)
         self.nn_batch_size = max(1, int(nn_batch_size))
         self.nn_shuffle = bool(nn_shuffle)
+        self.loss_ratio_primal = float(loss_ratio_primal)
+        self.loss_ratio_dual_x = float(loss_ratio_dual_x)
+        self.loss_ratio_opt = float(loss_ratio_opt)
+        self.loss_ratio_reg = float(loss_ratio_reg)
         rho_dual_pg_base = rho_dual_init if rho_dual_pg_init is None else rho_dual_pg_init
         rho_dual_x_base = rho_dual_init if rho_dual_x_init is None else rho_dual_x_init
         rho_dual_coc_base = rho_dual_init if rho_dual_coc_init is None else rho_dual_coc_init
@@ -3673,10 +3681,11 @@ class Agent_NN_BCD:
         )
         reg_loss = reg_base * self._get_regularization_scale()
 
-        primal_term = obj_primal * self.rho_primal
-        dual_x_term = obj_dual_x * self.rho_dual_x
-        opt_term = obj_opt * self.rho_opt
-        loss = primal_term + dual_x_term + opt_term + reg_loss
+        primal_term = self.loss_ratio_primal * obj_primal * self.rho_primal
+        dual_x_term = self.loss_ratio_dual_x * obj_dual_x * self.rho_dual_x
+        opt_term = self.loss_ratio_opt * obj_opt * self.rho_opt
+        scaled_reg_loss = self.loss_ratio_reg * reg_loss
+        loss = primal_term + dual_x_term + opt_term + scaled_reg_loss
 
         if not return_components:
             return loss
@@ -3688,7 +3697,7 @@ class Agent_NN_BCD:
             'primal_term': primal_term.detach(),
             'dual_x_term': dual_x_term.detach(),
             'opt_term': opt_term.detach(),
-            'reg_term': reg_loss.detach(),
+            'reg_term': scaled_reg_loss.detach(),
         }
         return loss, components
       
@@ -4738,6 +4747,10 @@ class Agent_NN_BCD:
             "rho_dual_coc": self.rho_dual_coc,
             "rho_opt": self.rho_opt,
             "gamma_dual_component_scale": self.gamma_dual_component_scale,
+            "loss_ratio_primal": self.loss_ratio_primal,
+            "loss_ratio_dual_x": self.loss_ratio_dual_x,
+            "loss_ratio_opt": self.loss_ratio_opt,
+            "loss_ratio_reg": self.loss_ratio_reg,
         }
         
         torch.save(state, filepath)
@@ -4864,6 +4877,10 @@ class Agent_NN_BCD:
             "gamma_dual_component_scale",
             self.gamma_dual_component_scale,
         )
+        self.loss_ratio_primal = float(state.get("loss_ratio_primal", self.loss_ratio_primal))
+        self.loss_ratio_dual_x = float(state.get("loss_ratio_dual_x", self.loss_ratio_dual_x))
+        self.loss_ratio_opt = float(state.get("loss_ratio_opt", self.loss_ratio_opt))
+        self.loss_ratio_reg = float(state.get("loss_ratio_reg", self.loss_ratio_reg))
 
         self.refresh_theta_zeta_values_from_networks()
 
