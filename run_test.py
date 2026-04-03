@@ -87,11 +87,25 @@ BCD_MAX_THETA_CONSTRAINTS_PER_TIME_SLOT = 10
 BCD_GAMMA_BASE = 1e-2
 
 # surrogate / both 模式：已训练 surrogate 模型目录（训练时输出的带时间戳路径）
-MODEL_DIR = 'result/surrogate_models/subproblem_models_case3lite_20260329_165256'
+# 设为 None 则自动查找 result/surrogate_models/ 下最新的匹配目录
+MODEL_DIR = None
 
 # bcd / both 模式：已训练 BCD 模型 .pth 文件路径
-# BCD_MODEL_PATH = 'result/bcd_models/bcd_model_case30_20260322_150043.pth'
-BCD_MODEL_PATH = 'result/bcd_models/bcd_model_case3lite_20260328_112148.pth'
+# 设为 None 则自动查找 result/bcd_models/ 下最新的匹配文件
+BCD_MODEL_PATH = None
+
+
+def _auto_discover_model_path(directory, glob_pattern, label):
+    """在 directory 下按 glob_pattern 查找最新文件/目录。"""
+    d = Path(__file__).parent / directory
+    if not d.exists():
+        return None
+    candidates = sorted(d.glob(glob_pattern), key=lambda p: p.stat().st_mtime, reverse=True)
+    if candidates:
+        rel = str(candidates[0].relative_to(Path(__file__).parent))
+        print(f"[自动发现] {label}: {candidates[0].name}")
+        return rel
+    return None
 
 # 顶部集中配置区：测试相关参数统一在这里调整
 MAX_SAMPLES = None         # None = 使用全部样本
@@ -2681,6 +2695,25 @@ def main():
         log(f"命名为 active_sets_{CASE_NAME}_*.json 的数据文件后重试")
         sys.exit(1)
 
+    # ── 自动发现模型路径（当顶部配置为 None 时） ────────────
+    resolved_model_dir = MODEL_DIR
+    resolved_bcd_path = BCD_MODEL_PATH
+    if resolved_model_dir is None:
+        resolved_model_dir = _auto_discover_model_path(
+            'result/surrogate_models', f'subproblem_models_{CASE_NAME}_*', 'Surrogate 模型目录')
+    if resolved_bcd_path is None:
+        resolved_bcd_path = _auto_discover_model_path(
+            'result/bcd_models', f'bcd_model_{CASE_NAME}_*.pth', 'BCD 模型文件')
+
+    if MODE in ('surrogate', 'both') and resolved_model_dir is None:
+        log(f"错误: 未找到 {CASE_NAME} 的 surrogate 模型目录")
+        log("请先运行 run_training.py 生成模型，或在顶部手动设置 MODEL_DIR")
+        sys.exit(1)
+    if MODE in ('bcd', 'both') and resolved_bcd_path is None:
+        log(f"错误: 未找到 {CASE_NAME} 的 BCD 模型文件")
+        log("请先运行 run_training.py MODE='bcd'/'both' 生成模型，或在顶部手动设置 BCD_MODEL_PATH")
+        sys.exit(1)
+
     # ── 执行模式分支 ─────────────────────────────────────
     try:
         if MODE == 'surrogate':
@@ -2692,8 +2725,7 @@ def main():
             T_from_data = all_samples[0]['pd_data'].shape[1]
             log(f"  样本 T={T_from_data}，评估使用 {len(all_samples)} 个样本，历史库 {len(full_samples)} 个样本")
 
-            # 将相对路径解析为绝对路径
-            model_dir = str((Path(__file__).parent / MODEL_DIR).resolve())
+            model_dir = str((Path(__file__).parent / resolved_model_dir).resolve())
             test_surrogate(
                 ppc, all_samples, T_DELTA, model_dir, UNIT_IDS, fig_dir,
                 scenario_bank=full_samples,
@@ -2701,7 +2733,7 @@ def main():
             )
 
         elif MODE == 'bcd':
-            bcd_path = str((Path(__file__).parent / BCD_MODEL_PATH).resolve())
+            bcd_path = str((Path(__file__).parent / resolved_bcd_path).resolve())
             test_bcd(
                 ppc,
                 data_file,
@@ -2714,7 +2746,6 @@ def main():
             )
 
         elif MODE == 'both':
-            # both 模式需要同时加载 v3 格式样本（供 surrogate 用）
             full_samples = load_json_data(data_file)
             all_samples = apply_sample_range(full_samples, sample_range)
             if MAX_SAMPLES and len(all_samples) > MAX_SAMPLES:
@@ -2723,8 +2754,8 @@ def main():
             T_from_data = all_samples[0]['pd_data'].shape[1]
             log(f"  样本 T={T_from_data}，评估使用 {len(all_samples)} 个样本，历史库 {len(full_samples)} 个样本")
 
-            model_dir  = str((Path(__file__).parent / MODEL_DIR).resolve())
-            bcd_path   = str((Path(__file__).parent / BCD_MODEL_PATH).resolve())
+            model_dir  = str((Path(__file__).parent / resolved_model_dir).resolve())
+            bcd_path   = str((Path(__file__).parent / resolved_bcd_path).resolve())
             test_both(ppc, data_file, all_samples, T_DELTA,
                       model_dir, bcd_path, MAX_SAMPLES, UNIT_IDS, fig_dir,
                       sample_range=sample_range, test_samples=test_samples,

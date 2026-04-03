@@ -1256,8 +1256,8 @@ def run_cursor_agent(
 ) -> tuple[str, int, str, str]:
     """使用 Cursor CLI agent 模式执行代码修改。
 
-    优先使用 `cursor agent` 子命令（需要 Cursor 0.48+）。
-    如果当前版本不支持，回退到打开 Cursor 编辑器 + 轮询文件变更的方式。
+    - cursor_interactive=True  → 编辑器轮询模式（在 Cursor UI 中可视化工作）
+    - cursor_interactive=False → cursor agent CLI headless 模式（需要 Cursor 0.48+）
     """
     cursor_exe = _find_cursor_exe()
     if not cursor_exe:
@@ -1269,9 +1269,11 @@ def run_cursor_agent(
 
     prompt_content = read_text(prompt_file)
 
-    # 先检测是否支持 cursor agent
-    has_agent = _cursor_supports_agent(cursor_exe)
+    if config.cursor_interactive:
+        log("[Cursor] 交互模式：使用编辑器轮询方式（在 Cursor 中可视化工作）")
+        return _run_cursor_editor_mode(config, cursor_exe, prompt_file, prompt_content)
 
+    has_agent = _cursor_supports_agent(cursor_exe)
     if has_agent:
         return _run_cursor_agent_cli(config, cursor_exe, prompt_file, prompt_content)
     else:
@@ -1285,46 +1287,38 @@ def _run_cursor_agent_cli(
     prompt_file: Path,
     prompt_content: str,
 ) -> tuple[str, int, str, str]:
-    """cursor agent CLI 模式（Cursor 0.48+）。"""
-    if config.cursor_interactive:
-        parts = [cursor_exe, "agent", "--force"]
-        mode_label = "交互模式"
-    else:
-        parts = [cursor_exe, "agent", "-p", "--force", "--trust"]
-        mode_label = "headless 模式"
+    """cursor agent CLI headless 模式（Cursor 0.48+）。通过 stdin 管道传入 prompt。"""
+    parts = [cursor_exe, "agent", "-p", "--force", "--trust"]
 
     if config.cursor_model:
         parts.extend(["--model", config.cursor_model])
 
-    MAX_DIRECT_LEN = 28000
-    use_stdin = len(prompt_content) > MAX_DIRECT_LEN
+    command_display = " ".join(parts) + f" (stdin<{prompt_file})"
+    log(f"[Cursor] agent CLI headless 模式 (prompt={len(prompt_content)}字符)")
 
-    if use_stdin:
-        command_display = " ".join(parts) + f" (stdin<{prompt_file})"
-    else:
-        parts.append(prompt_content)
-        command_display = " ".join(parts[:6]) + ' "..."'
-
-    log(f"[Cursor] agent CLI {mode_label} (prompt={len(prompt_content)}字符)")
-
+    start = time.time()
     try:
         proc = subprocess.run(
             parts,
             cwd=str(config.workspace),
-            input=prompt_content if use_stdin else None,
-            capture_output=not config.cursor_interactive,
+            input=prompt_content,
+            capture_output=True,
             text=True, encoding="utf-8", errors="replace",
             timeout=config.agent_timeout_sec,
         )
-        if config.cursor_interactive:
-            return command_display, proc.returncode, "", ""
-        return command_display, proc.returncode, proc.stdout, proc.stderr
     except subprocess.TimeoutExpired as exc:
         return (
             command_display, 124,
             getattr(exc, "stdout", None) or "",
             (getattr(exc, "stderr", None) or "") + f"\n[timeout] {config.agent_timeout_sec}s\n",
         )
+
+    elapsed = time.time() - start
+    if elapsed < 3 and len(proc.stdout.strip()) < 100:
+        log(f"[Cursor] agent CLI 似乎未正确执行（{elapsed:.1f}s 内退出），回退到编辑器轮询模式")
+        return _run_cursor_editor_mode(config, cursor_exe, prompt_file, prompt_content)
+
+    return command_display, proc.returncode, proc.stdout, proc.stderr
 
 
 def _run_cursor_editor_mode(
@@ -1765,17 +1759,49 @@ def ensure_workspace(config: Config) -> None:
         except ValueError as exc:
             raise ValueError(f"目标文件不在工作区内: {path}") from exc
 
+def _find_latest_file(directory: Path, glob_pattern: str) -> Optional[Path]:
+    """在 directory 下按 glob_pattern 查找最新文件/目录（按修改时间倒序）。"""
+    if not directory.exists():
+        return None
+    candidates = sorted(directory.glob(glob_pattern), key=lambda p: p.stat().st_mtime, reverse=True)
+    return candidates[0] if candidates else None
+
+
 def configure_joint():
-    """预配置joint模式，直接加载你的模型路径"""
+    """预配置joint模式，自动发现最新可用模型路径。"""
+    root = Path(__file__).parent.resolve()
+
+    bcd_dir = root / "result" / "bcd_models"
+    surr_dir = root / "result" / "surrogate_models"
+
+    bcd_path = _find_latest_file(bcd_dir, "bcd_model_case3lite_*.pth")
+    surr_path = _find_latest_file(surr_dir, "subproblem_models_case3lite_*")
+
+    if bcd_path:
+        log(f"[configure_joint] 自动发现 BCD 模型: {bcd_path.name}")
+    else:
+        log("[configure_joint] 警告: 未找到 case3lite 的 BCD 模型文件，"
+            "请先运行 run_training.py MODE='both' 生成模型")
+    if surr_path:
+        log(f"[configure_joint] 自动发现 surrogate 模型: {surr_path.name}")
+    else:
+        log("[configure_joint] 警告: 未找到 case3lite 的 surrogate 模型目录，"
+            "请先运行 run_training.py MODE='both' 生成模型")
+
+    eval_mode = "both" if bcd_path and surr_path else "surrogate" if surr_path else "both"
+    eval_command = f"python run_test.py"
+    if eval_mode != "both":
+        log(f"[configure_joint] BCD 模型缺失，评估将使用 MODE='{eval_mode}'")
+
     config = Config(
-        workspace=Path(__file__).parent.resolve(),
-        results_dir=Path(__file__).parent / "result/agentic_fp_optimizer",
+        workspace=root,
+        results_dir=root / "result/agentic_fp_optimizer",
         target_files=[
-            Path(__file__).parent / "src/feasibility_pump.py",
-            Path(__file__).parent / "src/fp_guided_recovery.py",
-            Path(__file__).parent / "src/feasibility_pump_case3lite.py",
+            root / "src/feasibility_pump.py",
+            root / "src/fp_guided_recovery.py",
+            root / "src/feasibility_pump_case3lite.py",
         ],
-        eval_command="python run_test.py --case case3lite --samples 5",
+        eval_command=eval_command,
         agent_kind="cursor",
         cursor_interactive=True,
         agent_command_template=None,
@@ -1799,9 +1825,8 @@ def configure_joint():
         system_prompt_file=None,
         accept_regressions=False,
         surrogate_model_type="joint",
-        surrogate_model_path=Path(__file__).parent /
-        "result/surrogate_models/subproblem_models_case3lite_20260329_165256",
-        bcd_model_path=Path(__file__).parent / "result/bcd_models/bcd_model_case3lite_20260328_112148.pth",
+        surrogate_model_path=surr_path,
+        bcd_model_path=bcd_path,
         case_name="case3lite",
         t_delta=1.0,
         time_periods=24,
@@ -1865,6 +1890,12 @@ def _run_optimization_loop(config: Config) -> int:
         f"return_code={baseline_eval.return_code}, score={baseline_eval.score:.3f}, "
         f"metrics={asdict(baseline_eval.metrics)}"
     )
+    if baseline_eval.return_code != 0:
+        eval_tail = tail_text(
+            baseline_eval.stdout + ("\n" + baseline_eval.stderr if baseline_eval.stderr else ""),
+            max_chars=1500,
+        )
+        log(f"[警告] 基线评估失败 (return_code={baseline_eval.return_code})，评估输出尾部:\n{eval_tail}")
 
     history: List[IterationRecord] = []
     no_improve_rounds = 0
