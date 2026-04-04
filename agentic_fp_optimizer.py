@@ -454,6 +454,7 @@ class Config:
     cursor_model: Optional[str] = None
     cursor_interactive: bool = False
     claude_cli_model: Optional[str] = None
+    claude_cli_allowed_tools: str = "Edit,Write,Read"
 
     # === 新增：Surrogate模型与多策略FP优化器配置 ===
 
@@ -760,14 +761,15 @@ def evaluate(config: Config, iteration_dir: Path, label: str) -> EvalResult:
     )
 
 
-def build_context_block(config: Config) -> str:
+def build_context_block(config: Config, max_chars_per_file: Optional[int] = None) -> str:
     chunks: List[str] = []
+    limit = config.max_context_chars_per_file if max_chars_per_file is None else max_chars_per_file
     for path in config.target_files:
         rel = path.relative_to(config.workspace)
         content = read_text(path) if path.exists() else ""
         chunks.append(
             f"### FILE: {rel}\n"
-            f"```python\n{truncate(content, config.max_context_chars_per_file)}\n```\n"
+            f"```python\n{truncate(content, limit)}\n```\n"
         )
     return "\n".join(chunks)
 
@@ -945,6 +947,40 @@ def build_multi_strategy_fp_block(config: Config) -> str:
     )
 
 
+def build_compact_strategy_block(config: Config) -> str:
+    if not config.fp_strategy_pool:
+        return ""
+
+    recommended_strategy = config.default_fp_strategy
+    if config.surrogate_model_type == "v3":
+        recommended_strategy = "guided"
+    elif config.surrogate_model_type == "bcd":
+        recommended_strategy = "legacy"
+    elif config.surrogate_model_type == "joint":
+        recommended_strategy = "guided"
+
+    strategy_details = ", ".join(config.fp_strategy_pool)
+    adaptation_mode = "enabled" if config.enable_strategy_adaptation else "disabled"
+    return textwrap.dedent(
+        f"""
+        === FP strategy guidance ===
+        available strategies: {strategy_details}
+        strategy adaptation: {adaptation_mode}
+        surrogate model type: {config.surrogate_model_type}
+        recommended default strategy: {recommended_strategy}
+        Keep this lightweight: prefer threshold tuning, simple fallbacks, and routing inside existing code paths.
+        Do not build a new multi-strategy framework unless the current files already have the needed hooks.
+        ===
+        """
+    )
+
+
+def has_recent_agent_timeout(history: List[IterationRecord], limit: int = 1) -> bool:
+    if limit <= 0:
+        return False
+    return any("exit_code=124" in (item.summary or "") for item in history[-limit:])
+
+
 def build_prompt(
     config: Config,
     baseline: EvalResult,
@@ -952,19 +988,28 @@ def build_prompt(
     best: EvalResult,
     history: List[IterationRecord],
 ) -> str:
+    compact_prompt = config.agent_kind == "claude-cli" and has_recent_agent_timeout(history, limit=1)
     system_extra = ""
     if config.system_prompt_file and config.system_prompt_file.exists():
         system_extra = read_text(config.system_prompt_file).strip()
 
     latest_output = truncate(
         latest.stdout + ("\n[stderr]\n" + latest.stderr if latest.stderr else ""),
-        config.max_eval_output_chars,
+        min(config.max_eval_output_chars, 4000) if compact_prompt else config.max_eval_output_chars,
     )
 
     # 构建新增的功能模块提示
     surrogate_block = build_surrogate_profile_block(config)
     physics_block = build_physics_informed_block(config)
-    multi_strategy_block = build_multi_strategy_fp_block(config)
+    multi_strategy_block = build_compact_strategy_block(config)
+    context_limit = min(config.max_context_chars_per_file, 8000) if compact_prompt else config.max_context_chars_per_file
+    history_limit = min(config.max_history_items, 3) if compact_prompt else config.max_history_items
+    timeout_hint = ""
+    if compact_prompt:
+        timeout_hint = (
+            "\n补充约束：上一轮 claude-cli 已超时。"
+            " 这一轮只允许做一个小改动，先读必要片段，尽快直接编辑，不要长时间规划或运行耗时命令。\n"
+        )
 
     # 构建Surrogate模型配置说明
     surrogate_config = textwrap.dedent(
@@ -1013,6 +1058,7 @@ def build_prompt(
         8. 【重要】如启用了代理模型适配、物理信息增强或多策略FP，必须实现对应的专用函数（见下方模块说明）。
 
         {optimization_focus}
+        {timeout_hint}
         {surrogate_config}
         {surrogate_block}
         {physics_block}
@@ -1042,10 +1088,10 @@ def build_prompt(
         ```
 
         历史尝试摘要：
-        {build_history_block(history, config.max_history_items)}
+        {build_history_block(history, history_limit)}
 
         目标文件上下文：
-        {build_context_block(config)}
+        {build_context_block(config, max_chars_per_file=context_limit)}
 
         {system_extra}
         """
@@ -1409,7 +1455,7 @@ def run_claude_cli_agent(
     parts = [
         claude_exe, "-p",
         "--output-format", "text",
-        "--allowedTools", "Edit,Write,Read,Bash",
+        "--allowedTools", config.claude_cli_allowed_tools,
     ]
     if config.claude_cli_model:
         parts.extend(["--model", config.claude_cli_model])
@@ -1802,7 +1848,7 @@ def configure_joint():
             root / "src/feasibility_pump_case3lite.py",
         ],
         eval_command=eval_command,
-        agent_kind="claude-cli",
+        agent_kind="cursor",
         cursor_interactive=False,
         agent_command_template=None,
         api_base_url=None,
@@ -1964,6 +2010,13 @@ def _run_optimization_loop(config: Config) -> int:
                 json.dumps([asdict(item) for item in history], ensure_ascii=False, indent=2),
             )
             no_improve_rounds += 1
+            if (
+                config.agent_kind == "claude-cli"
+                and "exit_code=124" in str(exc)
+                and has_recent_agent_timeout(history, limit=2)
+            ):
+                log("claude-cli 连续两轮超时，提前停止后续重试")
+                break
             continue
 
         after_snapshot = snapshot_files(config.target_files)
