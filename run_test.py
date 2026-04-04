@@ -67,7 +67,7 @@ if not check_and_install_dependencies_safe():
 #   'bcd'       - 加载 BCD 神经网络模型并报告参数统�?
 #   'both'      - 联合加载 BCD + surrogate，以全体代理约束评估（需同时配置下面两个路径�?
 #
-MODE      = 'both'
+MODE      = 'bcd'
 RUN_FP    = True       # surrogate / both 模式：是否运行可行性泵测试
 CASE_NAME = 'case3lite'   # 'case3' / 'case3lite' / 'case14' / 'case30' / 'case39' / 'case118'
 SURROGATE_CONSTRAINT_STRATEGY = 'all_templates_sign4'  # 'auto' / 'sensitive' / 'all' / 'all_templates_sign4' / 'all_single_time'
@@ -88,7 +88,7 @@ BCD_GAMMA_BASE = 1e-2
 
 # surrogate / both 模式：已训练 surrogate 模型目录（训练时输出的带时间戳路径）
 # 设为 None 则自动查找 result/surrogate_models/ 下最新的匹配目录
-MODEL_DIR = None
+MODEL_DIR = "result/bcd_models/bcd_model_case3lite_20260403_225254.pth"
 
 # bcd / both 模式：已训练 BCD 模型 .pth 文件路径
 # 设为 None 则自动查找 result/bcd_models/ 下最新的匹配文件
@@ -133,7 +133,7 @@ FP_PROJECTION_OBJECTIVE_TAU = 'adaptive'
 USE_CASE3LITE_CUSTOM_FP = True
 CASE3LITE_CUSTOM_FP_MAX_GLOBAL_COMBINATIONS = 24
 CASE3LITE_CUSTOM_FP_PLOT_DIR = 'result/figures_case3lite_custom_fp'
-ACTIVE_SETS_FILE = 'result/active_set/active_sets_case3lite_T24_n200_20260328_102856.json'  # 指定 active_sets JSON 文件路径（None=自动查找最新）
+ACTIVE_SETS_FILE = 'result/active_set/active_sets_case3lite_T24_n1000_20260403_180137.json'  # 指定 active_sets JSON 文件路径（None=自动查找最新）
 
 # ──────────────────────── 导入 ────────────────────────
 
