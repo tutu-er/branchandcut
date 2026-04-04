@@ -74,7 +74,9 @@ DUAL_BATCH_SIZE = 8
 DUAL_BATCH_STRATEGY = 'full-batch'   # 'full-batch' / 'mini-batch'
 DUAL_SHUFFLE = True
 DUAL_LR = 5e-4
-MAX_ITER = 500
+MAX_ITER = 500             # backward-compatible shared fallback
+BCD_MAX_ITER = MAX_ITER
+SUBPROBLEM_MAX_ITER = MAX_ITER
 DUAL_DECAY_ROUND = 25
 NN_EPOCHS = 5
 UNIT_IDS = None              # None = 所有机组；或如 [0, 1, 2]
@@ -87,7 +89,9 @@ JOINT_SURR_NN_EPOCHS = 5
 JOINT_DUAL_DECAY_ROUND = 0
 ACTIVE_SETS_FILE = "result/active_set/active_sets_case3lite_T24_n1000_20260403_180137.json"  # None = 自动查找最新
 BCD_MODEL_FILE = None
+BCD_CONTINUE_TRAINING = False
 SURROGATE_MODEL_DIR = None
+SURROGATE_CONTINUE_TRAINING = False
 SPARSE_TOP_K_VARIABLES = 20
 SPARSE_MAX_GROUPS = 5
 SPARSE_GROUP_SIZE = 3
@@ -131,15 +135,15 @@ SUBPROBLEM_LOSS_RATIO_OPT = 1.0
 SUBPROBLEM_LOSS_RATIO_REG = 1.0
 SUBPROBLEM_GAMMA_BASE = 1e-3
 SUBPROBLEM_MU_DUAL_FLOOR_INIT = 1
-SUBPROBLEM_MU_DUAL_FLOOR_INDIVIDUAL_ROUND = round(MAX_ITER/10)
-SUBPROBLEM_MU_DUAL_FLOOR_DECAY_ROUND = round(MAX_ITER/2)
+SUBPROBLEM_MU_DUAL_FLOOR_INDIVIDUAL_ROUND = round(SUBPROBLEM_MAX_ITER/10)
+SUBPROBLEM_MU_DUAL_FLOOR_DECAY_ROUND = round(SUBPROBLEM_MAX_ITER/2)
 SUBPROBLEM_NN_BATCH_STRATEGY = 'full-batch'   # 'full-batch' / 'mini-batch'
 SUBPROBLEM_NN_SIZE = 'medium'   # 'small' / 'medium' / 'large'
 SUBPROBLEM_NN_BATCH_SIZE = 4
 SUBPROBLEM_NN_SHUFFLE = True
 SUBPROBLEM_NN_LR = 1e-4
 SUBPROBLEM_X_COST_NN_LR = 1e-5
-SUBPROBLEM_PG_COST_START_ROUND = round(MAX_ITER/10)
+SUBPROBLEM_PG_COST_START_ROUND = round(SUBPROBLEM_MAX_ITER/10)
 SUBPROBLEM_PG_COST_SCALE_MULTIPLIER = 3
 SUBPROBLEM_PG_COST_LR = 2e-4
 SUBPROBLEM_PG_COST_SURR_LR = 5e-4
@@ -303,11 +307,160 @@ def pick_data_file(result_dir: Path, case_name: str) -> Path:
     return None
 
 
+def resolve_existing_path(path_value: str | None, label: str) -> Path | None:
+    if path_value is None:
+        return None
+    path = Path(path_value)
+    if not path.is_absolute():
+        path = Path(__file__).parent / path
+    if not path.exists():
+        raise FileNotFoundError(f"{label} does not exist: {path}")
+    return path
+
+
+def create_bcd_agent(ppc, all_samples, T_DELTA, *,
+                     n_workers: int = 4,
+                     external_sparse_templates=None,
+                     lambda_init_strategy: str = 'lp_relaxation',
+                     max_theta_constraints_per_time_slot: int = 10,
+                     theta_hot_start_strategy: str = 'dcpf_relative',
+                     zeta_hot_start_strategy: str = 'zero',
+                     theta_gaussian_std: float = 0.01,
+                     zeta_gaussian_std: float = 0.01,
+                     enable_dropout_during_nn_training: bool = True,
+                     rho_primal_init: float = 1e-2,
+                     rho_dual_init: float = 1e-2,
+                     rho_dual_pg_init: float | None = None,
+                     rho_dual_x_init: float | None = None,
+                     rho_dual_coc_init: float | None = None,
+                     rho_opt_init: float = 1e-2,
+                     loss_ratio_primal: float = 1.0,
+                     loss_ratio_dual_x: float = 1.0,
+                     loss_ratio_opt: float = 1.0,
+                     loss_ratio_reg: float = 1.0,
+                     gamma_base: float = 1e-2,
+                     mu_dual_floor_init: float = 0.1,
+                     ita_dual_floor_init: float = 0.1,
+                     nn_hidden_dims: list[int] | None = None,
+                     nn_batch_strategy: str = 'full-batch',
+                     nn_batch_size: int = 4,
+                     nn_shuffle: bool = True,
+                     nn_learning_rate: float = 5e-5):
+    if external_sparse_templates is not None and n_workers > 1:
+        log("璀﹀憡: external_sparse_templates 褰撳墠浠呮敮鎸佷覆琛?Agent_NN_BCD锛屽皢蹇界暐 n_workers > 1")
+        n_workers = 1
+
+    agent_kwargs = dict(
+        lambda_init_strategy=lambda_init_strategy,
+        max_theta_constraints_per_time_slot=max_theta_constraints_per_time_slot,
+        theta_hot_start_strategy=theta_hot_start_strategy,
+        zeta_hot_start_strategy=zeta_hot_start_strategy,
+        theta_gaussian_std=theta_gaussian_std,
+        zeta_gaussian_std=zeta_gaussian_std,
+        enable_dropout_during_nn_training=enable_dropout_during_nn_training,
+        rho_primal_init=rho_primal_init,
+        rho_dual_init=rho_dual_init,
+        rho_dual_pg_init=rho_dual_pg_init,
+        rho_dual_x_init=rho_dual_x_init,
+        rho_dual_coc_init=rho_dual_coc_init,
+        rho_opt_init=rho_opt_init,
+        gamma_base=gamma_base,
+        mu_dual_floor_init=mu_dual_floor_init,
+        ita_dual_floor_init=ita_dual_floor_init,
+        nn_hidden_dims=nn_hidden_dims,
+        nn_learning_rate=nn_learning_rate,
+        nn_batch_strategy=nn_batch_strategy,
+        nn_batch_size=nn_batch_size,
+        nn_shuffle=nn_shuffle,
+        loss_ratio_primal=loss_ratio_primal,
+        loss_ratio_dual_x=loss_ratio_dual_x,
+        loss_ratio_opt=loss_ratio_opt,
+        loss_ratio_reg=loss_ratio_reg,
+    )
+    if external_sparse_templates is not None:
+        agent_kwargs['external_sparse_templates'] = external_sparse_templates
+
+    if n_workers <= 1:
+        log("浣跨敤涓茶 Agent_NN_BCD")
+        return Agent_NN_BCD(ppc, all_samples, T_DELTA, **agent_kwargs)
+
+    log(f"浣跨敤骞惰 ParallelAgent_NN_BCD (n_workers={n_workers})")
+    agent_kwargs['n_workers'] = n_workers
+    return ParallelAgent_NN_BCD(ppc, all_samples, T_DELTA, **agent_kwargs)
+
+
+def create_subproblem_trainer(ppc, all_samples, T_DELTA, unit_id: int, *,
+                              n_workers: int = 4,
+                              lambda_predictor=None,
+                              constraint_generation_strategy: str = 'sensitive',
+                              rho_primal_init: float = 1e-3,
+                              rho_dual_init: float = 1e-3,
+                              rho_dual_pg_init: float | None = None,
+                              rho_dual_x_init: float | None = None,
+                              rho_dual_coc_init: float | None = None,
+                              rho_opt_init: float = 1e-3,
+                              loss_ratio_primal: float = 1.0,
+                              loss_ratio_dual_pg: float = 1.0,
+                              loss_ratio_dual_x: float = 1.0,
+                              loss_ratio_opt: float = 1.0,
+                              loss_ratio_reg: float = 1.0,
+                              subproblem_gamma_base: float = 1e-3,
+                              mu_lower_bound_init: float = 0.1,
+                              mu_individual_lower_bound_round: int = 3,
+                              mu_group_lower_bound_round: int = 50,
+                              subproblem_nn_hidden_dims: list[int] | None = None,
+                              subproblem_nn_batch_strategy: str = 'full-batch',
+                              subproblem_nn_batch_size: int = 4,
+                              subproblem_nn_shuffle: bool = True,
+                              subproblem_nn_learning_rate: float = 1e-4,
+                              subproblem_cost_learning_rate: float = 1e-5,
+                              pg_cost_start_round: int = 3,
+                              pg_cost_scale_multiplier: float = 1.2,
+                              pg_cost_lr: float = 2e-5,
+                              pg_cost_surr_lr: float = 5e-5,
+                              pg_cost_reg_deadband: float = 0.25):
+    trainer_kwargs = dict(
+        lambda_predictor=lambda_predictor,
+        constraint_generation_strategy=constraint_generation_strategy,
+        rho_primal_init=rho_primal_init,
+        rho_dual_init=rho_dual_init,
+        rho_dual_pg_init=rho_dual_pg_init,
+        rho_dual_x_init=rho_dual_x_init,
+        rho_dual_coc_init=rho_dual_coc_init,
+        rho_opt_init=rho_opt_init,
+        loss_ratio_primal=loss_ratio_primal,
+        loss_ratio_dual_pg=loss_ratio_dual_pg,
+        loss_ratio_dual_x=loss_ratio_dual_x,
+        loss_ratio_opt=loss_ratio_opt,
+        loss_ratio_reg=loss_ratio_reg,
+        gamma_base=subproblem_gamma_base,
+        mu_lower_bound_init=mu_lower_bound_init,
+        mu_individual_lower_bound_round=mu_individual_lower_bound_round,
+        mu_group_lower_bound_round=mu_group_lower_bound_round,
+        nn_hidden_dims=subproblem_nn_hidden_dims,
+        nn_batch_strategy=subproblem_nn_batch_strategy,
+        nn_batch_size=subproblem_nn_batch_size,
+        nn_shuffle=subproblem_nn_shuffle,
+        nn_learning_rate=subproblem_nn_learning_rate,
+        cost_learning_rate=subproblem_cost_learning_rate,
+        pg_cost_start_round=pg_cost_start_round,
+        pg_cost_scale_multiplier=pg_cost_scale_multiplier,
+        pg_cost_lr=pg_cost_lr,
+        pg_cost_surr_lr=pg_cost_surr_lr,
+        pg_cost_reg_deadband=pg_cost_reg_deadband,
+    )
+    if n_workers <= 1:
+        return SubproblemSurrogateTrainer(ppc, all_samples, T_DELTA, unit_id, **trainer_kwargs)
+    trainer_kwargs['n_workers'] = n_workers
+    return ParallelSubproblemSurrogateTrainer(ppc, all_samples, T_DELTA, unit_id, **trainer_kwargs)
+
+
 # ──────────────────────── 模式实现 ────────────────────────
 
 def run_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS,
-                  DUAL_EPOCHS, DUAL_BATCH_SIZE, MAX_ITER, NN_EPOCHS, save_dir,
+                  DUAL_EPOCHS, DUAL_BATCH_SIZE, SUBPROBLEM_MAX_ITER, NN_EPOCHS, save_dir,
                   n_workers: int = 4, logger: 'TrainingLogger | None' = None,
+                  load_dir: str | None = None,
                   dual_batch_strategy: str = 'full-batch',
                   dual_shuffle: bool = True,
                   dual_learning_rate: float = 5e-4,
@@ -351,7 +504,7 @@ def run_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS,
     print("\n" + "=" * 70)
     log(f"开始并行代理训练: {n_samples} 样本，{len(unit_ids)} 机组，"
         f"n_workers={n_workers}，dual_epochs={DUAL_EPOCHS}，"
-        f"bcd_iter={MAX_ITER}，nn_epochs={NN_EPOCHS}，"
+        f"subproblem_iter={SUBPROBLEM_MAX_ITER}，nn_epochs={NN_EPOCHS}，"
         f"constraint_strategy={constraint_generation_strategy}")
     log(
         f"dual_nn: batch_strategy={dual_batch_strategy}, batch_size={DUAL_BATCH_SIZE}, "
@@ -372,15 +525,37 @@ def run_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS,
 
     # 步骤 1：对偶变量预测器（串行，NN 训练无需并行化）
     dual_save_path = os.path.join(save_dir, 'dual_predictor.pth') if save_dir else None
-    dual_predictor = train_dual_predictor_from_data(
-        ppc, all_samples, T_delta=T_DELTA,
-        num_epochs=DUAL_EPOCHS,
-        batch_size=DUAL_BATCH_SIZE,
-        batch_strategy=dual_batch_strategy,
-        shuffle=dual_shuffle,
-        learning_rate=dual_learning_rate,
-        save_path=dual_save_path,
-    )
+    load_path = resolve_existing_path(load_dir, 'surrogate model dir') if load_dir else None
+    dual_checkpoint_path = load_path / 'dual_predictor.pth' if load_path else None
+    if dual_checkpoint_path is not None and dual_checkpoint_path.exists():
+        log(f"从已有模型继续训练 dual predictor: {dual_checkpoint_path}")
+        dual_predictor = load_trained_models(
+            ppc,
+            all_samples,
+            T_DELTA,
+            load_dir=str(load_path),
+            unit_ids=[],
+            constraint_generation_strategy=constraint_generation_strategy,
+        )[0]
+        dual_predictor.train(
+            num_epochs=DUAL_EPOCHS,
+            batch_size=DUAL_BATCH_SIZE,
+            batch_strategy=dual_batch_strategy,
+            shuffle=dual_shuffle,
+            learning_rate=dual_learning_rate,
+        )
+        if dual_save_path:
+            dual_predictor.save(dual_save_path)
+    else:
+        dual_predictor = train_dual_predictor_from_data(
+            ppc, all_samples, T_delta=T_DELTA,
+            num_epochs=DUAL_EPOCHS,
+            batch_size=DUAL_BATCH_SIZE,
+            batch_strategy=dual_batch_strategy,
+            shuffle=dual_shuffle,
+            learning_rate=dual_learning_rate,
+            save_path=dual_save_path,
+        )
 
     # 步骤 2：逐机组训练代理约束（n_workers<=1 串行，否则样本级并行）
     if save_dir:
@@ -455,10 +630,15 @@ def run_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS,
                 pg_cost_reg_deadband=pg_cost_reg_deadband,
                 n_workers=n_workers,
             )
+        if load_path is not None:
+            trainer_checkpoint_path = load_path / f'surrogate_unit_{g}.pth'
+            if trainer_checkpoint_path.exists():
+                log(f"继续训练 surrogate checkpoint: {trainer_checkpoint_path}")
+                trainer.load(str(trainer_checkpoint_path))
         if logger is not None:
             trainer.logger = logger
         trainer.iter(
-            max_iter=MAX_ITER,
+            max_iter=SUBPROBLEM_MAX_ITER,
             nn_epochs=NN_EPOCHS,
             nn_batch_strategy=subproblem_nn_batch_strategy,
             nn_batch_size=subproblem_nn_batch_size,
@@ -538,6 +718,8 @@ def print_surrogate_results(trainers, all_samples):
 def run_bcd(ppc, all_samples: list, T_DELTA, MAX_ITER, bcd_model_dir,
             case_name: str = 'case', timestamp: str = '', n_workers: int = 4, NN_EPOCHS: int = 10, DUAL_DECAY_ROUND: int = 10,
             logger: 'TrainingLogger | None' = None,
+            load_model_path: str | None = None,
+            restore_rho_from_checkpoint: bool = False,
             external_sparse_templates=None,
             lambda_init_strategy: str = 'lp_relaxation',
             max_theta_constraints_per_time_slot: int = 10,
@@ -670,6 +852,12 @@ def run_bcd(ppc, all_samples: list, T_DELTA, MAX_ITER, bcd_model_dir,
     log("开始 BCD 迭代训练")
     print("=" * 70)
 
+    if load_model_path is not None:
+        log(f"从已有 BCD checkpoint 继续训练: {load_model_path}")
+        agent.load_model_parameters(
+            str(load_model_path),
+            restore_rho_state=restore_rho_from_checkpoint,
+        )
     if logger is not None:
         agent.logger = logger
     agent.iter(
@@ -934,6 +1122,8 @@ def main():
     DUAL_BATCH_STRATEGY_VALUE = DUAL_BATCH_STRATEGY
     DUAL_SHUFFLE_VALUE = DUAL_SHUFFLE
     DUAL_LR_VALUE = DUAL_LR
+    BCD_MAX_ITER_VALUE = BCD_MAX_ITER
+    SUBPROBLEM_MAX_ITER_VALUE = SUBPROBLEM_MAX_ITER
     BCD_LAMBDA_INIT_STRATEGY_VALUE = BCD_LAMBDA_INIT_STRATEGY
     BCD_RHO_PRIMAL_INIT_VALUE = BCD_RHO_PRIMAL_INIT
     BCD_RHO_DUAL_INIT_VALUE = BCD_RHO_DUAL_INIT
@@ -1013,6 +1203,10 @@ def main():
         f"dual_x={SUBPROBLEM_LOSS_RATIO_DUAL_X_VALUE}, opt={SUBPROBLEM_LOSS_RATIO_OPT_VALUE}, "
         f"reg={SUBPROBLEM_LOSS_RATIO_REG_VALUE})"
     )
+    log(
+        f"Iteration config: bcd_max_iter={BCD_MAX_ITER_VALUE}, "
+        f"subproblem_max_iter={SUBPROBLEM_MAX_ITER_VALUE}, joint_max_iter={JOINT_MAX_ITER}"
+    )
 
     # ── 查找数据文件 ─────────────────────────────────────
     if ACTIVE_SETS_FILE is not None:
@@ -1040,9 +1234,11 @@ def main():
             if MAX_SAMPLES and len(all_samples_bcd) > MAX_SAMPLES:
                 log(f"  截取前 {MAX_SAMPLES} 个样本（共 {len(all_samples_bcd)}）")
                 all_samples_bcd = all_samples_bcd[:MAX_SAMPLES]
-            run_bcd(ppc, all_samples_bcd, T_DELTA, MAX_ITER, bcd_model_dir,
+            run_bcd(ppc, all_samples_bcd, T_DELTA, BCD_MAX_ITER_VALUE, bcd_model_dir,
                     case_name=CASE_NAME, timestamp=timestamp, n_workers=N_WORKERS_BCD, NN_EPOCHS=NN_EPOCHS, DUAL_DECAY_ROUND=DUAL_DECAY_ROUND,
                     logger=logger,
+                    load_model_path=str(resolve_existing_path(BCD_MODEL_FILE, 'BCD model file')) if BCD_CONTINUE_TRAINING and BCD_MODEL_FILE is not None else None,
+                    restore_rho_from_checkpoint=BCD_RESTORE_RHO_FROM_CHECKPOINT,
                     lambda_init_strategy=BCD_LAMBDA_INIT_STRATEGY_VALUE,
                     max_theta_constraints_per_time_slot=BCD_MAX_THETA_CONSTRAINTS_PER_TIME_SLOT_VALUE,
                     theta_hot_start_strategy=THETA_WARM_START_STRATEGY,
@@ -1086,7 +1282,7 @@ def main():
                 ppc,
                 all_samples_bcd,
                 T_DELTA,
-                MAX_ITER,
+                BCD_MAX_ITER_VALUE,
                 bcd_model_dir,
                 case_name=CASE_NAME,
                 timestamp=timestamp,
@@ -1134,42 +1330,50 @@ def main():
             T_from_data = all_samples[0]['pd_data'].shape[1]
             log(f"  样本 T={T_from_data}，使用 {len(all_samples)} 个样本")
 
-            dual_predictor, trainers = run_surrogate(
-                ppc, all_samples, T_DELTA, UNIT_IDS,
-                DUAL_EPOCHS, DUAL_BATCH_SIZE, MAX_ITER, NN_EPOCHS, save_dir,
-                n_workers=N_WORKERS_SUBPROBLEM, logger=logger,
-                dual_batch_strategy=DUAL_BATCH_STRATEGY_VALUE,
-                dual_shuffle=DUAL_SHUFFLE_VALUE,
-                dual_learning_rate=DUAL_LR_VALUE,
-                constraint_generation_strategy=CONSTRAINT_GENERATION_STRATEGY,
-                rho_primal_init=SUBPROBLEM_RHO_PRIMAL_INIT_VALUE,
-                rho_dual_init=SUBPROBLEM_RHO_DUAL_INIT_VALUE,
-                rho_dual_pg_init=SUBPROBLEM_RHO_DUAL_PG_INIT_VALUE,
-                rho_dual_x_init=SUBPROBLEM_RHO_DUAL_X_INIT_VALUE,
-                rho_dual_coc_init=SUBPROBLEM_RHO_DUAL_COC_INIT_VALUE,
-                rho_opt_init=SUBPROBLEM_RHO_OPT_INIT_VALUE,
-                loss_ratio_primal=SUBPROBLEM_LOSS_RATIO_PRIMAL_VALUE,
-                loss_ratio_dual_pg=SUBPROBLEM_LOSS_RATIO_DUAL_PG_VALUE,
-                loss_ratio_dual_x=SUBPROBLEM_LOSS_RATIO_DUAL_X_VALUE,
-                loss_ratio_opt=SUBPROBLEM_LOSS_RATIO_OPT_VALUE,
-                loss_ratio_reg=SUBPROBLEM_LOSS_RATIO_REG_VALUE,
-                subproblem_gamma_base=SUBPROBLEM_GAMMA_BASE_VALUE,
-                mu_lower_bound_init=SUBPROBLEM_MU_DUAL_FLOOR_INIT_VALUE,
-                mu_individual_lower_bound_round=SUBPROBLEM_MU_DUAL_FLOOR_INDIVIDUAL_ROUND_VALUE,
-                mu_group_lower_bound_round=SUBPROBLEM_MU_DUAL_FLOOR_DECAY_ROUND_VALUE,
-                subproblem_nn_size=SUBPROBLEM_NN_SIZE_VALUE,
-                subproblem_nn_hidden_dims=SUBPROBLEM_NN_HIDDEN_DIMS_VALUE,
-                subproblem_nn_batch_strategy=SUBPROBLEM_NN_BATCH_STRATEGY_VALUE,
-                subproblem_nn_batch_size=SUBPROBLEM_NN_BATCH_SIZE_VALUE,
-                subproblem_nn_shuffle=SUBPROBLEM_NN_SHUFFLE_VALUE,
-                subproblem_nn_learning_rate=SUBPROBLEM_NN_LR_VALUE,
-                subproblem_cost_learning_rate=SUBPROBLEM_X_COST_NN_LR_VALUE,
-                pg_cost_start_round=SUBPROBLEM_PG_COST_START_ROUND_VALUE,
-                pg_cost_scale_multiplier=SUBPROBLEM_PG_COST_SCALE_MULTIPLIER_VALUE,
-                pg_cost_lr=SUBPROBLEM_PG_COST_LR_VALUE,
-                pg_cost_surr_lr=SUBPROBLEM_PG_COST_SURR_LR_VALUE,
-                pg_cost_reg_deadband=SUBPROBLEM_PG_COST_REG_DEADBAND_VALUE,
-            )
+            if SURROGATE_MODEL_DIR is not None and not SURROGATE_CONTINUE_TRAINING:
+                dual_predictor, trainers = load_surrogate(
+                    ppc, all_samples, T_DELTA, UNIT_IDS,
+                    SURROGATE_MODEL_DIR, logger=logger,
+                    constraint_generation_strategy=CONSTRAINT_GENERATION_STRATEGY,
+                )
+            else:
+                dual_predictor, trainers = run_surrogate(
+                    ppc, all_samples, T_DELTA, UNIT_IDS,
+                    DUAL_EPOCHS, DUAL_BATCH_SIZE, SUBPROBLEM_MAX_ITER_VALUE, NN_EPOCHS, save_dir,
+                    n_workers=N_WORKERS_SUBPROBLEM, logger=logger,
+                    load_dir=str(resolve_existing_path(SURROGATE_MODEL_DIR, 'surrogate model dir')) if SURROGATE_CONTINUE_TRAINING and SURROGATE_MODEL_DIR is not None else None,
+                    dual_batch_strategy=DUAL_BATCH_STRATEGY_VALUE,
+                    dual_shuffle=DUAL_SHUFFLE_VALUE,
+                    dual_learning_rate=DUAL_LR_VALUE,
+                    constraint_generation_strategy=CONSTRAINT_GENERATION_STRATEGY,
+                    rho_primal_init=SUBPROBLEM_RHO_PRIMAL_INIT_VALUE,
+                    rho_dual_init=SUBPROBLEM_RHO_DUAL_INIT_VALUE,
+                    rho_dual_pg_init=SUBPROBLEM_RHO_DUAL_PG_INIT_VALUE,
+                    rho_dual_x_init=SUBPROBLEM_RHO_DUAL_X_INIT_VALUE,
+                    rho_dual_coc_init=SUBPROBLEM_RHO_DUAL_COC_INIT_VALUE,
+                    rho_opt_init=SUBPROBLEM_RHO_OPT_INIT_VALUE,
+                    loss_ratio_primal=SUBPROBLEM_LOSS_RATIO_PRIMAL_VALUE,
+                    loss_ratio_dual_pg=SUBPROBLEM_LOSS_RATIO_DUAL_PG_VALUE,
+                    loss_ratio_dual_x=SUBPROBLEM_LOSS_RATIO_DUAL_X_VALUE,
+                    loss_ratio_opt=SUBPROBLEM_LOSS_RATIO_OPT_VALUE,
+                    loss_ratio_reg=SUBPROBLEM_LOSS_RATIO_REG_VALUE,
+                    subproblem_gamma_base=SUBPROBLEM_GAMMA_BASE_VALUE,
+                    mu_lower_bound_init=SUBPROBLEM_MU_DUAL_FLOOR_INIT_VALUE,
+                    mu_individual_lower_bound_round=SUBPROBLEM_MU_DUAL_FLOOR_INDIVIDUAL_ROUND_VALUE,
+                    mu_group_lower_bound_round=SUBPROBLEM_MU_DUAL_FLOOR_DECAY_ROUND_VALUE,
+                    subproblem_nn_size=SUBPROBLEM_NN_SIZE_VALUE,
+                    subproblem_nn_hidden_dims=SUBPROBLEM_NN_HIDDEN_DIMS_VALUE,
+                    subproblem_nn_batch_strategy=SUBPROBLEM_NN_BATCH_STRATEGY_VALUE,
+                    subproblem_nn_batch_size=SUBPROBLEM_NN_BATCH_SIZE_VALUE,
+                    subproblem_nn_shuffle=SUBPROBLEM_NN_SHUFFLE_VALUE,
+                    subproblem_nn_learning_rate=SUBPROBLEM_NN_LR_VALUE,
+                    subproblem_cost_learning_rate=SUBPROBLEM_X_COST_NN_LR_VALUE,
+                    pg_cost_start_round=SUBPROBLEM_PG_COST_START_ROUND_VALUE,
+                    pg_cost_scale_multiplier=SUBPROBLEM_PG_COST_SCALE_MULTIPLIER_VALUE,
+                    pg_cost_lr=SUBPROBLEM_PG_COST_LR_VALUE,
+                    pg_cost_surr_lr=SUBPROBLEM_PG_COST_SURR_LR_VALUE,
+                    pg_cost_reg_deadband=SUBPROBLEM_PG_COST_REG_DEADBAND_VALUE,
+                )
             print_surrogate_results(trainers, all_samples)
 
             if RUN_FP:
@@ -1223,7 +1427,7 @@ def main():
                     timestamp=timestamp,
                 )
 
-            if BCD_MODEL_FILE is not None:
+            if BCD_MODEL_FILE is not None and not BCD_CONTINUE_TRAINING:
                 # 从已有模型加载，跳过 BCD 训练
                 bcd_path = Path(BCD_MODEL_FILE)
                 if not bcd_path.is_absolute():
@@ -1323,7 +1527,7 @@ def main():
                     ppc,
                     all_samples_bcd,
                     T_DELTA,
-                    MAX_ITER,
+                    BCD_MAX_ITER_VALUE,
                     bcd_model_dir,
                     case_name=CASE_NAME,
                     timestamp=timestamp,
@@ -1331,6 +1535,8 @@ def main():
                     NN_EPOCHS=NN_EPOCHS,
                     DUAL_DECAY_ROUND=DUAL_DECAY_ROUND,
                     logger=logger,
+                    load_model_path=str(resolve_existing_path(BCD_MODEL_FILE, 'BCD model file')) if BCD_CONTINUE_TRAINING and BCD_MODEL_FILE is not None else None,
+                    restore_rho_from_checkpoint=BCD_RESTORE_RHO_FROM_CHECKPOINT,
                     external_sparse_templates=sparse_template_library,
                     lambda_init_strategy=BCD_LAMBDA_INIT_STRATEGY_VALUE,
                     max_theta_constraints_per_time_slot=BCD_MAX_THETA_CONSTRAINTS_PER_TIME_SLOT_VALUE,
@@ -1370,7 +1576,7 @@ def main():
 
             # Step 3: surrogate 训练（或从已有模型加载跳过）
             # BCD 的对偶变量仅在后续联合训练中使用，不注入 subproblem 训练
-            if SURROGATE_MODEL_DIR is not None:
+            if SURROGATE_MODEL_DIR is not None and not SURROGATE_CONTINUE_TRAINING:
                 dual_predictor, trainers = load_surrogate(
                     ppc, all_samples, T_DELTA, UNIT_IDS,
                     SURROGATE_MODEL_DIR, logger=logger,
@@ -1379,8 +1585,9 @@ def main():
             else:
                 dual_predictor, trainers = run_surrogate(
                     ppc, all_samples, T_DELTA, UNIT_IDS,
-                    DUAL_EPOCHS, DUAL_BATCH_SIZE, MAX_ITER, NN_EPOCHS, save_dir,
+                    DUAL_EPOCHS, DUAL_BATCH_SIZE, SUBPROBLEM_MAX_ITER_VALUE, NN_EPOCHS, save_dir,
                     n_workers=N_WORKERS_SUBPROBLEM, logger=logger,
+                    load_dir=str(resolve_existing_path(SURROGATE_MODEL_DIR, 'surrogate model dir')) if SURROGATE_CONTINUE_TRAINING and SURROGATE_MODEL_DIR is not None else None,
                     dual_batch_strategy=DUAL_BATCH_STRATEGY_VALUE,
                     dual_shuffle=DUAL_SHUFFLE_VALUE,
                     dual_learning_rate=DUAL_LR_VALUE,
