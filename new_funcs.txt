@@ -1,0 +1,137 @@
+
+
+def detect_surrogate_bias_patterns(
+    x_lp: np.ndarray,
+    x_surr_lp: np.ndarray,
+    window: int = 2,
+) -> dict:
+    """
+    检测LP与Surrogate LP之间的启停时序偏差模式
+
+    Args:
+        x_lp: 标准LP解 (ng, T)
+        x_surr_lp: 代理约束LP解 (ng, T)
+        window: 偏差检测窗口大小（时段数）
+
+    Returns:
+        Dict包含:
+            - 'start_delay': 各机组启动延迟矩阵 (ng, T)
+            - 'stop_delay': 各机组停机延迟矩阵 (ng, T)
+            - 'high_bias_regions': 高偏差区域标记 (ng, T)
+    """
+    ng, T = x_lp.shape
+    x_lp_round = np.round(x_lp).astype(int)
+    x_surr_round = np.round(x_surr_lp).astype(int)
+
+    start_delay = np.zeros((ng, T), dtype=float)
+    stop_delay = np.zeros((ng, T), dtype=float)
+    high_bias_regions = np.zeros((ng, T), dtype=bool)
+
+    for g in range(ng):
+        for t in range(1, T):
+            # 检测启动/停机事件延迟
+            lp_start = (x_lp_round[g, t-1] == 0) and (x_lp_round[g, t] == 1)
+            surr_start = (x_surr_round[g, t-1] == 0) and (x_surr_round[g, t] == 1)
+
+            if lp_start:
+                for dt in range(-window, window + 1):
+                    if 0 <= t + dt < T:
+                        if dt == 0 and surr_start:
+                            break
+                        elif dt != 0 and (x_surr_round[g, t+dt-1] == 0) and (x_surr_round[g, t+dt] == 1):
+                            start_delay[g, t] = float(dt)
+                            lo = max(0, t-window)
+                            hi = min(T, t+window+1)
+                            high_bias_regions[g, lo:hi] = True
+                            break
+
+            lp_stop = (x_lp_round[g, t-1] == 1) and (x_lp_round[g, t] == 0)
+            surr_stop = (x_surr_round[g, t-1] == 1) and (x_surr_round[g, t] == 0)
+
+            if lp_stop:
+                for dt in range(-window, window + 1):
+                    if 0 <= t + dt < T:
+                        if dt == 0 and surr_stop:
+                            break
+                        elif dt != 0 and (x_surr_round[g, t+dt-1] == 1) and (x_surr_round[g, t+dt] == 0):
+                            stop_delay[g, t] = float(dt)
+                            lo = max(0, t-window)
+                            hi = min(T, t+window+1)
+                            high_bias_regions[g, lo:hi] = True
+                            break
+
+        for t in range(T):
+            diff = abs(x_lp[g, t] -x_surr_lp[g, t])
+            if diff > 0.35:
+                lo = max(0, t-1)
+                hi = min(T, t+2)
+                high_bias_regions[g, lo:hi] = True
+
+    return {
+        'start_delay': start_delay,
+        'stop_delay': stop_delay,
+        'high_bias_regions': high_bias_regions,
+    }
+
+
+def apply_bias_adjustment_to_trusted_mask(
+    trusted_mask: np.ndarray,
+    bias_patterns: dict,
+    conservative_factor: float = 0.6,
+) -> np.ndarray:
+    """
+    根据偏差模式调整可信度mask
+
+    在高偏差区域降低可信度，避免过早固定可能有偏移的变量
+    """
+    adjusted_mask = trusted_mask.copy()
+    high_bias_regions = bias_patterns.get('high_bias_regions', np.zeros_like(trusted_mask, dtype=bool))
+
+    random_test = np.random.random(high_bias_regions.shape)
+    adjust = ~high_bias_regions | (random_test > conservative_factor)
+    adjusted_mask = adjusted_mask & adjust
+
+
+
+    return adjusted_mask
+
+
+def shift_correction_heuristic(
+    x: np.ndarray,
+    bias_patterns: dict,
+    max_shift: int = 2,
+) -> np.ndarray:
+    """
+    基于检测到的启停偏移进行启发式修正
+    """
+    x_corrected = x.copy()
+    ng, T = x.shape
+    start_delay = bias_patterns.get('start_delay', np.zeros((ng, T), dtype=float))
+    stop_delay = bias_patterns.get('stop_delay', np.zeros((ng, T), dtype=float))
+
+    for g in range(ng):
+        for t in range(1, T):
+            delay = start_delay[g, t]
+            if abs(delay) >= 1.0 and x_corrected[g, t] == 1 and x_corrected[g, t-1] == 0:
+                shift = int(np.clip(delay, -max_shift, max_shift))
+                if shift != 0 and 0 <= t + shift < T:
+                    if shift > 0:
+                        x_corrected[g, t] = 0
+                        x_corrected[g, t + shift] = 1
+                    else:
+                        x_corrected[g, t] = 0
+                        x_corrected[g, t + shift] = 1
+
+            delay = stop_delay[g, t]
+            if abs(delay) >= 1.0 and x_corrected[g, t] == 0 and x_corrected[g, t-1] == 1:
+                shift = int(np.clip(delay, -max_shift, max_shift))
+                if shift != 0 and 0 <= t + shift < T:
+                    if shift > 0:
+                        x_corrected[g, t] = 1
+                        x_corrected[g, t + shift] = 0
+                    else:
+                        x_corrected[g, t] = 1
+                        x_corrected[g, t + shift] = 0
+
+    return x_corrected
+
