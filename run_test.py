@@ -67,7 +67,7 @@ if not check_and_install_dependencies_safe():
 #   'bcd'       - 加载 BCD 神经网络模型并报告参数统�?
 #   'both'      - 联合加载 BCD + surrogate，以全体代理约束评估（需同时配置下面两个路径�?
 #
-MODE      = 'bcd'
+MODE      = 'surrogate'
 RUN_FP    = True       # surrogate / both 模式：是否运行可行性泵测试
 CASE_NAME = 'case3lite'   # 'case3' / 'case3lite' / 'case14' / 'case30' / 'case39' / 'case118'
 SURROGATE_CONSTRAINT_STRATEGY = 'all_templates_sign4'  # 'auto' / 'sensitive' / 'all' / 'all_templates_sign4' / 'all_single_time'
@@ -88,11 +88,11 @@ BCD_GAMMA_BASE = 1e-2
 
 # surrogate / both 模式：已训练 surrogate 模型目录（训练时输出的带时间戳路径）
 # 设为 None 则自动查找 result/surrogate_models/ 下最新的匹配目录
-MODEL_DIR = "result/bcd_models/bcd_model_case3lite_20260403_225254.pth"
+MODEL_DIR = "result/surrogate_models/subproblem_models_case3lite_20260403_225254"
 
 # bcd / both 模式：已训练 BCD 模型 .pth 文件路径
 # 设为 None 则自动查找 result/bcd_models/ 下最新的匹配文件
-BCD_MODEL_PATH = None
+BCD_MODEL_PATH = "result/bcd_models/bcd_model_case3lite_20260405_001203.pth"
 
 
 def _auto_discover_model_path(directory, glob_pattern, label):
@@ -109,7 +109,7 @@ def _auto_discover_model_path(directory, glob_pattern, label):
 
 # 顶部集中配置区：测试相关参数统一在这里调整
 MAX_SAMPLES = None         # None = 使用全部样本
-SAMPLE_RANGE = "4:6"       # 左闭右开；例如 "210:220"
+SAMPLE_RANGE = "25:35"       # 左闭右开；例如 "210:220"
 T_DELTA = 1.0
 UNIT_IDS = None            # None = 所有机组；或如 [0, 1, 2]
 TEST_SAMPLES_DEFAULT = 3

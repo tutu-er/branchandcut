@@ -259,6 +259,20 @@ class ParallelSubproblemSurrogateTrainer(SubproblemSurrogateTrainer):
                     self.lambda_inherent[s] = lambda_inherent_sol
                     self.mu[s] = self._apply_mu_lower_bound_policy(mu_sol, lb_mu)
 
+            # ── 计算违反量（NN更新前） ──────────────────────────────
+            _z = lambda v: v if abs(v) >= 1e-12 else 0.0
+            obj_primal, obj_dual_pg, obj_dual_x, obj_dual_coc, obj_dual, obj_opt = self.cal_viol_components()
+            obj_primal, obj_dual_pg, obj_dual_x, obj_dual_coc, obj_dual, obj_opt = (
+                _z(obj_primal), _z(obj_dual_pg), _z(obj_dual_x), _z(obj_dual_coc), _z(obj_dual), _z(obj_opt)
+            )
+            print(
+                f"{prefix}   obj_primal={obj_primal:.6f}, "
+                f"obj_dual_pg={obj_dual_pg:.6f}, obj_dual_x={obj_dual_x:.6f}, "
+                f"obj_dual_coc={obj_dual_coc:.6f}, obj_dual={obj_dual:.6f}, "
+                f"obj_opt={obj_opt:.6f}",
+                flush=True,
+            )
+
             # ── 3. NN block（串行，批次化训练） ──────────────────────
             self.iter_with_surrogate_nn(
                 num_epochs=nn_epochs,
@@ -276,19 +290,16 @@ class ParallelSubproblemSurrogateTrainer(SubproblemSurrogateTrainer):
                 learning_rate=pg_cost_surr_learning_rate,
             )
 
-            # ── 计算并打印违反量 ─────────────────────────────────────
+            # ── 计算违反量（NN更新后） ──────────────────────────────
             obj_primal, obj_dual_pg, obj_dual_x, obj_dual_coc, obj_dual, obj_opt = self.cal_viol_components()
-            obj_primal = obj_primal if abs(obj_primal) >= 1e-12 else 0.0
-            obj_dual_pg = obj_dual_pg if abs(obj_dual_pg) >= 1e-12 else 0.0
-            obj_dual_x = obj_dual_x if abs(obj_dual_x) >= 1e-12 else 0.0
-            obj_dual_coc = obj_dual_coc if abs(obj_dual_coc) >= 1e-12 else 0.0
-            obj_dual   = obj_dual   if abs(obj_dual)   >= 1e-12 else 0.0
-            obj_opt    = obj_opt    if abs(obj_opt)    >= 1e-12 else 0.0
-
+            obj_primal, obj_dual_pg, obj_dual_x, obj_dual_coc, obj_dual, obj_opt = (
+                _z(obj_primal), _z(obj_dual_pg), _z(obj_dual_x), _z(obj_dual_coc), _z(obj_dual), _z(obj_opt)
+            )
             print(
                 f"{prefix}   obj_primal={obj_primal:.6f}, "
                 f"obj_dual_pg={obj_dual_pg:.6f}, obj_dual_x={obj_dual_x:.6f}, "
-                f"obj_dual_coc={obj_dual_coc:.6f}, obj_dual={obj_dual:.6f}, obj_opt={obj_opt:.6f}",
+                f"obj_dual_coc={obj_dual_coc:.6f}, obj_dual={obj_dual:.6f}, "
+                f"obj_opt={obj_opt:.6f}",
                 flush=True,
             )
 
@@ -300,7 +311,12 @@ class ParallelSubproblemSurrogateTrainer(SubproblemSurrogateTrainer):
                 self._sync_rho_dual_summary()
                 self.rho_opt    = min(self.rho_opt    + gamma * obj_opt,    self.rho_max)
             
-            print(f"{prefix}   ρ_primal={self.rho_primal:.4f}, ρ_dual={self.rho_dual:.4f}, ρ_opt={self.rho_opt:.4f}", flush=True)
+            print(
+                f"{prefix}   ρ_primal={self.rho_primal:.4f}, ρ_dual_pg={self.rho_dual_pg:.4f}, "
+                f"ρ_dual_x={self.rho_dual_x:.4f}, ρ_dual_coc={self.rho_dual_coc:.4f}, "
+                f"ρ_dual={self.rho_dual:.4f}, ρ_opt={self.rho_opt:.4f}",
+                flush=True,
+            )
 
         print(f"{prefix} ✓ 样本级并行训练完成", flush=True)
 

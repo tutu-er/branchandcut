@@ -1628,6 +1628,7 @@ class SubproblemSurrogateTrainer:
         if device is None:
             if TORCH_AVAILABLE and torch.cuda.is_available():
                 self.device = torch.device('cuda')
+                print(f"[SubproblemTrainer Unit-{unit_id}] 使用 CUDA 设备: {torch.cuda.get_device_name(0)}", flush=True)
             else:
                 self.device = torch.device('cpu')
         else:
@@ -3473,6 +3474,20 @@ class SubproblemSurrogateTrainer:
                     self.lambda_inherent[sample_id] = lambda_inherent_sol
                     self.mu[sample_id] = self._apply_mu_lower_bound_policy(mu_sol, lb_mu)
             
+            # 计算违反量（NN更新前）
+            _z = lambda v: v if abs(v) >= 1e-12 else 0.0
+            obj_primal, obj_dual_pg, obj_dual_x, obj_dual_coc, obj_dual, obj_opt = self.cal_viol_components()
+            obj_primal, obj_dual_pg, obj_dual_x, obj_dual_coc, obj_dual, obj_opt = (
+                _z(obj_primal), _z(obj_dual_pg), _z(obj_dual_x), _z(obj_dual_coc), _z(obj_dual), _z(obj_opt)
+            )
+            print(
+                f"[Unit-{self.unit_id}]   obj_primal={obj_primal:.6f}, "
+                f"obj_dual_pg={obj_dual_pg:.6f}, obj_dual_x={obj_dual_x:.6f}, "
+                f"obj_dual_coc={obj_dual_coc:.6f}, obj_dual={obj_dual:.6f}, "
+                f"obj_opt={obj_opt:.6f}",
+                flush=True,
+            )
+
             # 3. 神经网络更新代理约束参数
             self.iter_with_surrogate_nn(
                 num_epochs=nn_epochs,
@@ -3492,18 +3507,14 @@ class SubproblemSurrogateTrainer:
 
             # 计算违反量（NN更新后）
             obj_primal, obj_dual_pg, obj_dual_x, obj_dual_coc, obj_dual, obj_opt = self.cal_viol_components()
-            obj_primal = obj_primal if abs(obj_primal) >= 1e-12 else 0.0
-            obj_dual_pg = obj_dual_pg if abs(obj_dual_pg) >= 1e-12 else 0.0
-            obj_dual_x = obj_dual_x if abs(obj_dual_x) >= 1e-12 else 0.0
-            obj_dual_coc = obj_dual_coc if abs(obj_dual_coc) >= 1e-12 else 0.0
-            obj_dual   = obj_dual   if abs(obj_dual)   >= 1e-12 else 0.0
-            obj_opt    = obj_opt    if abs(obj_opt)    >= 1e-12 else 0.0
-
+            obj_primal, obj_dual_pg, obj_dual_x, obj_dual_coc, obj_dual, obj_opt = (
+                _z(obj_primal), _z(obj_dual_pg), _z(obj_dual_x), _z(obj_dual_coc), _z(obj_dual), _z(obj_opt)
+            )
             print(
-                f"  obj_primal: {obj_primal:.6f}, "
-                f"obj_dual_pg: {obj_dual_pg:.6f}, obj_dual_x: {obj_dual_x:.6f}, "
-                f"obj_dual_coc: {obj_dual_coc:.6f}, obj_dual: {obj_dual:.6f}, "
-                f"obj_opt: {obj_opt:.6f}",
+                f"[Unit-{self.unit_id}]   obj_primal={obj_primal:.6f}, "
+                f"obj_dual_pg={obj_dual_pg:.6f}, obj_dual_x={obj_dual_x:.6f}, "
+                f"obj_dual_coc={obj_dual_coc:.6f}, obj_dual={obj_dual:.6f}, "
+                f"obj_opt={obj_opt:.6f}",
                 flush=True,
             )
 
@@ -5218,10 +5229,15 @@ def _dual_predictor_trainer_init(
     if device is None:
         if TORCH_AVAILABLE and torch.cuda.is_available():
             self.device = torch.device('cuda')
+            print(f"[DualPredictor] 使用 CUDA 设备: {torch.cuda.get_device_name(0)}", flush=True)
         else:
             self.device = torch.device('cpu')
+            print("[DualPredictor] 使用 CPU 设备" + (
+                "（CUDA 不可用）" if TORCH_AVAILABLE else "（PyTorch 未安装）"
+            ), flush=True)
     else:
         self.device = device
+        print(f"[DualPredictor] 使用指定设备: {self.device}", flush=True)
 
     first_sample = active_set_data[0] if isinstance(active_set_data, list) else active_set_data
     self.input_dim = len(get_feature_vector_from_sample(dict(first_sample)))
@@ -5312,6 +5328,10 @@ def _dual_predictor_trainer_train(
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(self.optimizer, patience=10, factor=0.5)
     self.network.train()
 
+    print_interval = max(1, num_epochs // 10)
+    print(f"[DualPredictor] 开始训练 (epochs={num_epochs}, batch_strategy={resolved_batch_strategy}, "
+          f"batch_size={resolved_batch_size}, lr={resolved_learning_rate:.1e}, device={self.device})", flush=True)
+
     for _epoch in range(num_epochs):
         epoch_loss = 0.0
         for batch_X, batch_Y in dataloader:
@@ -5324,6 +5344,12 @@ def _dual_predictor_trainer_train(
 
         epoch_loss /= len(dataset)
         scheduler.step(epoch_loss)
+
+        if (_epoch + 1) % print_interval == 0 or _epoch == 0 or _epoch == num_epochs - 1:
+            current_lr = self.optimizer.param_groups[0]['lr']
+            print(f"  [DualPredictor] Epoch {_epoch+1}/{num_epochs}, Loss: {epoch_loss:.6f}, LR: {current_lr:.1e}", flush=True)
+
+    print(f"✓ 对偶变量预测器训练完成 (final_loss={epoch_loss:.6f})", flush=True)
 
 
 def _dual_predictor_trainer_predict(self, pd_data, renewable_data=None, unit_id=None) -> np.ndarray:
