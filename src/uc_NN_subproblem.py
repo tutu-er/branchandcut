@@ -1588,8 +1588,8 @@ class SubproblemSurrogateTrainer:
             constraint_generation_strategy
         )
         self.all_mode_group_size = 4 if self.constraint_generation_strategy == CONSTRAINT_STRATEGY_ALL_TEMPLATES_SIGN4 else 1
-        self.template_rhs_jitter_scale = 0.4
-        self.template_rhs_reg_deadband = 0.25
+        self.template_rhs_jitter_scale = 1.5
+        self.template_rhs_reg_deadband = 0.8
         self.coeff_reg_deadband = 0.35
         self.aux_cost_reg_deadband = 0.1
         self.pg_cost_reg_deadband = max(float(pg_cost_reg_deadband), 0.0)
@@ -1872,7 +1872,8 @@ class SubproblemSurrogateTrainer:
             ],
             dtype=float,
         )
-        rhs = np.zeros(4, dtype=float)
+        # RHS 基准 = 各模板在 x∈{0,1} 下的最大 LHS，保证所有整数组合初始可行
+        rhs = np.array([2.0, 1.0, 1.0, 0.0], dtype=float)
         return patterns, rhs
 
     def _build_template_rhs_base_vector(self, size: int) -> np.ndarray:
