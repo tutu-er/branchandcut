@@ -1217,6 +1217,27 @@ def _compute_commitment_distance_metrics(
     return l1_distance, hamming_distance
 
 
+def _can_run_global_fp(ppc, trainers: dict) -> tuple[bool, str]:
+    """Return whether the loaded trainers cover all generators for global FP."""
+    expected_ng = int(ppc['gen'].shape[0])
+    loaded_unit_ids = sorted(
+        int(unit_id)
+        for unit_id in trainers.keys()
+        if 0 <= int(unit_id) < expected_ng
+    )
+    expected_unit_ids = list(range(expected_ng))
+    if loaded_unit_ids != expected_unit_ids:
+        missing_unit_ids = [unit_id for unit_id in expected_unit_ids if unit_id not in loaded_unit_ids]
+        extra_unit_ids = [unit_id for unit_id in loaded_unit_ids if unit_id not in expected_unit_ids]
+        return (
+            False,
+            "skip global FP because surrogate trainers do not cover all generators: "
+            f"loaded_unit_ids={loaded_unit_ids}, expected_unit_ids={expected_unit_ids}, "
+            f"missing_unit_ids={missing_unit_ids}, extra_unit_ids={extra_unit_ids}",
+        )
+    return True, "global FP enabled"
+
+
 def _compute_commitment_distance_metrics_with_mask(
     x_candidate: np.ndarray,
     x_true: np.ndarray,
@@ -1834,7 +1855,8 @@ def test_surrogate(ppc, all_samples: list, T_DELTA: float,
         )
 
     fp_results = None
-    if RUN_FP:
+    can_run_fp, fp_gate_reason = _can_run_global_fp(ppc, trainers)
+    if RUN_FP and can_run_fp:
         fp_results = run_fp_test(
             ppc, all_samples, dual_predictor, trainers, T_DELTA, TEST_SAMPLES,
             scenario_bank=scenario_bank, fig_dir=fig_dir,
@@ -1848,6 +1870,8 @@ def test_surrogate(ppc, all_samples: list, T_DELTA: float,
             fig_dir,
             CASE_NAME,
         )
+    elif RUN_FP:
+        log(f"跳过可行性泵（RUN_FP=True, but {fp_gate_reason}）")
 
     summarize_lp_surrogate_fp_totals(
         ppc,
@@ -2797,7 +2821,8 @@ def test_both(ppc, data_file: Path, all_samples: list, T_DELTA: float,
         trainers=trainers, T_DELTA=T_DELTA,
     )
 
-    if RUN_FP:
+    can_run_fp, fp_gate_reason = _can_run_global_fp(ppc, trainers)
+    if RUN_FP and can_run_fp:
         log("── Step 4/4  以全体代理约束运行可行性泵")
         fp_results = run_fp_test(
             ppc, all_samples, dual_predictor, trainers, T_DELTA, test_samples,
@@ -2812,6 +2837,9 @@ def test_both(ppc, data_file: Path, all_samples: list, T_DELTA: float,
             fig_dir,
             CASE_NAME,
         )
+    elif RUN_FP:
+        fp_results = None
+        log(f"── Step 4/4  跳过可行性泵（RUN_FP=True, but {fp_gate_reason}）")
     else:
         fp_results = None
         log("── Step 4/4  跳过可行性泵（RUN_FP=False）")
