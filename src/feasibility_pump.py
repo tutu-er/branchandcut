@@ -1590,7 +1590,7 @@ def _build_ptdf_data(ppc_int: dict) -> tuple:
 
 # ========================== 内部辅助：单机组 LP（多代理约束�?==========================
 
-def _solve_unit_LP_with_surrogate(
+def _solve_unit_surrogate_model(
     trainer: SubproblemSurrogateTrainer,
     lambda_val: np.ndarray,
     alphas: np.ndarray,
@@ -1601,6 +1601,7 @@ def _solve_unit_LP_with_surrogate(
     pg_costs: Optional[np.ndarray] = None,
     scenario_sample: Optional[dict] = None,
     surrogate_soft_penalty: float = 1e8,
+    binary_x: bool = False,
 ) -> Tuple[np.ndarray, int, dict]:
     """
     求解单机组子问题 LP（使�?V3 三时段代理约束）�?
@@ -1626,12 +1627,19 @@ def _solve_unit_LP_with_surrogate(
     )
 
     def _solve_once(use_soft_surrogate: bool) -> Tuple[np.ndarray, int, dict]:
-        model = gp.Model('unit_lp_surrogate')
+        model_name = 'unit_milp_surrogate' if binary_x else 'unit_lp_surrogate'
+        model = gp.Model(model_name)
         model.Params.OutputFlag = 0
         model.Params.DualReductions = 0
 
         pg = model.addVars(T, lb=0, name='pg')
-        x = model.addVars(T, lb=0, ub=1, name='x')
+        x = model.addVars(
+            T,
+            lb=0,
+            ub=1,
+            vtype=GRB.BINARY if binary_x else GRB.CONTINUOUS,
+            name='x',
+        )
         cpower = model.addVars(T, lb=0, name='cpower')
 
         for t in range(T):
@@ -1715,6 +1723,7 @@ def _solve_unit_LP_with_surrogate(
         details = {
             'status': int(model.status),
             'status_name': _gurobi_status_name(model.status),
+            'binary_x': bool(binary_x),
             'used_soft_surrogate': bool(use_soft_surrogate),
             'surrogate_soft_penalty': float(surrogate_soft_penalty) if use_soft_surrogate else None,
             'n_surrogate_constraints': int(len(surrogate_rows)),
@@ -1786,6 +1795,62 @@ def _solve_unit_LP_with_surrogate(
         return x_soft, status_soft, details_soft
 
     return x_hard, status_hard, details_hard
+
+
+def _solve_unit_LP_with_surrogate(
+    trainer: SubproblemSurrogateTrainer,
+    lambda_val: np.ndarray,
+    alphas: np.ndarray,
+    betas: np.ndarray,
+    gammas: np.ndarray,
+    deltas: np.ndarray,
+    costs: Optional[np.ndarray] = None,
+    pg_costs: Optional[np.ndarray] = None,
+    scenario_sample: Optional[dict] = None,
+    surrogate_soft_penalty: float = 1e8,
+) -> Tuple[np.ndarray, int, dict]:
+    """Solve the surrogate subproblem with relaxed commitment variables."""
+    return _solve_unit_surrogate_model(
+        trainer,
+        lambda_val,
+        alphas,
+        betas,
+        gammas,
+        deltas,
+        costs=costs,
+        pg_costs=pg_costs,
+        scenario_sample=scenario_sample,
+        surrogate_soft_penalty=surrogate_soft_penalty,
+        binary_x=False,
+    )
+
+
+def _solve_unit_MILP_with_surrogate(
+    trainer: SubproblemSurrogateTrainer,
+    lambda_val: np.ndarray,
+    alphas: np.ndarray,
+    betas: np.ndarray,
+    gammas: np.ndarray,
+    deltas: np.ndarray,
+    costs: Optional[np.ndarray] = None,
+    pg_costs: Optional[np.ndarray] = None,
+    scenario_sample: Optional[dict] = None,
+    surrogate_soft_penalty: float = 1e8,
+) -> Tuple[np.ndarray, int, dict]:
+    """Solve the surrogate subproblem with binary commitment variables."""
+    return _solve_unit_surrogate_model(
+        trainer,
+        lambda_val,
+        alphas,
+        betas,
+        gammas,
+        deltas,
+        costs=costs,
+        pg_costs=pg_costs,
+        scenario_sample=scenario_sample,
+        surrogate_soft_penalty=surrogate_soft_penalty,
+        binary_x=True,
+    )
 
 
 # ========================== Step 2：收集多组整数解 ==========================

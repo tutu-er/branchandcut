@@ -15,7 +15,7 @@ ng = ppc["gen"].shape[0]
 nb = ppc["bus"].shape[0]
 print(f"  Generators: {ng}, Buses: {nb}, Branches: {ppc['branch'].shape[0]}", flush=True)
 
-print("\nCreating clusterer (2 clusters, max 3 scenarios/cluster)...", flush=True)
+print("\nCreating clusterer (2 clusters, subsampled UC for smoke test only)...", flush=True)
 clusterer = CommitmentClusterer(
     ppc=ppc,
     T_delta=1.0,
@@ -25,6 +25,7 @@ clusterer = CommitmentClusterer(
     lp_proximity_weight=0.0,
     max_cost_increase_ratio=None,
     max_scenarios_per_cluster=3,
+    require_all_cluster_days_in_uc=False,
     gurobi_time_limit=120.0,
     feature_mode="summary",
     verbose=False,

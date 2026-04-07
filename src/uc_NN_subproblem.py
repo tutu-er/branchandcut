@@ -1564,6 +1564,8 @@ class SubproblemSurrogateTrainer:
                  nn_batch_size: int = 4,
                  nn_shuffle: bool = True,
                  pg_cost_reg_deadband: float = 0.5,
+                 iter_delta_reg_weight: float = 5e-5,
+                 iter_delta_reg_deadband: float = 0.10,
                  loss_ratio_primal: float = 1.0,
                  loss_ratio_dual_pg: float = 1.0,
                  loss_ratio_dual_x: float = 1.0,
@@ -1660,6 +1662,8 @@ class SubproblemSurrogateTrainer:
         self.gamma_dual_component_scale = 3.0
         self.rho_max = 10.0
         self.reg_weight = 1e-4   # alpha/beta/gamma L2 正则化权重
+        self.iter_delta_reg_weight = float(iter_delta_reg_weight)
+        self.iter_delta_reg_deadband = max(float(iter_delta_reg_deadband), 0.0)
         self.mu_lower_bound = float(mu_lower_bound_init)
         rho_dual_pg_base = rho_dual_init if rho_dual_pg_init is None else rho_dual_pg_init
         rho_dual_x_base = rho_dual_init if rho_dual_x_init is None else rho_dual_x_init
@@ -1739,6 +1743,14 @@ class SubproblemSurrogateTrainer:
         
         # 初始化求解
         self._initialize_solve()
+
+        # 迭代间输出差异正则：用于抑制 NN 输出在相邻 BCD 迭代间剧烈跳变
+        self._prev_alpha_values = None
+        self._prev_beta_values = None
+        self._prev_gamma_values = None
+        self._prev_delta_values = None
+        self._prev_cost_values = None
+        self._prev_pg_cost_values = None
         
         print(f"✓ 机组{unit_id}子问题代理约束训练器初始化完成", flush=True)
     
@@ -1938,6 +1950,21 @@ class SubproblemSurrogateTrainer:
             return torch.sum(ref ** 2)
         ref = tensor if center is None else (tensor - center)
         excess = torch.relu(torch.abs(ref) - deadband)
+        return torch.sum(excess ** 2)
+
+    def _iter_delta_regularization(
+        self,
+        current: torch.Tensor,
+        prev: torch.Tensor | None,
+        deadband: float,
+    ) -> torch.Tensor:
+        """惩罚当前输出与上一代输出的差异（deadband 外二次惩罚）。"""
+        if prev is None:
+            return torch.tensor(0.0, dtype=current.dtype, device=current.device)
+        diff = current - prev
+        if deadband <= 0:
+            return torch.sum(diff ** 2)
+        excess = torch.relu(torch.abs(diff) - deadband)
         return torch.sum(excess ** 2)
 
     def _gate_pg_cost_tensor(self, pg_costs_tensor: torch.Tensor) -> torch.Tensor:
@@ -2930,6 +2957,43 @@ class SubproblemSurrogateTrainer:
                 self.coeff_reg_deadband,
             )
 
+        # 迭代间差异正则：抑制相邻 BCD 轮次 NN 输出跳变（可通过 iter_delta_reg_weight 控制）
+        if self.iter_delta_reg_weight > 0 and self._prev_alpha_values is not None:
+            nc = int(self.num_coupling_constraints)
+            prev_alphas = torch.tensor(
+                self._prev_alpha_values[sample_id][:nc],
+                dtype=alphas_tensor.dtype,
+                device=alphas_tensor.device,
+            )
+            prev_betas = torch.tensor(
+                self._prev_beta_values[sample_id][:nc],
+                dtype=betas_tensor.dtype,
+                device=betas_tensor.device,
+            )
+            prev_gammas = torch.tensor(
+                self._prev_gamma_values[sample_id][:nc],
+                dtype=gammas_tensor.dtype,
+                device=gammas_tensor.device,
+            )
+            prev_deltas = torch.tensor(
+                self._prev_delta_values[sample_id][:nc],
+                dtype=deltas_tensor.dtype,
+                device=deltas_tensor.device,
+            )
+            prev_costs = torch.tensor(
+                self._prev_cost_values[sample_id][: self.T],
+                dtype=costs_tensor.dtype,
+                device=costs_tensor.device,
+            )
+            iter_delta = (
+                self._iter_delta_regularization(alphas_tensor, prev_alphas, self.iter_delta_reg_deadband)
+                + self._iter_delta_regularization(betas_tensor, prev_betas, self.iter_delta_reg_deadband)
+                + self._iter_delta_regularization(gammas_tensor, prev_gammas, self.iter_delta_reg_deadband)
+                + self._iter_delta_regularization(deltas_tensor, prev_deltas, self.iter_delta_reg_deadband)
+                + self._iter_delta_regularization(costs_tensor, prev_costs, self.iter_delta_reg_deadband)
+            )
+            reg_loss = reg_loss + self.iter_delta_reg_weight * iter_delta
+
         # 总损失：三项BCD目标 + 正则化
         loss = (
             self.loss_ratio_primal * self.rho_primal * obj_primal
@@ -2978,6 +3042,17 @@ class SubproblemSurrogateTrainer:
             pg_costs_tensor,
             self.pg_cost_reg_deadband,
         )
+        if self.iter_delta_reg_weight > 0 and self._prev_pg_cost_values is not None:
+            prev_pg_costs = torch.tensor(
+                self._prev_pg_cost_values[sample_id][: self.T],
+                dtype=pg_costs_tensor.dtype,
+                device=pg_costs_tensor.device,
+            )
+            reg_loss = reg_loss + self.iter_delta_reg_weight * self._iter_delta_regularization(
+                pg_costs_tensor,
+                prev_pg_costs,
+                self.iter_delta_reg_deadband,
+            )
         return (
             self.loss_ratio_dual_pg * self.rho_dual_pg * obj_dual_pg
             + self.loss_ratio_reg * reg_loss
@@ -3524,6 +3599,13 @@ class SubproblemSurrogateTrainer:
             )
 
             # 3. 神经网络更新代理约束参数
+            #    先缓存上一代输出，供“迭代间差异正则”使用（默认权重为0时不影响训练）
+            self._prev_alpha_values = self.alpha_values.copy()
+            self._prev_beta_values = self.beta_values.copy()
+            self._prev_gamma_values = self.gamma_values.copy()
+            self._prev_delta_values = self.delta_values.copy()
+            self._prev_cost_values = self.cost_values.copy()
+            self._prev_pg_cost_values = self.pg_cost_values.copy()
             self.iter_with_surrogate_nn(
                 num_epochs=nn_epochs,
                 batch_size=nn_batch_size,

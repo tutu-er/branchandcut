@@ -42,7 +42,13 @@ LP_PROXIMITY_WEIGHT = 0.0
 # Max allowed cost increase vs. optimal (e.g. 0.05 = 5%); None to disable
 MAX_COST_INCREASE_RATIO: float | None = None
 
-# Subsample scenarios per cluster to control computation
+# When REQUIRE_ALL_CLUSTER_DAYS_IN_UC is True (default), every day in the cluster
+# is included in the shared UC so x_rep is jointly feasible for all of them.
+# max_scenarios_per_cluster is then ignored unless you set the flag below to False.
+REQUIRE_ALL_CLUSTER_DAYS_IN_UC = True
+
+# Only used if REQUIRE_ALL_CLUSTER_DAYS_IN_UC is False (not recommended for
+# joint feasibility across the whole cluster).
 MAX_SCENARIOS_PER_CLUSTER: int | None = 20
 
 # Gurobi solver time limit per cluster (seconds)
@@ -117,6 +123,7 @@ def main() -> None:
         lp_proximity_weight=LP_PROXIMITY_WEIGHT,
         max_cost_increase_ratio=MAX_COST_INCREASE_RATIO,
         max_scenarios_per_cluster=MAX_SCENARIOS_PER_CLUSTER,
+        require_all_cluster_days_in_uc=REQUIRE_ALL_CLUSTER_DAYS_IN_UC,
         gurobi_time_limit=GUROBI_TIME_LIMIT,
         feature_mode=FEATURE_MODE,
         pca_components=PCA_COMPONENTS,

@@ -506,6 +506,8 @@ class Agent_NN_BCD:
         loss_ratio_dual_x: float = 1.0,
         loss_ratio_opt: float = 1.0,
         loss_ratio_reg: float = 1.0,
+        iter_delta_reg_weight: float = 1e-4,
+        iter_delta_reg_deadband: float = 0.05,
     ):
         self.ppc = ppc
         self.ppc_raw = ppc
@@ -586,6 +588,8 @@ class Agent_NN_BCD:
         self.loss_ratio_dual_x = float(loss_ratio_dual_x)
         self.loss_ratio_opt = float(loss_ratio_opt)
         self.loss_ratio_reg = float(loss_ratio_reg)
+        self.iter_delta_reg_weight = float(iter_delta_reg_weight)
+        self.iter_delta_reg_deadband = max(float(iter_delta_reg_deadband), 0.0)
         rho_dual_pg_base = rho_dual_init if rho_dual_pg_init is None else rho_dual_pg_init
         rho_dual_x_base = rho_dual_init if rho_dual_x_init is None else rho_dual_x_init
         rho_dual_coc_base = rho_dual_init if rho_dual_coc_init is None else rho_dual_coc_init
@@ -597,6 +601,10 @@ class Agent_NN_BCD:
         # 初始化theta和zeta变量字典
         self.theta_vars = {}
         self.zeta_vars = {}
+
+        # 迭代间输出差异正则：上一代 theta/zeta（per-sample）缓存
+        self._prev_theta_values_list = None
+        self._prev_zeta_values_list = None
         
         # 初始化求解（获得初始x和lambda）
         self.pg, self.x, self.x_opt, self.coc, self.cpower, self.lambda_ = self.initialize_solve()
@@ -3119,6 +3127,10 @@ class Agent_NN_BCD:
                 f"obj_dual_x={obj_dual_x_pre:.6f}, obj_opt={obj_opt_pre:.6f}",
                 flush=True,
             )
+            #    先缓存上一代输出，供“迭代间差异正则”使用（默认权重为0时不影响训练）
+            if self.iter_delta_reg_weight > 0:
+                self._prev_theta_values_list = [dict(v) for v in self.theta_values_list]
+                self._prev_zeta_values_list = [dict(v) for v in self.zeta_values_list]
             theta_values_new, zeta_values_new = self.iter_with_theta_zeta_neural_network(
                 union_analysis=union_analysis,
                 num_epochs=nn_epochs,
@@ -3680,6 +3692,30 @@ class Agent_NN_BCD:
             + self.zeta_reg_weight * torch.sum(zeta_deadzone_excess)
         )
         reg_loss = reg_base * self._get_regularization_scale()
+
+        # 迭代间差异正则：控制输出系数与上一代差异不过大（deadband 外二次惩罚）
+        if self.iter_delta_reg_weight > 0 and self._prev_theta_values_list is not None:
+            prev_theta_dict = self._prev_theta_values_list[sample_id]
+            prev_zeta_dict = self._prev_zeta_values_list[sample_id]
+            prev_theta = torch.tensor(
+                [float(prev_theta_dict.get(name, 0.0)) for name in self.theta_var_names],
+                dtype=theta_tensor.dtype,
+                device=device,
+            )
+            prev_zeta = torch.tensor(
+                [float(prev_zeta_dict.get(name, 0.0)) for name in self.zeta_var_names],
+                dtype=zeta_tensor.dtype,
+                device=device,
+            )
+            theta_diff = theta_tensor - prev_theta
+            zeta_diff = zeta_tensor - prev_zeta
+            if self.iter_delta_reg_deadband > 0:
+                theta_excess = torch.relu(torch.abs(theta_diff) - self.iter_delta_reg_deadband)
+                zeta_excess = torch.relu(torch.abs(zeta_diff) - self.iter_delta_reg_deadband)
+                iter_delta_reg = torch.sum(theta_excess ** 2) + torch.sum(zeta_excess ** 2)
+            else:
+                iter_delta_reg = torch.sum(theta_diff ** 2) + torch.sum(zeta_diff ** 2)
+            reg_loss = reg_loss + self.iter_delta_reg_weight * iter_delta_reg
 
         primal_term = self.loss_ratio_primal * obj_primal * self.rho_primal
         dual_x_term = self.loss_ratio_dual_x * obj_dual_x * self.rho_dual_x

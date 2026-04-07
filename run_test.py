@@ -111,9 +111,10 @@ def _auto_discover_model_path(directory, glob_pattern, label):
 MAX_SAMPLES = None         # None = 使用全部样本
 SAMPLE_RANGE = "25:35"       # 左闭右开；例如 "210:220"
 T_DELTA = 1.0
-UNIT_IDS = None            # None = 所有机组；或如 [0, 1, 2]
+UNIT_IDS = [1]            # None = 所有机组；或如 [0, 1, 2]
 TEST_SAMPLES_DEFAULT = 3
 TEST_SAMPLES = 10
+RUN_SUBPROBLEM_MILP_TEST = True
 FP_MAX_ITER = 50
 FP_CONF_THRESHOLD = 0.15
 FP_MAX_PERTURBATION_HOT_STARTS = 6
@@ -198,6 +199,7 @@ if MODE in ('surrogate', 'both'):
             solve_global_LP_relaxation,
             solve_global_LP_relaxation_without_surrogate,
             _solve_unit_LP_with_surrogate,
+            _solve_unit_MILP_with_surrogate,
             _extract_unit_lambda,
             _resolve_surrogate_constraint_timesteps,
         )
@@ -1215,6 +1217,43 @@ def _compute_commitment_distance_metrics(
     return l1_distance, hamming_distance
 
 
+def _compute_commitment_distance_metrics_with_mask(
+    x_candidate: np.ndarray,
+    x_true: np.ndarray,
+) -> dict:
+    """Return masked commitment distance metrics and coverage."""
+    x_arr = np.asarray(x_candidate, dtype=float)
+    x_ref = np.asarray(x_true, dtype=float)
+    if x_arr.shape != x_ref.shape:
+        raise ValueError(
+            f"Commitment shape mismatch: candidate={x_arr.shape}, reference={x_ref.shape}"
+        )
+
+    valid_mask = np.isfinite(x_arr) & np.isfinite(x_ref)
+    covered = int(np.sum(valid_mask))
+    total = int(valid_mask.size)
+    if covered == 0:
+        return {
+            'covered': 0,
+            'total': total,
+            'coverage_ratio': 0.0,
+            'l1': float('nan'),
+            'hamming': None,
+            'integrality_gap': float('nan'),
+        }
+
+    x_valid = x_arr[valid_mask]
+    x_ref_valid = x_ref[valid_mask]
+    return {
+        'covered': covered,
+        'total': total,
+        'coverage_ratio': float(covered / max(total, 1)),
+        'l1': float(np.sum(np.abs(x_valid - x_ref_valid))),
+        'hamming': int(np.sum(np.round(x_valid).astype(int) != x_ref_valid.astype(int))),
+        'integrality_gap': float(np.mean(np.minimum(x_valid, 1.0 - x_valid))),
+    }
+
+
 def _evaluate_commitment_economic_cost(
     ppc,
     sample: dict,
@@ -1276,11 +1315,13 @@ def _build_subproblem_commitment_matrix(
     lambda_val: np.ndarray,
     trainers: dict,
     shape: tuple[int, int],
+    solve_milp: bool = False,
 ) -> np.ndarray:
     """逐机组求解 surrogate 子问题，并拼成 `(ng, T)` 启停矩阵。"""
     ng, T = shape
     x_sub = np.full((ng, T), np.nan, dtype=float)
     renewable_data = sample.get('renewable_data') if isinstance(sample, dict) else None
+    solve_unit = _solve_unit_MILP_with_surrogate if solve_milp else _solve_unit_LP_with_surrogate
 
     for unit_id, trainer in sorted(trainers.items()):
         unit_idx = int(unit_id)
@@ -1296,7 +1337,7 @@ def _build_subproblem_commitment_matrix(
             alphas, betas, gammas, deltas, costs, pg_costs = trainer.get_surrogate_params(
                 sample, lambda_unit, renewable_data=renewable_data,
             )
-            x_unit, status_unit, details_unit = _solve_unit_LP_with_surrogate(
+            x_unit, status_unit, details_unit = solve_unit(
                 trainer,
                 lambda_val,
                 alphas,
@@ -1311,11 +1352,15 @@ def _build_subproblem_commitment_matrix(
                 x_sub[unit_idx, :min(T, x_unit.shape[0])] = x_unit[:T]
             else:
                 log(
-                    f"  机组 {unit_idx}: surrogate 子问题状态="
+                    f"  机组 {unit_idx}: surrogate 子问题"
+                    f"{' MILP' if solve_milp else ' LP'} 状态="
                     f"{details_unit.get('status_name', status_unit)}"
                 )
         except Exception as e:
-            log(f"  机组 {unit_idx}: surrogate 子问题求解失败，已跳过 ({e})")
+            log(
+                f"  机组 {unit_idx}: surrogate 子问题"
+                f"{' MILP' if solve_milp else ' LP'} 求解失败，已跳过 ({e})"
+            )
 
     return x_sub
 
@@ -1518,6 +1563,124 @@ def run_lp_compare_test(ppc, all_samples: list, dual_predictor, trainers: dict,
     return list(zip(x_LP_plain_list, x_LP_surr_list, x_true_list))
 
 
+def run_subproblem_milp_test(
+    ppc,
+    all_samples: list,
+    dual_predictor,
+    trainers: dict,
+    T_DELTA: float,
+    n_test: int,
+) -> list[dict]:
+    """Compare surrogate unit subproblems solved as LP vs MILP under the same model."""
+    test_n = min(n_test, len(all_samples))
+    active_units = sorted(
+        int(unit_id)
+        for unit_id in trainers
+        if 0 <= int(unit_id) < int(ppc['gen'].shape[0])
+    )
+    print("\n" + "=" * 70)
+    log(f"Subproblem surrogate MILP 测试: {test_n} 个样本, active_units={active_units}")
+    print("=" * 70)
+
+    if not active_units:
+        log("未加载任何机组 surrogate 模型，跳过 subproblem MILP 测试")
+        return []
+
+    results = []
+    lp_solutions = []
+    milp_solutions = []
+
+    for i in range(test_n):
+        sample = all_samples[i]
+        pd_data = sample['pd_data']
+        log(f"  样本 {i + 1}/{test_n}，pd_data shape={pd_data.shape}")
+        try:
+            lambda_val = dual_predictor.predict(sample)
+        except Exception as exc:
+            log(f"    dual predictor 失败，跳过 ({exc})")
+            continue
+
+        x_true_full = _extract_true_solution(sample, (ppc['gen'].shape[0], pd_data.shape[1]))
+        x_true = np.asarray(x_true_full[active_units, :], dtype=float)
+
+        x_sub_lp_full = _build_subproblem_commitment_matrix(
+            sample,
+            lambda_val,
+            trainers,
+            x_true_full.shape,
+            solve_milp=False,
+        )
+        x_sub_milp_full = _build_subproblem_commitment_matrix(
+            sample,
+            lambda_val,
+            trainers,
+            x_true_full.shape,
+            solve_milp=True,
+        )
+
+        x_sub_lp = np.asarray(x_sub_lp_full[active_units, :], dtype=float)
+        x_sub_milp = np.asarray(x_sub_milp_full[active_units, :], dtype=float)
+
+        lp_metrics = _compute_commitment_distance_metrics_with_mask(x_sub_lp, x_true)
+        milp_metrics = _compute_commitment_distance_metrics_with_mask(x_sub_milp, x_true)
+        lp_vs_milp = _compute_commitment_distance_metrics_with_mask(x_sub_lp, x_sub_milp)
+
+        results.append(
+            {
+                'sample_index': i,
+                'lp': lp_metrics,
+                'milp': milp_metrics,
+                'lp_vs_milp': lp_vs_milp,
+            }
+        )
+        lp_solutions.append(x_sub_lp)
+        milp_solutions.append(x_sub_milp)
+
+        log(
+            "    LP: "
+            f"coverage={lp_metrics['covered']}/{lp_metrics['total']}, "
+            f"integ={lp_metrics['integrality_gap']:.4f}, "
+            f"Hamming={lp_metrics['hamming']} | "
+            "MILP: "
+            f"coverage={milp_metrics['covered']}/{milp_metrics['total']}, "
+            f"integ={milp_metrics['integrality_gap']:.4f}, "
+            f"Hamming={milp_metrics['hamming']} | "
+            "LP vs MILP: "
+            f"L1={lp_vs_milp['l1']:.4f}, "
+            f"Hamming={lp_vs_milp['hamming']}"
+        )
+
+    if results:
+        print("\n" + "=" * 70)
+        valid_lp = [r['lp'] for r in results if r['lp']['hamming'] is not None]
+        valid_milp = [r['milp'] for r in results if r['milp']['hamming'] is not None]
+        valid_diff = [r['lp_vs_milp'] for r in results if r['lp_vs_milp']['hamming'] is not None]
+        if valid_lp:
+            log(
+                f"Subproblem LP 汇总: mean_hamming={np.mean([m['hamming'] for m in valid_lp]):.2f}, "
+                f"mean_integrality={np.mean([m['integrality_gap'] for m in valid_lp]):.4f}"
+            )
+        if valid_milp:
+            log(
+                f"Subproblem MILP 汇总: mean_hamming={np.mean([m['hamming'] for m in valid_milp]):.2f}, "
+                f"mean_integrality={np.mean([m['integrality_gap'] for m in valid_milp]):.4f}"
+            )
+        if valid_diff:
+            log(
+                f"LP vs MILP 汇总: mean_L1={np.mean([m['l1'] for m in valid_diff]):.4f}, "
+                f"mean_hamming={np.mean([m['hamming'] for m in valid_diff]):.2f}"
+            )
+        _log_solution_similarity_summary(
+            "Subproblem LP",
+            lp_solutions,
+            "Subproblem MILP",
+            milp_solutions,
+        )
+        print("=" * 70)
+
+    return results
+
+
 def run_fp_test(ppc, all_samples: list, dual_predictor, trainers: dict,
                 T_DELTA: float, n_test: int, agent=None,
                 scenario_bank: list | None = None,
@@ -1660,6 +1823,15 @@ def test_surrogate(ppc, all_samples: list, T_DELTA: float,
     print("=" * 70)
     run_lp_compare_test(ppc, all_samples, dual_predictor, trainers,
                         T_DELTA, TEST_SAMPLES, fig_dir)
+    if RUN_SUBPROBLEM_MILP_TEST:
+        run_subproblem_milp_test(
+            ppc,
+            all_samples,
+            dual_predictor,
+            trainers,
+            T_DELTA,
+            TEST_SAMPLES,
+        )
 
     fp_results = None
     if RUN_FP:
@@ -2610,6 +2782,15 @@ def test_both(ppc, data_file: Path, all_samples: list, T_DELTA: float,
     log("── Step 4/4  LP 松弛解质量评估（FP 前置分析）")
     run_lp_compare_test(ppc, all_samples, dual_predictor, trainers,
                         T_DELTA, test_samples, fig_dir, agent=agent)
+    if RUN_SUBPROBLEM_MILP_TEST:
+        run_subproblem_milp_test(
+            ppc,
+            all_samples,
+            dual_predictor,
+            trainers,
+            T_DELTA,
+            test_samples,
+        )
     analyse_lp_distance(
         agent, test_samples, fig_dir, CASE_NAME,
         ppc=ppc, all_samples=all_samples, dual_predictor=dual_predictor,

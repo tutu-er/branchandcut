@@ -493,7 +493,14 @@ def evaluate_commitment_cost(
 # ---------------------------------------------------------------------------
 
 class CommitmentClusterer:
-    """Cluster daily UC scenarios and produce representative commitment schedules."""
+    """Cluster daily UC scenarios and produce representative commitment schedules.
+
+    By default ``require_all_cluster_days_in_uc=True``: the shared MILP includes
+    every day in the cluster, so the returned ``x_rep`` satisfies power balance,
+    limits, ramps, and DC flow jointly for all those days. Set
+    ``require_all_cluster_days_in_uc=False`` to subsample scenarios (faster but
+    ``x_rep`` is only guaranteed feasible on the sampled days).
+    """
 
     def __init__(
         self,
@@ -505,6 +512,7 @@ class CommitmentClusterer:
         lp_proximity_weight: float = 0.0,
         max_cost_increase_ratio: Optional[float] = None,
         max_scenarios_per_cluster: Optional[int] = None,
+        require_all_cluster_days_in_uc: bool = True,
         gurobi_time_limit: float = 600.0,
         feature_mode: str = "summary",
         pca_components: Optional[int] = None,
@@ -521,6 +529,7 @@ class CommitmentClusterer:
         self.lp_proximity_weight = lp_proximity_weight
         self.max_cost_increase_ratio = max_cost_increase_ratio
         self.max_scenarios_per_cluster = max_scenarios_per_cluster
+        self.require_all_cluster_days_in_uc = require_all_cluster_days_in_uc
         self.gurobi_time_limit = gurobi_time_limit
         self.feature_mode = feature_mode
         self.pca_components = pca_components
@@ -637,14 +646,41 @@ class CommitmentClusterer:
     # ----- Representative commitment per cluster -----
 
     def _select_cluster_scenarios(self, cluster_indices: List[int]) -> List[Dict]:
-        """Subsample if cluster is too large."""
+        """Return scenarios fed into shared UC.
+
+        When ``require_all_cluster_days_in_uc`` is True (default), every day in
+        the cluster is included so joint constraints hold for all of them.
+        Subsampling is only applied when that flag is False (compute shortcut;
+        then x_rep is not guaranteed feasible on omitted days).
+        """
         cluster_samples = [self.samples[i] for i in cluster_indices]
+        n = len(cluster_samples)
+
+        if self.require_all_cluster_days_in_uc:
+            if (
+                self.max_scenarios_per_cluster is not None
+                and n > self.max_scenarios_per_cluster
+            ):
+                print(
+                    f"  Note: require_all_cluster_days_in_uc=True — shared UC uses "
+                    f"all {n} cluster days (ignoring max_scenarios_per_cluster="
+                    f"{self.max_scenarios_per_cluster}).",
+                    flush=True,
+                )
+            return cluster_samples
+
         if (
             self.max_scenarios_per_cluster is not None
-            and len(cluster_samples) > self.max_scenarios_per_cluster
+            and n > self.max_scenarios_per_cluster
         ):
+            print(
+                "  WARNING: require_all_cluster_days_in_uc=False — subsampling UC "
+                f"to {self.max_scenarios_per_cluster} of {n} days. Representative "
+                "x is only guaranteed feasible on sampled days.",
+                flush=True,
+            )
             rng = np.random.default_rng(42)
-            chosen = rng.choice(len(cluster_samples), self.max_scenarios_per_cluster, replace=False)
+            chosen = rng.choice(n, self.max_scenarios_per_cluster, replace=False)
             cluster_samples = [cluster_samples[int(i)] for i in sorted(chosen)]
         return cluster_samples
 
@@ -681,6 +717,11 @@ class CommitmentClusterer:
 
         cluster_samples = self._select_cluster_scenarios(cluster_indices)
         n_used = len(cluster_samples)
+        print(
+            f"  Shared UC scenario count: {n_used} "
+            f"(require_all_cluster_days_in_uc={self.require_all_cluster_days_in_uc})",
+            flush=True,
+        )
 
         # Compute optimal costs
         opt_costs = []
@@ -898,6 +939,7 @@ class CommitmentClusterer:
                 "lp_proximity_weight": self.lp_proximity_weight,
                 "max_cost_increase_ratio": self.max_cost_increase_ratio,
                 "max_scenarios_per_cluster": self.max_scenarios_per_cluster,
+                "require_all_cluster_days_in_uc": self.require_all_cluster_days_in_uc,
                 "gurobi_time_limit": self.gurobi_time_limit,
                 "feature_mode": self.feature_mode,
                 "T_delta": self.T_delta,

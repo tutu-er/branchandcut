@@ -61,6 +61,8 @@ class ParallelAgent_NN_BCD(Agent_NN_BCD):
         loss_ratio_dual_x: float = 1.0,
         loss_ratio_opt: float = 1.0,
         loss_ratio_reg: float = 1.0,
+        iter_delta_reg_weight: float = 1e-4,
+        iter_delta_reg_deadband: float = 0.05,
         n_workers: int = 4,
     ):
         super().__init__(
@@ -93,6 +95,8 @@ class ParallelAgent_NN_BCD(Agent_NN_BCD):
             loss_ratio_dual_x=loss_ratio_dual_x,
             loss_ratio_opt=loss_ratio_opt,
             loss_ratio_reg=loss_ratio_reg,
+            iter_delta_reg_weight=iter_delta_reg_weight,
+            iter_delta_reg_deadband=iter_delta_reg_deadband,
         )
         self.n_workers = min(n_workers, self.n_samples)
 
