@@ -2000,17 +2000,41 @@ def identify_trusted_mask(
     Returns:
         trusted_mask: (ng, T) bool 数组，True 表示高可信度（固定）
     """
+    x_lp_arr = np.asarray(x_LP)
+    x_init_arr = np.asarray(x_init_k)
+    x_init_pert_arr = np.asarray(x_init_k_m)
+    if x_lp_arr.shape != x_init_arr.shape:
+        raise ValueError(
+            "identify_trusted_mask() requires x_LP and x_init_k to have the same shape. "
+            f"Got x_LP.shape={x_lp_arr.shape}, x_init_k.shape={x_init_arr.shape}. "
+            "This usually means the global FP pipeline was called with only a partial set "
+            "of surrogate trainers."
+        )
+    if x_init_pert_arr.ndim != 3:
+        raise ValueError(
+            "identify_trusted_mask() requires x_init_k_m to be a 3D array with shape "
+            "(ng, n_perturbations, T). "
+            f"Got x_init_k_m.shape={x_init_pert_arr.shape}."
+        )
+    if x_init_pert_arr.shape[0] != x_lp_arr.shape[0] or x_init_pert_arr.shape[2] != x_lp_arr.shape[1]:
+        raise ValueError(
+            "identify_trusted_mask() requires x_init_k_m to align with x_LP on generator/time axes. "
+            f"Got x_LP.shape={x_lp_arr.shape}, x_init_k_m.shape={x_init_pert_arr.shape}. "
+            "This usually means the global FP pipeline was called with only a partial set "
+            "of surrogate trainers."
+        )
+
     # 条件1：整数性强
-    near_zero = x_LP < conf_threshold
-    near_one = x_LP > 1.0 - conf_threshold
+    near_zero = x_lp_arr < conf_threshold
+    near_one = x_lp_arr > 1.0 - conf_threshold
     integrality_confident = near_zero | near_one
 
     # 条件2：多数投票一致�?
-    n_pert = x_init_k_m.shape[1]
-    x_ref = np.round(x_LP).astype(int)
+    n_pert = x_init_pert_arr.shape[1]
+    x_ref = np.round(x_lp_arr).astype(int)
 
     # 汇总所有投票（x_init_k + 所有扰动解�?
-    vote_sum = x_init_k.astype(float) + np.sum(x_init_k_m.astype(float), axis=1)
+    vote_sum = x_init_arr.astype(float) + np.sum(x_init_pert_arr.astype(float), axis=1)
     n_votes = 1 + n_pert
     majority = (vote_sum / n_votes >= 0.5).astype(int)
     consistent = (majority == x_ref)

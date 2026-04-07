@@ -986,6 +986,24 @@ def recover_integer_solution_case3lite(
     if rng is None:
         rng = np.random.default_rng(42)
 
+    expected_ng = int(ppc['gen'].shape[0])
+    loaded_unit_ids = sorted(
+        int(unit_id)
+        for unit_id in trainers.keys()
+        if 0 <= int(unit_id) < expected_ng
+    )
+    expected_unit_ids = list(range(expected_ng))
+    if loaded_unit_ids != expected_unit_ids:
+        missing_unit_ids = [unit_id for unit_id in expected_unit_ids if unit_id not in loaded_unit_ids]
+        extra_unit_ids = [unit_id for unit_id in loaded_unit_ids if unit_id not in expected_unit_ids]
+        raise ValueError(
+            "recover_integer_solution_case3lite() requires surrogate trainers for all generators "
+            f"because it builds a global FP trusted mask. "
+            f"loaded_unit_ids={loaded_unit_ids}, expected_unit_ids={expected_unit_ids}, "
+            f"missing_unit_ids={missing_unit_ids}, extra_unit_ids={extra_unit_ids}. "
+            "Do not use partial UNIT_IDS when running the global FP pipeline."
+        )
+
     if verbose:
         print("Case3lite custom FP: Step 1/6 predict lambda", flush=True)
     lambda_val = lambda_predictor.predict(sample)
