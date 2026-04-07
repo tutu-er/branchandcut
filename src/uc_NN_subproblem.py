@@ -1297,6 +1297,7 @@ class SubproblemSurrogateNet(nn.Module):
 CONSTRAINT_STRATEGY_ALL = "all"
 CONSTRAINT_STRATEGY_ALL_TEMPLATES_SIGN4 = "all_templates_sign4"
 CONSTRAINT_STRATEGY_ALL_SINGLE_TIME = "all_single_time"
+CONSTRAINT_STRATEGY_ALL_TEMPLATES_SIGN4_PLUS_SINGLE = "all_templates_sign4_plus_single"
 CONSTRAINT_STRATEGY_ALIAS_MAP = {
     "all_templates_rhs3": CONSTRAINT_STRATEGY_ALL_TEMPLATES_SIGN4,
 }
@@ -1307,6 +1308,7 @@ SUPPORTED_CONSTRAINT_GENERATION_STRATEGIES = {
     CONSTRAINT_STRATEGY_ALL,
     CONSTRAINT_STRATEGY_ALL_TEMPLATES_SIGN4,
     CONSTRAINT_STRATEGY_ALL_SINGLE_TIME,
+    CONSTRAINT_STRATEGY_ALL_TEMPLATES_SIGN4_PLUS_SINGLE,
 }
 
 
@@ -1481,6 +1483,16 @@ def select_constraint_layout(
             expanded_timesteps.extend([t] * 4)
             expanded_offsets.extend([SURROGATE_TRIPLE_WINDOW_OFFSETS] * 4)
         return expanded_timesteps, expanded_offsets
+    if strategy_norm == CONSTRAINT_STRATEGY_ALL_TEMPLATES_SIGN4_PLUS_SINGLE:
+        expanded_timesteps = []
+        expanded_offsets = []
+        for t in range(T - 2):
+            expanded_timesteps.extend([t] * 4)
+            expanded_offsets.extend([SURROGATE_TRIPLE_WINDOW_OFFSETS] * 4)
+        for t in range(T):
+            expanded_timesteps.append(t)
+            expanded_offsets.append(SURROGATE_SINGLE_TIME_OFFSETS)
+        return expanded_timesteps, expanded_offsets
     if strategy_norm == CONSTRAINT_STRATEGY_ALL:
         timesteps = list(range(T - 2))
         return timesteps, [SURROGATE_TRIPLE_WINDOW_OFFSETS] * len(timesteps)
@@ -1551,7 +1563,7 @@ class SubproblemSurrogateTrainer:
                  nn_batch_strategy: str = "full-batch",
                  nn_batch_size: int = 4,
                  nn_shuffle: bool = True,
-                 pg_cost_reg_deadband: float = 0.25,
+                 pg_cost_reg_deadband: float = 0.5,
                  loss_ratio_primal: float = 1.0,
                  loss_ratio_dual_pg: float = 1.0,
                  loss_ratio_dual_x: float = 1.0,
@@ -1587,11 +1599,14 @@ class SubproblemSurrogateTrainer:
         self.constraint_generation_strategy = normalize_constraint_generation_strategy(
             constraint_generation_strategy
         )
-        self.all_mode_group_size = 4 if self.constraint_generation_strategy == CONSTRAINT_STRATEGY_ALL_TEMPLATES_SIGN4 else 1
-        self.template_rhs_jitter_scale = 1.5
+        self.all_mode_group_size = 4 if self.constraint_generation_strategy in (
+            CONSTRAINT_STRATEGY_ALL_TEMPLATES_SIGN4,
+            CONSTRAINT_STRATEGY_ALL_TEMPLATES_SIGN4_PLUS_SINGLE,
+        ) else 1
+        self.template_rhs_jitter_scale = 2.0
         self.template_rhs_reg_deadband = 0.8
         self.coeff_reg_deadband = 0.35
-        self.aux_cost_reg_deadband = 0.1
+        self.aux_cost_reg_deadband = 0.5
         self.pg_cost_reg_deadband = max(float(pg_cost_reg_deadband), 0.0)
         self.requested_max_constraints = max_constraints
         self.max_constraints = max_constraints  # V3新增
@@ -1605,6 +1620,8 @@ class SubproblemSurrogateTrainer:
         self.nb = self.bus.shape[0]
         if self.constraint_generation_strategy == CONSTRAINT_STRATEGY_ALL_TEMPLATES_SIGN4:
             self.max_constraints = max(self.all_mode_group_size * (self.T - 2), 0)
+        elif self.constraint_generation_strategy == CONSTRAINT_STRATEGY_ALL_TEMPLATES_SIGN4_PLUS_SINGLE:
+            self.max_constraints = max(self.all_mode_group_size * (self.T - 2) + self.T, 0)
         elif self.constraint_generation_strategy == CONSTRAINT_STRATEGY_ALL_SINGLE_TIME:
             self.max_constraints = max(self.T, 0)
         elif self.constraint_generation_strategy == CONSTRAINT_STRATEGY_ALL:
@@ -1673,7 +1690,7 @@ class SubproblemSurrogateTrainer:
         self.cost_ema_alpha = 0.3  # cost_values EMA平滑系数，越小越平滑
         self.pg_cost_ema_alpha = 0.3
         self.iter_number = 0
-        self.x_cost_scale = 1.0
+        self.x_cost_scale = 2.0
         self.pg_cost_scale = 1.0
         self._sync_rho_dual_summary()
         
@@ -1699,7 +1716,7 @@ class SubproblemSurrogateTrainer:
         # 获取对偶变量λ
         self.lambda_vals = self._get_lambda_values()
         lambda_abs_mean = float(np.mean(np.abs(self.lambda_vals))) if self.lambda_vals.size > 0 else 0.0
-        base_pg_cost_scale = max(lambda_abs_mean / 20.0, 1e-3)
+        base_pg_cost_scale = max(lambda_abs_mean / 5.0, 1e-3)
         self.pg_cost_scale = base_pg_cost_scale * self.pg_cost_scale_multiplier
         
         # 初始化三时段耦合代理约束参数（占位，后续由NN填充）
@@ -1803,7 +1820,7 @@ class SubproblemSurrogateTrainer:
         """初始化代理约束神经网络 - V3版本"""
         input_dim = len(self._extract_features(0))
         delta_base = 0.0 if self._uses_template_rhs_bases() else 3.0
-        delta_scale = self.template_rhs_jitter_scale if self._uses_template_rhs_bases() else 2.0
+        delta_scale = self.template_rhs_jitter_scale if self._uses_template_rhs_bases() else 3.0
 
         self.surrogate_net = SubproblemSurrogateNet(
             input_dim=input_dim,
@@ -1860,7 +1877,10 @@ class SubproblemSurrogateTrainer:
         ]))
 
     def _uses_template_rhs_bases(self) -> bool:
-        return self.constraint_generation_strategy == CONSTRAINT_STRATEGY_ALL_TEMPLATES_SIGN4
+        return self.constraint_generation_strategy in (
+            CONSTRAINT_STRATEGY_ALL_TEMPLATES_SIGN4,
+            CONSTRAINT_STRATEGY_ALL_TEMPLATES_SIGN4_PLUS_SINGLE,
+        )
 
     def _build_all_template_patterns_and_rhs(self) -> tuple[np.ndarray, np.ndarray]:
         patterns = np.array(
@@ -1880,10 +1900,15 @@ class SubproblemSurrogateTrainer:
         if not self._uses_template_rhs_bases() or size <= 0:
             return np.zeros(max(size, 0), dtype=float)
         _, rhs = self._build_all_template_patterns_and_rhs()
-        n_groups = size // self.all_mode_group_size
+        n_sign4 = self.all_mode_group_size * max(self.T - 2, 0)
+        n_groups = n_sign4 // self.all_mode_group_size
         if n_groups <= 0:
             return np.zeros(size, dtype=float)
-        return np.tile(rhs, n_groups)
+        sign4_part = np.tile(rhs, n_groups)
+        if self.constraint_generation_strategy == CONSTRAINT_STRATEGY_ALL_TEMPLATES_SIGN4_PLUS_SINGLE:
+            single_part = np.ones(max(size - n_sign4, 0), dtype=float)
+            return np.concatenate([sign4_part, single_part])[:size]
+        return sign4_part[:size]
 
     def _postprocess_delta_tensor(self, deltas_tensor: torch.Tensor) -> torch.Tensor:
         if not self._uses_template_rhs_bases():
@@ -1973,21 +1998,30 @@ class SubproblemSurrogateTrainer:
 
     def _apply_initial_surrogate_templates(self):
         """Apply deterministic surrogate templates for expanded all-mode constraints."""
-        if self.constraint_generation_strategy != CONSTRAINT_STRATEGY_ALL_TEMPLATES_SIGN4 or self.num_coupling_constraints <= 0:
+        if self.constraint_generation_strategy not in (
+            CONSTRAINT_STRATEGY_ALL_TEMPLATES_SIGN4,
+            CONSTRAINT_STRATEGY_ALL_TEMPLATES_SIGN4_PLUS_SINGLE,
+        ) or self.num_coupling_constraints <= 0:
             return
 
         base_patterns, base_rhs = self._build_all_template_patterns_and_rhs()
-        n_groups = self.num_coupling_constraints // self.all_mode_group_size
+        n_sign4 = self.all_mode_group_size * max(self.T - 2, 0)
+        n_groups = n_sign4 // self.all_mode_group_size
         if n_groups <= 0:
             return
 
-        self.alpha_values[:] = np.tile(base_patterns[:, 0], n_groups)
-        self.beta_values[:] = np.tile(base_patterns[:, 1], n_groups)
-        self.gamma_values[:] = np.tile(base_patterns[:, 2], n_groups)
-        self.delta_values[:] = np.tile(base_rhs, n_groups)
+        # sign4 部分：覆盖前 n_sign4 条约束
+        self.alpha_values[:, :n_sign4] = np.tile(base_patterns[:, 0], n_groups)
+        self.beta_values[:, :n_sign4] = np.tile(base_patterns[:, 1], n_groups)
+        self.gamma_values[:, :n_sign4] = np.tile(base_patterns[:, 2], n_groups)
+        self.delta_values[:, :n_sign4] = np.tile(base_rhs, n_groups)
+        # single_time 尾部保持 NN 初值（alpha 自由，beta/gamma=0，delta 由 NN 生成）
 
     def _uses_group_mu_lower_bound(self) -> bool:
-        return self.constraint_generation_strategy == CONSTRAINT_STRATEGY_ALL_TEMPLATES_SIGN4 and self.all_mode_group_size > 1
+        return self.constraint_generation_strategy in (
+            CONSTRAINT_STRATEGY_ALL_TEMPLATES_SIGN4,
+            CONSTRAINT_STRATEGY_ALL_TEMPLATES_SIGN4_PLUS_SINGLE,
+        ) and self.all_mode_group_size > 1
 
     def _constraint_offsets_for_sample(self, sample_id: int) -> list[tuple[int, ...]]:
         return resolve_constraint_offsets_from_trainer(
@@ -3958,7 +3992,7 @@ def train_subproblem_surrogate_from_data(ppc, active_set_data: List[Dict], unit_
                                           nn_batch_strategy: str = "full-batch",
                                           nn_batch_size: int = 4,
                                           nn_shuffle: bool = True,
-                                          pg_cost_reg_deadband: float = 0.25,
+                                          pg_cost_reg_deadband: float = 0.5,
                                           save_path: str = None, device=None) -> SubproblemSurrogateTrainer:
     """
     训练单机组子问题代理约束

@@ -67,7 +67,7 @@ RUN_FP = True
 
 # 顶部集中配置区：训练相关参数统一在这里调整
 CASE_NAME = 'case3lite'      # 'case3' / 'case3lite' / 'case14' / 'case30' / 'case39' / 'case118'
-MAX_SAMPLES = 100            # None = 使用全部样本
+MAX_SAMPLES = 10            # None = 使用全部样本
 T_DELTA = 1.0
 DUAL_EPOCHS = 200
 DUAL_BATCH_SIZE = 4
@@ -94,7 +94,7 @@ SURROGATE_CONTINUE_TRAINING = False
 SPARSE_TOP_K_VARIABLES = 20
 SPARSE_MAX_GROUPS = 5
 SPARSE_GROUP_SIZE = 3
-SURROGATE_CONSTRAINT_STRATEGY = 'all_templates_sign4'  # 'sensitive' / 'all' / 'all_templates_sign4' / 'all_single_time'
+SURROGATE_CONSTRAINT_STRATEGY = 'all_templates_sign4_plus_single'  # 'sensitive' / 'all' / 'all_templates_sign4' / 'all_single_time' / 'all_templates_sign4_plus_single'
 BCD_LAMBDA_INIT_STRATEGY = 'ed_on_x_opt'   # 'lp_relaxation' / 'ed_on_x_opt'
 THETA_HOT_START_STRATEGY = 'dcpf_relative'   # 'dcpf_relative' / 'gaussian'
 ZETA_HOT_START_STRATEGY = 'zero'             # 'zero' / 'gaussian'
@@ -147,7 +147,7 @@ SUBPROBLEM_PG_COST_START_ROUND = round(SUBPROBLEM_MAX_ITER/10)
 SUBPROBLEM_PG_COST_SCALE_MULTIPLIER = 3
 SUBPROBLEM_PG_COST_LR = 2e-4
 SUBPROBLEM_PG_COST_SURR_LR = 5e-4
-SUBPROBLEM_PG_COST_REG_DEADBAND = 0.25
+SUBPROBLEM_PG_COST_REG_DEADBAND = 0.5
 
 # ──────────────────────── 导入 ────────────────────────
 
