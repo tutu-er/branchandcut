@@ -1,4 +1,4 @@
-﻿"""
+"""
 Parallel BCD wrapper for Agent_NN_BCD.
 
 This module keeps the neural-network block serial, while parallelizing the
