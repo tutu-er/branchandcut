@@ -109,6 +109,8 @@ class ParallelSubproblemSurrogateTrainer(SubproblemSurrogateTrainer):
         loss_ratio_dual_x: float = 1.0,
         loss_ratio_opt: float = 1.0,
         loss_ratio_reg: float = 1.0,
+        pg_block_prox_weight: float = 2e-2,
+        dual_block_prox_weight: float = 1e-2,
         device=None,
         n_workers: int = 4,
     ):
@@ -145,6 +147,8 @@ class ParallelSubproblemSurrogateTrainer(SubproblemSurrogateTrainer):
             loss_ratio_dual_x=loss_ratio_dual_x,
             loss_ratio_opt=loss_ratio_opt,
             loss_ratio_reg=loss_ratio_reg,
+            pg_block_prox_weight=pg_block_prox_weight,
+            dual_block_prox_weight=dual_block_prox_weight,
             device=device,
         )
         self.n_workers = min(n_workers, self.n_samples)

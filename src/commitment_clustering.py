@@ -1,18 +1,15 @@
-"""Commitment Clustering: cluster daily scenarios and generate representative
-commitment schedules with fewer unit start/stop transitions.
+"""Commitment clustering and pattern-library-restricted UC utilities.
 
-Multi-scenario shared-commitment UC formulation per cluster:
-- Shared binary x[g,t] across all days in the cluster
-- Independent dispatch pg[g,t,d] per day
-- Transition penalty to reduce startups/shutdowns
-- Optional LP-relaxation proximity term
-- Optional cost-increase bound
+This module currently supports two distinct workflows:
+- cluster scenarios and solve one shared-commitment UC per cluster
+- build a per-generator commitment-pattern library shared across scenarios
 """
 
 from __future__ import annotations
 
 import json
 import time
+from collections import Counter
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -120,6 +117,58 @@ def _build_ptdf_data(ppc_int: dict):
 def _count_transitions(x: np.ndarray) -> int:
     """Count total startup + shutdown transitions in a commitment matrix."""
     return int(np.sum(np.abs(np.diff(x.astype(float), axis=1)) > 0.5))
+
+
+def _pattern_to_key(pattern: np.ndarray) -> Tuple[int, ...]:
+    arr = np.asarray(pattern, dtype=int).reshape(-1)
+    return tuple(int(v) for v in arr)
+
+
+def _load_commitment_samples_from_json(json_path: str) -> List[Dict]:
+    """Load active-set samples into a normalized scenario list."""
+    reader = ActiveSetReader(json_path)
+    raw_samples = reader.load_all_samples()
+    raw_json = reader.data.get("all_samples", [])
+
+    samples: List[Dict] = []
+    for idx, s in enumerate(raw_samples):
+        if "error" in s:
+            print(f"  Skipping sample {idx}: {s['error']}", flush=True)
+            continue
+
+        x_mat = s.get("unit_commitment_matrix")
+        if x_mat is None or (isinstance(x_mat, np.ndarray) and x_mat.size == 0):
+            print(f"  Skipping sample {idx}: no commitment matrix", flush=True)
+            continue
+
+        load = s.get("load_data")
+        if load is None or (isinstance(load, np.ndarray) and load.size == 0):
+            load = s.get("pd_data")
+        if load is None or (isinstance(load, np.ndarray) and load.size == 0):
+            print(f"  Skipping sample {idx}: no load data", flush=True)
+            continue
+
+        load = np.asarray(load, dtype=float)
+        x_mat = np.asarray(x_mat, dtype=int)
+        renewable = s.get("renewable_data")
+        if renewable is not None:
+            renewable = np.asarray(renewable, dtype=float)
+
+        cost = None
+        raw_s = raw_json[idx] if idx < len(raw_json) else {}
+        if "total_cost" in raw_s:
+            cost = float(raw_s["total_cost"])
+
+        samples.append({
+            "sample_id": s.get("sample_id", idx),
+            "load_data": load,
+            "renewable_data": renewable,
+            "unit_commitment_matrix": x_mat,
+            "optimal_cost": cost,
+        })
+
+    print(f"  Loaded {len(samples)} valid samples from {json_path}", flush=True)
+    return samples
 
 
 # ---------------------------------------------------------------------------
@@ -543,51 +592,8 @@ class CommitmentClusterer:
 
     def load_samples_from_json(self, json_path: str) -> List[Dict]:
         """Load samples from an active_set JSON produced by ActiveSetLearner."""
-        reader = ActiveSetReader(json_path)
-        raw_samples = reader.load_all_samples()
-        raw_json = reader.data.get("all_samples", [])
-
-        samples: List[Dict] = []
-        for idx, s in enumerate(raw_samples):
-            if "error" in s:
-                print(f"  Skipping sample {idx}: {s['error']}", flush=True)
-                continue
-
-            x_mat = s.get("unit_commitment_matrix")
-            if x_mat is None or (isinstance(x_mat, np.ndarray) and x_mat.size == 0):
-                print(f"  Skipping sample {idx}: no commitment matrix", flush=True)
-                continue
-
-            load = s.get("load_data")
-            if load is None or (isinstance(load, np.ndarray) and load.size == 0):
-                load = s.get("pd_data")
-            if load is None or (isinstance(load, np.ndarray) and load.size == 0):
-                print(f"  Skipping sample {idx}: no load data", flush=True)
-                continue
-
-            load = np.asarray(load, dtype=float)
-            x_mat = np.asarray(x_mat, dtype=int)
-            renewable = s.get("renewable_data")
-            if renewable is not None:
-                renewable = np.asarray(renewable, dtype=float)
-
-            # Try to recover optimal cost from raw JSON lambda/cost info
-            cost = None
-            raw_s = raw_json[idx] if idx < len(raw_json) else {}
-            if "total_cost" in raw_s:
-                cost = float(raw_s["total_cost"])
-
-            samples.append({
-                "sample_id": s.get("sample_id", idx),
-                "load_data": load,
-                "renewable_data": renewable,
-                "unit_commitment_matrix": x_mat,
-                "optimal_cost": cost,
-            })
-
-        self.samples = samples
-        print(f"  Loaded {len(samples)} valid samples from {json_path}", flush=True)
-        return samples
+        self.samples = _load_commitment_samples_from_json(json_path)
+        return self.samples
 
     # ----- Feature extraction -----
 
@@ -945,6 +951,597 @@ class CommitmentClusterer:
                 "T_delta": self.T_delta,
             },
             "clusters": self.cluster_results,
+        }
+
+        Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+        with open(output_path, "w", encoding="utf-8") as f:
+            json.dump(output, f, ensure_ascii=False, indent=2, default=str)
+
+        print(f"\nResults saved to: {output_path}", flush=True)
+        return output_path
+
+
+# ---------------------------------------------------------------------------
+# Per-generator commitment-pattern library
+# ---------------------------------------------------------------------------
+
+def solve_pattern_restricted_uc(
+    ppc: dict,
+    scenario: Dict,
+    allowed_patterns: List[List[np.ndarray]],
+    T_delta: float,
+    time_limit: float = 600.0,
+    mip_gap: float = 1e-4,
+    verbose: bool = False,
+) -> Tuple[Optional[np.ndarray], float, str, Optional[List[int]]]:
+    """Solve UC for one scenario with per-generator pattern-library restrictions."""
+    ppc_int = ext2int(ppc)
+    gen = ppc_int["gen"]
+    gencost = ppc_int["gencost"]
+    ng = gen.shape[0]
+
+    if len(allowed_patterns) != ng:
+        raise ValueError(
+            f"allowed_patterns length {len(allowed_patterns)} does not match ng={ng}"
+        )
+
+    load_data = np.asarray(scenario["load_data"], dtype=float)
+    renewable_data = scenario.get("renewable_data")
+    if renewable_data is not None:
+        renewable_data = np.asarray(renewable_data, dtype=float)
+
+    T = load_data.shape[1]
+    nb = load_data.shape[0]
+
+    for g, patterns_g in enumerate(allowed_patterns):
+        if not patterns_g:
+            return None, float("inf"), f"generator_{g}_has_no_patterns", None
+        for pattern in patterns_g:
+            if np.asarray(pattern).shape != (T,):
+                raise ValueError(
+                    f"generator {g} pattern shape {np.asarray(pattern).shape} does not match T={T}"
+                )
+
+    Ru, Rd, Ru_co, Rd_co = _get_ramp_limits(ppc, gen, T_delta)
+    min_up_steps, min_down_steps = _get_min_up_down_steps(ppc, gen, T_delta)
+    start_cost = gencost[:, 1]
+    shut_cost = gencost[:, 2]
+
+    if renewable_data is not None:
+        renewable_bus_ids = np.where(np.any(np.abs(renewable_data) > 1e-9, axis=1))[0]
+    else:
+        renewable_bus_ids = np.array([], dtype=int)
+    nr = len(renewable_bus_ids)
+
+    try:
+        PTDF_full, ptdf_g, branch_limit, active_lines = _build_ptdf_data(ppc_int)
+    except Exception as e:
+        print(f"  Warning: PTDF build failed ({e}); DC flow constraints skipped", flush=True)
+        active_lines = []
+        ptdf_g = None
+        branch_limit = None
+        PTDF_full = None
+
+    model = gp.Model("PatternRestrictedUC")
+    model.Params.OutputFlag = 1 if verbose else 0
+    model.Params.LogToConsole = 1 if verbose else 0
+    model.Params.TimeLimit = time_limit
+    model.Params.MIPGap = mip_gap
+
+    y = {}
+    for g, patterns_g in enumerate(allowed_patterns):
+        for k in range(len(patterns_g)):
+            y[g, k] = model.addVar(vtype=GRB.BINARY, name=f"y_{g}_{k}")
+
+    x = model.addVars(ng, T, lb=0.0, ub=1.0, name="x")
+    coc = model.addVars(ng, T - 1, lb=0.0, name="coc")
+    pg = model.addVars(ng, T, lb=0.0, name="pg")
+    cpower = model.addVars(ng, T, lb=0.0, name="cp")
+    p_ren = model.addVars(nr, T, lb=0.0, name="pr") if nr > 0 else None
+
+    model.update()
+
+    for g, patterns_g in enumerate(allowed_patterns):
+        model.addConstr(
+            gp.quicksum(y[g, k] for k in range(len(patterns_g))) == 1,
+            name=f"select_pattern_{g}",
+        )
+        for t in range(T):
+            model.addConstr(
+                x[g, t] == gp.quicksum(
+                    float(patterns_g[k][t]) * y[g, k]
+                    for k in range(len(patterns_g))
+                ),
+                name=f"pattern_link_{g}_{t}",
+            )
+
+    for g in range(ng):
+        for tau in range(1, int(min_up_steps[g]) + 1):
+            for t1 in range(T - tau):
+                model.addConstr(x[g, t1 + 1] - x[g, t1] <= x[g, t1 + tau])
+
+    for g in range(ng):
+        for tau in range(1, int(min_down_steps[g]) + 1):
+            for t1 in range(T - tau):
+                model.addConstr(-x[g, t1 + 1] + x[g, t1] <= 1 - x[g, t1 + tau])
+
+    for t in range(1, T):
+        for g in range(ng):
+            model.addConstr(coc[g, t - 1] >= start_cost[g] * (x[g, t] - x[g, t - 1]))
+            model.addConstr(coc[g, t - 1] >= shut_cost[g] * (x[g, t - 1] - x[g, t]))
+
+    for t in range(T):
+        ren_supply = (
+            gp.quicksum(p_ren[r, t] for r in range(nr))
+            if nr > 0 and p_ren is not None else 0
+        )
+        model.addConstr(
+            gp.quicksum(pg[g, t] for g in range(ng)) + ren_supply
+            == float(np.sum(load_data[:, t])),
+            name=f"pb_{t}",
+        )
+        for g in range(ng):
+            model.addConstr(pg[g, t] >= gen[g, PMIN] * x[g, t])
+            model.addConstr(pg[g, t] <= gen[g, PMAX] * x[g, t])
+            model.addConstr(
+                cpower[g, t]
+                >= gencost[g, -2] / T_delta * pg[g, t]
+                + gencost[g, -1] / T_delta * x[g, t]
+            )
+
+    if nr > 0 and renewable_data is not None and p_ren is not None:
+        for r, bus_idx in enumerate(renewable_bus_ids):
+            for t in range(T):
+                model.addConstr(p_ren[r, t] <= float(renewable_data[bus_idx, t]))
+
+    for g in range(ng):
+        for t in range(1, T):
+            model.addConstr(
+                pg[g, t] - pg[g, t - 1]
+                <= Ru[g] * x[g, t - 1] + Ru_co[g] * (1 - x[g, t - 1])
+            )
+            model.addConstr(
+                pg[g, t - 1] - pg[g, t]
+                <= Rd[g] * x[g, t] + Rd_co[g] * (1 - x[g, t])
+            )
+
+    if active_lines and ptdf_g is not None:
+        ptdf_Pd = PTDF_full @ load_data
+        if nr > 0 and renewable_data is not None:
+            R_bus = np.zeros((nb, nr))
+            for r, bus_idx in enumerate(renewable_bus_ids):
+                R_bus[bus_idx, r] = 1.0
+            ptdf_R = PTDF_full @ R_bus
+        else:
+            ptdf_R = None
+
+        for l_idx in active_lines:
+            limit = float(branch_limit[l_idx])
+            for t in range(T):
+                flow_expr = gp.quicksum(
+                    float(ptdf_g[l_idx, g]) * pg[g, t] for g in range(ng)
+                ) - float(ptdf_Pd[l_idx, t])
+                if ptdf_R is not None and nr > 0 and p_ren is not None:
+                    flow_expr += gp.quicksum(
+                        float(ptdf_R[l_idx, r]) * p_ren[r, t] for r in range(nr)
+                    )
+                model.addConstr(flow_expr <= limit)
+                model.addConstr(flow_expr >= -limit)
+
+    obj = (
+        gp.quicksum(cpower[g, t] for g in range(ng) for t in range(T))
+        + gp.quicksum(coc[g, t] for g in range(ng) for t in range(T - 1))
+    )
+    model.setObjective(obj, GRB.MINIMIZE)
+    model.optimize()
+
+    if model.status == GRB.OPTIMAL:
+        status_str = "optimal"
+    elif model.status == GRB.TIME_LIMIT and model.SolCount > 0:
+        status_str = "time_limit_with_solution"
+    elif model.status == GRB.SUBOPTIMAL:
+        status_str = "suboptimal"
+    else:
+        return None, float("inf"), f"infeasible_or_error(status={model.status})", None
+
+    x_sol = np.array([[x[g, t].X for t in range(T)] for g in range(ng)])
+    x_sol = np.round(x_sol).astype(int)
+    selected_indices = []
+    for g, patterns_g in enumerate(allowed_patterns):
+        chosen_k = int(np.argmax([y[g, k].X for k in range(len(patterns_g))]))
+        selected_indices.append(chosen_k)
+
+    return x_sol, float(model.objVal), status_str, selected_indices
+
+
+class CommitmentPatternLibrary:
+    """Restrict each generator to a shared library of day-ahead commitment patterns."""
+
+    def __init__(
+        self,
+        ppc: dict,
+        T_delta: float = 1.0,
+        case_name: str = "case118",
+        initial_patterns_per_unit: int = 10,
+        max_patterns_per_unit: Optional[int] = None,
+        gurobi_time_limit: float = 600.0,
+        mip_gap: float = 1e-4,
+        max_samples: Optional[int] = None,
+        verbose: bool = False,
+    ):
+        self.ppc = ppc
+        self.T_delta = T_delta
+        self.case_name = case_name
+        self.initial_patterns_per_unit = max(1, int(initial_patterns_per_unit))
+        self.max_patterns_per_unit = (
+            None if max_patterns_per_unit is None else max(1, int(max_patterns_per_unit))
+        )
+        self.gurobi_time_limit = gurobi_time_limit
+        self.mip_gap = mip_gap
+        self.max_samples = max_samples
+        self.verbose = verbose
+
+        self.samples: List[Dict] = []
+        self.pattern_counters: List[Counter] = []
+        self.pattern_library: List[List[np.ndarray]] = []
+        self.pattern_library_keys: List[List[Tuple[int, ...]]] = []
+        self.pattern_library_key_sets: List[set] = []
+        self.initial_pattern_counts: List[int] = []
+        self.expansion_log: List[Dict] = []
+        self.scenario_results: List[Dict] = []
+        self.summary: Dict = {}
+
+    def load_samples_from_json(self, json_path: str) -> List[Dict]:
+        self.samples = _load_commitment_samples_from_json(json_path)
+        if self.max_samples is not None and len(self.samples) > self.max_samples:
+            self.samples = self.samples[:self.max_samples]
+            print(f"  Truncated samples to first {len(self.samples)} scenarios", flush=True)
+        return self.samples
+
+    def _compute_optimal_cost_via_ed(self, sample: Dict) -> float:
+        if sample.get("optimal_cost") is not None:
+            return float(sample["optimal_cost"])
+        result = evaluate_commitment_cost(
+            self.ppc,
+            sample["load_data"],
+            sample["unit_commitment_matrix"],
+            self.T_delta,
+            renewable_data=sample.get("renewable_data"),
+        )
+        if result["success"]:
+            sample["optimal_cost"] = float(result["total_cost"])
+            return float(result["total_cost"])
+        return float("inf")
+
+    def _build_pattern_counters(self) -> List[Counter]:
+        if not self.samples:
+            raise ValueError("samples are not loaded")
+        ng = self.samples[0]["unit_commitment_matrix"].shape[0]
+        counters = [Counter() for _ in range(ng)]
+        for sample in self.samples:
+            x_mat = np.asarray(sample["unit_commitment_matrix"], dtype=int)
+            for g in range(ng):
+                counters[g][_pattern_to_key(x_mat[g, :])] += 1
+        self.pattern_counters = counters
+        return counters
+
+    def _initialize_pattern_library(self) -> None:
+        if not self.pattern_counters:
+            self._build_pattern_counters()
+
+        self.pattern_library = []
+        self.pattern_library_keys = []
+        self.pattern_library_key_sets = []
+        self.initial_pattern_counts = []
+
+        for g, counter in enumerate(self.pattern_counters):
+            chosen = counter.most_common(self.initial_patterns_per_unit)
+            keys = [key for key, _ in chosen]
+            patterns = [np.asarray(key, dtype=int) for key in keys]
+            self.pattern_library.append(patterns)
+            self.pattern_library_keys.append(keys[:])
+            self.pattern_library_key_sets.append(set(keys))
+            self.initial_pattern_counts.append(len(patterns))
+            print(
+                f"  Generator {g:02d}: init patterns={len(patterns)}, "
+                f"observed unique={len(counter)}",
+                flush=True,
+            )
+
+    def _add_pattern_for_generator(
+        self,
+        generator_id: int,
+        pattern_key: Tuple[int, ...],
+    ) -> bool:
+        if pattern_key in self.pattern_library_key_sets[generator_id]:
+            return False
+        if (
+            self.max_patterns_per_unit is not None
+            and len(self.pattern_library[generator_id]) >= self.max_patterns_per_unit
+        ):
+            return False
+        self.pattern_library[generator_id].append(np.asarray(pattern_key, dtype=int))
+        self.pattern_library_keys[generator_id].append(pattern_key)
+        self.pattern_library_key_sets[generator_id].add(pattern_key)
+        return True
+
+    def _expand_library_for_scenario(self, sample: Dict) -> List[int]:
+        x_opt = np.asarray(sample["unit_commitment_matrix"], dtype=int)
+        added_generators = []
+        for g in range(x_opt.shape[0]):
+            pattern_key = _pattern_to_key(x_opt[g, :])
+            added = self._add_pattern_for_generator(g, pattern_key)
+            if added:
+                added_generators.append(g)
+        return added_generators
+
+    def _solve_scenario(self, sample: Dict) -> Dict:
+        t_start = time.time()
+        x_sol, obj_val, status, selected_indices = solve_pattern_restricted_uc(
+            ppc=self.ppc,
+            scenario=sample,
+            allowed_patterns=self.pattern_library,
+            T_delta=self.T_delta,
+            time_limit=self.gurobi_time_limit,
+            mip_gap=self.mip_gap,
+            verbose=self.verbose,
+        )
+        solve_time = time.time() - t_start
+        return {
+            "x_sol": x_sol,
+            "objective_value": obj_val,
+            "status": status,
+            "selected_pattern_indices": selected_indices,
+            "solve_time_s": solve_time,
+            "success": x_sol is not None,
+        }
+
+    def _ensure_library_feasibility(self) -> None:
+        print("\n[2/4] Traversing scenarios and expanding pattern library when needed...", flush=True)
+        self.expansion_log = []
+
+        for idx, sample in enumerate(self.samples):
+            sample_id = sample["sample_id"]
+            solve_info = self._solve_scenario(sample)
+            if solve_info["success"]:
+                print(
+                    f"  Scenario {idx + 1}/{len(self.samples)} sample_id={sample_id}: "
+                    f"feasible with current library",
+                    flush=True,
+                )
+                continue
+
+            added_generators = self._expand_library_for_scenario(sample)
+            print(
+                f"  Scenario {idx + 1}/{len(self.samples)} sample_id={sample_id}: "
+                f"infeasible, added patterns for generators {added_generators}",
+                flush=True,
+            )
+
+            retry_info = self._solve_scenario(sample)
+            if not retry_info["success"]:
+                opt_feas = evaluate_commitment_cost(
+                    self.ppc,
+                    sample["load_data"],
+                    sample["unit_commitment_matrix"],
+                    self.T_delta,
+                    renewable_data=sample.get("renewable_data"),
+                )
+                raise RuntimeError(
+                    "Pattern-library-restricted UC remained infeasible after adding "
+                    f"scenario-optimal patterns for sample_id={sample_id}. "
+                    f"retry_status={retry_info['status']}, "
+                    f"optimal_x_feasible={opt_feas.get('success', False)}"
+                )
+
+            self.expansion_log.append({
+                "sample_id": sample_id,
+                "scenario_index": idx,
+                "added_generators": added_generators,
+                "n_added": len(added_generators),
+                "retry_status": retry_info["status"],
+            })
+
+    def _evaluate_all_scenarios(self) -> List[Dict]:
+        print("\n[3/4] Evaluating final pattern library on all scenarios...", flush=True)
+        scenario_results: List[Dict] = []
+
+        for idx, sample in enumerate(self.samples):
+            sample_id = sample["sample_id"]
+            solve_info = self._solve_scenario(sample)
+            x_sol = solve_info["x_sol"]
+            obj_val = solve_info["objective_value"]
+            status = solve_info["status"]
+            selected_indices = solve_info["selected_pattern_indices"]
+            solve_time = solve_info["solve_time_s"]
+
+            if x_sol is None:
+                scenario_results.append({
+                    "sample_id": sample_id,
+                    "scenario_index": idx,
+                    "success": False,
+                    "solver_status": status,
+                    "restricted_cost": None,
+                    "optimal_cost": None,
+                    "cost_increase_pct": None,
+                })
+                continue
+
+            x_opt = np.asarray(sample["unit_commitment_matrix"], dtype=int)
+            optimal_cost = self._compute_optimal_cost_via_ed(sample)
+            transitions_opt = _count_transitions(x_opt)
+            transitions_restricted = _count_transitions(x_sol)
+
+            selected_keys = [
+                self.pattern_library_keys[g][selected_indices[g]]
+                for g in range(len(selected_indices))
+            ]
+            optimal_keys = [_pattern_to_key(x_opt[g, :]) for g in range(x_opt.shape[0])]
+            matched_units = int(sum(
+                1 for g in range(x_opt.shape[0]) if selected_keys[g] == optimal_keys[g]
+            ))
+
+            cost_increase_pct = None
+            if np.isfinite(optimal_cost) and optimal_cost > 0:
+                cost_increase_pct = (obj_val - optimal_cost) / optimal_cost * 100.0
+
+            scenario_results.append({
+                "sample_id": sample_id,
+                "scenario_index": idx,
+                "success": True,
+                "solver_status": status,
+                "restricted_cost": obj_val,
+                "optimal_cost": optimal_cost if np.isfinite(optimal_cost) else None,
+                "cost_increase_pct": cost_increase_pct,
+                "optimal_transitions": transitions_opt,
+                "restricted_transitions": transitions_restricted,
+                "matched_unit_patterns": matched_units,
+                "changed_unit_patterns": int(x_opt.shape[0] - matched_units),
+                "selected_pattern_indices": selected_indices,
+                "solve_time_s": solve_time,
+            })
+
+        self.scenario_results = scenario_results
+        return scenario_results
+
+    def _build_summary(self) -> Dict:
+        feasible_results = [r for r in self.scenario_results if r.get("success")]
+        feasible_cost_increases = [
+            r["cost_increase_pct"]
+            for r in feasible_results
+            if r.get("cost_increase_pct") is not None
+        ]
+        optimal_costs = [
+            r["optimal_cost"] for r in feasible_results if r.get("optimal_cost") is not None
+        ]
+        restricted_costs = [
+            r["restricted_cost"] for r in feasible_results if r.get("restricted_cost") is not None
+        ]
+        final_counts = [len(patterns) for patterns in self.pattern_library]
+        added_counts = [
+            len(self.pattern_library[g]) - self.initial_pattern_counts[g]
+            for g in range(len(self.pattern_library))
+        ]
+
+        summary = {
+            "n_scenarios": len(self.samples),
+            "n_feasible": len(feasible_results),
+            "feasibility_rate": (
+                len(feasible_results) / len(self.samples) if self.samples else 0.0
+            ),
+            "avg_optimal_cost": float(np.mean(optimal_costs)) if optimal_costs else None,
+            "avg_restricted_cost": float(np.mean(restricted_costs)) if restricted_costs else None,
+            "avg_cost_increase_pct": (
+                float(np.mean(feasible_cost_increases)) if feasible_cost_increases else None
+            ),
+            "max_cost_increase_pct": (
+                float(np.max(feasible_cost_increases)) if feasible_cost_increases else None
+            ),
+            "p95_cost_increase_pct": (
+                float(np.percentile(feasible_cost_increases, 95))
+                if feasible_cost_increases else None
+            ),
+            "mean_final_patterns_per_unit": (
+                float(np.mean(final_counts)) if final_counts else None
+            ),
+            "max_final_patterns_per_unit": max(final_counts) if final_counts else None,
+            "total_added_patterns": int(np.sum(added_counts)) if added_counts else 0,
+            "n_scenarios_triggering_expansion": len(self.expansion_log),
+        }
+        self.summary = summary
+        return summary
+
+    def _print_summary(self) -> None:
+        summary = self.summary or self._build_summary()
+        print("\n[4/4] Summary", flush=True)
+        print("=" * 72, flush=True)
+        print(
+            f"  Feasibility: {summary['feasibility_rate']:.1%} "
+            f"({summary['n_feasible']}/{summary['n_scenarios']})",
+            flush=True,
+        )
+        print(f"  Avg optimal cost:    {summary['avg_optimal_cost']}", flush=True)
+        print(f"  Avg restricted cost: {summary['avg_restricted_cost']}", flush=True)
+        print(f"  Avg cost increase:   {summary['avg_cost_increase_pct']}%", flush=True)
+        print(f"  Max cost increase:   {summary['max_cost_increase_pct']}%", flush=True)
+        print(f"  P95 cost increase:   {summary['p95_cost_increase_pct']}%", flush=True)
+        print(
+            f"  Pattern expansions:  {summary['n_scenarios_triggering_expansion']} scenarios, "
+            f"{summary['total_added_patterns']} added unit-patterns",
+            flush=True,
+        )
+        print(
+            f"  Final patterns/unit: mean={summary['mean_final_patterns_per_unit']}, "
+            f"max={summary['max_final_patterns_per_unit']}",
+            flush=True,
+        )
+        print("=" * 72, flush=True)
+
+    def run(self, json_path: str) -> List[Dict]:
+        print("=" * 72, flush=True)
+        print("  Commitment Pattern Library Pipeline", flush=True)
+        print("=" * 72, flush=True)
+
+        print("\n[1/4] Loading samples and initializing library...", flush=True)
+        self.load_samples_from_json(json_path)
+        self._build_pattern_counters()
+        self._initialize_pattern_library()
+
+        self._ensure_library_feasibility()
+        self._evaluate_all_scenarios()
+        self._build_summary()
+        self._print_summary()
+        return self.scenario_results
+
+    def save_results(self, output_path: Optional[str] = None) -> str:
+        if output_path is None:
+            out_dir = Path(__file__).resolve().parent.parent / "result" / "commitment_clustering"
+            out_dir.mkdir(parents=True, exist_ok=True)
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            output_path = str(
+                out_dir
+                / f"pattern_library_{self.case_name}_K{self.initial_patterns_per_unit}_{timestamp}.json"
+            )
+
+        pattern_library_output = []
+        for g, counter in enumerate(self.pattern_counters):
+            total_obs = int(sum(counter.values()))
+            patterns_out = []
+            for k, key in enumerate(self.pattern_library_keys[g]):
+                freq = int(counter.get(key, 0))
+                share_pct = (freq / total_obs * 100.0) if total_obs > 0 else None
+                patterns_out.append({
+                    "pattern_index": k,
+                    "frequency": freq,
+                    "share_pct": share_pct,
+                    "pattern": "".join(str(v) for v in key),
+                })
+            pattern_library_output.append({
+                "generator_id": g,
+                "initial_pattern_count": self.initial_pattern_counts[g],
+                "final_pattern_count": len(self.pattern_library[g]),
+                "unique_observed_patterns": len(counter),
+                "patterns": patterns_out,
+            })
+
+        output = {
+            "metadata": {
+                "case_name": self.case_name,
+                "n_samples": len(self.samples),
+                "timestamp": datetime.now().isoformat(),
+            },
+            "parameters": {
+                "initial_patterns_per_unit": self.initial_patterns_per_unit,
+                "max_patterns_per_unit": self.max_patterns_per_unit,
+                "gurobi_time_limit": self.gurobi_time_limit,
+                "mip_gap": self.mip_gap,
+                "max_samples": self.max_samples,
+                "T_delta": self.T_delta,
+            },
+            "summary": self.summary,
+            "pattern_library": pattern_library_output,
+            "expansion_log": self.expansion_log,
+            "scenarios": self.scenario_results,
         }
 
         Path(output_path).parent.mkdir(parents=True, exist_ok=True)

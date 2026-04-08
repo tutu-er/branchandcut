@@ -508,6 +508,8 @@ class Agent_NN_BCD:
         loss_ratio_reg: float = 1.0,
         iter_delta_reg_weight: float = 1e-4,
         iter_delta_reg_deadband: float = 0.05,
+        pg_block_prox_weight: float = 2e-2,
+        dual_block_prox_weight: float = 1e-2,
     ):
         self.ppc = ppc
         self.ppc_raw = ppc
@@ -590,6 +592,8 @@ class Agent_NN_BCD:
         self.loss_ratio_reg = float(loss_ratio_reg)
         self.iter_delta_reg_weight = float(iter_delta_reg_weight)
         self.iter_delta_reg_deadband = max(float(iter_delta_reg_deadband), 0.0)
+        self.pg_block_prox_weight = max(float(pg_block_prox_weight), 0.0)
+        self.dual_block_prox_weight = max(float(dual_block_prox_weight), 0.0)
         rho_dual_pg_base = rho_dual_init if rho_dual_pg_init is None else rho_dual_pg_init
         rho_dual_x_base = rho_dual_init if rho_dual_x_init is None else rho_dual_x_init
         rho_dual_coc_base = rho_dual_init if rho_dual_coc_init is None else rho_dual_coc_init
@@ -653,6 +657,159 @@ class Agent_NN_BCD:
             self.rho_opt,
         )
         return float(np.sqrt(max(min_rho, 0.0)))
+
+    def _add_squared_distance_term(self, expr, reference_value: float, scale: float):
+        reference_value = float(reference_value)
+        scale = max(float(scale), 1e-6)
+        diff = (expr - reference_value) / scale
+        return diff * diff
+
+    def _build_pg_block_prox_obj(self, model, sample_id: int, pg, x, coc):
+        prox_obj = gp.LinExpr()
+        if self.pg_block_prox_weight <= 0:
+            return prox_obj
+
+        prev_pg = self.pg[sample_id]
+        prev_x = self.x[sample_id]
+        prev_coc = self.coc[sample_id]
+        start_cost = self.gencost[:, 1]
+        shut_cost = self.gencost[:, 2]
+
+        for g in range(self.ng):
+            pg_scale = max(float(self.gen[g, PMAX]), 1.0)
+            coc_scale = max(float(start_cost[g]), float(shut_cost[g]), 1.0)
+            for t in range(self.T):
+                prox_obj += self._add_squared_distance_term(
+                    pg[g, t],
+                    prev_pg[g, t],
+                    pg_scale,
+                )
+                prox_obj += self._add_squared_distance_term(
+                    x[g, t],
+                    prev_x[g, t],
+                    1.0,
+                )
+            for t in range(self.T - 1):
+                prox_obj += self._add_squared_distance_term(
+                    coc[g, t],
+                    prev_coc[g, t],
+                    coc_scale,
+                )
+
+        return prox_obj
+
+    def _build_dual_block_prox_obj(
+        self,
+        model,
+        sample_id: int,
+        lambda_power_balance,
+        lambda_pg_lower,
+        lambda_pg_upper,
+        lambda_ramp_up,
+        lambda_ramp_down,
+        lambda_min_on,
+        lambda_min_off,
+        lambda_start_cost,
+        lambda_shut_cost,
+        lambda_coc_nonneg,
+        lambda_dcpf_upper,
+        lambda_dcpf_lower,
+        lambda_x_upper,
+        lambda_x_lower,
+        mu,
+        ita,
+        Ton: int,
+        Toff: int,
+    ):
+        prox_obj = gp.LinExpr()
+        if self.dual_block_prox_weight <= 0:
+            return prox_obj
+
+        prev_lambda = self.lambda_[sample_id] if self.lambda_[sample_id] is not None else self._create_empty_lambda_dict()
+        prev_mu = self.mu[sample_id]
+        prev_ita = self.ita[sample_id]
+
+        for t in range(self.T):
+            prev_val = float(prev_lambda['lambda_power_balance'][t])
+            prox_obj += self._add_squared_distance_term(
+                lambda_power_balance[t],
+                prev_val,
+                max(1.0, abs(prev_val)),
+            )
+
+        for g in range(self.ng):
+            for t in range(self.T):
+                for var_name, var_container in (
+                    ('lambda_pg_lower', lambda_pg_lower),
+                    ('lambda_pg_upper', lambda_pg_upper),
+                    ('lambda_x_upper', lambda_x_upper),
+                    ('lambda_x_lower', lambda_x_lower),
+                ):
+                    prev_val = float(prev_lambda[var_name][g, t])
+                    prox_obj += self._add_squared_distance_term(
+                        var_container[g, t],
+                        prev_val,
+                        max(1.0, abs(prev_val)),
+                    )
+                prev_ita_val = float(prev_ita[g, t])
+                prox_obj += self._add_squared_distance_term(
+                    ita[g, t],
+                    prev_ita_val,
+                    max(1.0, abs(prev_ita_val)),
+                )
+
+            for t in range(self.T - 1):
+                for var_name, var_container in (
+                    ('lambda_ramp_up', lambda_ramp_up),
+                    ('lambda_ramp_down', lambda_ramp_down),
+                    ('lambda_start_cost', lambda_start_cost),
+                    ('lambda_shut_cost', lambda_shut_cost),
+                    ('lambda_coc_nonneg', lambda_coc_nonneg),
+                ):
+                    prev_val = float(prev_lambda[var_name][g, t])
+                    prox_obj += self._add_squared_distance_term(
+                        var_container[g, t],
+                        prev_val,
+                        max(1.0, abs(prev_val)),
+                    )
+
+            for tau in range(Ton):
+                for t in range(self.T):
+                    prev_val = float(prev_lambda['lambda_min_on'][g, tau, t])
+                    prox_obj += self._add_squared_distance_term(
+                        lambda_min_on[g, tau, t],
+                        prev_val,
+                        max(1.0, abs(prev_val)),
+                    )
+            for tau in range(Toff):
+                for t in range(self.T):
+                    prev_val = float(prev_lambda['lambda_min_off'][g, tau, t])
+                    prox_obj += self._add_squared_distance_term(
+                        lambda_min_off[g, tau, t],
+                        prev_val,
+                        max(1.0, abs(prev_val)),
+                    )
+
+        for l in range(self.nl):
+            for t in range(self.T):
+                for var_name, var_container in (
+                    ('lambda_dcpf_upper', lambda_dcpf_upper),
+                    ('lambda_dcpf_lower', lambda_dcpf_lower),
+                ):
+                    prev_val = float(prev_lambda[var_name][l, t])
+                    prox_obj += self._add_squared_distance_term(
+                        var_container[l, t],
+                        prev_val,
+                        max(1.0, abs(prev_val)),
+                    )
+                prev_mu_val = float(prev_mu[l, t])
+                prox_obj += self._add_squared_distance_term(
+                    mu[l, t],
+                    prev_mu_val,
+                    max(1.0, abs(prev_mu_val)),
+                )
+
+        return prox_obj
 
     def _solve_lp_with_fixed_x(self, Pd: np.ndarray, x_vals: np.ndarray):
         """以固定 x 矩阵构建纯 LP，求解后返回连续变量解和对偶变量字典。
@@ -2538,7 +2695,13 @@ class Agent_NN_BCD:
             obj_opt += parametric_obj_opt
         
         # 设置目标函数
-        total_objective = obj_binary + self.rho_primal * obj_primal + self.rho_opt * obj_opt
+        obj_prox = self._build_pg_block_prox_obj(model, sample_id, pg, x, coc)
+        total_objective = (
+            obj_binary
+            + self.rho_primal * obj_primal
+            + self.rho_opt * obj_opt
+            + self.pg_block_prox_weight * obj_prox
+        )
         model.setObjective(total_objective, GRB.MINIMIZE)
 
         self._apply_fast_gurobi_tolerances(model, mip=True)
@@ -2551,7 +2714,11 @@ class Agent_NN_BCD:
             coc_sol = np.array([[coc[g, t].X for t in range(self.T-1)] for g in range(self.ng)])
         
             if sample_id <= 2:
-                print(f"pg_block, sample_id: {sample_id}, obj_primal: {obj_primal.getValue()}, obj_opt: {obj_opt.getValue()}, obj_binary: {obj_binary.getValue()}")
+                print(
+                    f"pg_block, sample_id: {sample_id}, obj_primal: {obj_primal.getValue()}, "
+                    f"obj_opt: {obj_opt.getValue()}, obj_binary: {obj_binary.getValue()}, "
+                    f"obj_prox: {obj_prox.getValue() if hasattr(obj_prox, 'getValue') else 0.0}"
+                )
             
             return pg_sol, x_sol, cpower_sol, coc_sol
         else:
@@ -2818,11 +2985,34 @@ class Agent_NN_BCD:
             obj_opt += obj_opt_para
    
         # 设置目标函数
+        obj_dual_prox = self._build_dual_block_prox_obj(
+            model,
+            sample_id,
+            lambda_power_balance,
+            lambda_pg_lower,
+            lambda_pg_upper,
+            lambda_ramp_up,
+            lambda_ramp_down,
+            lambda_min_on,
+            lambda_min_off,
+            lambda_start_cost,
+            lambda_shut_cost,
+            lambda_coc_nonneg,
+            lambda_dcpf_upper,
+            lambda_dcpf_lower,
+            lambda_x_upper,
+            lambda_x_lower,
+            mu,
+            ita,
+            Ton,
+            Toff,
+        )
         total_objective = (
             self.rho_dual_pg * obj_dual_pg
             + self.rho_dual_x * obj_dual_x
             + self.rho_dual_coc * obj_dual_coc
             + self.rho_opt * obj_opt
+            + self.dual_block_prox_weight * obj_dual_prox
             + penal_mu
             + penal_ita
         )
@@ -2862,7 +3052,8 @@ class Agent_NN_BCD:
                     f"obj_dual_pg: {obj_dual_pg.getValue()}, "
                     f"obj_dual_x: {obj_dual_x.getValue()}, "
                     f"obj_dual_coc: {obj_dual_coc.getValue()}, "
-                    f"obj_dual: {obj_dual.getValue()}, obj_opt: {obj_opt.getValue()}",
+                    f"obj_dual: {obj_dual.getValue()}, obj_opt: {obj_opt.getValue()}, "
+                    f"obj_dual_prox: {obj_dual_prox.getValue() if hasattr(obj_dual_prox, 'getValue') else 0.0}",
                     flush=True,
                 )
             
@@ -4787,6 +4978,8 @@ class Agent_NN_BCD:
             "loss_ratio_dual_x": self.loss_ratio_dual_x,
             "loss_ratio_opt": self.loss_ratio_opt,
             "loss_ratio_reg": self.loss_ratio_reg,
+            "pg_block_prox_weight": self.pg_block_prox_weight,
+            "dual_block_prox_weight": self.dual_block_prox_weight,
         }
         
         torch.save(state, filepath)
@@ -4917,6 +5110,14 @@ class Agent_NN_BCD:
         self.loss_ratio_dual_x = float(state.get("loss_ratio_dual_x", self.loss_ratio_dual_x))
         self.loss_ratio_opt = float(state.get("loss_ratio_opt", self.loss_ratio_opt))
         self.loss_ratio_reg = float(state.get("loss_ratio_reg", self.loss_ratio_reg))
+        self.pg_block_prox_weight = max(
+            float(state.get("pg_block_prox_weight", self.pg_block_prox_weight)),
+            0.0,
+        )
+        self.dual_block_prox_weight = max(
+            float(state.get("dual_block_prox_weight", self.dual_block_prox_weight)),
+            0.0,
+        )
 
         self.refresh_theta_zeta_values_from_networks()
 

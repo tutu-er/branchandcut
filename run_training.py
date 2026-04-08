@@ -61,13 +61,13 @@ if not check_and_install_dependencies():
 #   'sparse'    - 稀疏支持集发现 → sparse BCD 训练
 #   'both'      - BCD 训练 → surrogate 训练 → 联合 BCD 训练
 #
-MODE = 'both'
+MODE = 'surrogate'
 ENABLE_SPARSE_SUPPORTS = False
 RUN_FP = True
 
 # 顶部集中配置区：训练相关参数统一在这里调整
 CASE_NAME = 'case3lite'      # 'case3' / 'case3lite' / 'case14' / 'case30' / 'case39' / 'case118'
-MAX_SAMPLES = 300            # None = 使用全部样本
+MAX_SAMPLES = 3            # None = 使用全部样本
 T_DELTA = 1.0
 DUAL_EPOCHS = 200
 DUAL_BATCH_SIZE = 8
@@ -77,7 +77,7 @@ DUAL_LR = 5e-4
 MAX_ITER = 300             # backward-compatible shared fallback
 BCD_MAX_ITER = MAX_ITER
 SUBPROBLEM_MAX_ITER = MAX_ITER
-NN_EPOCHS = 8
+NN_EPOCHS = 4
 UNIT_IDS = None              # None = 所有机组；或如 [0, 1, 2]
 FP_TEST_SAMPLES = 3
 N_WORKERS_BCD = 4
@@ -94,7 +94,7 @@ SURROGATE_CONTINUE_TRAINING = True
 SPARSE_TOP_K_VARIABLES = 20
 SPARSE_MAX_GROUPS = 5
 SPARSE_GROUP_SIZE = 3
-SURROGATE_CONSTRAINT_STRATEGY = 'all_templates_sign4_plus_single'  # 'sensitive' / 'all' / 'all_templates_sign4' / 'all_single_time' / 'all_templates_sign4_plus_single'
+SURROGATE_CONSTRAINT_STRATEGY = 'all_templates_sign4'  # 'sensitive' / 'all' / 'all_templates_sign4' / 'all_single_time' / 'all_templates_sign4_plus_single'
 BCD_LAMBDA_INIT_STRATEGY = 'ed_on_x_opt'   # 'lp_relaxation' / 'ed_on_x_opt'
 THETA_HOT_START_STRATEGY = 'dcpf_relative'   # 'dcpf_relative' / 'gaussian'
 ZETA_HOT_START_STRATEGY = 'zero'             # 'zero' / 'gaussian'
@@ -120,21 +120,21 @@ BCD_RESTORE_RHO_FROM_CHECKPOINT = False
 BCD_MAX_THETA_CONSTRAINTS_PER_TIME_SLOT = 20
 BCD_GAMMA_BASE = 1e-3
 DUAL_DECAY_ROUND = round(BCD_MAX_ITER/8)
-BCD_MU_DUAL_FLOOR_INIT = 0.1
-BCD_ITA_DUAL_FLOOR_INIT = 0.1
-SUBPROBLEM_RHO_PRIMAL_INIT = 0.1
+BCD_MU_DUAL_FLOOR_INIT = 0
+BCD_ITA_DUAL_FLOOR_INIT = 0
+SUBPROBLEM_RHO_PRIMAL_INIT = 1
 SUBPROBLEM_RHO_DUAL_INIT = 1e-3
 SUBPROBLEM_RHO_DUAL_PG_INIT = 1
 SUBPROBLEM_RHO_DUAL_X_INIT = 1e-3
 SUBPROBLEM_RHO_DUAL_COC_INIT = 1
-SUBPROBLEM_RHO_OPT_INIT = 1e-3
+SUBPROBLEM_RHO_OPT_INIT = 1
 SUBPROBLEM_LOSS_RATIO_PRIMAL = 1.0
 SUBPROBLEM_LOSS_RATIO_DUAL_PG = 1.0
 SUBPROBLEM_LOSS_RATIO_DUAL_X = 2e0
 SUBPROBLEM_LOSS_RATIO_OPT = 1.0
 SUBPROBLEM_LOSS_RATIO_REG = 1.0
 SUBPROBLEM_GAMMA_BASE = 1e-3
-SUBPROBLEM_MU_DUAL_FLOOR_INIT = 1
+SUBPROBLEM_MU_DUAL_FLOOR_INIT = 0
 SUBPROBLEM_MU_DUAL_FLOOR_INDIVIDUAL_ROUND = round(SUBPROBLEM_MAX_ITER/10)
 SUBPROBLEM_MU_DUAL_FLOOR_DECAY_ROUND = round(SUBPROBLEM_MAX_ITER/8)
 SUBPROBLEM_NN_BATCH_STRATEGY = 'full-batch'   # 'full-batch' / 'mini-batch'
@@ -154,6 +154,10 @@ BCD_ITER_DELTA_REG_WEIGHT = 1e-4
 BCD_ITER_DELTA_REG_DEADBAND = 0.05
 SUBPROBLEM_ITER_DELTA_REG_WEIGHT = 5e-5
 SUBPROBLEM_ITER_DELTA_REG_DEADBAND = 0.10
+BCD_PG_BLOCK_PROX_WEIGHT = 2e-2
+BCD_DUAL_BLOCK_PROX_WEIGHT = 1e-2
+SUBPROBLEM_PG_BLOCK_PROX_WEIGHT = 2e-2
+SUBPROBLEM_DUAL_BLOCK_PROX_WEIGHT = 1e-2
 
 # ──────────────────────── 导入 ────────────────────────
 
@@ -352,6 +356,8 @@ def create_bcd_agent(ppc, all_samples, T_DELTA, *,
                      nn_batch_size: int = 4,
                      nn_shuffle: bool = True,
                      nn_learning_rate: float = 5e-5,
+                     pg_block_prox_weight: float = BCD_PG_BLOCK_PROX_WEIGHT,
+                     dual_block_prox_weight: float = BCD_DUAL_BLOCK_PROX_WEIGHT,
                      iter_delta_reg_weight: float = BCD_ITER_DELTA_REG_WEIGHT,
                      iter_delta_reg_deadband: float = BCD_ITER_DELTA_REG_DEADBAND):
     if external_sparse_templates is not None and n_workers > 1:
@@ -380,6 +386,8 @@ def create_bcd_agent(ppc, all_samples, T_DELTA, *,
         nn_batch_strategy=nn_batch_strategy,
         nn_batch_size=nn_batch_size,
         nn_shuffle=nn_shuffle,
+        pg_block_prox_weight=pg_block_prox_weight,
+        dual_block_prox_weight=dual_block_prox_weight,
         loss_ratio_primal=loss_ratio_primal,
         loss_ratio_dual_x=loss_ratio_dual_x,
         loss_ratio_opt=loss_ratio_opt,
@@ -429,6 +437,8 @@ def create_subproblem_trainer(ppc, all_samples, T_DELTA, unit_id: int, *,
                               pg_cost_lr: float = 2e-5,
                               pg_cost_surr_lr: float = 5e-5,
                               pg_cost_reg_deadband: float = 0.25,
+                              pg_block_prox_weight: float = SUBPROBLEM_PG_BLOCK_PROX_WEIGHT,
+                              dual_block_prox_weight: float = SUBPROBLEM_DUAL_BLOCK_PROX_WEIGHT,
                               iter_delta_reg_weight: float = SUBPROBLEM_ITER_DELTA_REG_WEIGHT,
                               iter_delta_reg_deadband: float = SUBPROBLEM_ITER_DELTA_REG_DEADBAND):
     trainer_kwargs = dict(
@@ -460,6 +470,8 @@ def create_subproblem_trainer(ppc, all_samples, T_DELTA, unit_id: int, *,
         pg_cost_lr=pg_cost_lr,
         pg_cost_surr_lr=pg_cost_surr_lr,
         pg_cost_reg_deadband=pg_cost_reg_deadband,
+        pg_block_prox_weight=pg_block_prox_weight,
+        dual_block_prox_weight=dual_block_prox_weight,
         iter_delta_reg_weight=iter_delta_reg_weight,
         iter_delta_reg_deadband=iter_delta_reg_deadband,
     )
@@ -506,6 +518,8 @@ def run_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS,
                   pg_cost_lr: float = 2e-5,
                   pg_cost_surr_lr: float = 5e-5,
                   pg_cost_reg_deadband: float = 0.25,
+                  pg_block_prox_weight: float = SUBPROBLEM_PG_BLOCK_PROX_WEIGHT,
+                  dual_block_prox_weight: float = SUBPROBLEM_DUAL_BLOCK_PROX_WEIGHT,
                   iter_delta_reg_weight: float = SUBPROBLEM_ITER_DELTA_REG_WEIGHT,
                   iter_delta_reg_deadband: float = SUBPROBLEM_ITER_DELTA_REG_DEADBAND):
     """V3 代理约束训练（样本级并行），返回 (dual_predictor, trainers)。"""
@@ -536,6 +550,10 @@ def run_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS,
     log(
         f"iter_delta_reg: subproblem_weight={iter_delta_reg_weight}, "
         f"subproblem_deadband={iter_delta_reg_deadband}"
+    )
+    log(
+        f"subproblem_prox: pg_block={pg_block_prox_weight}, "
+        f"dual_block={dual_block_prox_weight}"
     )
     log(
         f"subproblem_loss_ratio: primal={loss_ratio_primal}, dual_pg={loss_ratio_dual_pg}, "
@@ -615,6 +633,8 @@ def run_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS,
                 pg_cost_lr=pg_cost_lr,
                 pg_cost_surr_lr=pg_cost_surr_lr,
                 pg_cost_reg_deadband=pg_cost_reg_deadband,
+                pg_block_prox_weight=pg_block_prox_weight,
+                dual_block_prox_weight=dual_block_prox_weight,
                 iter_delta_reg_weight=iter_delta_reg_weight,
                 iter_delta_reg_deadband=iter_delta_reg_deadband,
             )
@@ -650,6 +670,8 @@ def run_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS,
                 pg_cost_lr=pg_cost_lr,
                 pg_cost_surr_lr=pg_cost_surr_lr,
                 pg_cost_reg_deadband=pg_cost_reg_deadband,
+                pg_block_prox_weight=pg_block_prox_weight,
+                dual_block_prox_weight=dual_block_prox_weight,
                 iter_delta_reg_weight=iter_delta_reg_weight,
                 iter_delta_reg_deadband=iter_delta_reg_deadband,
                 n_workers=n_workers,
@@ -772,7 +794,9 @@ def run_bcd(ppc, all_samples: list, T_DELTA, MAX_ITER, bcd_model_dir,
             nn_batch_strategy: str = 'full-batch',
             nn_batch_size: int = 4,
             nn_shuffle: bool = True,
-            nn_learning_rate: float = 5e-5):
+            nn_learning_rate: float = 5e-5,
+            pg_block_prox_weight: float = BCD_PG_BLOCK_PROX_WEIGHT,
+            dual_block_prox_weight: float = BCD_DUAL_BLOCK_PROX_WEIGHT):
     """BCD 主代理训练（样本级并行），返回 ParallelAgent_NN_BCD 实例。"""
     log("模式: BCD 主代理训练（Agent_NN_BCD）")
     log(f"使用 {len(all_samples)} 个样本")
@@ -798,6 +822,10 @@ def run_bcd(ppc, all_samples: list, T_DELTA, MAX_ITER, bcd_model_dir,
     log(
         f"iter_delta_reg: bcd_weight={iter_delta_reg_weight}, "
         f"bcd_deadband={iter_delta_reg_deadband}"
+    )
+    log(
+        f"bcd_prox: pg_block={pg_block_prox_weight}, "
+        f"dual_block={dual_block_prox_weight}"
     )
 
     print("\n" + "=" * 70)
@@ -839,6 +867,8 @@ def run_bcd(ppc, all_samples: list, T_DELTA, MAX_ITER, bcd_model_dir,
             nn_batch_strategy=nn_batch_strategy,
             nn_batch_size=nn_batch_size,
             nn_shuffle=nn_shuffle,
+            pg_block_prox_weight=pg_block_prox_weight,
+            dual_block_prox_weight=dual_block_prox_weight,
             loss_ratio_primal=loss_ratio_primal,
             loss_ratio_dual_x=loss_ratio_dual_x,
             loss_ratio_opt=loss_ratio_opt,
@@ -873,6 +903,8 @@ def run_bcd(ppc, all_samples: list, T_DELTA, MAX_ITER, bcd_model_dir,
             nn_batch_strategy=nn_batch_strategy,
             nn_batch_size=nn_batch_size,
             nn_shuffle=nn_shuffle,
+            pg_block_prox_weight=pg_block_prox_weight,
+            dual_block_prox_weight=dual_block_prox_weight,
             loss_ratio_primal=loss_ratio_primal,
             loss_ratio_dual_x=loss_ratio_dual_x,
             loss_ratio_opt=loss_ratio_opt,
@@ -991,7 +1023,9 @@ def run_sparse_bcd(ppc, all_samples: list, T_DELTA, MAX_ITER, bcd_model_dir,
                    nn_batch_strategy: str = 'full-batch',
                    nn_batch_size: int = 4,
                    nn_shuffle: bool = True,
-                   nn_learning_rate: float = 5e-5):
+                   nn_learning_rate: float = 5e-5,
+                   pg_block_prox_weight: float = BCD_PG_BLOCK_PROX_WEIGHT,
+                   dual_block_prox_weight: float = BCD_DUAL_BLOCK_PROX_WEIGHT):
     """
     sparse 模式：
     1. 用普通 Agent_NN_BCD 初始化，拿到 x_lp/x_true
@@ -1030,6 +1064,8 @@ def run_sparse_bcd(ppc, all_samples: list, T_DELTA, MAX_ITER, bcd_model_dir,
         ita_dual_floor_init=ita_dual_floor_init,
         iter_delta_reg_weight=iter_delta_reg_weight,
         iter_delta_reg_deadband=iter_delta_reg_deadband,
+        pg_block_prox_weight=pg_block_prox_weight,
+        dual_block_prox_weight=dual_block_prox_weight,
         nn_hidden_dims=nn_hidden_dims,
         nn_learning_rate=nn_learning_rate,
         nn_batch_strategy=nn_batch_strategy,
@@ -1085,6 +1121,8 @@ def run_sparse_bcd(ppc, all_samples: list, T_DELTA, MAX_ITER, bcd_model_dir,
         ita_dual_floor_init=ita_dual_floor_init,
         iter_delta_reg_weight=BCD_ITER_DELTA_REG_WEIGHT,
         iter_delta_reg_deadband=BCD_ITER_DELTA_REG_DEADBAND,
+        pg_block_prox_weight=pg_block_prox_weight,
+        dual_block_prox_weight=dual_block_prox_weight,
         nn_size=nn_size,
         nn_hidden_dims=nn_hidden_dims,
         nn_batch_strategy=nn_batch_strategy,
@@ -1179,6 +1217,8 @@ def main():
     BCD_GAMMA_BASE_VALUE = BCD_GAMMA_BASE
     BCD_MU_DUAL_FLOOR_INIT_VALUE = BCD_MU_DUAL_FLOOR_INIT
     BCD_ITA_DUAL_FLOOR_INIT_VALUE = BCD_ITA_DUAL_FLOOR_INIT
+    BCD_PG_BLOCK_PROX_WEIGHT_VALUE = BCD_PG_BLOCK_PROX_WEIGHT
+    BCD_DUAL_BLOCK_PROX_WEIGHT_VALUE = BCD_DUAL_BLOCK_PROX_WEIGHT
     SUBPROBLEM_RHO_PRIMAL_INIT_VALUE = SUBPROBLEM_RHO_PRIMAL_INIT
     SUBPROBLEM_RHO_DUAL_INIT_VALUE = SUBPROBLEM_RHO_DUAL_INIT
     SUBPROBLEM_RHO_DUAL_PG_INIT_VALUE = SUBPROBLEM_RHO_DUAL_PG_INIT
@@ -1209,6 +1249,8 @@ def main():
     SUBPROBLEM_PG_COST_LR_VALUE = SUBPROBLEM_PG_COST_LR
     SUBPROBLEM_PG_COST_SURR_LR_VALUE = SUBPROBLEM_PG_COST_SURR_LR
     SUBPROBLEM_PG_COST_REG_DEADBAND_VALUE = SUBPROBLEM_PG_COST_REG_DEADBAND
+    SUBPROBLEM_PG_BLOCK_PROX_WEIGHT_VALUE = SUBPROBLEM_PG_BLOCK_PROX_WEIGHT
+    SUBPROBLEM_DUAL_BLOCK_PROX_WEIGHT_VALUE = SUBPROBLEM_DUAL_BLOCK_PROX_WEIGHT
 
     # 创建训练指标收集器
     logger = TrainingLogger()
@@ -1306,7 +1348,9 @@ def main():
                     nn_batch_strategy=BCD_NN_BATCH_STRATEGY_VALUE,
                     nn_batch_size=BCD_NN_BATCH_SIZE_VALUE,
                     nn_shuffle=BCD_NN_SHUFFLE_VALUE,
-                    nn_learning_rate=BCD_NN_LR_VALUE)
+                    nn_learning_rate=BCD_NN_LR_VALUE,
+                    pg_block_prox_weight=BCD_PG_BLOCK_PROX_WEIGHT_VALUE,
+                    dual_block_prox_weight=BCD_DUAL_BLOCK_PROX_WEIGHT_VALUE)
             if RUN_FP:
                 log("警告: bcd 模式不支持 RUN_FP（需要 trainers），请改用 both 模式")
 
@@ -1359,6 +1403,8 @@ def main():
                 nn_batch_size=BCD_NN_BATCH_SIZE_VALUE,
                 nn_shuffle=BCD_NN_SHUFFLE_VALUE,
                 nn_learning_rate=BCD_NN_LR_VALUE,
+                pg_block_prox_weight=BCD_PG_BLOCK_PROX_WEIGHT_VALUE,
+                dual_block_prox_weight=BCD_DUAL_BLOCK_PROX_WEIGHT_VALUE,
             )
             if RUN_FP:
                 log("警告: sparse 模式暂不支持 RUN_FP（需要 trainers），请改用 both 模式或单独接入模板库")
@@ -1415,6 +1461,8 @@ def main():
                     pg_cost_lr=SUBPROBLEM_PG_COST_LR_VALUE,
                     pg_cost_surr_lr=SUBPROBLEM_PG_COST_SURR_LR_VALUE,
                     pg_cost_reg_deadband=SUBPROBLEM_PG_COST_REG_DEADBAND_VALUE,
+                    pg_block_prox_weight=SUBPROBLEM_PG_BLOCK_PROX_WEIGHT_VALUE,
+                    dual_block_prox_weight=SUBPROBLEM_DUAL_BLOCK_PROX_WEIGHT_VALUE,
                     iter_delta_reg_weight=SUBPROBLEM_ITER_DELTA_REG_WEIGHT,
                     iter_delta_reg_deadband=SUBPROBLEM_ITER_DELTA_REG_DEADBAND,
                 )
@@ -1461,6 +1509,8 @@ def main():
                     ita_dual_floor_init=BCD_ITA_DUAL_FLOOR_INIT_VALUE,
                     iter_delta_reg_weight=BCD_ITER_DELTA_REG_WEIGHT,
                     iter_delta_reg_deadband=BCD_ITER_DELTA_REG_DEADBAND,
+                    pg_block_prox_weight=BCD_PG_BLOCK_PROX_WEIGHT_VALUE,
+                    dual_block_prox_weight=BCD_DUAL_BLOCK_PROX_WEIGHT_VALUE,
                     nn_hidden_dims=BCD_NN_HIDDEN_DIMS_VALUE,
                 )
                 _, sparse_template_library = build_sparse_template_library_from_bcd_agent(
@@ -1506,6 +1556,8 @@ def main():
                         ita_dual_floor_init=BCD_ITA_DUAL_FLOOR_INIT_VALUE,
                         iter_delta_reg_weight=BCD_ITER_DELTA_REG_WEIGHT,
                         iter_delta_reg_deadband=BCD_ITER_DELTA_REG_DEADBAND,
+                        pg_block_prox_weight=BCD_PG_BLOCK_PROX_WEIGHT_VALUE,
+                        dual_block_prox_weight=BCD_DUAL_BLOCK_PROX_WEIGHT_VALUE,
                         nn_hidden_dims=BCD_NN_HIDDEN_DIMS_VALUE,
                         nn_learning_rate=BCD_NN_LR_VALUE,
                         nn_batch_strategy=BCD_NN_BATCH_STRATEGY_VALUE,
@@ -1535,6 +1587,8 @@ def main():
                         ita_dual_floor_init=BCD_ITA_DUAL_FLOOR_INIT_VALUE,
                         iter_delta_reg_weight=BCD_ITER_DELTA_REG_WEIGHT,
                         iter_delta_reg_deadband=BCD_ITER_DELTA_REG_DEADBAND,
+                        pg_block_prox_weight=BCD_PG_BLOCK_PROX_WEIGHT_VALUE,
+                        dual_block_prox_weight=BCD_DUAL_BLOCK_PROX_WEIGHT_VALUE,
                         nn_hidden_dims=BCD_NN_HIDDEN_DIMS_VALUE,
                         nn_learning_rate=BCD_NN_LR_VALUE,
                         nn_batch_strategy=BCD_NN_BATCH_STRATEGY_VALUE,
@@ -1562,6 +1616,8 @@ def main():
                         ita_dual_floor_init=BCD_ITA_DUAL_FLOOR_INIT_VALUE,
                         iter_delta_reg_weight=BCD_ITER_DELTA_REG_WEIGHT,
                         iter_delta_reg_deadband=BCD_ITER_DELTA_REG_DEADBAND,
+                        pg_block_prox_weight=BCD_PG_BLOCK_PROX_WEIGHT_VALUE,
+                        dual_block_prox_weight=BCD_DUAL_BLOCK_PROX_WEIGHT_VALUE,
                         nn_hidden_dims=BCD_NN_HIDDEN_DIMS_VALUE,
                         nn_learning_rate=BCD_NN_LR_VALUE,
                         nn_batch_strategy=BCD_NN_BATCH_STRATEGY_VALUE,
@@ -1612,6 +1668,8 @@ def main():
                     ita_dual_floor_init=BCD_ITA_DUAL_FLOOR_INIT_VALUE,
                     iter_delta_reg_weight=BCD_ITER_DELTA_REG_WEIGHT,
                     iter_delta_reg_deadband=BCD_ITER_DELTA_REG_DEADBAND,
+                    pg_block_prox_weight=BCD_PG_BLOCK_PROX_WEIGHT_VALUE,
+                    dual_block_prox_weight=BCD_DUAL_BLOCK_PROX_WEIGHT_VALUE,
                     nn_size=BCD_NN_SIZE_VALUE,
                     nn_hidden_dims=BCD_NN_HIDDEN_DIMS_VALUE,
                     nn_batch_strategy=BCD_NN_BATCH_STRATEGY_VALUE,
@@ -1673,6 +1731,8 @@ def main():
                     pg_cost_lr=SUBPROBLEM_PG_COST_LR_VALUE,
                     pg_cost_surr_lr=SUBPROBLEM_PG_COST_SURR_LR_VALUE,
                     pg_cost_reg_deadband=SUBPROBLEM_PG_COST_REG_DEADBAND_VALUE,
+                    pg_block_prox_weight=SUBPROBLEM_PG_BLOCK_PROX_WEIGHT_VALUE,
+                    dual_block_prox_weight=SUBPROBLEM_DUAL_BLOCK_PROX_WEIGHT_VALUE,
                     iter_delta_reg_weight=SUBPROBLEM_ITER_DELTA_REG_WEIGHT,
                     iter_delta_reg_deadband=SUBPROBLEM_ITER_DELTA_REG_DEADBAND,
                 )

@@ -1,9 +1,4 @@
-"""Run commitment clustering for case118.
-
-Cluster 366 daily scenarios by load/renewable/commitment features, then
-solve a multi-scenario shared-commitment UC per cluster to produce
-representative commitment schedules with fewer start/stop transitions.
-"""
+"""Run per-generator commitment-pattern library optimization for case118."""
 
 from __future__ import annotations
 
@@ -17,7 +12,7 @@ from src.numpy_compat import ensure_numpy_compat_for_pypower
 
 ensure_numpy_compat_for_pypower()
 
-from src.commitment_clustering import CommitmentClusterer
+from src.commitment_clustering import CommitmentPatternLibrary
 from src.mti118_data_loader import load_case118_ppc_with_mti_limits
 
 # ======================================================================
@@ -30,38 +25,23 @@ CASE_NAME = "case118"
 # Set to None to auto-detect the latest file in result/active_set/.
 ACTIVE_SETS_FILE: str | None = None
 
-# Number of clusters M
-N_CLUSTERS = 10
+# Initial shared pattern count per generator.
+# If a scenario is infeasible, the script will add the scenario-optimal pattern
+# for the missing generators and continue.
+INITIAL_PATTERNS_PER_UNIT = 10
 
-# Transition penalty weight (lambda): higher -> fewer start/stops
-TRANSITION_PENALTY = 1.0
+# Optional hard cap. Set to None to allow adaptive expansion beyond the initial
+# count so that all scenarios can be made feasible.
+MAX_PATTERNS_PER_UNIT: int | None = None
 
-# LP relaxation proximity weight (mu): 0 to disable
-LP_PROXIMITY_WEIGHT = 0.0
-
-# Max allowed cost increase vs. optimal (e.g. 0.05 = 5%); None to disable
-MAX_COST_INCREASE_RATIO: float | None = None
-
-# When REQUIRE_ALL_CLUSTER_DAYS_IN_UC is True (default), every day in the cluster
-# is included in the shared UC so x_rep is jointly feasible for all of them.
-# max_scenarios_per_cluster is then ignored unless you set the flag below to False.
-REQUIRE_ALL_CLUSTER_DAYS_IN_UC = True
-
-# Only used if REQUIRE_ALL_CLUSTER_DAYS_IN_UC is False (not recommended for
-# joint feasibility across the whole cluster).
-MAX_SCENARIOS_PER_CLUSTER: int | None = 20
+# Optional scenario truncation for debugging; None runs all scenarios.
+MAX_SAMPLES: int | None = None
 
 # Gurobi solver time limit per cluster (seconds)
 GUROBI_TIME_LIMIT = 600.0
 
 # MIP gap for Gurobi
 MIP_GAP = 1e-4
-
-# Feature mode: "summary" (load+ren+online_count per hour) or "full" (flatten x)
-FEATURE_MODE = "summary"
-
-# PCA components for dimensionality reduction; None to skip
-PCA_COMPONENTS: int | None = None
 
 # case118 ppc loading
 AGGREGATE_THERMAL_BY_BUS = True
@@ -114,24 +94,20 @@ def main() -> None:
           f"{ppc['bus'].shape[0]} buses, "
           f"{ppc['branch'].shape[0]} branches", flush=True)
 
-    clusterer = CommitmentClusterer(
+    library = CommitmentPatternLibrary(
         ppc=ppc,
         T_delta=T_DELTA,
         case_name=CASE_NAME,
-        n_clusters=N_CLUSTERS,
-        transition_penalty=TRANSITION_PENALTY,
-        lp_proximity_weight=LP_PROXIMITY_WEIGHT,
-        max_cost_increase_ratio=MAX_COST_INCREASE_RATIO,
-        max_scenarios_per_cluster=MAX_SCENARIOS_PER_CLUSTER,
-        require_all_cluster_days_in_uc=REQUIRE_ALL_CLUSTER_DAYS_IN_UC,
+        initial_patterns_per_unit=INITIAL_PATTERNS_PER_UNIT,
+        max_patterns_per_unit=MAX_PATTERNS_PER_UNIT,
         gurobi_time_limit=GUROBI_TIME_LIMIT,
-        feature_mode=FEATURE_MODE,
-        pca_components=PCA_COMPONENTS,
+        mip_gap=MIP_GAP,
+        max_samples=MAX_SAMPLES,
         verbose=VERBOSE_SOLVER,
     )
 
-    clusterer.run(json_path)
-    output = clusterer.save_results(OUTPUT_PATH)
+    library.run(json_path)
+    output = library.save_results(OUTPUT_PATH)
     print(f"\nDone. Output: {output}", flush=True)
 
 

@@ -1571,6 +1571,8 @@ class SubproblemSurrogateTrainer:
                  loss_ratio_dual_x: float = 1.0,
                  loss_ratio_opt: float = 1.0,
                  loss_ratio_reg: float = 1.0,
+                 pg_block_prox_weight: float = 2e-2,
+                 dual_block_prox_weight: float = 1e-2,
                  device=None):
         """
         初始化单机组子问题代理约束训练器 - V3三时段版本
@@ -1691,6 +1693,8 @@ class SubproblemSurrogateTrainer:
         self.loss_ratio_dual_x = float(loss_ratio_dual_x)
         self.loss_ratio_opt = float(loss_ratio_opt)
         self.loss_ratio_reg = float(loss_ratio_reg)
+        self.pg_block_prox_weight = max(float(pg_block_prox_weight), 0.0)
+        self.dual_block_prox_weight = max(float(dual_block_prox_weight), 0.0)
         self.cost_ema_alpha = 0.3  # cost_values EMA平滑系数，越小越平滑
         self.pg_cost_ema_alpha = 0.3
         self.iter_number = 0
@@ -1887,6 +1891,150 @@ class SubproblemSurrogateTrainer:
             self.rho_dual_x,
             self.rho_dual_coc,
         ]))
+
+    def _add_squared_distance_term(self, expr, reference_value: float, scale: float):
+        reference_value = float(reference_value)
+        scale = max(float(scale), 1e-6)
+        diff = (expr - reference_value) / scale
+        return diff * diff
+
+    def _build_primal_block_prox_obj(self, model, sample_id: int, pg, x, coc):
+        prox_obj = gp.LinExpr()
+        if self.pg_block_prox_weight <= 0:
+            return prox_obj
+
+        prev_pg = self.pg[sample_id]
+        prev_x = self.x[sample_id]
+        prev_coc = self.coc[sample_id]
+        g = self.unit_id
+        pg_scale = max(float(self.gen[g, PMAX]), 1.0)
+        coc_scale = max(float(self.gencost[g, 1]), float(self.gencost[g, 2]), 1.0)
+
+        for t in range(self.T):
+            prox_obj += self._add_squared_distance_term(
+                pg[t],
+                prev_pg[t],
+                pg_scale,
+            )
+            prox_obj += self._add_squared_distance_term(
+                x[t],
+                prev_x[t],
+                1.0,
+            )
+        for t in range(self.T - 1):
+            prox_obj += self._add_squared_distance_term(
+                coc[t],
+                prev_coc[t],
+                coc_scale,
+            )
+
+        return prox_obj
+
+    def _empty_lambda_inherent(self, Ton: int, Toff: int) -> dict:
+        return {
+            'lambda_pg_lower': np.zeros(self.T, dtype=float),
+            'lambda_pg_upper': np.zeros(self.T, dtype=float),
+            'lambda_ramp_up': np.zeros(max(self.T - 1, 0), dtype=float),
+            'lambda_ramp_down': np.zeros(max(self.T - 1, 0), dtype=float),
+            'lambda_min_on': np.array(
+                [np.zeros(self.T - tau, dtype=float) for tau in range(1, Ton + 1)],
+                dtype=object,
+            ),
+            'lambda_min_off': np.array(
+                [np.zeros(self.T - tau, dtype=float) for tau in range(1, Toff + 1)],
+                dtype=object,
+            ),
+            'lambda_start_cost': np.zeros(max(self.T - 1, 0), dtype=float),
+            'lambda_shut_cost': np.zeros(max(self.T - 1, 0), dtype=float),
+            'lambda_coc_nonneg': np.zeros(max(self.T - 1, 0), dtype=float),
+            'lambda_x_upper': np.zeros(self.T, dtype=float),
+            'lambda_x_lower': np.zeros(self.T, dtype=float),
+        }
+
+    def _build_dual_block_prox_obj(
+        self,
+        model,
+        sample_id: int,
+        lam_pg_lower,
+        lam_pg_upper,
+        lam_ramp_up,
+        lam_ramp_down,
+        lam_start_cost,
+        lam_shut_cost,
+        lam_coc_nonneg,
+        lam_x_upper,
+        lam_x_lower,
+        lam_min_on,
+        lam_min_off,
+        mu,
+        Ton: int,
+        Toff: int,
+    ):
+        prox_obj = gp.LinExpr()
+        if self.dual_block_prox_weight <= 0:
+            return prox_obj
+
+        prev_lambda = self.lambda_inherent[sample_id]
+        if prev_lambda is None:
+            prev_lambda = self._empty_lambda_inherent(Ton, Toff)
+        prev_mu = self.mu[sample_id]
+
+        for t in range(self.T):
+            for var_name, var_container in (
+                ('lambda_pg_lower', lam_pg_lower),
+                ('lambda_pg_upper', lam_pg_upper),
+                ('lambda_x_upper', lam_x_upper),
+                ('lambda_x_lower', lam_x_lower),
+            ):
+                prev_val = float(prev_lambda[var_name][t])
+                prox_obj += self._add_squared_distance_term(
+                    var_container[t],
+                    prev_val,
+                    max(1.0, abs(prev_val)),
+                )
+
+        for t in range(self.T - 1):
+            for var_name, var_container in (
+                ('lambda_ramp_up', lam_ramp_up),
+                ('lambda_ramp_down', lam_ramp_down),
+                ('lambda_start_cost', lam_start_cost),
+                ('lambda_shut_cost', lam_shut_cost),
+                ('lambda_coc_nonneg', lam_coc_nonneg),
+            ):
+                prev_val = float(prev_lambda[var_name][t])
+                prox_obj += self._add_squared_distance_term(
+                    var_container[t],
+                    prev_val,
+                    max(1.0, abs(prev_val)),
+                )
+
+        for tau in range(1, Ton + 1):
+            for t1 in range(self.T - tau):
+                prev_val = float(prev_lambda['lambda_min_on'][tau - 1][t1])
+                prox_obj += self._add_squared_distance_term(
+                    lam_min_on[tau - 1, t1],
+                    prev_val,
+                    max(1.0, abs(prev_val)),
+                )
+
+        for tau in range(1, Toff + 1):
+            for t1 in range(self.T - tau):
+                prev_val = float(prev_lambda['lambda_min_off'][tau - 1][t1])
+                prox_obj += self._add_squared_distance_term(
+                    lam_min_off[tau - 1, t1],
+                    prev_val,
+                    max(1.0, abs(prev_val)),
+                )
+
+        for k in range(self.num_coupling_constraints):
+            prev_val = float(prev_mu[k])
+            prox_obj += self._add_squared_distance_term(
+                mu[k],
+                prev_val,
+                max(1.0, abs(prev_val)),
+            )
+
+        return prox_obj
 
     def _uses_template_rhs_bases(self) -> bool:
         return self.constraint_generation_strategy in (
@@ -2426,10 +2574,12 @@ class SubproblemSurrogateTrainer:
                                   for k in range(len(sensitive_t)))
 
         # --- 目标函数 ---
+        obj_prox = self._build_primal_block_prox_obj(model, sample_id, pg, x, coc)
         model.setObjective(
             self.rho_primal * obj_primal
             + self.rho_opt  * obj_opt
-            + obj_binary,
+            + obj_binary
+            + self.pg_block_prox_weight * obj_prox,
             GRB.MINIMIZE,
         )
         model.optimize()
@@ -2439,7 +2589,8 @@ class SubproblemSurrogateTrainer:
                 print(f"primal_block, sample_id: {sample_id}, "
                       f"obj_primal: {obj_primal.getValue():.4f}, "
                       f"obj_opt: {obj_opt.getValue():.4f}, "
-                      f"obj_binary: {obj_binary.getValue():.4f}", flush=True)
+                      f"obj_binary: {obj_binary.getValue():.4f}, "
+                      f"obj_prox: {obj_prox.getValue() if hasattr(obj_prox, 'getValue') else 0.0:.4f}", flush=True)
 
             pg_sol     = np.array([pg[t].X     for t in range(self.T)])
             x_sol      = np.array([x[t].X      for t in range(self.T)])
@@ -2731,11 +2882,30 @@ class SubproblemSurrogateTrainer:
                 obj_opt += viol * mu[k]
 
         # ===== 设置目标函数并求解 =====
+        obj_dual_prox = self._build_dual_block_prox_obj(
+            model,
+            sample_id,
+            lam_pg_lower,
+            lam_pg_upper,
+            lam_ramp_up,
+            lam_ramp_down,
+            lam_start_cost,
+            lam_shut_cost,
+            lam_coc_nonneg,
+            lam_x_upper,
+            lam_x_lower,
+            lam_min_on,
+            lam_min_off,
+            mu,
+            Ton,
+            Toff,
+        )
         model.setObjective(
             self.rho_dual_pg * obj_dual_pg
             + self.rho_dual_x * obj_dual_x
             + self.rho_dual_coc * obj_dual_coc
-            + self.rho_opt * obj_opt,
+            + self.rho_opt * obj_opt
+            + self.dual_block_prox_weight * obj_dual_prox,
             GRB.MINIMIZE
         )
         model.optimize()
@@ -2767,7 +2937,8 @@ class SubproblemSurrogateTrainer:
                       f"obj_dual_x={obj_dual_x.getValue():.4f}, "
                       f"obj_dual_coc={obj_dual_coc.getValue():.4f}, "
                       f"obj_dual={obj_dual.getValue():.4f}, "
-                      f"obj_opt={obj_opt.getValue() if hasattr(obj_opt, 'getValue') else obj_opt:.4f}",
+                      f"obj_opt={obj_opt.getValue() if hasattr(obj_opt, 'getValue') else obj_opt:.4f}, "
+                      f"obj_dual_prox={obj_dual_prox.getValue() if hasattr(obj_dual_prox, 'getValue') else 0.0:.4f}",
                       flush=True)
 
             return lambda_inherent_sol, mu_sol
@@ -3861,6 +4032,8 @@ class SubproblemSurrogateTrainer:
                 'loss_ratio_dual_x': self.loss_ratio_dual_x,
                 'loss_ratio_opt': self.loss_ratio_opt,
                 'loss_ratio_reg': self.loss_ratio_reg,
+                'pg_block_prox_weight': self.pg_block_prox_weight,
+                'dual_block_prox_weight': self.dual_block_prox_weight,
                 'template_rhs_jitter_scale': self.template_rhs_jitter_scale,
                 'template_rhs_reg_deadband': self.template_rhs_reg_deadband,
                 'coeff_reg_deadband': self.coeff_reg_deadband,
@@ -3944,6 +4117,14 @@ class SubproblemSurrogateTrainer:
             self.loss_ratio_dual_x = float(state.get('loss_ratio_dual_x', self.loss_ratio_dual_x))
             self.loss_ratio_opt = float(state.get('loss_ratio_opt', self.loss_ratio_opt))
             self.loss_ratio_reg = float(state.get('loss_ratio_reg', self.loss_ratio_reg))
+            self.pg_block_prox_weight = max(
+                float(state.get('pg_block_prox_weight', self.pg_block_prox_weight)),
+                0.0,
+            )
+            self.dual_block_prox_weight = max(
+                float(state.get('dual_block_prox_weight', self.dual_block_prox_weight)),
+                0.0,
+            )
             self.pg_cost_reg_deadband = state.get(
                 'pg_cost_reg_deadband',
                 self.pg_cost_reg_deadband,

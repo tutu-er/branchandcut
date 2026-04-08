@@ -1238,6 +1238,17 @@ def _can_run_global_fp(ppc, trainers: dict) -> tuple[bool, str]:
     return True, "global FP enabled"
 
 
+def _describe_loaded_surrogate_units(ppc, trainers: dict) -> str:
+    """Return a compact summary of loaded surrogate trainer unit ids."""
+    expected_ng = int(ppc['gen'].shape[0])
+    loaded_unit_ids = sorted(
+        int(unit_id)
+        for unit_id in trainers.keys()
+        if 0 <= int(unit_id) < expected_ng
+    )
+    return f"loaded_unit_ids={loaded_unit_ids}, expected_ng={expected_ng}"
+
+
 def _compute_commitment_distance_metrics_with_mask(
     x_candidate: np.ndarray,
     x_true: np.ndarray,
@@ -1832,6 +1843,12 @@ def test_surrogate(ppc, all_samples: list, T_DELTA: float,
         f"output_dim={getattr(dual_predictor, 'output_dim', 'n/a')}"
     )
     log(f"已加载 {len(trainers)} 个机组的代理约束模型")
+    log(f"surrogate units: {_describe_loaded_surrogate_units(ppc, trainers)}")
+    can_run_fp, fp_gate_reason = _can_run_global_fp(ppc, trainers)
+    if RUN_FP and can_run_fp:
+        log(f"FP gate: enabled ({fp_gate_reason})")
+    elif RUN_FP:
+        log(f"FP gate: disabled ({fp_gate_reason})")
     print_surrogate_results(trainers, all_samples[:TEST_SAMPLES])
 
     print("\n" + "=" * 70)
@@ -1840,7 +1857,12 @@ def test_surrogate(ppc, all_samples: list, T_DELTA: float,
     plot_surrogate_analysis(trainers, all_samples, fig_dir, CASE_NAME)
 
     print("\n" + "=" * 70)
-    log("LP 松弛解质量评估（FP 前置分析）...")
+    if RUN_FP and can_run_fp:
+        log("LP 松弛解质量评估（FP 前置分析）...")
+    elif RUN_FP:
+        log(f"LP 松弛解质量评估（仅分析，不运行 FP；{fp_gate_reason}）...")
+    else:
+        log("LP 松弛解质量评估（RUN_FP=False）...")
     print("=" * 70)
     run_lp_compare_test(ppc, all_samples, dual_predictor, trainers,
                         T_DELTA, TEST_SAMPLES, fig_dir)
@@ -1855,7 +1877,6 @@ def test_surrogate(ppc, all_samples: list, T_DELTA: float,
         )
 
     fp_results = None
-    can_run_fp, fp_gate_reason = _can_run_global_fp(ppc, trainers)
     if RUN_FP and can_run_fp:
         fp_results = run_fp_test(
             ppc, all_samples, dual_predictor, trainers, T_DELTA, TEST_SAMPLES,
@@ -2783,6 +2804,12 @@ def test_both(ppc, data_file: Path, all_samples: list, T_DELTA: float,
         f"output_dim={getattr(dual_predictor, 'output_dim', 'n/a')}"
     )
     log(f"已加载 {len(trainers)} 个机组的代理约束模型（全体约束）")
+    log(f"surrogate units: {_describe_loaded_surrogate_units(ppc, trainers)}")
+    can_run_fp, fp_gate_reason = _can_run_global_fp(ppc, trainers)
+    if RUN_FP and can_run_fp:
+        log(f"FP gate: enabled ({fp_gate_reason})")
+    elif RUN_FP:
+        log(f"FP gate: disabled ({fp_gate_reason})")
     print_surrogate_results(trainers, all_samples[:test_samples])
 
     # ── Step 3: 绘图 ───────────────────────────────────────
@@ -2803,7 +2830,12 @@ def test_both(ppc, data_file: Path, all_samples: list, T_DELTA: float,
     plot_both_analysis(agent, trainers, fig_dir, CASE_NAME)
 
     # ── Step 4: LP 评估 + 可行性泵（全体代理约束） ────────
-    log("── Step 4/4  LP 松弛解质量评估（FP 前置分析）")
+    if RUN_FP and can_run_fp:
+        log("── Step 4/4  LP 松弛解质量评估（FP 前置分析）")
+    elif RUN_FP:
+        log(f"── Step 4/4  LP 松弛解质量评估（仅分析，不运行 FP；{fp_gate_reason}）")
+    else:
+        log("── Step 4/4  LP 松弛解质量评估（RUN_FP=False）")
     run_lp_compare_test(ppc, all_samples, dual_predictor, trainers,
                         T_DELTA, test_samples, fig_dir, agent=agent)
     if RUN_SUBPROBLEM_MILP_TEST:
@@ -2821,7 +2853,6 @@ def test_both(ppc, data_file: Path, all_samples: list, T_DELTA: float,
         trainers=trainers, T_DELTA=T_DELTA,
     )
 
-    can_run_fp, fp_gate_reason = _can_run_global_fp(ppc, trainers)
     if RUN_FP and can_run_fp:
         log("── Step 4/4  以全体代理约束运行可行性泵")
         fp_results = run_fp_test(
