@@ -63,11 +63,11 @@ if not check_and_install_dependencies():
 #
 MODE = 'surrogate'
 ENABLE_SPARSE_SUPPORTS = False
-RUN_FP = True
+RUN_FP = False
 
 # 顶部集中配置区：训练相关参数统一在这里调整
 CASE_NAME = 'case3lite'      # 'case3' / 'case3lite' / 'case14' / 'case30' / 'case39' / 'case118'
-MAX_SAMPLES = 3            # None = 使用全部样本
+MAX_SAMPLES = 100            # None = 使用全部样本
 T_DELTA = 1.0
 DUAL_EPOCHS = 200
 DUAL_BATCH_SIZE = 8
@@ -78,7 +78,7 @@ MAX_ITER = 300             # backward-compatible shared fallback
 BCD_MAX_ITER = MAX_ITER
 SUBPROBLEM_MAX_ITER = MAX_ITER
 NN_EPOCHS = 4
-UNIT_IDS = None              # None = 所有机组；或如 [0, 1, 2]
+UNIT_IDS = [1]              # None = 所有机组；或如 [0, 1, 2]
 FP_TEST_SAMPLES = 3
 N_WORKERS_BCD = 4
 N_WORKERS_SUBPROBLEM = 4
@@ -86,15 +86,16 @@ JOINT_MAX_ITER = 10
 JOINT_NN_EPOCHS = 5
 JOINT_SURR_NN_EPOCHS = 5
 JOINT_DUAL_DECAY_ROUND = 0
+JOINT_DUAL_SIGN_RELAX_INTERVAL = 4
 ACTIVE_SETS_FILE = "result/active_set/active_sets_case3lite_T24_n1000_20260403_180137.json"  # None = 自动查找最新
-BCD_MODEL_FILE = "result/bcd_models/bcd_model_case3lite_20260403_225254.pth"
-BCD_CONTINUE_TRAINING = True
-SURROGATE_MODEL_DIR = "result/surrogate_models/subproblem_models_case3lite_20260403_225254"
-SURROGATE_CONTINUE_TRAINING = True
+BCD_MODEL_FILE = None
+BCD_CONTINUE_TRAINING = False
+SURROGATE_MODEL_DIR = None
+SURROGATE_CONTINUE_TRAINING = False
 SPARSE_TOP_K_VARIABLES = 20
 SPARSE_MAX_GROUPS = 5
 SPARSE_GROUP_SIZE = 3
-SURROGATE_CONSTRAINT_STRATEGY = 'all_templates_sign4'  # 'sensitive' / 'all' / 'all_templates_sign4' / 'all_single_time' / 'all_templates_sign4_plus_single'
+SURROGATE_CONSTRAINT_STRATEGY = 'all_single_time'  # 'sensitive' / 'all' / 'all_templates_sign4' / 'all_single_time' / 'all_templates_sign4_plus_single'
 BCD_LAMBDA_INIT_STRATEGY = 'ed_on_x_opt'   # 'lp_relaxation' / 'ed_on_x_opt'
 THETA_HOT_START_STRATEGY = 'dcpf_relative'   # 'dcpf_relative' / 'gaussian'
 ZETA_HOT_START_STRATEGY = 'zero'             # 'zero' / 'gaussian'
@@ -110,54 +111,62 @@ BCD_RHO_PRIMAL_INIT = 1e-3
 BCD_RHO_DUAL_INIT = 1e-3
 BCD_RHO_DUAL_PG_INIT = 1
 BCD_RHO_DUAL_X_INIT = 1e-3
-BCD_RHO_DUAL_COC_INIT = 1
+BCD_RHO_DUAL_COC_INIT = 1e1
 BCD_RHO_OPT_INIT = 1e-3
 BCD_LOSS_RATIO_PRIMAL = 1.0
 BCD_LOSS_RATIO_DUAL_X = 2e0
 BCD_LOSS_RATIO_OPT = 1.0
 BCD_LOSS_RATIO_REG = 1.0
+BCD_NN_SMOOTH_ABS_EPS = 1e-5
 BCD_RESTORE_RHO_FROM_CHECKPOINT = False
 BCD_MAX_THETA_CONSTRAINTS_PER_TIME_SLOT = 20
 BCD_GAMMA_BASE = 1e-3
 DUAL_DECAY_ROUND = round(BCD_MAX_ITER/8)
+BCD_DUAL_SIGN_RELAX_INTERVAL = 4
 BCD_MU_DUAL_FLOOR_INIT = 0
 BCD_ITA_DUAL_FLOOR_INIT = 0
-SUBPROBLEM_RHO_PRIMAL_INIT = 1
+SUBPROBLEM_RHO_PRIMAL_INIT = 1e-1
 SUBPROBLEM_RHO_DUAL_INIT = 1e-3
-SUBPROBLEM_RHO_DUAL_PG_INIT = 1
-SUBPROBLEM_RHO_DUAL_X_INIT = 1e-3
-SUBPROBLEM_RHO_DUAL_COC_INIT = 1
-SUBPROBLEM_RHO_OPT_INIT = 1
+SUBPROBLEM_RHO_DUAL_PG_INIT = 1e-1
+SUBPROBLEM_RHO_DUAL_X_INIT = 1e-1
+SUBPROBLEM_RHO_DUAL_COC_INIT = 1e1
+SUBPROBLEM_RHO_OPT_INIT = 1e-1
 SUBPROBLEM_LOSS_RATIO_PRIMAL = 1.0
 SUBPROBLEM_LOSS_RATIO_DUAL_PG = 1.0
 SUBPROBLEM_LOSS_RATIO_DUAL_X = 2e0
+SUBPROBLEM_NN_SMOOTH_ABS_EPS = 1e-5
+SUBPROBLEM_NN_DUAL_TERM_INTERVAL = 1  # None=NN训练时完全屏蔽dual项；k=每k轮NN才启用一次dual项
 SUBPROBLEM_LOSS_RATIO_OPT = 1.0
 SUBPROBLEM_LOSS_RATIO_REG = 1.0
 SUBPROBLEM_GAMMA_BASE = 1e-3
-SUBPROBLEM_MU_DUAL_FLOOR_INIT = 0
-SUBPROBLEM_MU_DUAL_FLOOR_INDIVIDUAL_ROUND = round(SUBPROBLEM_MAX_ITER/10)
-SUBPROBLEM_MU_DUAL_FLOOR_DECAY_ROUND = round(SUBPROBLEM_MAX_ITER/8)
+SUBPROBLEM_MU_DUAL_FLOOR_INIT = 3
+SUBPROBLEM_MU_DUAL_FLOOR_INDIVIDUAL_ROUND = round(SUBPROBLEM_MAX_ITER-10)
+SUBPROBLEM_MU_DUAL_FLOOR_DECAY_ROUND = round(SUBPROBLEM_MAX_ITER-10)
+SUBPROBLEM_MU_SIGNED_ROUND_INTERVAL = 4
+SUBPROBLEM_X_BOUND_DUAL_ZERO_ROUNDS = 0
 SUBPROBLEM_NN_BATCH_STRATEGY = 'full-batch'   # 'full-batch' / 'mini-batch'
 SUBPROBLEM_NN_SIZE = 'medium'   # 'small' / 'medium' / 'large'
 SUBPROBLEM_NN_BATCH_SIZE = 4
 SUBPROBLEM_NN_SHUFFLE = True
-SUBPROBLEM_NN_LR = 1e-4
+SUBPROBLEM_NN_LR = 5e-4
 SUBPROBLEM_X_COST_NN_LR = 1e-5
-SUBPROBLEM_PG_COST_START_ROUND = round(SUBPROBLEM_MAX_ITER/10)
-SUBPROBLEM_PG_COST_SCALE_MULTIPLIER = 3
-SUBPROBLEM_PG_COST_LR = 2e-4
-SUBPROBLEM_PG_COST_SURR_LR = 5e-4
-SUBPROBLEM_PG_COST_REG_DEADBAND = 0.5
+SUBPROBLEM_PG_COST_NN_EPOCHS = 12
+SUBPROBLEM_PG_COST_START_ROUND = round(SUBPROBLEM_MAX_ITER/2)
+SUBPROBLEM_PG_COST_SCALE_MULTIPLIER = 2
+SUBPROBLEM_PG_COST_LR = 1e-4
+SUBPROBLEM_PG_COST_SURR_LR = 2e-4
+SUBPROBLEM_PG_COST_REG_DEADBAND = 1.0
+SUBPROBLEM_PG_COST_SMOOTH_ABS_EPS = 1e-5
 
 # 迭代间输出差异正则：温和抑制相邻 BCD 轮次输出跳变；可按算例继续调节
 BCD_ITER_DELTA_REG_WEIGHT = 1e-4
 BCD_ITER_DELTA_REG_DEADBAND = 0.05
 SUBPROBLEM_ITER_DELTA_REG_WEIGHT = 5e-5
 SUBPROBLEM_ITER_DELTA_REG_DEADBAND = 0.10
-BCD_PG_BLOCK_PROX_WEIGHT = 2e-2
+BCD_PG_BLOCK_PROX_WEIGHT = 0
 BCD_DUAL_BLOCK_PROX_WEIGHT = 1e-2
-SUBPROBLEM_PG_BLOCK_PROX_WEIGHT = 2e-2
-SUBPROBLEM_DUAL_BLOCK_PROX_WEIGHT = 1e-2
+SUBPROBLEM_PG_BLOCK_PROX_WEIGHT = 0
+SUBPROBLEM_DUAL_BLOCK_PROX_WEIGHT = 1e-3
 
 # ──────────────────────── 导入 ────────────────────────
 
@@ -177,6 +186,7 @@ try:
         SubproblemSurrogateTrainer,
         ActiveSetReader,
         load_trained_models,
+        resolve_constraint_offsets_from_trainer,
     )
     from uc_NN_subproblem_parallel import ParallelSubproblemSurrogateTrainer
     from case_registry import get_case_ppc
@@ -356,6 +366,7 @@ def create_bcd_agent(ppc, all_samples, T_DELTA, *,
                      nn_batch_size: int = 4,
                      nn_shuffle: bool = True,
                      nn_learning_rate: float = 5e-5,
+                     nn_smooth_abs_eps: float = BCD_NN_SMOOTH_ABS_EPS,
                      pg_block_prox_weight: float = BCD_PG_BLOCK_PROX_WEIGHT,
                      dual_block_prox_weight: float = BCD_DUAL_BLOCK_PROX_WEIGHT,
                      iter_delta_reg_weight: float = BCD_ITER_DELTA_REG_WEIGHT,
@@ -386,6 +397,7 @@ def create_bcd_agent(ppc, all_samples, T_DELTA, *,
         nn_batch_strategy=nn_batch_strategy,
         nn_batch_size=nn_batch_size,
         nn_shuffle=nn_shuffle,
+        nn_smooth_abs_eps=nn_smooth_abs_eps,
         pg_block_prox_weight=pg_block_prox_weight,
         dual_block_prox_weight=dual_block_prox_weight,
         loss_ratio_primal=loss_ratio_primal,
@@ -420,23 +432,29 @@ def create_subproblem_trainer(ppc, all_samples, T_DELTA, unit_id: int, *,
                               loss_ratio_primal: float = 1.0,
                               loss_ratio_dual_pg: float = 1.0,
                               loss_ratio_dual_x: float = 1.0,
+                              nn_dual_term_interval: int | None = 1,
                               loss_ratio_opt: float = 1.0,
                               loss_ratio_reg: float = 1.0,
                               subproblem_gamma_base: float = 1e-3,
                               mu_lower_bound_init: float = 0.1,
                               mu_individual_lower_bound_round: int = 3,
                               mu_group_lower_bound_round: int = 50,
+                              mu_signed_round_interval: int | None = None,
+                              x_bound_dual_zero_rounds: int = 0,
                               subproblem_nn_hidden_dims: list[int] | None = None,
                               subproblem_nn_batch_strategy: str = 'full-batch',
                               subproblem_nn_batch_size: int = 4,
                               subproblem_nn_shuffle: bool = True,
                               subproblem_nn_learning_rate: float = 1e-4,
                               subproblem_cost_learning_rate: float = 1e-5,
+                              subproblem_nn_smooth_abs_eps: float = SUBPROBLEM_NN_SMOOTH_ABS_EPS,
+                              pg_cost_nn_epochs: int | None = None,
                               pg_cost_start_round: int = 3,
                               pg_cost_scale_multiplier: float = 1.2,
                               pg_cost_lr: float = 2e-5,
                               pg_cost_surr_lr: float = 5e-5,
                               pg_cost_reg_deadband: float = 0.25,
+                              pg_cost_smooth_abs_eps: float = 1e-6,
                               pg_block_prox_weight: float = SUBPROBLEM_PG_BLOCK_PROX_WEIGHT,
                               dual_block_prox_weight: float = SUBPROBLEM_DUAL_BLOCK_PROX_WEIGHT,
                               iter_delta_reg_weight: float = SUBPROBLEM_ITER_DELTA_REG_WEIGHT,
@@ -453,23 +471,29 @@ def create_subproblem_trainer(ppc, all_samples, T_DELTA, unit_id: int, *,
         loss_ratio_primal=loss_ratio_primal,
         loss_ratio_dual_pg=loss_ratio_dual_pg,
         loss_ratio_dual_x=loss_ratio_dual_x,
+        nn_dual_term_interval=nn_dual_term_interval,
         loss_ratio_opt=loss_ratio_opt,
         loss_ratio_reg=loss_ratio_reg,
         gamma_base=subproblem_gamma_base,
-        mu_lower_bound_init=mu_lower_bound_init,
-        mu_individual_lower_bound_round=mu_individual_lower_bound_round,
-        mu_group_lower_bound_round=mu_group_lower_bound_round,
-        nn_hidden_dims=subproblem_nn_hidden_dims,
+                mu_lower_bound_init=mu_lower_bound_init,
+                mu_individual_lower_bound_round=mu_individual_lower_bound_round,
+                mu_group_lower_bound_round=mu_group_lower_bound_round,
+                mu_signed_round_interval=mu_signed_round_interval,
+                x_bound_dual_zero_rounds=x_bound_dual_zero_rounds,
+                nn_hidden_dims=subproblem_nn_hidden_dims,
         nn_batch_strategy=subproblem_nn_batch_strategy,
         nn_batch_size=subproblem_nn_batch_size,
         nn_shuffle=subproblem_nn_shuffle,
         nn_learning_rate=subproblem_nn_learning_rate,
         cost_learning_rate=subproblem_cost_learning_rate,
+        nn_smooth_abs_eps=subproblem_nn_smooth_abs_eps,
+        pg_cost_nn_epochs=pg_cost_nn_epochs,
         pg_cost_start_round=pg_cost_start_round,
         pg_cost_scale_multiplier=pg_cost_scale_multiplier,
         pg_cost_lr=pg_cost_lr,
         pg_cost_surr_lr=pg_cost_surr_lr,
         pg_cost_reg_deadband=pg_cost_reg_deadband,
+        pg_cost_smooth_abs_eps=pg_cost_smooth_abs_eps,
         pg_block_prox_weight=pg_block_prox_weight,
         dual_block_prox_weight=dual_block_prox_weight,
         iter_delta_reg_weight=iter_delta_reg_weight,
@@ -502,22 +526,28 @@ def run_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS,
                   loss_ratio_primal: float = 1.0,
                   loss_ratio_dual_pg: float = 1.0,
                   loss_ratio_dual_x: float = 1.0,
+                  nn_dual_term_interval: int | None = 1,
                   loss_ratio_opt: float = 1.0,
                   loss_ratio_reg: float = 1.0,
                   subproblem_gamma_base: float = 1e-3,
                   mu_lower_bound_init: float = 0.1,
                   mu_individual_lower_bound_round: int = 3,
                   mu_group_lower_bound_round: int = 50,
+                  mu_signed_round_interval: int | None = None,
+                  x_bound_dual_zero_rounds: int = 0,
                   subproblem_nn_batch_strategy: str = 'full-batch',
                   subproblem_nn_batch_size: int = 4,
                   subproblem_nn_shuffle: bool = True,
                   subproblem_nn_learning_rate: float = 1e-4,
                   subproblem_cost_learning_rate: float = 1e-5,
+                  subproblem_nn_smooth_abs_eps: float = SUBPROBLEM_NN_SMOOTH_ABS_EPS,
+                  pg_cost_nn_epochs: int | None = None,
                   pg_cost_start_round: int = 3,
                   pg_cost_scale_multiplier: float = 1.2,
                   pg_cost_lr: float = 2e-5,
                   pg_cost_surr_lr: float = 5e-5,
                   pg_cost_reg_deadband: float = 0.25,
+                  pg_cost_smooth_abs_eps: float = 1e-6,
                   pg_block_prox_weight: float = SUBPROBLEM_PG_BLOCK_PROX_WEIGHT,
                   dual_block_prox_weight: float = SUBPROBLEM_DUAL_BLOCK_PROX_WEIGHT,
                   iter_delta_reg_weight: float = SUBPROBLEM_ITER_DELTA_REG_WEIGHT,
@@ -545,7 +575,9 @@ def run_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS,
         f"batch_size={subproblem_nn_batch_size}, shuffle={subproblem_nn_shuffle}, "
         f"size={subproblem_nn_size}, hidden_dims={subproblem_nn_hidden_dims}, "
         f"main_lr={subproblem_nn_learning_rate}, x_cost_lr={subproblem_cost_learning_rate}, "
-        f"c_pg_surr_lr={pg_cost_surr_lr}"
+        f"nn_smooth_eps={subproblem_nn_smooth_abs_eps}, "
+        f"c_pg_epochs={pg_cost_nn_epochs}, c_pg_surr_lr={pg_cost_surr_lr}, "
+        f"c_pg_smooth_eps={pg_cost_smooth_abs_eps}"
     )
     log(
         f"iter_delta_reg: subproblem_weight={iter_delta_reg_weight}, "
@@ -616,23 +648,29 @@ def run_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS,
                 loss_ratio_primal=loss_ratio_primal,
                 loss_ratio_dual_pg=loss_ratio_dual_pg,
                 loss_ratio_dual_x=loss_ratio_dual_x,
+                nn_dual_term_interval=nn_dual_term_interval,
                 loss_ratio_opt=loss_ratio_opt,
                 loss_ratio_reg=loss_ratio_reg,
                 gamma_base=subproblem_gamma_base,
                 mu_lower_bound_init=mu_lower_bound_init,
                 mu_individual_lower_bound_round=mu_individual_lower_bound_round,
                 mu_group_lower_bound_round=mu_group_lower_bound_round,
+                mu_signed_round_interval=mu_signed_round_interval,
+                x_bound_dual_zero_rounds=x_bound_dual_zero_rounds,
                 nn_hidden_dims=subproblem_nn_hidden_dims,
                 nn_batch_strategy=subproblem_nn_batch_strategy,
                 nn_batch_size=subproblem_nn_batch_size,
                 nn_shuffle=subproblem_nn_shuffle,
                 nn_learning_rate=subproblem_nn_learning_rate,
                 cost_learning_rate=subproblem_cost_learning_rate,
+                nn_smooth_abs_eps=subproblem_nn_smooth_abs_eps,
                 pg_cost_start_round=pg_cost_start_round,
                 pg_cost_scale_multiplier=pg_cost_scale_multiplier,
                 pg_cost_lr=pg_cost_lr,
                 pg_cost_surr_lr=pg_cost_surr_lr,
                 pg_cost_reg_deadband=pg_cost_reg_deadband,
+                pg_cost_nn_epochs=pg_cost_nn_epochs,
+                pg_cost_smooth_abs_eps=pg_cost_smooth_abs_eps,
                 pg_block_prox_weight=pg_block_prox_weight,
                 dual_block_prox_weight=dual_block_prox_weight,
                 iter_delta_reg_weight=iter_delta_reg_weight,
@@ -653,23 +691,29 @@ def run_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS,
                 loss_ratio_primal=loss_ratio_primal,
                 loss_ratio_dual_pg=loss_ratio_dual_pg,
                 loss_ratio_dual_x=loss_ratio_dual_x,
+                nn_dual_term_interval=nn_dual_term_interval,
                 loss_ratio_opt=loss_ratio_opt,
                 loss_ratio_reg=loss_ratio_reg,
                 gamma_base=subproblem_gamma_base,
                 mu_lower_bound_init=mu_lower_bound_init,
                 mu_individual_lower_bound_round=mu_individual_lower_bound_round,
                 mu_group_lower_bound_round=mu_group_lower_bound_round,
+                mu_signed_round_interval=mu_signed_round_interval,
+                x_bound_dual_zero_rounds=x_bound_dual_zero_rounds,
                 nn_hidden_dims=subproblem_nn_hidden_dims,
                 nn_batch_strategy=subproblem_nn_batch_strategy,
                 nn_batch_size=subproblem_nn_batch_size,
                 nn_shuffle=subproblem_nn_shuffle,
                 nn_learning_rate=subproblem_nn_learning_rate,
                 cost_learning_rate=subproblem_cost_learning_rate,
+                nn_smooth_abs_eps=subproblem_nn_smooth_abs_eps,
                 pg_cost_start_round=pg_cost_start_round,
                 pg_cost_scale_multiplier=pg_cost_scale_multiplier,
                 pg_cost_lr=pg_cost_lr,
                 pg_cost_surr_lr=pg_cost_surr_lr,
                 pg_cost_reg_deadband=pg_cost_reg_deadband,
+                pg_cost_nn_epochs=pg_cost_nn_epochs,
+                pg_cost_smooth_abs_eps=pg_cost_smooth_abs_eps,
                 pg_block_prox_weight=pg_block_prox_weight,
                 dual_block_prox_weight=dual_block_prox_weight,
                 iter_delta_reg_weight=iter_delta_reg_weight,
@@ -686,6 +730,7 @@ def run_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS,
         trainer.iter(
             max_iter=SUBPROBLEM_MAX_ITER,
             nn_epochs=NN_EPOCHS,
+            pg_cost_nn_epochs=pg_cost_nn_epochs,
             nn_batch_strategy=subproblem_nn_batch_strategy,
             nn_batch_size=subproblem_nn_batch_size,
             nn_shuffle=subproblem_nn_shuffle,
@@ -744,18 +789,37 @@ def print_surrogate_results(trainers, all_samples):
 
         print(f"  样本0 时序约束示例（最多5条）:")
         x0 = trainer.x[0]
-        for t in range(min(5, nc)):
-            if t + 2 >= T:
-                break
-            a = trainer.alpha_values[0, t]
-            b = trainer.beta_values[0, t]
-            g = trainer.gamma_values[0, t]
-            d = trainer.delta_values[0, t]
-            lhs = a * x0[t] + b * x0[t + 1] + g * x0[t + 2]
+        offsets0 = resolve_constraint_offsets_from_trainer(trainer, 0, nc)
+        timesteps0 = list(getattr(trainer, 'sensitive_timesteps', [[]])[0]) if getattr(trainer, 'sensitive_timesteps', None) else list(range(nc))
+        for k in range(min(5, nc, len(timesteps0), len(offsets0))):
+            t = int(timesteps0[k])
+            offsets = tuple(int(v) for v in offsets0[k])
+            a = trainer.alpha_values[0, k]
+            b = trainer.beta_values[0, k]
+            g = trainer.gamma_values[0, k]
+            d = trainer.delta_values[0, k]
+
+            terms = []
+            lhs = 0.0
+            if 0 in offsets and 0 <= t < T:
+                terms.append(f"{a:.3f}*x[{t}]")
+                lhs += a * x0[t]
+            if 1 in offsets and 0 <= t + 1 < T:
+                terms.append(f"{b:.3f}*x[{t+1}]")
+                lhs += b * x0[t + 1]
+            if 2 in offsets and 0 <= t + 2 < T:
+                terms.append(f"{g:.3f}*x[{t+2}]")
+                lhs += g * x0[t + 2]
+            if not terms:
+                continue
+
             viol = max(0.0, lhs - d)
-            print(f"    t={t}: {a:.3f}*x[{t}] + {b:.3f}*x[{t+1}] "
-                  f"+ {g:.3f}*x[{t+2}] <= {d:.3f}  "
-                  f"(lhs={lhs:.3f}, viol={viol:.4f})")
+            offsets_str = ",".join(str(v) for v in offsets)
+            print(
+                f"    k={k}, t={t}, offsets=({offsets_str}): "
+                f"{' + '.join(terms)} <= {d:.3f}  "
+                f"(lhs={lhs:.3f}, viol={viol:.4f})"
+            )
 
         integrality = float(np.sum(x0 * (1 - x0)))
         print(f"  整数性指标(样本0): {integrality:.6f}  (0=完全整数)")
@@ -763,6 +827,7 @@ def print_surrogate_results(trainers, all_samples):
 
 def run_bcd(ppc, all_samples: list, T_DELTA, MAX_ITER, bcd_model_dir,
             case_name: str = 'case', timestamp: str = '', n_workers: int = 4, NN_EPOCHS: int = 10, DUAL_DECAY_ROUND: int = 10,
+            DUAL_SIGN_RELAX_INTERVAL: int | None = None,
             logger: 'TrainingLogger | None' = None,
             load_model_path: str | None = None,
             restore_rho_from_checkpoint: bool = False,
@@ -795,6 +860,7 @@ def run_bcd(ppc, all_samples: list, T_DELTA, MAX_ITER, bcd_model_dir,
             nn_batch_size: int = 4,
             nn_shuffle: bool = True,
             nn_learning_rate: float = 5e-5,
+            nn_smooth_abs_eps: float = BCD_NN_SMOOTH_ABS_EPS,
             pg_block_prox_weight: float = BCD_PG_BLOCK_PROX_WEIGHT,
             dual_block_prox_weight: float = BCD_DUAL_BLOCK_PROX_WEIGHT):
     """BCD 主代理训练（样本级并行），返回 ParallelAgent_NN_BCD 实例。"""
@@ -806,7 +872,8 @@ def run_bcd(ppc, all_samples: list, T_DELTA, MAX_ITER, bcd_model_dir,
         f"nn_dropout={'on' if enable_dropout_during_nn_training else 'off'}, "
         f"nn_size={nn_size}, nn_hidden_dims={nn_hidden_dims}, "
         f"nn_batch={nn_batch_strategy}, nn_batch_size={nn_batch_size}, "
-        f"nn_shuffle={nn_shuffle}, nn_lr={nn_learning_rate}"
+        f"nn_shuffle={nn_shuffle}, nn_lr={nn_learning_rate}, "
+        f"nn_smooth_eps={nn_smooth_abs_eps}"
     )
     log(
         f"rho_init: primal={rho_primal_init}, dual={rho_dual_init}, "
@@ -862,11 +929,13 @@ def run_bcd(ppc, all_samples: list, T_DELTA, MAX_ITER, bcd_model_dir,
             gamma_base=gamma_base,
             mu_dual_floor_init=mu_dual_floor_init,
             ita_dual_floor_init=ita_dual_floor_init,
+            dual_sign_relax_interval=DUAL_SIGN_RELAX_INTERVAL,
             nn_hidden_dims=nn_hidden_dims,
             nn_learning_rate=nn_learning_rate,
             nn_batch_strategy=nn_batch_strategy,
             nn_batch_size=nn_batch_size,
             nn_shuffle=nn_shuffle,
+            nn_smooth_abs_eps=nn_smooth_abs_eps,
             pg_block_prox_weight=pg_block_prox_weight,
             dual_block_prox_weight=dual_block_prox_weight,
             loss_ratio_primal=loss_ratio_primal,
@@ -898,11 +967,13 @@ def run_bcd(ppc, all_samples: list, T_DELTA, MAX_ITER, bcd_model_dir,
             gamma_base=gamma_base,
             mu_dual_floor_init=mu_dual_floor_init,
             ita_dual_floor_init=ita_dual_floor_init,
+            dual_sign_relax_interval=DUAL_SIGN_RELAX_INTERVAL,
             nn_hidden_dims=nn_hidden_dims,
             nn_learning_rate=nn_learning_rate,
             nn_batch_strategy=nn_batch_strategy,
             nn_batch_size=nn_batch_size,
             nn_shuffle=nn_shuffle,
+            nn_smooth_abs_eps=nn_smooth_abs_eps,
             pg_block_prox_weight=pg_block_prox_weight,
             dual_block_prox_weight=dual_block_prox_weight,
             loss_ratio_primal=loss_ratio_primal,
@@ -929,6 +1000,7 @@ def run_bcd(ppc, all_samples: list, T_DELTA, MAX_ITER, bcd_model_dir,
     agent.iter(
         max_iter=MAX_ITER,
         dual_decay_round=DUAL_DECAY_ROUND,
+        dual_sign_relax_interval=DUAL_SIGN_RELAX_INTERVAL,
         nn_epochs=NN_EPOCHS,
         nn_batch_strategy=nn_batch_strategy,
         nn_batch_size=nn_batch_size,
@@ -994,6 +1066,7 @@ def build_sparse_template_library_from_bcd_agent(
 def run_sparse_bcd(ppc, all_samples: list, T_DELTA, MAX_ITER, bcd_model_dir,
                    case_name: str = 'case', timestamp: str = '',
                    NN_EPOCHS: int = 10, DUAL_DECAY_ROUND: int = 10,
+                   DUAL_SIGN_RELAX_INTERVAL: int | None = None,
                    top_k_variables: int = 20, max_groups: int = 5, group_size: int = 3,
                    logger: 'TrainingLogger | None' = None,
                    lambda_init_strategy: str = 'lp_relaxation',
@@ -1097,6 +1170,7 @@ def run_sparse_bcd(ppc, all_samples: list, T_DELTA, MAX_ITER, bcd_model_dir,
         n_workers=1,
         NN_EPOCHS=NN_EPOCHS,
         DUAL_DECAY_ROUND=DUAL_DECAY_ROUND,
+        DUAL_SIGN_RELAX_INTERVAL=BCD_DUAL_SIGN_RELAX_INTERVAL,
         logger=logger,
         external_sparse_templates=template_library,
         lambda_init_strategy=lambda_init_strategy,
@@ -1213,10 +1287,12 @@ def main():
     BCD_LOSS_RATIO_DUAL_X_VALUE = BCD_LOSS_RATIO_DUAL_X
     BCD_LOSS_RATIO_OPT_VALUE = BCD_LOSS_RATIO_OPT
     BCD_LOSS_RATIO_REG_VALUE = BCD_LOSS_RATIO_REG
+    BCD_NN_SMOOTH_ABS_EPS_VALUE = BCD_NN_SMOOTH_ABS_EPS
     BCD_MAX_THETA_CONSTRAINTS_PER_TIME_SLOT_VALUE = BCD_MAX_THETA_CONSTRAINTS_PER_TIME_SLOT
     BCD_GAMMA_BASE_VALUE = BCD_GAMMA_BASE
     BCD_MU_DUAL_FLOOR_INIT_VALUE = BCD_MU_DUAL_FLOOR_INIT
     BCD_ITA_DUAL_FLOOR_INIT_VALUE = BCD_ITA_DUAL_FLOOR_INIT
+    BCD_DUAL_SIGN_RELAX_INTERVAL_VALUE = BCD_DUAL_SIGN_RELAX_INTERVAL
     BCD_PG_BLOCK_PROX_WEIGHT_VALUE = BCD_PG_BLOCK_PROX_WEIGHT
     BCD_DUAL_BLOCK_PROX_WEIGHT_VALUE = BCD_DUAL_BLOCK_PROX_WEIGHT
     SUBPROBLEM_RHO_PRIMAL_INIT_VALUE = SUBPROBLEM_RHO_PRIMAL_INIT
@@ -1228,12 +1304,16 @@ def main():
     SUBPROBLEM_LOSS_RATIO_PRIMAL_VALUE = SUBPROBLEM_LOSS_RATIO_PRIMAL
     SUBPROBLEM_LOSS_RATIO_DUAL_PG_VALUE = SUBPROBLEM_LOSS_RATIO_DUAL_PG
     SUBPROBLEM_LOSS_RATIO_DUAL_X_VALUE = SUBPROBLEM_LOSS_RATIO_DUAL_X
+    SUBPROBLEM_NN_SMOOTH_ABS_EPS_VALUE = SUBPROBLEM_NN_SMOOTH_ABS_EPS
+    SUBPROBLEM_NN_DUAL_TERM_INTERVAL_VALUE = SUBPROBLEM_NN_DUAL_TERM_INTERVAL
     SUBPROBLEM_LOSS_RATIO_OPT_VALUE = SUBPROBLEM_LOSS_RATIO_OPT
     SUBPROBLEM_LOSS_RATIO_REG_VALUE = SUBPROBLEM_LOSS_RATIO_REG
     SUBPROBLEM_GAMMA_BASE_VALUE = SUBPROBLEM_GAMMA_BASE
     SUBPROBLEM_MU_DUAL_FLOOR_INIT_VALUE = SUBPROBLEM_MU_DUAL_FLOOR_INIT
     SUBPROBLEM_MU_DUAL_FLOOR_INDIVIDUAL_ROUND_VALUE = SUBPROBLEM_MU_DUAL_FLOOR_INDIVIDUAL_ROUND
     SUBPROBLEM_MU_DUAL_FLOOR_DECAY_ROUND_VALUE = SUBPROBLEM_MU_DUAL_FLOOR_DECAY_ROUND
+    SUBPROBLEM_MU_SIGNED_ROUND_INTERVAL_VALUE = SUBPROBLEM_MU_SIGNED_ROUND_INTERVAL
+    SUBPROBLEM_X_BOUND_DUAL_ZERO_ROUNDS_VALUE = SUBPROBLEM_X_BOUND_DUAL_ZERO_ROUNDS
     SUBPROBLEM_NN_BATCH_STRATEGY_VALUE = SUBPROBLEM_NN_BATCH_STRATEGY
     SUBPROBLEM_NN_BATCH_SIZE_VALUE = SUBPROBLEM_NN_BATCH_SIZE
     SUBPROBLEM_NN_SHUFFLE_VALUE = SUBPROBLEM_NN_SHUFFLE
@@ -1244,11 +1324,13 @@ def main():
         'SUBPROBLEM_NN_SIZE',
     )
     SUBPROBLEM_X_COST_NN_LR_VALUE = SUBPROBLEM_X_COST_NN_LR
+    SUBPROBLEM_PG_COST_NN_EPOCHS_VALUE = SUBPROBLEM_PG_COST_NN_EPOCHS
     SUBPROBLEM_PG_COST_START_ROUND_VALUE = SUBPROBLEM_PG_COST_START_ROUND
     SUBPROBLEM_PG_COST_SCALE_MULTIPLIER_VALUE = SUBPROBLEM_PG_COST_SCALE_MULTIPLIER
     SUBPROBLEM_PG_COST_LR_VALUE = SUBPROBLEM_PG_COST_LR
     SUBPROBLEM_PG_COST_SURR_LR_VALUE = SUBPROBLEM_PG_COST_SURR_LR
     SUBPROBLEM_PG_COST_REG_DEADBAND_VALUE = SUBPROBLEM_PG_COST_REG_DEADBAND
+    SUBPROBLEM_PG_COST_SMOOTH_ABS_EPS_VALUE = SUBPROBLEM_PG_COST_SMOOTH_ABS_EPS
     SUBPROBLEM_PG_BLOCK_PROX_WEIGHT_VALUE = SUBPROBLEM_PG_BLOCK_PROX_WEIGHT
     SUBPROBLEM_DUAL_BLOCK_PROX_WEIGHT_VALUE = SUBPROBLEM_DUAL_BLOCK_PROX_WEIGHT
 
@@ -1282,7 +1364,8 @@ def main():
         f"Loss ratio config: BCD(primal={BCD_LOSS_RATIO_PRIMAL_VALUE}, dual_x={BCD_LOSS_RATIO_DUAL_X_VALUE}, "
         f"opt={BCD_LOSS_RATIO_OPT_VALUE}, reg={BCD_LOSS_RATIO_REG_VALUE}); "
         f"subproblem(primal={SUBPROBLEM_LOSS_RATIO_PRIMAL_VALUE}, dual_pg={SUBPROBLEM_LOSS_RATIO_DUAL_PG_VALUE}, "
-        f"dual_x={SUBPROBLEM_LOSS_RATIO_DUAL_X_VALUE}, opt={SUBPROBLEM_LOSS_RATIO_OPT_VALUE}, "
+        f"dual_x={SUBPROBLEM_LOSS_RATIO_DUAL_X_VALUE}, nn_dual_interval={SUBPROBLEM_NN_DUAL_TERM_INTERVAL_VALUE}, "
+        f"opt={SUBPROBLEM_LOSS_RATIO_OPT_VALUE}, "
         f"reg={SUBPROBLEM_LOSS_RATIO_REG_VALUE})"
     )
     log(
@@ -1317,7 +1400,7 @@ def main():
                 log(f"  截取前 {MAX_SAMPLES} 个样本（共 {len(all_samples_bcd)}）")
                 all_samples_bcd = all_samples_bcd[:MAX_SAMPLES]
             run_bcd(ppc, all_samples_bcd, T_DELTA, BCD_MAX_ITER_VALUE, bcd_model_dir,
-                    case_name=CASE_NAME, timestamp=timestamp, n_workers=N_WORKERS_BCD, NN_EPOCHS=NN_EPOCHS, DUAL_DECAY_ROUND=DUAL_DECAY_ROUND,
+                    case_name=CASE_NAME, timestamp=timestamp, n_workers=N_WORKERS_BCD, NN_EPOCHS=NN_EPOCHS, DUAL_DECAY_ROUND=DUAL_DECAY_ROUND, DUAL_SIGN_RELAX_INTERVAL=BCD_DUAL_SIGN_RELAX_INTERVAL_VALUE,
                     logger=logger,
                     load_model_path=str(resolve_existing_path(BCD_MODEL_FILE, 'BCD model file')) if BCD_CONTINUE_TRAINING and BCD_MODEL_FILE is not None else None,
                     restore_rho_from_checkpoint=BCD_RESTORE_RHO_FROM_CHECKPOINT,
@@ -1349,6 +1432,7 @@ def main():
                     nn_batch_size=BCD_NN_BATCH_SIZE_VALUE,
                     nn_shuffle=BCD_NN_SHUFFLE_VALUE,
                     nn_learning_rate=BCD_NN_LR_VALUE,
+                    nn_smooth_abs_eps=BCD_NN_SMOOTH_ABS_EPS_VALUE,
                     pg_block_prox_weight=BCD_PG_BLOCK_PROX_WEIGHT_VALUE,
                     dual_block_prox_weight=BCD_DUAL_BLOCK_PROX_WEIGHT_VALUE)
             if RUN_FP:
@@ -1374,6 +1458,7 @@ def main():
                 timestamp=timestamp,
                 NN_EPOCHS=NN_EPOCHS,
                 DUAL_DECAY_ROUND=DUAL_DECAY_ROUND,
+                DUAL_SIGN_RELAX_INTERVAL=BCD_DUAL_SIGN_RELAX_INTERVAL,
                 top_k_variables=SPARSE_TOP_K_VARIABLES,
                 max_groups=SPARSE_MAX_GROUPS,
                 group_size=SPARSE_GROUP_SIZE,
@@ -1403,6 +1488,7 @@ def main():
                 nn_batch_size=BCD_NN_BATCH_SIZE_VALUE,
                 nn_shuffle=BCD_NN_SHUFFLE_VALUE,
                 nn_learning_rate=BCD_NN_LR_VALUE,
+                nn_smooth_abs_eps=BCD_NN_SMOOTH_ABS_EPS_VALUE,
                 pg_block_prox_weight=BCD_PG_BLOCK_PROX_WEIGHT_VALUE,
                 dual_block_prox_weight=BCD_DUAL_BLOCK_PROX_WEIGHT_VALUE,
             )
@@ -1443,12 +1529,15 @@ def main():
                     loss_ratio_primal=SUBPROBLEM_LOSS_RATIO_PRIMAL_VALUE,
                     loss_ratio_dual_pg=SUBPROBLEM_LOSS_RATIO_DUAL_PG_VALUE,
                     loss_ratio_dual_x=SUBPROBLEM_LOSS_RATIO_DUAL_X_VALUE,
+                    nn_dual_term_interval=SUBPROBLEM_NN_DUAL_TERM_INTERVAL_VALUE,
                     loss_ratio_opt=SUBPROBLEM_LOSS_RATIO_OPT_VALUE,
                     loss_ratio_reg=SUBPROBLEM_LOSS_RATIO_REG_VALUE,
                     subproblem_gamma_base=SUBPROBLEM_GAMMA_BASE_VALUE,
                     mu_lower_bound_init=SUBPROBLEM_MU_DUAL_FLOOR_INIT_VALUE,
                     mu_individual_lower_bound_round=SUBPROBLEM_MU_DUAL_FLOOR_INDIVIDUAL_ROUND_VALUE,
                     mu_group_lower_bound_round=SUBPROBLEM_MU_DUAL_FLOOR_DECAY_ROUND_VALUE,
+                    mu_signed_round_interval=SUBPROBLEM_MU_SIGNED_ROUND_INTERVAL_VALUE,
+                    x_bound_dual_zero_rounds=SUBPROBLEM_X_BOUND_DUAL_ZERO_ROUNDS_VALUE,
                     subproblem_nn_size=SUBPROBLEM_NN_SIZE_VALUE,
                     subproblem_nn_hidden_dims=SUBPROBLEM_NN_HIDDEN_DIMS_VALUE,
                     subproblem_nn_batch_strategy=SUBPROBLEM_NN_BATCH_STRATEGY_VALUE,
@@ -1456,11 +1545,14 @@ def main():
                     subproblem_nn_shuffle=SUBPROBLEM_NN_SHUFFLE_VALUE,
                     subproblem_nn_learning_rate=SUBPROBLEM_NN_LR_VALUE,
                     subproblem_cost_learning_rate=SUBPROBLEM_X_COST_NN_LR_VALUE,
+                    subproblem_nn_smooth_abs_eps=SUBPROBLEM_NN_SMOOTH_ABS_EPS_VALUE,
+                    pg_cost_nn_epochs=SUBPROBLEM_PG_COST_NN_EPOCHS_VALUE,
                     pg_cost_start_round=SUBPROBLEM_PG_COST_START_ROUND_VALUE,
                     pg_cost_scale_multiplier=SUBPROBLEM_PG_COST_SCALE_MULTIPLIER_VALUE,
                     pg_cost_lr=SUBPROBLEM_PG_COST_LR_VALUE,
                     pg_cost_surr_lr=SUBPROBLEM_PG_COST_SURR_LR_VALUE,
                     pg_cost_reg_deadband=SUBPROBLEM_PG_COST_REG_DEADBAND_VALUE,
+                    pg_cost_smooth_abs_eps=SUBPROBLEM_PG_COST_SMOOTH_ABS_EPS_VALUE,
                     pg_block_prox_weight=SUBPROBLEM_PG_BLOCK_PROX_WEIGHT_VALUE,
                     dual_block_prox_weight=SUBPROBLEM_DUAL_BLOCK_PROX_WEIGHT_VALUE,
                     iter_delta_reg_weight=SUBPROBLEM_ITER_DELTA_REG_WEIGHT,
@@ -1560,6 +1652,7 @@ def main():
                         dual_block_prox_weight=BCD_DUAL_BLOCK_PROX_WEIGHT_VALUE,
                         nn_hidden_dims=BCD_NN_HIDDEN_DIMS_VALUE,
                         nn_learning_rate=BCD_NN_LR_VALUE,
+                        nn_smooth_abs_eps=BCD_NN_SMOOTH_ABS_EPS_VALUE,
                         nn_batch_strategy=BCD_NN_BATCH_STRATEGY_VALUE,
                         nn_batch_size=BCD_NN_BATCH_SIZE_VALUE,
                         nn_shuffle=BCD_NN_SHUFFLE_VALUE,
@@ -1591,6 +1684,7 @@ def main():
                         dual_block_prox_weight=BCD_DUAL_BLOCK_PROX_WEIGHT_VALUE,
                         nn_hidden_dims=BCD_NN_HIDDEN_DIMS_VALUE,
                         nn_learning_rate=BCD_NN_LR_VALUE,
+                        nn_smooth_abs_eps=BCD_NN_SMOOTH_ABS_EPS_VALUE,
                         nn_batch_strategy=BCD_NN_BATCH_STRATEGY_VALUE,
                         nn_batch_size=BCD_NN_BATCH_SIZE_VALUE,
                         nn_shuffle=BCD_NN_SHUFFLE_VALUE,
@@ -1620,6 +1714,7 @@ def main():
                         dual_block_prox_weight=BCD_DUAL_BLOCK_PROX_WEIGHT_VALUE,
                         nn_hidden_dims=BCD_NN_HIDDEN_DIMS_VALUE,
                         nn_learning_rate=BCD_NN_LR_VALUE,
+                        nn_smooth_abs_eps=BCD_NN_SMOOTH_ABS_EPS_VALUE,
                         nn_batch_strategy=BCD_NN_BATCH_STRATEGY_VALUE,
                         nn_batch_size=BCD_NN_BATCH_SIZE_VALUE,
                         nn_shuffle=BCD_NN_SHUFFLE_VALUE,
@@ -1642,6 +1737,7 @@ def main():
                     n_workers=N_WORKERS_BCD if not ENABLE_SPARSE_SUPPORTS else 1,
                     NN_EPOCHS=NN_EPOCHS,
                     DUAL_DECAY_ROUND=DUAL_DECAY_ROUND,
+                    DUAL_SIGN_RELAX_INTERVAL=BCD_DUAL_SIGN_RELAX_INTERVAL_VALUE,
                     logger=logger,
                     load_model_path=str(resolve_existing_path(BCD_MODEL_FILE, 'BCD model file')) if BCD_CONTINUE_TRAINING and BCD_MODEL_FILE is not None else None,
                     restore_rho_from_checkpoint=BCD_RESTORE_RHO_FROM_CHECKPOINT,
@@ -1676,6 +1772,7 @@ def main():
                     nn_batch_size=BCD_NN_BATCH_SIZE_VALUE,
                     nn_shuffle=BCD_NN_SHUFFLE_VALUE,
                     nn_learning_rate=BCD_NN_LR_VALUE,
+                    nn_smooth_abs_eps=BCD_NN_SMOOTH_ABS_EPS_VALUE,
                 )
 
             # Step 2: 加载 v3 格式样本（subproblem 独立训练，不注入 BCD 对偶变量）
@@ -1713,12 +1810,15 @@ def main():
                     loss_ratio_primal=SUBPROBLEM_LOSS_RATIO_PRIMAL_VALUE,
                     loss_ratio_dual_pg=SUBPROBLEM_LOSS_RATIO_DUAL_PG_VALUE,
                     loss_ratio_dual_x=SUBPROBLEM_LOSS_RATIO_DUAL_X_VALUE,
+                    nn_dual_term_interval=SUBPROBLEM_NN_DUAL_TERM_INTERVAL_VALUE,
                     loss_ratio_opt=SUBPROBLEM_LOSS_RATIO_OPT_VALUE,
                     loss_ratio_reg=SUBPROBLEM_LOSS_RATIO_REG_VALUE,
                     subproblem_gamma_base=SUBPROBLEM_GAMMA_BASE_VALUE,
                     mu_lower_bound_init=SUBPROBLEM_MU_DUAL_FLOOR_INIT_VALUE,
                     mu_individual_lower_bound_round=SUBPROBLEM_MU_DUAL_FLOOR_INDIVIDUAL_ROUND_VALUE,
                     mu_group_lower_bound_round=SUBPROBLEM_MU_DUAL_FLOOR_DECAY_ROUND_VALUE,
+                    mu_signed_round_interval=SUBPROBLEM_MU_SIGNED_ROUND_INTERVAL_VALUE,
+                    x_bound_dual_zero_rounds=SUBPROBLEM_X_BOUND_DUAL_ZERO_ROUNDS_VALUE,
                     subproblem_nn_size=SUBPROBLEM_NN_SIZE_VALUE,
                     subproblem_nn_hidden_dims=SUBPROBLEM_NN_HIDDEN_DIMS_VALUE,
                     subproblem_nn_batch_strategy=SUBPROBLEM_NN_BATCH_STRATEGY_VALUE,
@@ -1726,11 +1826,14 @@ def main():
                     subproblem_nn_shuffle=SUBPROBLEM_NN_SHUFFLE_VALUE,
                     subproblem_nn_learning_rate=SUBPROBLEM_NN_LR_VALUE,
                     subproblem_cost_learning_rate=SUBPROBLEM_X_COST_NN_LR_VALUE,
+                    subproblem_nn_smooth_abs_eps=SUBPROBLEM_NN_SMOOTH_ABS_EPS_VALUE,
+                    pg_cost_nn_epochs=SUBPROBLEM_PG_COST_NN_EPOCHS_VALUE,
                     pg_cost_start_round=SUBPROBLEM_PG_COST_START_ROUND_VALUE,
                     pg_cost_scale_multiplier=SUBPROBLEM_PG_COST_SCALE_MULTIPLIER_VALUE,
                     pg_cost_lr=SUBPROBLEM_PG_COST_LR_VALUE,
                     pg_cost_surr_lr=SUBPROBLEM_PG_COST_SURR_LR_VALUE,
                     pg_cost_reg_deadband=SUBPROBLEM_PG_COST_REG_DEADBAND_VALUE,
+                    pg_cost_smooth_abs_eps=SUBPROBLEM_PG_COST_SMOOTH_ABS_EPS_VALUE,
                     pg_block_prox_weight=SUBPROBLEM_PG_BLOCK_PROX_WEIGHT_VALUE,
                     dual_block_prox_weight=SUBPROBLEM_DUAL_BLOCK_PROX_WEIGHT_VALUE,
                     iter_delta_reg_weight=SUBPROBLEM_ITER_DELTA_REG_WEIGHT,

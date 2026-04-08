@@ -70,7 +70,7 @@ if not check_and_install_dependencies_safe():
 MODE      = 'surrogate'
 RUN_FP    = True       # surrogate / both 模式：是否运行可行性泵测试
 CASE_NAME = 'case3lite'   # 'case3' / 'case3lite' / 'case14' / 'case30' / 'case39' / 'case118'
-SURROGATE_CONSTRAINT_STRATEGY = 'all_templates_sign4'  # 'auto' / 'sensitive' / 'all' / 'all_templates_sign4' / 'all_single_time'
+SURROGATE_CONSTRAINT_STRATEGY = 'all_single_time'  # 'auto' / 'sensitive' / 'all' / 'all_templates_sign4' / 'all_single_time'
 BCD_LAMBDA_INIT_STRATEGY = 'lp_relaxation'   # 'lp_relaxation' / 'ed_on_x_opt'
 THETA_HOT_START_STRATEGY = 'dcpf_relative'   # 'dcpf_relative' / 'gaussian'
 ZETA_HOT_START_STRATEGY = 'zero'             # 'zero' / 'gaussian'
@@ -88,7 +88,7 @@ BCD_GAMMA_BASE = 1e-2
 
 # surrogate / both 模式：已训练 surrogate 模型目录（训练时输出的带时间戳路径）
 # 设为 None 则自动查找 result/surrogate_models/ 下最新的匹配目录
-MODEL_DIR = "result/surrogate_models/subproblem_models_case3lite_20260403_225254"
+MODEL_DIR = "result/surrogate_models/subproblem_models_case3lite_20260408_202756"
 
 # bcd / both 模式：已训练 BCD 模型 .pth 文件路径
 # 设为 None 则自动查找 result/bcd_models/ 下最新的匹配文件
@@ -109,7 +109,7 @@ def _auto_discover_model_path(directory, glob_pattern, label):
 
 # 顶部集中配置区：测试相关参数统一在这里调整
 MAX_SAMPLES = None         # None = 使用全部样本
-SAMPLE_RANGE = "25:35"       # 左闭右开；例如 "210:220"
+SAMPLE_RANGE = "0:1"       # 左闭右开；例如 "210:220"
 T_DELTA = 1.0
 UNIT_IDS = [1]            # None = 所有机组；或如 [0, 1, 2]
 TEST_SAMPLES_DEFAULT = 3
@@ -1130,8 +1130,8 @@ def print_surrogate_results(trainers: dict, all_samples: list) -> None:
         x0 = trainer.x[0]
         sample0 = all_samples[0] if all_samples else {'sample_id': 0}
         timestep_map, offset_map = _resolve_surrogate_display_layout(trainer, sample0, nc)
-        print(f"  样本0 代理约束示例（最多5条）:")
-        for k in range(min(5, nc)):
+        print(f"  样本0 代理约束示例（最多10条）:")
+        for k in range(min(10, nc)):
             ts = timestep_map[k]
             a = trainer.alpha_values[0, k]
             b = trainer.beta_values[0, k]

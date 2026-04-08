@@ -124,6 +124,43 @@ def _pattern_to_key(pattern: np.ndarray) -> Tuple[int, ...]:
     return tuple(int(v) for v in arr)
 
 
+def _status_is_proven_optimal(status: Optional[str]) -> bool:
+    return status == "optimal"
+
+
+def _status_has_solution(status: Optional[str]) -> bool:
+    return status in {"optimal", "time_limit_with_solution", "suboptimal"}
+
+
+def _status_rank(status: Optional[str]) -> int:
+    if status == "optimal":
+        return 3
+    if status == "time_limit_with_solution":
+        return 2
+    if status == "suboptimal":
+        return 1
+    return 0
+
+
+def _numeric_summary(values: List[float]) -> Dict[str, Optional[float]]:
+    if not values:
+        return {
+            "mean": None,
+            "median": None,
+            "min": None,
+            "max": None,
+            "p95": None,
+        }
+    arr = np.asarray(values, dtype=float)
+    return {
+        "mean": float(np.mean(arr)),
+        "median": float(np.median(arr)),
+        "min": float(np.min(arr)),
+        "max": float(np.max(arr)),
+        "p95": float(np.percentile(arr, 95)),
+    }
+
+
 def _load_commitment_samples_from_json(json_path: str) -> List[Dict]:
     """Load active-set samples into a normalized scenario list."""
     reader = ActiveSetReader(json_path)
@@ -1167,6 +1204,8 @@ class CommitmentPatternLibrary:
         gurobi_time_limit: float = 600.0,
         mip_gap: float = 1e-4,
         max_samples: Optional[int] = None,
+        repair_non_optimal: bool = True,
+        non_optimal_time_limit_factor: float = 2.0,
         verbose: bool = False,
     ):
         self.ppc = ppc
@@ -1179,6 +1218,8 @@ class CommitmentPatternLibrary:
         self.gurobi_time_limit = gurobi_time_limit
         self.mip_gap = mip_gap
         self.max_samples = max_samples
+        self.repair_non_optimal = repair_non_optimal
+        self.non_optimal_time_limit_factor = max(float(non_optimal_time_limit_factor), 1.0)
         self.verbose = verbose
 
         self.samples: List[Dict] = []
@@ -1188,6 +1229,7 @@ class CommitmentPatternLibrary:
         self.pattern_library_key_sets: List[set] = []
         self.initial_pattern_counts: List[int] = []
         self.expansion_log: List[Dict] = []
+        self.optimality_repair_log: List[Dict] = []
         self.scenario_results: List[Dict] = []
         self.summary: Dict = {}
 
@@ -1275,14 +1317,82 @@ class CommitmentPatternLibrary:
                 added_generators.append(g)
         return added_generators
 
-    def _solve_scenario(self, sample: Dict) -> Dict:
+    @staticmethod
+    def _select_better_solve_info(base_info: Dict, retry_info: Dict) -> Dict:
+        base_rank = _status_rank(base_info.get("status"))
+        retry_rank = _status_rank(retry_info.get("status"))
+        if retry_rank > base_rank:
+            return retry_info
+        if retry_rank < base_rank:
+            return base_info
+
+        if retry_info.get("success") and not base_info.get("success"):
+            return retry_info
+        if base_info.get("success") and not retry_info.get("success"):
+            return base_info
+
+        base_obj = base_info.get("objective_value", float("inf"))
+        retry_obj = retry_info.get("objective_value", float("inf"))
+        if retry_obj + 1e-6 < base_obj:
+            return retry_info
+        return base_info
+
+    def _repair_non_optimal_scenario(
+        self,
+        sample: Dict,
+        solve_info: Dict,
+        scenario_index: int,
+        phase: str,
+    ) -> Dict:
+        status = solve_info.get("status")
+        if not self.repair_non_optimal or not _status_has_solution(status):
+            return solve_info
+        if _status_is_proven_optimal(status):
+            return solve_info
+
+        sample_id = sample["sample_id"]
+        added_generators = self._expand_library_for_scenario(sample)
+        retry_time_limit = max(
+            self.gurobi_time_limit,
+            self.gurobi_time_limit * self.non_optimal_time_limit_factor,
+        )
+        retry_info = self._solve_scenario(sample, time_limit=retry_time_limit)
+        final_info = self._select_better_solve_info(solve_info, retry_info)
+
+        self.optimality_repair_log.append({
+            "sample_id": sample_id,
+            "scenario_index": scenario_index,
+            "phase": phase,
+            "initial_status": solve_info.get("status"),
+            "retry_status": retry_info.get("status"),
+            "final_status": final_info.get("status"),
+            "initial_objective_value": solve_info.get("objective_value"),
+            "retry_objective_value": retry_info.get("objective_value"),
+            "final_objective_value": final_info.get("objective_value"),
+            "initial_solve_time_s": solve_info.get("solve_time_s"),
+            "retry_solve_time_s": retry_info.get("solve_time_s"),
+            "added_generators": added_generators,
+            "n_added": len(added_generators),
+            "retry_time_limit": retry_time_limit,
+            "improved": final_info is not solve_info,
+        })
+
+        print(
+            f"  Scenario {scenario_index + 1}/{len(self.samples)} sample_id={sample_id}: "
+            f"non-optimal status {status} -> {final_info.get('status')} after repair "
+            f"(added_generators={added_generators}, retry_time_limit={retry_time_limit:.1f}s)",
+            flush=True,
+        )
+        return final_info
+
+    def _solve_scenario(self, sample: Dict, time_limit: Optional[float] = None) -> Dict:
         t_start = time.time()
         x_sol, obj_val, status, selected_indices = solve_pattern_restricted_uc(
             ppc=self.ppc,
             scenario=sample,
             allowed_patterns=self.pattern_library,
             T_delta=self.T_delta,
-            time_limit=self.gurobi_time_limit,
+            time_limit=self.gurobi_time_limit if time_limit is None else float(time_limit),
             mip_gap=self.mip_gap,
             verbose=self.verbose,
         )
@@ -1299,14 +1409,22 @@ class CommitmentPatternLibrary:
     def _ensure_library_feasibility(self) -> None:
         print("\n[2/4] Traversing scenarios and expanding pattern library when needed...", flush=True)
         self.expansion_log = []
+        self.optimality_repair_log = []
 
         for idx, sample in enumerate(self.samples):
             sample_id = sample["sample_id"]
             solve_info = self._solve_scenario(sample)
             if solve_info["success"]:
+                if not _status_is_proven_optimal(solve_info["status"]):
+                    solve_info = self._repair_non_optimal_scenario(
+                        sample,
+                        solve_info,
+                        scenario_index=idx,
+                        phase="feasibility_pass",
+                    )
                 print(
                     f"  Scenario {idx + 1}/{len(self.samples)} sample_id={sample_id}: "
-                    f"feasible with current library",
+                    f"feasible with current library (status={solve_info['status']})",
                     flush=True,
                 )
                 continue
@@ -1349,6 +1467,13 @@ class CommitmentPatternLibrary:
         for idx, sample in enumerate(self.samples):
             sample_id = sample["sample_id"]
             solve_info = self._solve_scenario(sample)
+            if solve_info["success"] and not _status_is_proven_optimal(solve_info["status"]):
+                solve_info = self._repair_non_optimal_scenario(
+                    sample,
+                    solve_info,
+                    scenario_index=idx,
+                    phase="evaluation_pass",
+                )
             x_sol = solve_info["x_sol"]
             obj_val = solve_info["objective_value"]
             status = solve_info["status"]
@@ -1405,6 +1530,7 @@ class CommitmentPatternLibrary:
         return scenario_results
 
     def _build_summary(self) -> Dict:
+        status_counts = Counter(r.get("solver_status", "unknown") for r in self.scenario_results)
         feasible_results = [r for r in self.scenario_results if r.get("success")]
         feasible_cost_increases = [
             r["cost_increase_pct"]
@@ -1422,6 +1548,26 @@ class CommitmentPatternLibrary:
             len(self.pattern_library[g]) - self.initial_pattern_counts[g]
             for g in range(len(self.pattern_library))
         ]
+        matched_units = [
+            float(r["matched_unit_patterns"])
+            for r in feasible_results
+            if r.get("matched_unit_patterns") is not None
+        ]
+        changed_units = [
+            float(r["changed_unit_patterns"])
+            for r in feasible_results
+            if r.get("changed_unit_patterns") is not None
+        ]
+        solve_times = [
+            float(r["solve_time_s"])
+            for r in feasible_results
+            if r.get("solve_time_s") is not None
+        ]
+        cost_gap_stats = _numeric_summary(feasible_cost_increases)
+        solve_time_stats = _numeric_summary(solve_times)
+        matched_unit_stats = _numeric_summary(matched_units)
+        changed_unit_stats = _numeric_summary(changed_units)
+        n_proven_optimal = int(status_counts.get("optimal", 0))
 
         summary = {
             "n_scenarios": len(self.samples),
@@ -1429,24 +1575,38 @@ class CommitmentPatternLibrary:
             "feasibility_rate": (
                 len(feasible_results) / len(self.samples) if self.samples else 0.0
             ),
+            "solver_status_counts": {str(k): int(v) for k, v in status_counts.items()},
+            "n_proven_optimal": n_proven_optimal,
+            "n_feasible_non_optimal": int(len(feasible_results) - n_proven_optimal),
             "avg_optimal_cost": float(np.mean(optimal_costs)) if optimal_costs else None,
             "avg_restricted_cost": float(np.mean(restricted_costs)) if restricted_costs else None,
-            "avg_cost_increase_pct": (
-                float(np.mean(feasible_cost_increases)) if feasible_cost_increases else None
-            ),
-            "max_cost_increase_pct": (
-                float(np.max(feasible_cost_increases)) if feasible_cost_increases else None
-            ),
-            "p95_cost_increase_pct": (
-                float(np.percentile(feasible_cost_increases, 95))
-                if feasible_cost_increases else None
-            ),
+            "avg_cost_increase_pct": cost_gap_stats["mean"],
+            "median_cost_increase_pct": cost_gap_stats["median"],
+            "min_cost_increase_pct": cost_gap_stats["min"],
+            "max_cost_increase_pct": cost_gap_stats["max"],
+            "p95_cost_increase_pct": cost_gap_stats["p95"],
+            "matched_unit_patterns_mean": matched_unit_stats["mean"],
+            "matched_unit_patterns_min": matched_unit_stats["min"],
+            "matched_unit_patterns_max": matched_unit_stats["max"],
+            "changed_unit_patterns_mean": changed_unit_stats["mean"],
+            "changed_unit_patterns_max": changed_unit_stats["max"],
+            "solve_time_s_mean": solve_time_stats["mean"],
+            "solve_time_s_median": solve_time_stats["median"],
+            "solve_time_s_max": solve_time_stats["max"],
+            "solve_time_s_p95": solve_time_stats["p95"],
             "mean_final_patterns_per_unit": (
                 float(np.mean(final_counts)) if final_counts else None
             ),
             "max_final_patterns_per_unit": max(final_counts) if final_counts else None,
             "total_added_patterns": int(np.sum(added_counts)) if added_counts else 0,
             "n_scenarios_triggering_expansion": len(self.expansion_log),
+            "n_non_optimal_repairs": len(self.optimality_repair_log),
+            "n_non_optimal_repaired_to_optimal": int(sum(
+                1
+                for log in self.optimality_repair_log
+                if log.get("initial_status") != "optimal"
+                and log.get("final_status") == "optimal"
+            )),
         }
         self.summary = summary
         return summary
@@ -1463,11 +1623,31 @@ class CommitmentPatternLibrary:
         print(f"  Avg optimal cost:    {summary['avg_optimal_cost']}", flush=True)
         print(f"  Avg restricted cost: {summary['avg_restricted_cost']}", flush=True)
         print(f"  Avg cost increase:   {summary['avg_cost_increase_pct']}%", flush=True)
+        print(f"  Median cost increase:{summary['median_cost_increase_pct']}%", flush=True)
         print(f"  Max cost increase:   {summary['max_cost_increase_pct']}%", flush=True)
         print(f"  P95 cost increase:   {summary['p95_cost_increase_pct']}%", flush=True)
+        print(f"  Solver statuses:     {summary['solver_status_counts']}", flush=True)
+        print(
+            f"  Matched unit patterns: mean={summary['matched_unit_patterns_mean']}, "
+            f"min={summary['matched_unit_patterns_min']}, "
+            f"max={summary['matched_unit_patterns_max']}",
+            flush=True,
+        )
+        print(
+            f"  Solve time (s):      mean={summary['solve_time_s_mean']}, "
+            f"median={summary['solve_time_s_median']}, "
+            f"p95={summary['solve_time_s_p95']}, "
+            f"max={summary['solve_time_s_max']}",
+            flush=True,
+        )
         print(
             f"  Pattern expansions:  {summary['n_scenarios_triggering_expansion']} scenarios, "
             f"{summary['total_added_patterns']} added unit-patterns",
+            flush=True,
+        )
+        print(
+            f"  Non-optimal repairs: {summary['n_non_optimal_repairs']} attempts, "
+            f"{summary['n_non_optimal_repaired_to_optimal']} repaired to optimal",
             flush=True,
         )
         print(
@@ -1536,11 +1716,15 @@ class CommitmentPatternLibrary:
                 "gurobi_time_limit": self.gurobi_time_limit,
                 "mip_gap": self.mip_gap,
                 "max_samples": self.max_samples,
+                "repair_non_optimal": self.repair_non_optimal,
+                "non_optimal_time_limit_factor": self.non_optimal_time_limit_factor,
                 "T_delta": self.T_delta,
             },
             "summary": self.summary,
             "pattern_library": pattern_library_output,
             "expansion_log": self.expansion_log,
+            "optimality_repair_log": self.optimality_repair_log,
+            "scenario_results": self.scenario_results,
             "scenarios": self.scenario_results,
         }
 

@@ -52,6 +52,7 @@ class ParallelAgent_NN_BCD(Agent_NN_BCD):
         gamma_base: float = 1e-2,
         mu_dual_floor_init: float = 0.1,
         ita_dual_floor_init: float = 0.1,
+        dual_sign_relax_interval: int | None = None,
         nn_hidden_dims: list[int] | None = None,
         nn_learning_rate: float = 5e-5,
         nn_batch_strategy: str = "full-batch",
@@ -61,6 +62,7 @@ class ParallelAgent_NN_BCD(Agent_NN_BCD):
         loss_ratio_dual_x: float = 1.0,
         loss_ratio_opt: float = 1.0,
         loss_ratio_reg: float = 1.0,
+        nn_smooth_abs_eps: float = 1e-6,
         iter_delta_reg_weight: float = 1e-4,
         iter_delta_reg_deadband: float = 0.05,
         pg_block_prox_weight: float = 2e-2,
@@ -88,6 +90,7 @@ class ParallelAgent_NN_BCD(Agent_NN_BCD):
             gamma_base=gamma_base,
             mu_dual_floor_init=mu_dual_floor_init,
             ita_dual_floor_init=ita_dual_floor_init,
+            dual_sign_relax_interval=dual_sign_relax_interval,
             nn_hidden_dims=nn_hidden_dims,
             nn_learning_rate=nn_learning_rate,
             nn_batch_strategy=nn_batch_strategy,
@@ -97,6 +100,7 @@ class ParallelAgent_NN_BCD(Agent_NN_BCD):
             loss_ratio_dual_x=loss_ratio_dual_x,
             loss_ratio_opt=loss_ratio_opt,
             loss_ratio_reg=loss_ratio_reg,
+            nn_smooth_abs_eps=nn_smooth_abs_eps,
             iter_delta_reg_weight=iter_delta_reg_weight,
             iter_delta_reg_deadband=iter_delta_reg_deadband,
             pg_block_prox_weight=pg_block_prox_weight,
@@ -220,17 +224,12 @@ class ParallelAgent_NN_BCD(Agent_NN_BCD):
             obj_dual = obj_dual if abs(obj_dual) >= eps12 else 0.0
             obj_opt = obj_opt if abs(obj_opt) >= eps12 else 0.0
 
+            nn_metrics_pre = self.cal_nn_logging_components(union_analysis=union_analysis)
             print(
-                f"[ParallelBCD] obj_primal={obj_primal:.6f}, "
-                f"obj_dual_pg={obj_dual_pg:.6f}, obj_dual_x={obj_dual_x:.6f}, "
-                f"obj_dual_coc={obj_dual_coc:.6f}, obj_dual={obj_dual:.6f}, "
-                f"obj_opt={obj_opt:.6f}",
-                flush=True,
-            )
-
-            print(
-                f"[ParallelBCD][NN-loss] obj_primal={obj_primal:.6f}, "
-                f"obj_dual_x={obj_dual_x:.6f}, obj_opt={obj_opt:.6f}",
+                f"[ParallelBCD][NN-metric][before] obj_primal={nn_metrics_pre['obj_primal']:.6f}, "
+                f"obj_dual_x={nn_metrics_pre['obj_dual_x']:.6f}, "
+                f"obj_opt={nn_metrics_pre['obj_opt']:.6f}, "
+                f"reg={nn_metrics_pre['reg']:.6f}",
                 flush=True,
             )
             if TORCH_AVAILABLE and hasattr(self, 'device'):
@@ -252,6 +251,15 @@ class ParallelAgent_NN_BCD(Agent_NN_BCD):
             self.zeta_values_list = zeta_new
             self.theta_values = self.theta_values_list[0]
             self.zeta_values = self.zeta_values_list[0]
+
+            nn_metrics_after = self.cal_nn_logging_components(union_analysis=union_analysis)
+            print(
+                f"[ParallelBCD][NN-metric][after] obj_primal={nn_metrics_after['obj_primal']:.6f}, "
+                f"obj_dual_x={nn_metrics_after['obj_dual_x']:.6f}, "
+                f"obj_opt={nn_metrics_after['obj_opt']:.6f}, "
+                f"reg={nn_metrics_after['reg']:.6f}",
+                flush=True,
+            )
 
             print(f"[ParallelBCD] Iteration {i+1}/{max_iter} finished", flush=True)
 

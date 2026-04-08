@@ -497,6 +497,7 @@ class Agent_NN_BCD:
         gamma_base: float = 1e-2,
         mu_dual_floor_init: float = 0.1,
         ita_dual_floor_init: float = 0.1,
+        dual_sign_relax_interval: int | None = None,
         nn_hidden_dims: List[int] | None = None,
         nn_learning_rate: float = 5e-5,
         nn_batch_strategy: str = "full-batch",
@@ -506,6 +507,7 @@ class Agent_NN_BCD:
         loss_ratio_dual_x: float = 1.0,
         loss_ratio_opt: float = 1.0,
         loss_ratio_reg: float = 1.0,
+        nn_smooth_abs_eps: float = 1e-6,
         iter_delta_reg_weight: float = 1e-4,
         iter_delta_reg_deadband: float = 0.05,
         pg_block_prox_weight: float = 2e-2,
@@ -534,6 +536,10 @@ class Agent_NN_BCD:
         self.dual_para_bound_quit_iteration = 50
         self.mu_dual_floor_init = float(mu_dual_floor_init)
         self.ita_dual_floor_init = float(ita_dual_floor_init)
+        if dual_sign_relax_interval is None:
+            self.dual_sign_relax_interval = 2
+        else:
+            self.dual_sign_relax_interval = max(int(dual_sign_relax_interval), 0)
         self.dual_para_bound = self.mu_dual_floor_init
         
         # BCD迭代参数
@@ -570,6 +576,8 @@ class Agent_NN_BCD:
             
         self.ng = self.gen.shape[0]
         self.nl = self.branch.shape[0]
+        self.theta_constraint_direction_signs = np.ones((self.nl, self.T), dtype=float)
+        self.zeta_constraint_direction_signs = np.ones((self.ng, self.T), dtype=float)
         
         self.active_set_data = active_set_data
         self.external_sparse_templates = external_sparse_templates
@@ -590,6 +598,7 @@ class Agent_NN_BCD:
         self.loss_ratio_dual_x = float(loss_ratio_dual_x)
         self.loss_ratio_opt = float(loss_ratio_opt)
         self.loss_ratio_reg = float(loss_ratio_reg)
+        self.nn_smooth_abs_eps = max(float(nn_smooth_abs_eps), 0.0)
         self.iter_delta_reg_weight = float(iter_delta_reg_weight)
         self.iter_delta_reg_deadband = max(float(iter_delta_reg_deadband), 0.0)
         self.pg_block_prox_weight = max(float(pg_block_prox_weight), 0.0)
@@ -647,6 +656,31 @@ class Agent_NN_BCD:
             self.rho_dual_x,
             self.rho_dual_coc,
         ]))
+
+    def _smooth_abs(self, tensor: torch.Tensor, eps: float | None = None) -> torch.Tensor:
+        resolved_eps = self.nn_smooth_abs_eps if eps is None else max(float(eps), 0.0)
+        if resolved_eps <= 0:
+            return torch.abs(tensor)
+        return torch.sqrt(tensor * tensor + resolved_eps) - np.sqrt(resolved_eps)
+
+    def _smooth_relu(self, tensor: torch.Tensor, eps: float | None = None) -> torch.Tensor:
+        resolved_eps = self.nn_smooth_abs_eps if eps is None else max(float(eps), 0.0)
+        if resolved_eps <= 0:
+            return torch.relu(tensor)
+        sqrt_eps = np.sqrt(resolved_eps)
+        smoothed = 0.5 * (tensor + torch.sqrt(tensor * tensor + resolved_eps) - sqrt_eps)
+        return torch.clamp_min(smoothed, 0.0)
+
+    def _smooth_deadband_excess(
+        self,
+        tensor: torch.Tensor,
+        deadband: float,
+        eps: float | None = None,
+    ) -> torch.Tensor:
+        return self._smooth_relu(
+            self._smooth_abs(tensor, self.nn_smooth_abs_eps) - float(deadband),
+            eps=eps,
+        )
 
     def _get_regularization_scale(self) -> float:
         min_rho = min(
@@ -2372,6 +2406,118 @@ class Agent_NN_BCD:
             device=dev,
         )
 
+    def _current_dual_decay_round(self) -> int:
+        dual_decay_round = getattr(self, 'dual_decay_round', None)
+        if dual_decay_round is None:
+            dual_decay_round = getattr(self, 'dual_para_bound_quit_iteration', 50)
+        return max(int(dual_decay_round), 0)
+
+    def _is_dual_floor_active(self) -> bool:
+        return self.iter_number < self._current_dual_decay_round()
+
+    def _is_dual_sign_relaxation_round(self) -> bool:
+        interval = int(getattr(self, 'dual_sign_relax_interval', 0) or 0)
+        return (
+            interval > 0
+            and self._is_dual_floor_active()
+            and max(float(getattr(self, 'mu_dual_floor_init', 0.0)), float(getattr(self, 'ita_dual_floor_init', 0.0))) > 0.0
+            and ((self.iter_number + 1) % interval == 0)
+        )
+
+    def _sync_parametric_direction_strategy_state(self) -> None:
+        self.theta_constraint_direction_signs = np.asarray(self.theta_constraint_direction_signs, dtype=float)
+        self.zeta_constraint_direction_signs = np.asarray(self.zeta_constraint_direction_signs, dtype=float)
+
+    def _get_theta_constraint_direction(self, branch_id: int, time_slot: int) -> float:
+        signs = np.asarray(getattr(self, 'theta_constraint_direction_signs', None), dtype=float)
+        if signs.shape != (self.nl, self.T):
+            self.theta_constraint_direction_signs = np.ones((self.nl, self.T), dtype=float)
+            signs = self.theta_constraint_direction_signs
+        if 0 <= branch_id < self.nl and 0 <= time_slot < self.T:
+            return float(signs[branch_id, time_slot])
+        return 1.0
+
+    def _get_zeta_constraint_direction(self, unit_id: int, time_slot: int) -> float:
+        signs = np.asarray(getattr(self, 'zeta_constraint_direction_signs', None), dtype=float)
+        if signs.shape != (self.ng, self.T):
+            self.zeta_constraint_direction_signs = np.ones((self.ng, self.T), dtype=float)
+            signs = self.zeta_constraint_direction_signs
+        if 0 <= unit_id < self.ng and 0 <= time_slot < self.T:
+            return float(signs[unit_id, time_slot])
+        return 1.0
+
+    def _resolve_direction_signs_from_signed_duals(
+        self,
+        dual_values: np.ndarray,
+        current_signs: np.ndarray,
+        tol: float = 1e-8,
+    ) -> np.ndarray:
+        dual_arr = np.asarray(dual_values, dtype=float)
+        if dual_arr.size == 0:
+            return np.asarray(current_signs, dtype=float).copy()
+        pos_count = np.sum(dual_arr > tol, axis=0)
+        neg_count = np.sum(dual_arr < -tol, axis=0)
+        resolved = np.asarray(current_signs, dtype=float).copy()
+        resolved[pos_count > neg_count] = 1.0
+        resolved[neg_count > pos_count] = -1.0
+        return resolved
+
+    def _finalize_signed_dual_values(
+        self,
+        dual_values: np.ndarray,
+        direction_signs: np.ndarray,
+        abs_floor: float,
+    ) -> np.ndarray:
+        dual_abs = np.abs(np.asarray(dual_values, dtype=float))
+        if abs_floor > 0:
+            dual_abs = np.maximum(dual_abs, abs_floor)
+        return dual_abs
+
+    def _direction_corrected_theta_values(self, theta_values: dict | None) -> dict:
+        if theta_values is None:
+            return {}
+        corrected = dict(theta_values)
+        union_analysis = getattr(self, '_current_union_analysis', None)
+        if not (self.enable_theta_constraints and union_analysis and 'union_constraints' in union_analysis):
+            return corrected
+        for constraint_info in union_analysis['union_constraints']:
+            branch_id = constraint_info['branch_id']
+            time_slot = constraint_info['time_slot']
+            sign = self._get_theta_constraint_direction(branch_id, time_slot)
+            if sign == 1.0:
+                continue
+            for coeff_info in constraint_info.get('nonzero_pg_coefficients', []):
+                unit_id = coeff_info['unit_id']
+                member_time = self._theta_member_time_index(constraint_info, coeff_info)
+                theta_name = self._theta_var_name(branch_id, unit_id, member_time)
+                if theta_name in corrected:
+                    corrected[theta_name] = float(corrected[theta_name]) * sign
+            theta_rhs_name = self._theta_rhs_name(branch_id, time_slot)
+            if theta_rhs_name in corrected:
+                corrected[theta_rhs_name] = float(corrected[theta_rhs_name]) * sign
+        return corrected
+
+    def _direction_corrected_zeta_values(self, zeta_values: dict | None) -> dict:
+        if zeta_values is None:
+            return {}
+        corrected = dict(zeta_values)
+        union_analysis = getattr(self, '_current_union_analysis', None)
+        if not (self.enable_zeta_constraints and union_analysis and 'union_zeta_constraints' in union_analysis):
+            return corrected
+        for constraint in union_analysis['union_zeta_constraints']:
+            unit_id = constraint['unit_id']
+            time_slot = constraint['time_slot']
+            sign = self._get_zeta_constraint_direction(unit_id, time_slot)
+            if sign == 1.0:
+                continue
+            zeta_name = f'zeta_unit_{unit_id}_time_{time_slot}'
+            if zeta_name in corrected:
+                corrected[zeta_name] = float(corrected[zeta_name]) * sign
+            zeta_rhs_name = f'zeta_rhs_unit_{unit_id}_time_{time_slot}'
+            if zeta_rhs_name in corrected:
+                corrected[zeta_rhs_name] = float(corrected[zeta_rhs_name]) * sign
+        return corrected
+
     def _preprocess_union_analysis_cache(self, union_analysis) -> None:
         """将 union_analysis 预处理为结构化元组，消除 loss 热路径中的字符串格式化与字典扫描。
 
@@ -2758,17 +2904,16 @@ class Agent_NN_BCD:
         
         # mu和ita变量（注意：ita的维度是(ng, T)）
         
-        if self.dual_decay_round is not None:
-            dual_decay_round_ = self.dual_decay_round
-        else:
-            dual_decay_round_ = self.dual_para_bound_quit_iteration
-            
-        if (self.iter_number < dual_decay_round_):
-            mu = model.addVars(self.nl, self.T, lb=self.mu_dual_floor_init, name='mu')
-            ita = model.addVars(self.ng, self.T, lb=self.ita_dual_floor_init, name='ita')
-        else:
-            mu = model.addVars(self.nl, self.T, lb=0, name='mu')
-            ita = model.addVars(self.ng, self.T, lb=0, name='ita')            
+        dual_decay_round_ = self._current_dual_decay_round()
+        floor_active = self.iter_number < dual_decay_round_
+        sign_relax_round = self._is_dual_sign_relaxation_round()
+
+        mu_lb = -GRB.INFINITY if (floor_active and sign_relax_round) else 0.0
+        ita_lb = -GRB.INFINITY if (floor_active and sign_relax_round) else 0.0
+        mu = model.addVars(self.nl, self.T, lb=mu_lb, name='mu')
+        ita = model.addVars(self.ng, self.T, lb=ita_lb, name='ita')
+        mu_abs = model.addVars(self.nl, self.T, lb=0, name='mu_abs')
+        ita_abs = model.addVars(self.ng, self.T, lb=0, name='ita_abs')
 
         mu_max = model.addVar(lb=0, name='mu_max')
         ita_max = model.addVar(lb=0, name='ita_max')
@@ -2776,12 +2921,24 @@ class Agent_NN_BCD:
         
         for l in range(self.nl):
             for t in range(self.T):
-                model.addConstr(mu_max >= mu[l, t] - deadband, name=f'mu_max_constr_{l}_{t}')
-                model.addConstr(mu_max >= -mu[l, t] - deadband, name=f'mu_max_constr_neg_{l}_{t}')
+                model.addConstr(mu_abs[l, t] >= mu[l, t], name=f'mu_abs_pos_{l}_{t}')
+                model.addConstr(mu_abs[l, t] >= -mu[l, t], name=f'mu_abs_neg_{l}_{t}')
+                if floor_active:
+                    if sign_relax_round:
+                        model.addConstr(mu_abs[l, t] >= self.mu_dual_floor_init, name=f'mu_abs_lb_{l}_{t}')
+                    else:
+                        model.addConstr(mu[l, t] >= self.mu_dual_floor_init, name=f'mu_lb_{l}_{t}')
+                model.addConstr(mu_max >= mu_abs[l, t] - deadband, name=f'mu_max_constr_{l}_{t}')
         for g in range(self.ng):
             for t in range(self.T):
-                model.addConstr(ita_max >= ita[g, t] - deadband, name=f'ita_max_constr_{g}_{t}')
-                model.addConstr(ita_max >= -ita[g, t] - deadband, name=f'ita_max_constr_neg_{g}_{t}')
+                model.addConstr(ita_abs[g, t] >= ita[g, t], name=f'ita_abs_pos_{g}_{t}')
+                model.addConstr(ita_abs[g, t] >= -ita[g, t], name=f'ita_abs_neg_{g}_{t}')
+                if floor_active:
+                    if sign_relax_round:
+                        model.addConstr(ita_abs[g, t] >= self.ita_dual_floor_init, name=f'ita_abs_lb_{g}_{t}')
+                    else:
+                        model.addConstr(ita[g, t] >= self.ita_dual_floor_init, name=f'ita_lb_{g}_{t}')
+                model.addConstr(ita_max >= ita_abs[g, t] - deadband, name=f'ita_max_constr_{g}_{t}')
         
         penalty_factor = 0
         penal_mu = penalty_factor * mu_max
@@ -2974,13 +3131,13 @@ class Agent_NN_BCD:
         # 添加参数化约束的obj_opt项（参考uc_dfsm_bcd.py）
         if self.enable_theta_constraints and union_analysis and 'union_constraints' in union_analysis and theta_values is not None:
             model, obj_opt_para = self._add_parametric_obj_dual_block(
-                model, self.x[sample_id, :, :], mu, sample_id, theta_values, union_analysis, PTDF=PTDF, branch_limit=branch_limit
+                model, self.x[sample_id, :, :], mu, mu_abs, sample_id, theta_values, union_analysis, PTDF=PTDF, branch_limit=branch_limit
             )
             obj_opt += obj_opt_para
         
         if self.enable_zeta_constraints and union_analysis and 'union_zeta_constraints' in union_analysis and zeta_values is not None:
             model, obj_opt_para = self._add_parametric_balance_power_obj_dual_block(
-                model, self.x[sample_id, :, :], ita, sample_id, zeta_values, union_analysis
+                model, self.x[sample_id, :, :], ita, ita_abs, sample_id, zeta_values, union_analysis
             )
             obj_opt += obj_opt_para
    
@@ -3221,6 +3378,7 @@ class Agent_NN_BCD:
         self,
         max_iter=20,
         dual_decay_round=10,
+        dual_sign_relax_interval: int | None = None,
         nn_epochs=10,
         union_analysis=None,
         nn_batch_strategy: str | None = None,
@@ -3240,12 +3398,15 @@ class Agent_NN_BCD:
             union_analysis = self._current_union_analysis
 
         self.dual_decay_round = dual_decay_round
+        if dual_sign_relax_interval is not None:
+            self.dual_sign_relax_interval = max(int(dual_sign_relax_interval), 0)
 
         gamma = self.gamma_base / (self.n_samples * max_iter)
 
         for i in range(max_iter):
             print(f"🔄 迭代 {i+1}/{max_iter} 开始", flush=True)
             self.iter_number = i
+            self._sync_parametric_direction_strategy_state()
 
             # 1. 迭代PG块
             EPS = 1e-10
@@ -3271,6 +3432,12 @@ class Agent_NN_BCD:
                 self.coc[sample_id, :, :] = np.where(np.abs(coc_sol) < EPS, 0, coc_sol)
             
             # 2. 迭代对偶块
+            sign_relax_round = self._is_dual_sign_relaxation_round()
+            mu_floor = self.mu_dual_floor_init if self._is_dual_floor_active() else 0.0
+            ita_floor = self.ita_dual_floor_init if self._is_dual_floor_active() else 0.0
+            raw_mu_solutions = np.zeros((self.n_samples, self.nl, self.T), dtype=float)
+            raw_ita_solutions = np.zeros((self.n_samples, self.ng, self.T), dtype=float)
+            solved_mask = np.zeros(self.n_samples, dtype=bool)
             for sample_id in range(self.n_samples):
                 lambda_sol, mu_sol, ita_sol = self.iter_with_dual_block(
                     sample_id=sample_id,
@@ -3283,8 +3450,33 @@ class Agent_NN_BCD:
                     break
                 
                 self.lambda_[sample_id] = lambda_sol
-                self.mu[sample_id, :, :] = np.where(np.abs(mu_sol) < EPS, 0, mu_sol)
-                self.ita[sample_id, :, :] = np.where(np.abs(ita_sol) < EPS, 0, ita_sol)
+                raw_mu_solutions[sample_id] = mu_sol
+                raw_ita_solutions[sample_id] = ita_sol
+                solved_mask[sample_id] = True
+            if sign_relax_round and np.any(solved_mask):
+                self.theta_constraint_direction_signs = self._resolve_direction_signs_from_signed_duals(
+                    raw_mu_solutions[solved_mask],
+                    self.theta_constraint_direction_signs,
+                )
+                self.zeta_constraint_direction_signs = self._resolve_direction_signs_from_signed_duals(
+                    raw_ita_solutions[solved_mask],
+                    self.zeta_constraint_direction_signs,
+                )
+            for sample_id in range(self.n_samples):
+                if not solved_mask[sample_id]:
+                    continue
+                mu_signed = self._finalize_signed_dual_values(
+                    raw_mu_solutions[sample_id],
+                    self.theta_constraint_direction_signs,
+                    mu_floor,
+                )
+                ita_signed = self._finalize_signed_dual_values(
+                    raw_ita_solutions[sample_id],
+                    self.zeta_constraint_direction_signs,
+                    ita_floor,
+                )
+                self.mu[sample_id, :, :] = np.where(np.abs(mu_signed) < EPS, 0, mu_signed)
+                self.ita[sample_id, :, :] = np.where(np.abs(ita_signed) < EPS, 0, ita_signed)
             
             # 3. 刷新迭代级张量缓存（整批转换，避免 loss 内逐张量创建）
             if TORCH_AVAILABLE and hasattr(self, 'device'):
@@ -3304,18 +3496,14 @@ class Agent_NN_BCD:
             obj_dual_coc_pre = obj_dual_coc_pre if abs(obj_dual_coc_pre) >= EPS_PRE else 0.0
             obj_dual_pre = obj_dual_pre if abs(obj_dual_pre) >= EPS_PRE else 0.0
             obj_opt_pre = obj_opt_pre if abs(obj_opt_pre) >= EPS_PRE else 0.0
-            print(
-                f"[BCD] obj_primal={obj_primal_pre:.6f}, "
-                f"obj_dual_pg={obj_dual_pg_pre:.6f}, obj_dual_x={obj_dual_x_pre:.6f}, "
-                f"obj_dual_coc={obj_dual_coc_pre:.6f}, obj_dual={obj_dual_pre:.6f}, "
-                f"obj_opt={obj_opt_pre:.6f}",
-                flush=True,
-            )
+            nn_metrics_pre = self.cal_nn_logging_components(union_analysis=union_analysis)
 
             # 4. 使用神经网络更新theta和zeta
             print(
-                f"[BCD][NN-loss] obj_primal={obj_primal_pre:.6f}, "
-                f"obj_dual_x={obj_dual_x_pre:.6f}, obj_opt={obj_opt_pre:.6f}",
+                f"[BCD][NN-metric][before] obj_primal={nn_metrics_pre['obj_primal']:.6f}, "
+                f"obj_dual_x={nn_metrics_pre['obj_dual_x']:.6f}, "
+                f"obj_opt={nn_metrics_pre['obj_opt']:.6f}, "
+                f"reg={nn_metrics_pre['reg']:.6f}",
                 flush=True,
             )
             #    先缓存上一代输出，供“迭代间差异正则”使用（默认权重为0时不影响训练）
@@ -3359,10 +3547,12 @@ class Agent_NN_BCD:
             obj_dual = obj_dual if abs(obj_dual) >= EPS else 0.0
             obj_opt = obj_opt if abs(obj_opt) >= EPS else 0.0
             
+            nn_metrics_after = self.cal_nn_logging_components(union_analysis=union_analysis)
             print(
-                f"obj_primal:{obj_primal}, obj_dual_pg:{obj_dual_pg}, "
-                f"obj_dual_x:{obj_dual_x}, obj_dual_coc:{obj_dual_coc}, "
-                f"obj_dual:{obj_dual}, obj_opt:{obj_opt}",
+                f"[BCD][NN-metric][after] obj_primal={nn_metrics_after['obj_primal']:.6f}, "
+                f"obj_dual_x={nn_metrics_after['obj_dual_x']:.6f}, "
+                f"obj_opt={nn_metrics_after['obj_opt']:.6f}, "
+                f"reg={nn_metrics_after['reg']:.6f}",
                 flush=True,
             )
             self.rho_primal = min(self.rho_primal + gamma * obj_primal, self.rho_max)
@@ -3562,7 +3752,8 @@ class Agent_NN_BCD:
                     
                     theta_rhs_name = self._theta_rhs_name(branch_id, time_slot)
                     theta_rhs = sample_theta.get(theta_rhs_name, 1.0)
-                    violation = lhs_expr - theta_rhs
+                    direction = self._get_theta_constraint_direction(branch_id, time_slot)
+                    violation = direction * (lhs_expr - theta_rhs)
                     abs_violation = abs(violation)
                     obj_primal += max(0, violation)
                     if branch_id < self.nl and sample_id < len(self.mu):
@@ -3582,7 +3773,8 @@ class Agent_NN_BCD:
                     
                     zeta_rhs_name = f'zeta_rhs_unit_{unit_id}_time_{time_slot}'
                     zeta_rhs = sample_zeta.get(zeta_rhs_name, 1.0)
-                    violation = lhs_expr - zeta_rhs
+                    direction = self._get_zeta_constraint_direction(unit_id, time_slot)
+                    violation = direction * (lhs_expr - zeta_rhs)
                     abs_violation = abs(violation)
                     obj_primal += max(0, violation)
                     if sample_id < len(self.ita):
@@ -3665,13 +3857,13 @@ class Agent_NN_BCD:
                         # theta 相关的对偶约束贡献（O(1) 查找，表在循环外预建）
                         for _branch_id, _anchor_time, _theta_val in theta_lookup.get((g, t), []):
                             if _branch_id < self.nl:
-                                dual_expr += _theta_val * self.mu[sample_id, _branch_id, _anchor_time]
+                                dual_expr += self._get_theta_constraint_direction(_branch_id, _anchor_time) * _theta_val * self.mu[sample_id, _branch_id, _anchor_time]
                             else:
                                 dual_expr += _theta_val * getattr(self, 'dual_para_bound', 0.1)
 
                         # zeta 相关的对偶约束贡献（O(1) 查找）
                         for _zeta_val in zeta_lookup.get((g, t), []):
-                            dual_expr += _zeta_val * self.ita[sample_id, g, t]
+                            dual_expr += self._get_zeta_constraint_direction(g, t) * _zeta_val * self.ita[sample_id, g, t]
 
                         # 对偶约束：梯度 = 0
                         obj_dual_x += abs(dual_expr)
@@ -3697,6 +3889,49 @@ class Agent_NN_BCD:
             union_analysis=union_analysis
         )
         return obj_primal, obj_dual, obj_opt
+
+    def cal_nn_logging_components(self, union_analysis=None) -> dict[str, float]:
+        if not TORCH_AVAILABLE or self.n_samples <= 0:
+            return {
+                'obj_primal': 0.0,
+                'obj_dual_x': 0.0,
+                'obj_opt': 0.0,
+                'reg': 0.0,
+            }
+        if union_analysis is None:
+            union_analysis = self._current_union_analysis
+        self._refresh_iter_tensor_cache()
+
+        totals = {
+            'obj_primal': 0.0,
+            'obj_dual_x': 0.0,
+            'obj_opt': 0.0,
+            'reg': 0.0,
+        }
+        for sample_id in range(self.n_samples):
+            theta_tensor = torch.tensor(
+                [float(self.theta_values_list[sample_id].get(name, 0.0)) for name in self.theta_var_names],
+                dtype=torch.float32,
+                device=self.device,
+            )
+            zeta_tensor = torch.tensor(
+                [float(self.zeta_values_list[sample_id].get(name, 0.0)) for name in self.zeta_var_names],
+                dtype=torch.float32,
+                device=self.device,
+            )
+            _, components = self.loss_function_differentiable(
+                sample_id,
+                theta_tensor,
+                zeta_tensor,
+                union_analysis=union_analysis,
+                device=self.device,
+                return_components=True,
+            )
+            totals['obj_primal'] += float(components['obj_primal'].cpu().item())
+            totals['obj_dual_x'] += float(components['obj_dual_x'].cpu().item())
+            totals['obj_opt'] += float(components['obj_opt'].cpu().item())
+            totals['reg'] += float(components['reg_term'].cpu().item())
+        return totals
     
     def loss_function_differentiable(self, sample_id, theta_tensor, zeta_tensor,
                                      union_analysis=None, device=None,
@@ -3814,13 +4049,14 @@ class Agent_NN_BCD:
 
             theta_rhs = theta_tensor[rhs_idx] if rhs_idx >= 0 else _one
 
-            violation = lhs_expr - theta_rhs
-            obj_primal = obj_primal + torch.relu(violation)
+            direction = self._get_theta_constraint_direction(branch_id, time_slot)
+            violation = direction * (lhs_expr - theta_rhs)
+            obj_primal = obj_primal + self._smooth_relu(violation)
 
             if branch_id < self.nl:
-                obj_opt = obj_opt + torch.abs(violation) * mu[branch_id, time_slot]
+                obj_opt = obj_opt + self._smooth_abs(violation) * torch.abs(mu[branch_id, time_slot])
             else:
-                obj_opt = obj_opt + torch.abs(violation) * _default_mu
+                obj_opt = obj_opt + self._smooth_abs(violation) * _default_mu
 
         # 计算zeta相关的参数化约束损失（使用预处理缓存）
         for unit_id, time_slot, zeta_idx, rhs_idx in self._cached_zeta_constraints:
@@ -3829,9 +4065,10 @@ class Agent_NN_BCD:
 
             zeta_rhs = zeta_tensor[rhs_idx] if rhs_idx >= 0 else _one
 
-            violation = lhs_expr - zeta_rhs
-            obj_primal = obj_primal + torch.relu(violation)
-            obj_opt = obj_opt + torch.abs(violation) * ita[unit_id, time_slot]
+            direction = self._get_zeta_constraint_direction(unit_id, time_slot)
+            violation = direction * (lhs_expr - zeta_rhs)
+            obj_primal = obj_primal + self._smooth_relu(violation)
+            obj_opt = obj_opt + self._smooth_abs(violation) * torch.abs(ita[unit_id, time_slot])
 
         # theta/zeta 仅影响 x 驻点条件，因此可微 dual loss 只包含 obj_dual_x。
         for g in range(self.ng):
@@ -3864,20 +4101,22 @@ class Agent_NN_BCD:
                 # 参数化约束的对偶贡献（theta相关）——使用查找表，O(1) 替代全量扫描
                 for theta_idx, branch_id, anchor_time in self._dual_theta_lookup.get((g, t), []):
                     theta = theta_tensor[theta_idx]
+                    direction = self._get_theta_constraint_direction(branch_id, anchor_time)
                     if branch_id < self.nl:
-                        dual_expr = dual_expr + theta * mu[branch_id, anchor_time]
+                        dual_expr = dual_expr + direction * theta * mu[branch_id, anchor_time]
                     else:
-                        dual_expr = dual_expr + theta * _default_mu
+                        dual_expr = dual_expr + direction * theta * _default_mu
 
                 # 参数化约束的对偶贡献（zeta相关）——使用查找表
                 for zeta_idx in self._dual_zeta_lookup.get((g, t), []):
-                    dual_expr = dual_expr + zeta_tensor[zeta_idx] * ita[g, t]
+                    direction = self._get_zeta_constraint_direction(g, t)
+                    dual_expr = dual_expr + direction * zeta_tensor[zeta_idx] * ita[g, t]
 
-                obj_dual_x = obj_dual_x + torch.abs(dual_expr)
+                obj_dual_x = obj_dual_x + self._smooth_abs(dual_expr)
         
         # L1 正则化：[-1, 1] 死区内不惩罚，仅惩罚超出死区的幅值
-        theta_deadzone_excess = torch.clamp(torch.abs(theta_tensor) - 1.0, min=0.0)
-        zeta_deadzone_excess = torch.clamp(torch.abs(zeta_tensor) - 1.0, min=0.0)
+        theta_deadzone_excess = self._smooth_deadband_excess(theta_tensor, 1.0)
+        zeta_deadzone_excess = self._smooth_deadband_excess(zeta_tensor, 1.0)
         reg_base = (
             self.theta_reg_weight * torch.sum(theta_deadzone_excess)
             + self.zeta_reg_weight * torch.sum(zeta_deadzone_excess)
@@ -3901,8 +4140,14 @@ class Agent_NN_BCD:
             theta_diff = theta_tensor - prev_theta
             zeta_diff = zeta_tensor - prev_zeta
             if self.iter_delta_reg_deadband > 0:
-                theta_excess = torch.relu(torch.abs(theta_diff) - self.iter_delta_reg_deadband)
-                zeta_excess = torch.relu(torch.abs(zeta_diff) - self.iter_delta_reg_deadband)
+                theta_excess = self._smooth_deadband_excess(
+                    theta_diff,
+                    self.iter_delta_reg_deadband,
+                )
+                zeta_excess = self._smooth_deadband_excess(
+                    zeta_diff,
+                    self.iter_delta_reg_deadband,
+                )
                 iter_delta_reg = torch.sum(theta_excess ** 2) + torch.sum(zeta_excess ** 2)
             else:
                 iter_delta_reg = torch.sum(theta_diff ** 2) + torch.sum(zeta_diff ** 2)
@@ -4004,11 +4249,12 @@ class Agent_NN_BCD:
                 else:
                     parametric_rhs = 1.0  # 默认值
 
+                direction = self._get_theta_constraint_direction(branch_id, time_slot)
                 # 添加违反量和绝对值变量
                 parametric_rhs_viol = model.addVar(lb=0, name=f'parametric_rhs_viol_{branch_id}_{time_slot}')
                 parametric_rhs_abs = model.addVar(lb=0, name=f'parametric_rhs_abs_{branch_id}_{time_slot}')
 
-                model.addConstr(parametric_rhs_viol >= lhs_expr - parametric_rhs, name=f'parametric_rhs_viol_{branch_id}_{time_slot}')
+                model.addConstr(parametric_rhs_viol >= direction * (lhs_expr - parametric_rhs), name=f'parametric_rhs_viol_{branch_id}_{time_slot}')
                 model.addConstr(parametric_rhs_abs >= lhs_expr - parametric_rhs, name=f'parametric_rhs_abs1_{branch_id}_{time_slot}')
                 model.addConstr(parametric_rhs_abs >= -lhs_expr + parametric_rhs, name=f'parametric_rhs_abs2_{branch_id}_{time_slot}')
 
@@ -4084,11 +4330,12 @@ class Agent_NN_BCD:
                 else:
                     parametric_rhs = 1.0  # 默认值
 
+                direction = self._get_zeta_constraint_direction(unit_id, time_slot)
                 # 添加违反量和绝对值变量
                 parametric_rhs_viol = model.addVar(lb=0, name=f'parametric_balance_power_rhs_viol_{unit_id}_{time_slot}')
                 parametric_rhs_abs = model.addVar(lb=0, name=f'parametric_balance_power_rhs_abs_{unit_id}_{time_slot}')
 
-                model.addConstr(parametric_rhs_viol >= lhs_expr - parametric_rhs, name=f'parametric_balance_power_rhs_viol_{unit_id}_{time_slot}')
+                model.addConstr(parametric_rhs_viol >= direction * (lhs_expr - parametric_rhs), name=f'parametric_balance_power_rhs_viol_{unit_id}_{time_slot}')
                 model.addConstr(parametric_rhs_abs >= lhs_expr - parametric_rhs, name=f'parametric_balance_power_rhs_abs1_{unit_id}_{time_slot}')
                 model.addConstr(parametric_rhs_abs >= -lhs_expr + parametric_rhs, name=f'parametric_balance_power_rhs_abs2_{unit_id}_{time_slot}')
                 
@@ -4162,7 +4409,8 @@ class Agent_NN_BCD:
                 else:
                     parametric_rhs = 1.0  # 默认值
 
-                model.addConstr(lhs_expr <= parametric_rhs, name=f'parametric_solid_{branch_id}_{time_slot}')
+                direction = self._get_theta_constraint_direction(branch_id, time_slot)
+                model.addConstr(direction * lhs_expr <= direction * parametric_rhs, name=f'parametric_solid_{branch_id}_{time_slot}')
 
             model.update()
             
@@ -4209,7 +4457,8 @@ class Agent_NN_BCD:
                 else:
                     parametric_rhs = 1.0  # 默认值
 
-                model.addConstr(lhs_expr <= parametric_rhs, name=f'parametric_balance_power_solid_{unit_id}_{time_slot}')
+                direction = self._get_zeta_constraint_direction(unit_id, time_slot)
+                model.addConstr(direction * lhs_expr <= direction * parametric_rhs, name=f'parametric_balance_power_solid_{unit_id}_{time_slot}')
 
             model.update()
             
@@ -4259,7 +4508,7 @@ class Agent_NN_BCD:
                     
                     # 检查branch_id是否在有效范围内（真实支路范围）
                     if branch_id < self.nl:
-                        dual_expr += parametric_coeff * mu[branch_id, time_slot]
+                        dual_expr += self._get_theta_constraint_direction(branch_id, time_slot) * parametric_coeff * mu[branch_id, time_slot]
                     else:
                         # 对于手动约束（虚拟branch_id），使用默认mu值
                         default_mu = getattr(self, 'dual_para_bound', 0.1)
@@ -4303,7 +4552,7 @@ class Agent_NN_BCD:
                 
                 parametric_coeff = original_coeff + zeta
                     
-                dual_expr += parametric_coeff * ita[unit_id, time_slot]
+                dual_expr += self._get_zeta_constraint_direction(unit_id, time_slot) * parametric_coeff * ita[unit_id, time_slot]
 
             return dual_expr
         except Exception as e:
@@ -4312,7 +4561,7 @@ class Agent_NN_BCD:
             traceback.print_exc()   
             return 0.0
     
-    def _add_parametric_obj_dual_block(self, model, x, mu, sample_id, theta_values=None, union_analysis=None, PTDF=None, branch_limit=None):
+    def _add_parametric_obj_dual_block(self, model, x, mu, mu_abs, sample_id, theta_values=None, union_analysis=None, PTDF=None, branch_limit=None):
         """
         添加包含theta参数的DCPF罚项到obj_opt（参考uc_dfsm_bcd.py，但使用直接优化系数的形式）
         """
@@ -4377,7 +4626,7 @@ class Agent_NN_BCD:
                 # 过滤数值精度问题
                 if parametric_rhs_abs > 1e-10:
                     if branch_id < self.nl:
-                        obj_opt += parametric_rhs_abs * mu[branch_id, time_slot]
+                        obj_opt += parametric_rhs_abs * mu_abs[branch_id, time_slot]
                     else:
                         # 对于手动约束（虚拟branch_id），使用默认mu值
                         default_mu = getattr(self, 'dual_para_bound', 0.1)
@@ -4392,7 +4641,7 @@ class Agent_NN_BCD:
             traceback.print_exc()
             return model, gp.LinExpr()
     
-    def _add_parametric_balance_power_obj_dual_block(self, model, x, ita, sample_id, zeta_values=None, union_analysis=None):
+    def _add_parametric_balance_power_obj_dual_block(self, model, x, ita, ita_abs, sample_id, zeta_values=None, union_analysis=None):
         """
         添加包含zeta参数的平衡功率罚项到obj_opt（参考uc_dfsm_bcd.py，但使用直接优化系数的形式）
         """
@@ -4437,7 +4686,7 @@ class Agent_NN_BCD:
 
                 # 过滤数值精度问题
                 if parametric_rhs_abs > 1e-10:
-                    obj_opt += parametric_rhs_abs * ita[unit_id, time_slot]
+                    obj_opt += parametric_rhs_abs * ita_abs[unit_id, time_slot]
 
             model.update()
 
@@ -4856,12 +5105,23 @@ class Agent_NN_BCD:
                 os.makedirs(dirpath, exist_ok=True)
         
         # 将可能的 numpy 类型转换为 Python 原生类型
-        theta_serializable = {str(k): float(v) for k, v in self.theta_values.items()}
-        zeta_serializable = {str(k): float(v) for k, v in self.zeta_values.items()} if hasattr(self, 'zeta_values') and self.zeta_values else {}
-        
+        theta_serializable = {
+            str(k): float(v)
+            for k, v in self._direction_corrected_theta_values(self.theta_values).items()
+        }
+        zeta_serializable = (
+            {
+                str(k): float(v)
+                for k, v in self._direction_corrected_zeta_values(self.zeta_values).items()
+            }
+            if hasattr(self, 'zeta_values') and self.zeta_values else {}
+        )
+
         data = {
             'theta_values': theta_serializable,
-            'zeta_values': zeta_serializable
+            'zeta_values': zeta_serializable,
+            'theta_constraint_direction_signs': self.theta_constraint_direction_signs.tolist(),
+            'zeta_constraint_direction_signs': self.zeta_constraint_direction_signs.tolist(),
         }
         
         with open(filepath, 'w', encoding='utf-8') as f:
@@ -4896,16 +5156,30 @@ class Agent_NN_BCD:
             'sample_ids': sample_ids,
             'theta_var_names': list(getattr(self, 'theta_var_names', [])),
             'zeta_var_names': list(getattr(self, 'zeta_var_names', [])),
-            'theta_values': {str(k): float(v) for k, v in (self.theta_values or {}).items()},
-            'zeta_values': {str(k): float(v) for k, v in (self.zeta_values or {}).items()},
+            'theta_values': {
+                str(k): float(v)
+                for k, v in self._direction_corrected_theta_values(self.theta_values or {}).items()
+            },
+            'zeta_values': {
+                str(k): float(v)
+                for k, v in self._direction_corrected_zeta_values(self.zeta_values or {}).items()
+            },
             'theta_values_list': [
-                {str(k): float(v) for k, v in values.items()}
+                {
+                    str(k): float(v)
+                    for k, v in self._direction_corrected_theta_values(values).items()
+                }
                 for values in self.theta_values_list
             ],
             'zeta_values_list': [
-                {str(k): float(v) for k, v in values.items()}
+                {
+                    str(k): float(v)
+                    for k, v in self._direction_corrected_zeta_values(values).items()
+                }
                 for values in self.zeta_values_list
             ],
+            'theta_constraint_direction_signs': self.theta_constraint_direction_signs.tolist(),
+            'zeta_constraint_direction_signs': self.zeta_constraint_direction_signs.tolist(),
         }
 
         with open(filepath, 'w', encoding='utf-8') as f:
@@ -4933,6 +5207,12 @@ class Agent_NN_BCD:
         self.theta_values = {str(k): float(v) for k, v in tv.items()}
         if zv:
             self.zeta_values = {str(k): float(v) for k, v in zv.items()}
+        theta_signs = data.get('theta_constraint_direction_signs')
+        zeta_signs = data.get('zeta_constraint_direction_signs')
+        if theta_signs is not None:
+            self.theta_constraint_direction_signs = np.asarray(theta_signs, dtype=float)
+        if zeta_signs is not None:
+            self.zeta_constraint_direction_signs = np.asarray(zeta_signs, dtype=float)
         
         print(f"✓ theta_values 和 zeta_values 已从文件加载: {filepath}，theta变量数量: {len(self.theta_values)}，zeta变量数量: {len(self.zeta_values) if hasattr(self, 'zeta_values') else 0}", flush=True)
         return self.theta_values
@@ -4967,6 +5247,9 @@ class Agent_NN_BCD:
             "lambda_": self.lambda_,
             "mu": self.mu,
             "ita": self.ita,
+            "theta_constraint_direction_signs": self.theta_constraint_direction_signs,
+            "zeta_constraint_direction_signs": self.zeta_constraint_direction_signs,
+            "dual_sign_relax_interval": self.dual_sign_relax_interval,
             "rho_primal": self.rho_primal,
             "rho_dual": self.rho_dual,
             "rho_dual_pg": self.rho_dual_pg,
@@ -4978,6 +5261,7 @@ class Agent_NN_BCD:
             "loss_ratio_dual_x": self.loss_ratio_dual_x,
             "loss_ratio_opt": self.loss_ratio_opt,
             "loss_ratio_reg": self.loss_ratio_reg,
+            "nn_smooth_abs_eps": self.nn_smooth_abs_eps,
             "pg_block_prox_weight": self.pg_block_prox_weight,
             "dual_block_prox_weight": self.dual_block_prox_weight,
         }
@@ -5085,6 +5369,10 @@ class Agent_NN_BCD:
                 if isinstance(module, nn.Linear)
             ][:-1],
         )
+        self.nn_smooth_abs_eps = max(
+            float(state.get("nn_smooth_abs_eps", self.nn_smooth_abs_eps)),
+            0.0,
+        )
 
         # 恢复对偶变量（向后兼容旧checkpoint）
         if "lambda_" in state:
@@ -5093,6 +5381,11 @@ class Agent_NN_BCD:
             self.mu = state["mu"]
         if "ita" in state:
             self.ita = state["ita"]
+        if "theta_constraint_direction_signs" in state:
+            self.theta_constraint_direction_signs = np.asarray(state["theta_constraint_direction_signs"], dtype=float)
+        if "zeta_constraint_direction_signs" in state:
+            self.zeta_constraint_direction_signs = np.asarray(state["zeta_constraint_direction_signs"], dtype=float)
+        self.dual_sign_relax_interval = max(int(state.get("dual_sign_relax_interval", self.dual_sign_relax_interval)), 0)
         if restore_rho_state:
             if "rho_primal" in state:
                 self.rho_primal = state["rho_primal"]

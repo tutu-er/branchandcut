@@ -5,6 +5,7 @@ import sys
 import io
 import time
 import json
+import copy
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -1553,6 +1554,8 @@ class SubproblemSurrogateTrainer:
                  mu_lower_bound_init: float = 0.1,
                  mu_individual_lower_bound_round: int = 3,
                  mu_group_lower_bound_round: int = 50,
+                 mu_signed_round_interval: int | None = None,
+                 x_bound_dual_zero_rounds: int = 0,
                  pg_cost_start_round: int = 3,
                  pg_cost_scale_multiplier: float = 1.2,
                  nn_hidden_dims: List[int] = None,
@@ -1563,12 +1566,16 @@ class SubproblemSurrogateTrainer:
                  nn_batch_strategy: str = "full-batch",
                  nn_batch_size: int = 4,
                  nn_shuffle: bool = True,
+                 pg_cost_nn_epochs: int | None = None,
                  pg_cost_reg_deadband: float = 0.5,
+                 nn_smooth_abs_eps: float = 1e-6,
+                 pg_cost_smooth_abs_eps: float = 1e-6,
                  iter_delta_reg_weight: float = 5e-5,
                  iter_delta_reg_deadband: float = 0.10,
                  loss_ratio_primal: float = 1.0,
                  loss_ratio_dual_pg: float = 1.0,
                  loss_ratio_dual_x: float = 1.0,
+                 nn_dual_term_interval: int | None = 1,
                  loss_ratio_opt: float = 1.0,
                  loss_ratio_reg: float = 1.0,
                  pg_block_prox_weight: float = 2e-2,
@@ -1612,6 +1619,8 @@ class SubproblemSurrogateTrainer:
         self.coeff_reg_deadband = 0.35
         self.aux_cost_reg_deadband = 0.5
         self.pg_cost_reg_deadband = max(float(pg_cost_reg_deadband), 0.0)
+        self.nn_smooth_abs_eps = max(float(nn_smooth_abs_eps), 0.0)
+        self.pg_cost_smooth_abs_eps = max(float(pg_cost_smooth_abs_eps), 0.0)
         self.requested_max_constraints = max_constraints
         self.max_constraints = max_constraints  # V3新增
         
@@ -1678,6 +1687,11 @@ class SubproblemSurrogateTrainer:
             int(mu_group_lower_bound_round),
             self.mu_individual_lower_bound_round,
         )
+        if mu_signed_round_interval is None:
+            self.mu_signed_round_interval = 2
+        else:
+            self.mu_signed_round_interval = max(int(mu_signed_round_interval), 0)
+        self.x_bound_dual_zero_rounds = max(int(x_bound_dual_zero_rounds), 0)
         self.pg_cost_start_round = max(int(pg_cost_start_round), 0)
         self.pg_cost_scale_multiplier = max(float(pg_cost_scale_multiplier), 1e-6)
         self.nn_hidden_dims = normalize_nn_hidden_dims(nn_hidden_dims, [256, 256])
@@ -1688,15 +1702,23 @@ class SubproblemSurrogateTrainer:
         self.nn_batch_strategy = normalize_nn_batch_strategy(nn_batch_strategy)
         self.nn_batch_size = max(int(nn_batch_size), 1)
         self.nn_shuffle = bool(nn_shuffle)
+        self.pg_cost_nn_epochs = None if pg_cost_nn_epochs is None else max(int(pg_cost_nn_epochs), 1)
         self.loss_ratio_primal = float(loss_ratio_primal)
         self.loss_ratio_dual_pg = float(loss_ratio_dual_pg)
         self.loss_ratio_dual_x = float(loss_ratio_dual_x)
+        if nn_dual_term_interval is None:
+            self.nn_dual_term_interval = None
+        else:
+            resolved_dual_interval = int(nn_dual_term_interval)
+            if resolved_dual_interval <= 0:
+                raise ValueError(
+                    f"nn_dual_term_interval must be None or a positive integer, got {nn_dual_term_interval}"
+                )
+            self.nn_dual_term_interval = resolved_dual_interval
         self.loss_ratio_opt = float(loss_ratio_opt)
         self.loss_ratio_reg = float(loss_ratio_reg)
         self.pg_block_prox_weight = max(float(pg_block_prox_weight), 0.0)
         self.dual_block_prox_weight = max(float(dual_block_prox_weight), 0.0)
-        self.cost_ema_alpha = 0.3  # cost_values EMA平滑系数，越小越平滑
-        self.pg_cost_ema_alpha = 0.3
         self.iter_number = 0
         self.x_cost_scale = 2.0
         self.pg_cost_scale = 1.0
@@ -1712,7 +1734,8 @@ class SubproblemSurrogateTrainer:
         # 初始化为max_constraints大小
         self.num_coupling_constraints = self.max_constraints
         self.template_rhs_base_vector = self._build_template_rhs_base_vector(self.num_coupling_constraints)
-        self.mu = np.ones((self.n_samples, self.num_coupling_constraints)) * self.mu_lower_bound
+        self.surrogate_direction_signs = np.ones(self.num_coupling_constraints, dtype=float)
+        self.mu = np.ones((self.n_samples, self.num_coupling_constraints), dtype=float) * self.mu_lower_bound
 
         # 固有约束的对偶变量（由dual block更新，用于NN loss的完整KKT驻点条件）
         self.lambda_inherent = [None] * self.n_samples
@@ -1878,9 +1901,12 @@ class SubproblemSurrogateTrainer:
             f"  - c_pg_start_round={self.pg_cost_start_round}, "
             f"main_nn_lr={self.nn_learning_rate:.2e}, x_cost_nn_lr={self.cost_learning_rate:.2e}, "
             f"c_pg_lr={self.pg_cost_lr:.2e}, c_pg_surr_lr={self.pg_cost_surr_lr:.2e}, "
-            f"c_pg_deadband={self.pg_cost_reg_deadband:.4f}",
+            f"c_pg_epochs={self.pg_cost_nn_epochs}, c_pg_deadband={self.pg_cost_reg_deadband:.4f}, "
+            f"nn_smooth_eps={self.nn_smooth_abs_eps:.1e}, "
+            f"c_pg_smooth_eps={self.pg_cost_smooth_abs_eps:.1e}",
             flush=True,
         )
+        print(f"  - nn_dual_term_interval={self.nn_dual_term_interval}", flush=True)
 
     def _pg_costs_active(self) -> bool:
         return self.iter_number >= self.pg_cost_start_round
@@ -1892,11 +1918,43 @@ class SubproblemSurrogateTrainer:
             self.rho_dual_coc,
         ]))
 
+    def _nn_dual_terms_active(self) -> bool:
+        if self.nn_dual_term_interval is None:
+            return False
+        if self.nn_dual_term_interval <= 1:
+            return True
+        return ((self.iter_number + 1) % self.nn_dual_term_interval) == 0
+
     def _add_squared_distance_term(self, expr, reference_value: float, scale: float):
         reference_value = float(reference_value)
         scale = max(float(scale), 1e-6)
         diff = (expr - reference_value) / scale
         return diff * diff
+
+    def _smooth_abs(self, tensor: torch.Tensor, eps: float) -> torch.Tensor:
+        eps = max(float(eps), 0.0)
+        if eps <= 0:
+            return torch.abs(tensor)
+        return torch.sqrt(tensor * tensor + eps) - np.sqrt(eps)
+
+    def _smooth_relu(self, tensor: torch.Tensor, eps: float | None = None) -> torch.Tensor:
+        resolved_eps = self.nn_smooth_abs_eps if eps is None else max(float(eps), 0.0)
+        if resolved_eps <= 0:
+            return torch.relu(tensor)
+        sqrt_eps = np.sqrt(resolved_eps)
+        smoothed = 0.5 * (tensor + torch.sqrt(tensor * tensor + resolved_eps) - sqrt_eps)
+        return torch.clamp_min(smoothed, 0.0)
+
+    def _smooth_deadband_excess(
+        self,
+        tensor: torch.Tensor,
+        deadband: float,
+        eps: float | None = None,
+    ) -> torch.Tensor:
+        return self._smooth_relu(
+            self._smooth_abs(tensor, self.nn_smooth_abs_eps) - float(deadband),
+            eps=eps,
+        )
 
     def _build_primal_block_prox_obj(self, model, sample_id: int, pg, x, coc):
         prox_obj = gp.LinExpr()
@@ -2097,7 +2155,7 @@ class SubproblemSurrogateTrainer:
             ref = tensor if center is None else (tensor - center)
             return torch.sum(ref ** 2)
         ref = tensor if center is None else (tensor - center)
-        excess = torch.relu(torch.abs(ref) - deadband)
+        excess = self._smooth_deadband_excess(ref, deadband)
         return torch.sum(excess ** 2)
 
     def _iter_delta_regularization(
@@ -2112,7 +2170,7 @@ class SubproblemSurrogateTrainer:
         diff = current - prev
         if deadband <= 0:
             return torch.sum(diff ** 2)
-        excess = torch.relu(torch.abs(diff) - deadband)
+        excess = self._smooth_deadband_excess(diff, deadband)
         return torch.sum(excess ** 2)
 
     def _gate_pg_cost_tensor(self, pg_costs_tensor: torch.Tensor) -> torch.Tensor:
@@ -2145,26 +2203,109 @@ class SubproblemSurrogateTrainer:
             resolved_batch_size = max(1, base_batch_size)
         return resolved_batch_strategy, resolved_batch_size, resolved_shuffle
 
-    def _generate_initial_values_from_nn(self):
-        """用未训练的 SubproblemSurrogateNet forward pass 生成 alpha/beta/gamma/delta 初值。"""
+    def _refresh_cached_surrogate_outputs(self, zero_auxiliary: bool = False) -> None:
+        """Recompute cached surrogate parameters from the current network weights."""
+        if not TORCH_AVAILABLE or self.n_samples <= 0:
+            return
+
+        was_training = self.surrogate_net.training
         self.surrogate_net.eval()
 
-        # 批量提取所有 sample 的特征
         features_list = [self._extract_features(s) for s in range(self.n_samples)]
-        feat_tensor = torch.tensor(np.array(features_list), dtype=torch.float32).to(self.device)
+        feat_tensor = torch.tensor(
+            np.array(features_list),
+            dtype=torch.float32,
+            device=self.device,
+        )
 
         with torch.no_grad():
             alphas, betas, gammas, deltas, costs = self.surrogate_net.forward_main(feat_tensor)
             pg_costs = self.surrogate_net.forward_pg_cost(feat_tensor)
+            deltas = self._postprocess_delta_tensor(deltas)
 
-        self.alpha_values = alphas.cpu().numpy()
-        self.beta_values = betas.cpu().numpy()
-        self.gamma_values = gammas.cpu().numpy()
-        self.delta_values = self._postprocess_delta_tensor(deltas).cpu().numpy()
-        self.cost_values = np.zeros((self.n_samples, self.T))  # 强制初值为零，避免未训练NN的随机输出干扰
-        self.pg_cost_values = np.zeros((self.n_samples, self.T))
+            if zero_auxiliary:
+                costs = torch.zeros_like(costs)
+                pg_costs = torch.zeros_like(pg_costs)
+            elif not self._pg_costs_active():
+                pg_costs = torch.zeros_like(pg_costs)
 
-        self.surrogate_net.train()
+        self.alpha_values = alphas.detach().cpu().numpy()
+        self.beta_values = betas.detach().cpu().numpy()
+        self.gamma_values = gammas.detach().cpu().numpy()
+        self.delta_values = deltas.detach().cpu().numpy()
+        self.cost_values = costs.detach().cpu().numpy()
+        self.pg_cost_values = pg_costs.detach().cpu().numpy()
+
+        if was_training:
+            self.surrogate_net.train()
+
+    def _weighted_violation_merit(
+        self,
+        components: Tuple[float, float, float, float, float, float],
+    ) -> float:
+        """Single merit used to accept or reject NN updates."""
+        obj_primal, obj_dual_pg, obj_dual_x, obj_dual_coc, _, obj_opt = components
+        return float(
+            self.loss_ratio_primal * self.rho_primal * obj_primal
+            + self.loss_ratio_dual_pg * self.rho_dual_pg * obj_dual_pg
+            + self.loss_ratio_dual_x * self.rho_dual_x * obj_dual_x
+            + self.rho_dual_coc * obj_dual_coc
+            + self.loss_ratio_opt * self.rho_opt * obj_opt
+        )
+
+    def _capture_nn_update_state(self) -> dict:
+        """Snapshot current NN/cached state so a bad update can be rolled back."""
+        state = {
+            'surrogate_net_state_dict': copy.deepcopy(self.surrogate_net.state_dict()),
+            'alpha_values': self.alpha_values.copy(),
+            'beta_values': self.beta_values.copy(),
+            'gamma_values': self.gamma_values.copy(),
+            'delta_values': self.delta_values.copy(),
+            'cost_values': self.cost_values.copy(),
+            'pg_cost_values': self.pg_cost_values.copy(),
+            'last_surr_nn_loss': getattr(self, '_last_surr_nn_loss', None),
+            'last_pg_cost_nn_loss': getattr(self, '_last_pg_cost_nn_loss', None),
+        }
+        for attr_name in (
+            '_surr_optimizer',
+            '_surr_cost_optimizer',
+            '_surr_scheduler',
+            '_surr_pg_cost_optimizer',
+            '_surr_pg_cost_scheduler',
+        ):
+            attr_value = getattr(self, attr_name, None)
+            state[attr_name] = None if attr_value is None else copy.deepcopy(attr_value.state_dict())
+        return state
+
+    def _restore_nn_update_state(self, state: dict) -> None:
+        """Restore the last accepted NN/cached state."""
+        self.surrogate_net.load_state_dict(state['surrogate_net_state_dict'])
+        self.alpha_values = state['alpha_values'].copy()
+        self.beta_values = state['beta_values'].copy()
+        self.gamma_values = state['gamma_values'].copy()
+        self.delta_values = state['delta_values'].copy()
+        self.cost_values = state['cost_values'].copy()
+        self.pg_cost_values = state['pg_cost_values'].copy()
+        self._last_surr_nn_loss = state.get('last_surr_nn_loss')
+        self._last_pg_cost_nn_loss = state.get('last_pg_cost_nn_loss')
+
+        for attr_name in (
+            '_surr_optimizer',
+            '_surr_cost_optimizer',
+            '_surr_scheduler',
+            '_surr_pg_cost_optimizer',
+            '_surr_pg_cost_scheduler',
+        ):
+            attr_state = state.get(attr_name)
+            attr_value = getattr(self, attr_name, None)
+            if attr_state is None:
+                setattr(self, attr_name, None)
+            elif attr_value is not None:
+                attr_value.load_state_dict(attr_state)
+
+    def _generate_initial_values_from_nn(self):
+        """用未训练的 SubproblemSurrogateNet forward pass 生成 alpha/beta/gamma/delta 初值。"""
+        self._refresh_cached_surrogate_outputs(zero_auxiliary=True)
 
         print(f"  ✓ 用NN forward pass生成代理约束初值 "
               f"(alpha: mean={self.alpha_values.mean():.4f}; "
@@ -2198,6 +2339,67 @@ class SubproblemSurrogateTrainer:
             CONSTRAINT_STRATEGY_ALL_TEMPLATES_SIGN4_PLUS_SINGLE,
         ) and self.all_mode_group_size > 1
 
+    def _sync_surrogate_direction_strategy_state(self) -> None:
+        self.surrogate_direction_signs = self._get_surrogate_direction_signs()
+
+    def _get_surrogate_direction_signs(self, size: int | None = None) -> np.ndarray:
+        signs = getattr(self, 'surrogate_direction_signs', None)
+        if signs is None:
+            signs = np.ones(self.num_coupling_constraints, dtype=float)
+            self.surrogate_direction_signs = signs
+        signs = np.asarray(signs, dtype=float)
+        if signs.ndim != 1 or signs.size != self.num_coupling_constraints:
+            signs = np.ones(self.num_coupling_constraints, dtype=float)
+            self.surrogate_direction_signs = signs
+        if size is None:
+            return signs.copy()
+        return signs[: int(size)].copy()
+
+    def _is_mu_sign_relaxation_round(self) -> bool:
+        interval = int(getattr(self, 'mu_signed_round_interval', 0) or 0)
+        lb = float(self._current_mu_lower_bound_value())
+        return (
+            interval > 0
+            and lb > 0.0
+            and ((self.iter_number + 1) % interval == 0)
+        )
+
+    def _resolve_surrogate_direction_signs_from_mu(
+        self,
+        mu_values_by_sample: np.ndarray,
+        tol: float = 1e-8,
+    ) -> np.ndarray:
+        base_signs = self._get_surrogate_direction_signs()
+        mu_arr = np.asarray(mu_values_by_sample, dtype=float)
+        if mu_arr.size == 0:
+            return base_signs
+        if mu_arr.ndim == 1:
+            mu_arr = mu_arr.reshape(1, -1)
+        if mu_arr.shape[-1] != self.num_coupling_constraints:
+            return base_signs
+
+        pos_count = np.sum(mu_arr > tol, axis=0)
+        neg_count = np.sum(mu_arr < -tol, axis=0)
+        resolved = base_signs.copy()
+        resolved[pos_count > neg_count] = 1.0
+        resolved[neg_count > pos_count] = -1.0
+        return resolved
+
+    def _apply_surrogate_direction_to_params(
+        self,
+        alphas: np.ndarray,
+        betas: np.ndarray,
+        gammas: np.ndarray,
+        deltas: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        signs = self._get_surrogate_direction_signs(len(alphas))
+        return (
+            np.asarray(alphas, dtype=float) * signs,
+            np.asarray(betas, dtype=float) * signs,
+            np.asarray(gammas, dtype=float) * signs,
+            np.asarray(deltas, dtype=float) * signs,
+        )
+
     def _constraint_offsets_for_sample(self, sample_id: int) -> list[tuple[int, ...]]:
         return resolve_constraint_offsets_from_trainer(
             self,
@@ -2215,9 +2417,12 @@ class SubproblemSurrogateTrainer:
     def _current_mu_lower_bound_value(self) -> float:
         return self.mu_lower_bound if self._get_mu_lower_bound_phase() != "none" else 0.0
 
+    def _force_zero_x_bound_duals(self) -> bool:
+        return self.iter_number < self.x_bound_dual_zero_rounds
+
     def _apply_mu_lower_bound_policy(self, mu_values: np.ndarray, lb_mu: float) -> np.ndarray:
-        """Preserve grouped lower-bound semantics for mu in all mode."""
-        mu_arr = np.maximum(np.asarray(mu_values, dtype=float).reshape(-1), 0.0)
+        """Preserve grouped lower-bound semantics for |mu| in all mode."""
+        mu_arr = np.abs(np.asarray(mu_values, dtype=float).reshape(-1))
         if lb_mu <= 0:
             return mu_arr
 
@@ -2235,6 +2440,15 @@ class SubproblemSurrogateTrainer:
             if deficit > 0:
                 mu_arr[start:stop] += deficit / self.all_mode_group_size
         return mu_arr
+
+    def _finalize_mu_values(
+        self,
+        mu_values: np.ndarray,
+        lb_mu: float,
+        direction_signs: np.ndarray | None = None,
+    ) -> np.ndarray:
+        mu_abs = self._apply_mu_lower_bound_policy(mu_values, lb_mu)
+        return mu_abs
 
     def _initialize_solve(self):
         """初始化求解：从active_set提取x，求解LP获取初始原始解和对偶变量（lambda_inherent）。
@@ -2416,8 +2630,15 @@ class SubproblemSurrogateTrainer:
         c_x / c_pg 均不入原始块目标；相关调整仅通过 dual block / 驻点损失传递。
         """
         g = self.unit_id
-        mu_vals = self.mu[sample_id]           # (num_coupling_constraints,)
+        mu_vals = np.abs(self.mu[sample_id])   # (num_coupling_constraints,)
         lam_inh = self.lambda_inherent[sample_id]  # dict，由 _initialize_solve 保证非None
+
+        alphas, betas, gammas, deltas = self._apply_surrogate_direction_to_params(
+            alphas,
+            betas,
+            gammas,
+            deltas,
+        )
 
         Pmin    = self.gen[g, PMIN]
         Pmax    = self.gen[g, PMAX]
@@ -2651,6 +2872,14 @@ class SubproblemSurrogateTrainer:
 
         phase = self._get_mu_lower_bound_phase()
         lb = self._current_mu_lower_bound_value()
+        sign_relax_round = self._is_mu_sign_relaxation_round()
+        direction_signs = self._get_surrogate_direction_signs()
+        alphas, betas, gammas, deltas = self._apply_surrogate_direction_to_params(
+            alphas,
+            betas,
+            gammas,
+            deltas,
+        )
 
         model = gp.Model('dual_block_v3')
         model.Params.OutputFlag = 0
@@ -2665,8 +2894,9 @@ class SubproblemSurrogateTrainer:
         lam_start_cost  = model.addVars(self.T - 1,  lb=0, name='lam_start_cost')
         lam_shut_cost   = model.addVars(self.T - 1,  lb=0, name='lam_shut_cost')
         lam_coc_nonneg  = model.addVars(self.T - 1,  lb=0, name='lam_coc_nonneg')
-        lam_x_upper     = model.addVars(self.T,      lb=0, name='lam_x_upper')
-        lam_x_lower     = model.addVars(self.T,      lb=0, name='lam_x_lower')
+        x_bound_dual_ub = 0.0 if self._force_zero_x_bound_duals() else GRB.INFINITY
+        lam_x_upper     = model.addVars(self.T,      lb=0, ub=x_bound_dual_ub, name='lam_x_upper')
+        lam_x_lower     = model.addVars(self.T,      lb=0, ub=x_bound_dual_ub, name='lam_x_lower')
 
         # min_on / min_off：只为有效约束索引创建变量
         lam_min_on  = {}
@@ -2679,14 +2909,23 @@ class SubproblemSurrogateTrainer:
                 lam_min_off[tau - 1, t1] = model.addVar(lb=0, name=f'lam_min_off_{tau-1}_{t1}')
 
         # 代理耦合约束对偶变量
-        mu_var_lb = lb if phase == "individual" else 0.0
-        mu = model.addVars(self.num_coupling_constraints, lb=mu_var_lb, name='mu')
+        mu_lb = -GRB.INFINITY if (phase != "none" and sign_relax_round) else 0.0
+        mu = model.addVars(self.num_coupling_constraints, lb=mu_lb, name='mu')
+        mu_abs = model.addVars(self.num_coupling_constraints, lb=0, name='mu_abs')
+        for k in range(self.num_coupling_constraints):
+            model.addConstr(mu_abs[k] >= mu[k], name=f'mu_abs_pos_{k}')
+            model.addConstr(mu_abs[k] >= -mu[k], name=f'mu_abs_neg_{k}')
+            if phase == "individual" and lb > 0:
+                if sign_relax_round:
+                    model.addConstr(mu_abs[k] >= lb, name=f'mu_abs_lb_{k}')
+                else:
+                    model.addConstr(mu[k] >= lb, name=f'mu_lb_{k}')
         if phase == "group" and lb > 0 and self._uses_group_mu_lower_bound():
             for group_idx in range(self.num_coupling_constraints // self.all_mode_group_size):
                 group_start = group_idx * self.all_mode_group_size
                 group_stop = group_start + self.all_mode_group_size
                 model.addConstr(
-                    gp.quicksum(mu[k] for k in range(group_start, group_stop)) >= lb,
+                    gp.quicksum((mu_abs[k] if sign_relax_round else mu[k]) for k in range(group_start, group_stop)) >= lb,
                     name=f'mu_group_lb_{group_idx}',
                 )
 
@@ -2879,7 +3118,7 @@ class SubproblemSurrogateTrainer:
             )
             viol = abs(lhs - deltas[k])
             if viol > 1e-10:
-                obj_opt += viol * mu[k]
+                obj_opt += viol * mu_abs[k]
 
         # ===== 设置目标函数并求解 =====
         obj_dual_prox = self._build_dual_block_prox_obj(
@@ -2968,7 +3207,8 @@ class SubproblemSurrogateTrainer:
     def loss_function_differentiable(self, sample_id: int, alphas_tensor: torch.Tensor,
                                      betas_tensor: torch.Tensor, gammas_tensor: torch.Tensor,
                                      deltas_tensor: torch.Tensor, costs_tensor: torch.Tensor,
-                                     device) -> torch.Tensor:
+                                     device,
+                                     return_components: bool = False) -> torch.Tensor:
         """
         主代理网络 loss。
 
@@ -2980,8 +3220,18 @@ class SubproblemSurrogateTrainer:
         # 从BCD迭代得到的变量
         x_val   = torch.tensor(self.x[sample_id],   dtype=torch.float32, device=device)  # (T,)
         mu_vals = torch.tensor(self.mu[sample_id],  dtype=torch.float32, device=device)  # (num_coupling_constraints,)
+        mu_abs_vals = torch.abs(mu_vals)
         lambda_val = torch.tensor(self.lambda_vals[sample_id], dtype=torch.float32, device=device)
         lam_inh = self.lambda_inherent[sample_id]  # dict or None
+        direction_signs = torch.tensor(
+            self._get_surrogate_direction_signs(len(alphas_tensor)),
+            dtype=torch.float32,
+            device=device,
+        )
+        signed_alphas = alphas_tensor * direction_signs
+        signed_betas = betas_tensor * direction_signs
+        signed_gammas = gammas_tensor * direction_signs
+        signed_deltas = deltas_tensor * direction_signs
         
         # ========== 计算obj_primal ==========
         # V3三时段约束违反量（按 sensitive_timesteps 索引）
@@ -2993,12 +3243,12 @@ class SubproblemSurrogateTrainer:
                 x_val,
                 t,
                 constraint_offsets[k],
-                alphas_tensor[k],
-                betas_tensor[k],
-                gammas_tensor[k],
+                signed_alphas[k],
+                signed_betas[k],
+                signed_gammas[k],
                 self.T,
             )
-            coupling_viol = torch.relu(coupling_lhs - deltas_tensor[k])
+            coupling_viol = self._smooth_relu(coupling_lhs - signed_deltas[k])
             obj_primal = obj_primal + coupling_viol
 
         # ========== 计算obj_opt ==========
@@ -3009,13 +3259,16 @@ class SubproblemSurrogateTrainer:
                 x_val,
                 t,
                 constraint_offsets[k],
-                alphas_tensor[k],
-                betas_tensor[k],
-                gammas_tensor[k],
+                signed_alphas[k],
+                signed_betas[k],
+                signed_gammas[k],
                 self.T,
             )
-            coupling_abs = torch.abs(coupling_lhs - deltas_tensor[k])
-            obj_opt = obj_opt + coupling_abs * mu_vals[k]
+            coupling_abs = self._smooth_abs(
+                coupling_lhs - signed_deltas[k],
+                self.nn_smooth_abs_eps,
+            )
+            obj_opt = obj_opt + coupling_abs * mu_abs_vals[k]
         
         # ========== 计算obj_dual_x ==========
         # x[t]驻点：b + Pmin*lam_pg_lower[t] - Pmax*lam_pg_upper[t]
@@ -3102,7 +3355,10 @@ class SubproblemSurrogateTrainer:
                     if time_idx == t:
                         dual_expr = dual_expr + coeff * mu_vals[k]
 
-            obj_dual_x = obj_dual_x + torch.abs(dual_expr)
+            obj_dual_x = obj_dual_x + self._smooth_abs(
+                dual_expr,
+                self.nn_smooth_abs_eps,
+            )
 
         # 死区正则：限制幅值失控，但不给模板附近/小范围波动施加默认回拉。
         reg_loss = self.reg_weight * (
@@ -3166,20 +3422,41 @@ class SubproblemSurrogateTrainer:
             reg_loss = reg_loss + self.iter_delta_reg_weight * iter_delta
 
         # 总损失：三项BCD目标 + 正则化
+        dual_x_term = (
+            self.loss_ratio_dual_x * self.rho_dual_x * obj_dual_x
+            if self._nn_dual_terms_active()
+            else torch.zeros((), dtype=obj_dual_x.dtype, device=obj_dual_x.device)
+        )
+        primal_term = self.loss_ratio_primal * self.rho_primal * obj_primal
+        opt_term = self.loss_ratio_opt * self.rho_opt * obj_opt
+        reg_term = self.loss_ratio_reg * reg_loss
         loss = (
-            self.loss_ratio_primal * self.rho_primal * obj_primal
-            + self.loss_ratio_dual_x * self.rho_dual_x * obj_dual_x
-            + self.loss_ratio_opt * self.rho_opt * obj_opt
-            + self.loss_ratio_reg * reg_loss
+            primal_term
+            + dual_x_term
+            + opt_term
+            + reg_term
         )
 
-        return loss
+        if not return_components:
+            return loss
+
+        components = {
+            'obj_primal': obj_primal.detach(),
+            'obj_dual_x': obj_dual_x.detach(),
+            'obj_opt': obj_opt.detach(),
+            'primal_term': primal_term.detach(),
+            'dual_x_term': dual_x_term.detach(),
+            'opt_term': opt_term.detach(),
+            'reg_term': reg_term.detach(),
+        }
+        return loss, components
 
     def loss_function_c_pg_differentiable(
         self,
         sample_id: int,
         pg_costs_tensor: torch.Tensor,
         device,
+        return_components: bool = False,
     ) -> torch.Tensor:
         """c_pg 单独 loss，只优化 pg 驻点项和 c_pg 自身正则。"""
         g = self.unit_id
@@ -3205,8 +3482,10 @@ class SubproblemSurrogateTrainer:
                 if t < self.T - 1:
                     pg_const -= float(lam_ru[t])
                     pg_const += float(lam_rd[t])
-                obj_dual_pg = obj_dual_pg + torch.abs(
-                    torch.tensor(pg_const, dtype=torch.float32, device=device) + pg_costs_tensor[t]
+                residual = torch.tensor(pg_const, dtype=torch.float32, device=device) + pg_costs_tensor[t]
+                obj_dual_pg = obj_dual_pg + self._smooth_abs(
+                    residual,
+                    self.pg_cost_smooth_abs_eps,
                 )
 
         reg_loss = self.reg_weight * self._deadband_quadratic(
@@ -3224,10 +3503,68 @@ class SubproblemSurrogateTrainer:
                 prev_pg_costs,
                 self.iter_delta_reg_deadband,
             )
-        return (
-            self.loss_ratio_dual_pg * self.rho_dual_pg * obj_dual_pg
-            + self.loss_ratio_reg * reg_loss
-        )
+        dual_pg_term = self.loss_ratio_dual_pg * self.rho_dual_pg * obj_dual_pg
+        reg_term = self.loss_ratio_reg * reg_loss
+        loss = dual_pg_term + reg_term
+        if not return_components:
+            return loss
+        components = {
+            'obj_dual_pg': obj_dual_pg.detach(),
+            'dual_pg_term': dual_pg_term.detach(),
+            'reg_term': reg_term.detach(),
+        }
+        return loss, components
+
+    def cal_nn_logging_components(self) -> dict[str, float]:
+        if not TORCH_AVAILABLE or self.n_samples <= 0:
+            return {
+                'obj_primal': 0.0,
+                'obj_dual_pg': 0.0,
+                'obj_dual_x': 0.0,
+                'obj_opt': 0.0,
+                'reg_main': 0.0,
+                'reg_pg': 0.0,
+            }
+
+        totals = {
+            'obj_primal': 0.0,
+            'obj_dual_pg': 0.0,
+            'obj_dual_x': 0.0,
+            'obj_opt': 0.0,
+            'reg_main': 0.0,
+            'reg_pg': 0.0,
+        }
+        for sample_id in range(self.n_samples):
+            alphas_tensor = torch.tensor(self.alpha_values[sample_id], dtype=torch.float32, device=self.device)
+            betas_tensor = torch.tensor(self.beta_values[sample_id], dtype=torch.float32, device=self.device)
+            gammas_tensor = torch.tensor(self.gamma_values[sample_id], dtype=torch.float32, device=self.device)
+            deltas_tensor = torch.tensor(self.delta_values[sample_id], dtype=torch.float32, device=self.device)
+            costs_tensor = torch.tensor(self.cost_values[sample_id], dtype=torch.float32, device=self.device)
+            pg_costs_tensor = torch.tensor(self.pg_cost_values[sample_id], dtype=torch.float32, device=self.device)
+
+            _, main_components = self.loss_function_differentiable(
+                sample_id,
+                alphas_tensor,
+                betas_tensor,
+                gammas_tensor,
+                deltas_tensor,
+                costs_tensor,
+                self.device,
+                return_components=True,
+            )
+            _, pg_components = self.loss_function_c_pg_differentiable(
+                sample_id,
+                pg_costs_tensor,
+                self.device,
+                return_components=True,
+            )
+            totals['obj_primal'] += float(main_components['obj_primal'].cpu().item())
+            totals['obj_dual_x'] += float(main_components['obj_dual_x'].cpu().item())
+            totals['obj_opt'] += float(main_components['obj_opt'].cpu().item())
+            totals['reg_main'] += float(main_components['reg_term'].cpu().item())
+            totals['obj_dual_pg'] += float(pg_components['obj_dual_pg'].cpu().item())
+            totals['reg_pg'] += float(pg_components['reg_term'].cpu().item())
+        return totals
     
     def iter_with_surrogate_nn(
         self,
@@ -3334,18 +3671,6 @@ class SubproblemSurrogateTrainer:
                 epoch_loss += loss.detach().cpu().item()
                 batch_count += 1
 
-                # 更新参数值（V3：5个参数）
-                self.alpha_values[sample_id] = alphas_tensor.detach().cpu().numpy()
-                self.beta_values[sample_id] = betas_tensor.detach().cpu().numpy()
-                self.gamma_values[sample_id] = gammas_tensor.detach().cpu().numpy()
-                self.delta_values[sample_id] = deltas_tensor.detach().cpu().numpy()
-                # cost_values 使用 EMA 平滑，避免迭代间剧烈变化
-                new_costs = costs_tensor.detach().cpu().numpy()
-                self.cost_values[sample_id] = (
-                    (1 - self.cost_ema_alpha) * self.cost_values[sample_id]
-                    + self.cost_ema_alpha * new_costs
-                )
-
                 # batch 满或 epoch 结束：clip + step
                 if batch_count == resolved_batch_size or sample_pos == self.n_samples - 1:
                     torch.nn.utils.clip_grad_norm_(self.surrogate_net.parameters(), max_norm=1.0)
@@ -3363,6 +3688,7 @@ class SubproblemSurrogateTrainer:
         # 记录最终 epoch loss 供 logger 使用
         if self.n_samples > 0:
             self._last_surr_nn_loss = epoch_loss / self.n_samples
+            self._refresh_cached_surrogate_outputs()
 
     def iter_with_c_pg_nn(
         self,
@@ -3448,12 +3774,6 @@ class SubproblemSurrogateTrainer:
                     epoch_loss += loss.detach().cpu().item()
                     batch_count += 1
 
-                    new_pg_costs = pg_costs_tensor.detach().cpu().numpy()
-                    self.pg_cost_values[sample_id] = (
-                        (1 - self.pg_cost_ema_alpha) * self.pg_cost_values[sample_id]
-                        + self.pg_cost_ema_alpha * new_pg_costs
-                    )
-
                     if batch_count == resolved_batch_size or sample_pos == self.n_samples - 1:
                         torch.nn.utils.clip_grad_norm_(
                             self.surrogate_net.pg_cost_net.parameters(),
@@ -3473,6 +3793,7 @@ class SubproblemSurrogateTrainer:
 
             if self.n_samples > 0:
                 self._last_pg_cost_nn_loss = epoch_loss / self.n_samples
+                self._refresh_cached_surrogate_outputs()
         finally:
             self._set_c_pg_training_mode(False)
 
@@ -3502,7 +3823,13 @@ class SubproblemSurrogateTrainer:
             betas   = self.beta_values[sample_id]
             gammas  = self.gamma_values[sample_id]
             deltas  = self.delta_values[sample_id]
-            mu_vals = self.mu[sample_id]
+            mu_vals = np.abs(self.mu[sample_id])
+            alphas, betas, gammas, deltas = self._apply_surrogate_direction_to_params(
+                alphas,
+                betas,
+                gammas,
+                deltas,
+            )
             lam_inh = self.lambda_inherent[sample_id]
             lambda_val = self.lambda_vals[sample_id]   # 电价对偶变量
 
@@ -3687,6 +4014,99 @@ class SubproblemSurrogateTrainer:
         obj_dual = obj_dual_pg + obj_dual_x + obj_dual_coc
         return obj_primal, obj_dual_pg, obj_dual_x, obj_dual_coc, obj_dual, obj_opt
 
+    def cal_obj_opt_breakdown(self) -> dict[str, float]:
+        breakdown = {
+            'surrogate': 0.0,
+            'pg_lower': 0.0,
+            'pg_upper': 0.0,
+            'x_lower': 0.0,
+            'x_upper': 0.0,
+            'ramp_up': 0.0,
+            'ramp_down': 0.0,
+            'min_on': 0.0,
+            'min_off': 0.0,
+            'start_cost': 0.0,
+            'shut_cost': 0.0,
+            'coc_nonneg': 0.0,
+        }
+
+        g = self.unit_id
+
+        for sample_id in range(self.n_samples):
+            x_val = self.x[sample_id]
+            pg_val = self.pg[sample_id]
+            coc_val = self.coc[sample_id]
+            alphas = self.alpha_values[sample_id]
+            betas = self.beta_values[sample_id]
+            gammas = self.gamma_values[sample_id]
+            deltas = self.delta_values[sample_id]
+            mu_vals = np.abs(self.mu[sample_id])
+            alphas, betas, gammas, deltas = self._apply_surrogate_direction_to_params(
+                alphas,
+                betas,
+                gammas,
+                deltas,
+            )
+            lam_inh = self.lambda_inherent[sample_id]
+
+            Pmin_v = float(self.gen[g, PMIN])
+            Pmax_v = float(self.gen[g, PMAX])
+            Ru_v = float(self.Ru_all[g])
+            Rd_v = float(self.Rd_all[g])
+            Ru_co_v = float(self.Ru_co_all[g])
+            Rd_co_v = float(self.Rd_co_all[g])
+            sc_v = self.gencost[g, 1]
+            shc_v = self.gencost[g, 2]
+            Ton_v = min(4, self.T)
+            Toff_v = min(4, self.T)
+
+            sensitive_t = self.sensitive_timesteps[sample_id]
+            constraint_offsets = self._constraint_offsets_for_sample(sample_id)
+            for k, ts in enumerate(sensitive_t):
+                coupling_lhs = build_surrogate_constraint_expression(
+                    x_val,
+                    ts,
+                    constraint_offsets[k],
+                    alphas[k],
+                    betas[k],
+                    gammas[k],
+                    self.T,
+                )
+                breakdown['surrogate'] += abs(coupling_lhs - deltas[k]) * mu_vals[k]
+
+            if lam_inh is None:
+                continue
+
+            for t in range(self.T):
+                breakdown['pg_lower'] += abs(Pmin_v * x_val[t] - pg_val[t]) * abs(float(lam_inh['lambda_pg_lower'][t]))
+                breakdown['pg_upper'] += abs(pg_val[t] - Pmax_v * x_val[t]) * abs(float(lam_inh['lambda_pg_upper'][t]))
+                breakdown['x_lower'] += x_val[t] * abs(float(lam_inh['lambda_x_lower'][t]))
+                breakdown['x_upper'] += (1 - x_val[t]) * abs(float(lam_inh['lambda_x_upper'][t]))
+
+            for t in range(1, self.T):
+                ru_expr = pg_val[t] - pg_val[t-1] - Ru_v * x_val[t-1] - Ru_co_v * (1 - x_val[t-1])
+                rd_expr = pg_val[t-1] - pg_val[t] - Rd_v * x_val[t] - Rd_co_v * (1 - x_val[t])
+                start_expr = sc_v * (x_val[t] - x_val[t-1]) - coc_val[t-1]
+                shut_expr = shc_v * (x_val[t-1] - x_val[t]) - coc_val[t-1]
+                breakdown['ramp_up'] += abs(ru_expr) * abs(float(lam_inh['lambda_ramp_up'][t-1]))
+                breakdown['ramp_down'] += abs(rd_expr) * abs(float(lam_inh['lambda_ramp_down'][t-1]))
+                breakdown['start_cost'] += abs(start_expr) * abs(float(lam_inh['lambda_start_cost'][t-1]))
+                breakdown['shut_cost'] += abs(shut_expr) * abs(float(lam_inh['lambda_shut_cost'][t-1]))
+                breakdown['coc_nonneg'] += coc_val[t-1] * abs(float(lam_inh['lambda_coc_nonneg'][t-1]))
+
+            for tau in range(1, Ton_v + 1):
+                for t1 in range(self.T - tau):
+                    expr = x_val[t1+1] - x_val[t1] - x_val[t1+tau]
+                    breakdown['min_on'] += abs(expr) * abs(float(lam_inh['lambda_min_on'][tau-1][t1]))
+
+            for tau in range(1, Toff_v + 1):
+                for t1 in range(self.T - tau):
+                    expr = -x_val[t1+1] + x_val[t1] - (1 - x_val[t1+tau])
+                    breakdown['min_off'] += abs(expr) * abs(float(lam_inh['lambda_min_off'][tau-1][t1]))
+
+        breakdown['total'] = float(sum(breakdown.values()))
+        return {k: float(v) for k, v in breakdown.items()}
+
     def cal_viol(self) -> Tuple[float, float, float]:
         obj_primal, _, _, _, obj_dual, obj_opt = self.cal_viol_components()
         return obj_primal, obj_dual, obj_opt
@@ -3695,6 +4115,7 @@ class SubproblemSurrogateTrainer:
         self,
         max_iter: int = 20,
         nn_epochs: int = 10,
+        pg_cost_nn_epochs: int | None = None,
         nn_batch_strategy: str | None = None,
         nn_batch_size: int | None = None,
         nn_shuffle: bool | None = None,
@@ -3711,10 +4132,14 @@ class SubproblemSurrogateTrainer:
         gamma = self.gamma_base / (self.n_samples * max(max_iter, 1))
         gamma_dual = gamma * self.gamma_dual_component_scale
         self.gamma = gamma
+        resolved_pg_cost_nn_epochs = (
+            self.pg_cost_nn_epochs if pg_cost_nn_epochs is None else max(int(pg_cost_nn_epochs), 1)
+        )
         
         for i in range(max_iter):
             print(f"🔄 迭代 {i+1}/{max_iter}", flush=True)
             self.iter_number = i
+            self._sync_surrogate_direction_strategy_state()
             
             EPS = 1e-10
             
@@ -3740,6 +4165,9 @@ class SubproblemSurrogateTrainer:
             
             # 2. 对偶块迭代（V3：联合更新固有约束对偶变量和代理耦合对偶变量）
             lb_mu = self._current_mu_lower_bound_value()
+            sign_relax_round = self._is_mu_sign_relaxation_round()
+            raw_mu_solutions = np.zeros((self.n_samples, self.num_coupling_constraints), dtype=float)
+            solved_mask = np.zeros(self.n_samples, dtype=bool)
             for sample_id in range(self.n_samples):
                 alphas = self.alpha_values[sample_id]
                 betas  = self.beta_values[sample_id]
@@ -3753,7 +4181,20 @@ class SubproblemSurrogateTrainer:
                 )
                 if lambda_inherent_sol is not None:
                     self.lambda_inherent[sample_id] = lambda_inherent_sol
-                    self.mu[sample_id] = self._apply_mu_lower_bound_policy(mu_sol, lb_mu)
+                    raw_mu_solutions[sample_id] = mu_sol
+                    solved_mask[sample_id] = True
+            if sign_relax_round and np.any(solved_mask):
+                self.surrogate_direction_signs = self._resolve_surrogate_direction_signs_from_mu(
+                    raw_mu_solutions[solved_mask]
+                )
+            direction_signs = self._get_surrogate_direction_signs()
+            for sample_id in range(self.n_samples):
+                if solved_mask[sample_id]:
+                    self.mu[sample_id] = self._finalize_mu_values(
+                        raw_mu_solutions[sample_id],
+                        lb_mu,
+                        direction_signs=direction_signs,
+                    )
             
             # 计算违反量（NN更新前）
             _z = lambda v: v if abs(v) >= 1e-12 else 0.0
@@ -3761,12 +4202,19 @@ class SubproblemSurrogateTrainer:
             obj_primal, obj_dual_pg, obj_dual_x, obj_dual_coc, obj_dual, obj_opt = (
                 _z(obj_primal), _z(obj_dual_pg), _z(obj_dual_x), _z(obj_dual_coc), _z(obj_dual), _z(obj_opt)
             )
+            nn_metrics_pre = self.cal_nn_logging_components()
             print(
-                f"[Unit-{self.unit_id}]   obj_primal={obj_primal:.6f}, "
-                f"obj_dual_pg={obj_dual_pg:.6f}, obj_dual_x={obj_dual_x:.6f}, "
-                f"obj_dual_coc={obj_dual_coc:.6f}, obj_dual={obj_dual:.6f}, "
-                f"obj_opt={obj_opt:.6f}",
+                f"[Unit-{self.unit_id}][NN-metric][before] "
+                f"obj_primal={nn_metrics_pre['obj_primal']:.6f}, "
+                f"obj_dual_pg={nn_metrics_pre['obj_dual_pg']:.6f}, "
+                f"obj_dual_x={nn_metrics_pre['obj_dual_x']:.6f}, "
+                f"obj_opt={nn_metrics_pre['obj_opt']:.6f}, "
+                f"reg_main={nn_metrics_pre['reg_main']:.6f}, "
+                f"reg_pg={nn_metrics_pre['reg_pg']:.6f}",
                 flush=True,
+            )
+            merit_before_nn = self._weighted_violation_merit(
+                (obj_primal, obj_dual_pg, obj_dual_x, obj_dual_coc, obj_dual, obj_opt)
             )
 
             # 3. 神经网络更新代理约束参数
@@ -3777,6 +4225,7 @@ class SubproblemSurrogateTrainer:
             self._prev_delta_values = self.delta_values.copy()
             self._prev_cost_values = self.cost_values.copy()
             self._prev_pg_cost_values = self.pg_cost_values.copy()
+            nn_snapshot = self._capture_nn_update_state()
             self.iter_with_surrogate_nn(
                 num_epochs=nn_epochs,
                 batch_size=nn_batch_size,
@@ -3786,23 +4235,52 @@ class SubproblemSurrogateTrainer:
                 cost_learning_rate=cost_learning_rate,
             )
             self.iter_with_c_pg_nn(
-                num_epochs=nn_epochs,
+                num_epochs=resolved_pg_cost_nn_epochs,
                 batch_size=nn_batch_size,
                 batch_strategy=nn_batch_strategy,
                 shuffle=nn_shuffle,
                 learning_rate=pg_cost_surr_learning_rate,
             )
+            self._refresh_cached_surrogate_outputs()
 
             # 计算违反量（NN更新后）
             obj_primal, obj_dual_pg, obj_dual_x, obj_dual_coc, obj_dual, obj_opt = self.cal_viol_components()
             obj_primal, obj_dual_pg, obj_dual_x, obj_dual_coc, obj_dual, obj_opt = (
                 _z(obj_primal), _z(obj_dual_pg), _z(obj_dual_x), _z(obj_dual_coc), _z(obj_dual), _z(obj_opt)
             )
+            merit_after_nn = self._weighted_violation_merit(
+                (obj_primal, obj_dual_pg, obj_dual_x, obj_dual_coc, obj_dual, obj_opt)
+            )
+            merit_tol = max(1e-8, 1e-4 * max(1.0, abs(merit_before_nn)))
+            if merit_after_nn > merit_before_nn + merit_tol:
+                self._restore_nn_update_state(nn_snapshot)
+                obj_primal, obj_dual_pg, obj_dual_x, obj_dual_coc, obj_dual, obj_opt = self.cal_viol_components()
+                obj_primal, obj_dual_pg, obj_dual_x, obj_dual_coc, obj_dual, obj_opt = (
+                    _z(obj_primal), _z(obj_dual_pg), _z(obj_dual_x), _z(obj_dual_coc), _z(obj_dual), _z(obj_opt)
+                )
+                merit_after_nn = self._weighted_violation_merit(
+                    (obj_primal, obj_dual_pg, obj_dual_x, obj_dual_coc, obj_dual, obj_opt)
+                )
+                print(
+                    f"[Unit-{self.unit_id}]   rollback NN update: "
+                    f"merit_before={merit_before_nn:.6f}, merit_after={merit_after_nn:.6f}",
+                    flush=True,
+                )
+            else:
+                print(
+                    f"[Unit-{self.unit_id}]   accept NN update: "
+                    f"merit_before={merit_before_nn:.6f}, merit_after={merit_after_nn:.6f}",
+                    flush=True,
+                )
+            nn_metrics_after = self.cal_nn_logging_components()
             print(
-                f"[Unit-{self.unit_id}]   obj_primal={obj_primal:.6f}, "
-                f"obj_dual_pg={obj_dual_pg:.6f}, obj_dual_x={obj_dual_x:.6f}, "
-                f"obj_dual_coc={obj_dual_coc:.6f}, obj_dual={obj_dual:.6f}, "
-                f"obj_opt={obj_opt:.6f}",
+                f"[Unit-{self.unit_id}][NN-metric][after] "
+                f"obj_primal={nn_metrics_after['obj_primal']:.6f}, "
+                f"obj_dual_pg={nn_metrics_after['obj_dual_pg']:.6f}, "
+                f"obj_dual_x={nn_metrics_after['obj_dual_x']:.6f}, "
+                f"obj_opt={nn_metrics_after['obj_opt']:.6f}, "
+                f"reg_main={nn_metrics_after['reg_main']:.6f}, "
+                f"reg_pg={nn_metrics_after['reg_pg']:.6f}",
                 flush=True,
             )
 
@@ -3824,6 +4302,26 @@ class SubproblemSurrogateTrainer:
             print("  " + "-" * 40, flush=True)
 
             # logger 钩子
+            if i == max_iter - 1:
+                obj_opt_breakdown = self.cal_obj_opt_breakdown()
+                print(
+                    f"[Unit-{self.unit_id}][full][final] obj_opt_breakdown: "
+                    f"surrogate={obj_opt_breakdown['surrogate']:.6f}, "
+                    f"pg_lower={obj_opt_breakdown['pg_lower']:.6f}, "
+                    f"pg_upper={obj_opt_breakdown['pg_upper']:.6f}, "
+                    f"x_lower={obj_opt_breakdown['x_lower']:.6f}, "
+                    f"x_upper={obj_opt_breakdown['x_upper']:.6f}, "
+                    f"ramp_up={obj_opt_breakdown['ramp_up']:.6f}, "
+                    f"ramp_down={obj_opt_breakdown['ramp_down']:.6f}, "
+                    f"min_on={obj_opt_breakdown['min_on']:.6f}, "
+                    f"min_off={obj_opt_breakdown['min_off']:.6f}, "
+                    f"start_cost={obj_opt_breakdown['start_cost']:.6f}, "
+                    f"shut_cost={obj_opt_breakdown['shut_cost']:.6f}, "
+                    f"coc_nonneg={obj_opt_breakdown['coc_nonneg']:.6f}, "
+                    f"total={obj_opt_breakdown['total']:.6f}",
+                    flush=True,
+                )
+
             if self.logger is not None:
                 nn_loss = getattr(self, '_last_surr_nn_loss', None)
                 self.logger.log_surrogate_iter(
@@ -3843,6 +4341,7 @@ class SubproblemSurrogateTrainer:
                     mu_mean=float(np.mean(self.mu)),
                     nn_loss=nn_loss,
                 )
+
 
         print(f"✓ 机组{self.unit_id} V3三时段耦合代理约束训练完成", flush=True)
     
@@ -3895,10 +4394,21 @@ class SubproblemSurrogateTrainer:
             pg_costs = self.surrogate_net.forward_pg_cost(features_tensor)
             deltas = self._postprocess_delta_tensor(deltas.squeeze(0)).unsqueeze(0)
 
-        return (alphas.squeeze(0).cpu().numpy(),
-                betas.squeeze(0).cpu().numpy(),
-                gammas.squeeze(0).cpu().numpy(),
-                deltas.squeeze(0).cpu().numpy(),
+        alphas_np = alphas.squeeze(0).cpu().numpy()
+        betas_np = betas.squeeze(0).cpu().numpy()
+        gammas_np = gammas.squeeze(0).cpu().numpy()
+        deltas_np = deltas.squeeze(0).cpu().numpy()
+        alphas_np, betas_np, gammas_np, deltas_np = self._apply_surrogate_direction_to_params(
+            alphas_np,
+            betas_np,
+            gammas_np,
+            deltas_np,
+        )
+
+        return (alphas_np,
+                betas_np,
+                gammas_np,
+                deltas_np,
                 costs.squeeze(0).cpu().numpy(),
                 pg_costs.squeeze(0).cpu().numpy())
 
@@ -4003,6 +4513,7 @@ class SubproblemSurrogateTrainer:
                 'x_cost_scale': self.x_cost_scale,
                 'pg_cost_scale': self.pg_cost_scale,
                 'mu': self.mu,
+                'surrogate_direction_signs': self._get_surrogate_direction_signs(),
                 'rho_primal': self.rho_primal,
                 'rho_dual': self.rho_dual,
                 'rho_dual_pg': self.rho_dual_pg,
@@ -4016,6 +4527,8 @@ class SubproblemSurrogateTrainer:
                 'constraint_generation_strategy': self.constraint_generation_strategy,
                 'mu_individual_lower_bound_round': self.mu_individual_lower_bound_round,
                 'mu_group_lower_bound_round': self.mu_group_lower_bound_round,
+                'mu_signed_round_interval': self.mu_signed_round_interval,
+                'x_bound_dual_zero_rounds': self.x_bound_dual_zero_rounds,
                 'pg_cost_start_round': self.pg_cost_start_round,
                 'pg_cost_scale_multiplier': self.pg_cost_scale_multiplier,
                 'nn_learning_rate': self.nn_learning_rate,
@@ -4023,13 +4536,17 @@ class SubproblemSurrogateTrainer:
                 'cost_learning_rate': self.cost_learning_rate,
                 'pg_cost_lr': self.pg_cost_lr,
                 'pg_cost_surr_lr': self.pg_cost_surr_lr,
+                'pg_cost_nn_epochs': self.pg_cost_nn_epochs,
                 'nn_batch_strategy': self.nn_batch_strategy,
                 'nn_batch_size': self.nn_batch_size,
                 'nn_shuffle': self.nn_shuffle,
                 'pg_cost_reg_deadband': self.pg_cost_reg_deadband,
+                'nn_smooth_abs_eps': self.nn_smooth_abs_eps,
+                'pg_cost_smooth_abs_eps': self.pg_cost_smooth_abs_eps,
                 'loss_ratio_primal': self.loss_ratio_primal,
                 'loss_ratio_dual_pg': self.loss_ratio_dual_pg,
                 'loss_ratio_dual_x': self.loss_ratio_dual_x,
+                'nn_dual_term_interval': self.nn_dual_term_interval,
                 'loss_ratio_opt': self.loss_ratio_opt,
                 'loss_ratio_reg': self.loss_ratio_reg,
                 'pg_block_prox_weight': self.pg_block_prox_weight,
@@ -4069,6 +4586,11 @@ class SubproblemSurrogateTrainer:
             self.x_cost_scale = state.get('x_cost_scale', self.x_cost_scale)
             self.pg_cost_scale = state.get('pg_cost_scale', self.pg_cost_scale)
             self.mu = state['mu']
+            loaded_direction_signs = state.get('surrogate_direction_signs')
+            if loaded_direction_signs is None:
+                self.surrogate_direction_signs = np.ones(self.num_coupling_constraints, dtype=float)
+            else:
+                self.surrogate_direction_signs = np.asarray(loaded_direction_signs, dtype=float).reshape(-1)
             self.rho_primal = state['rho_primal']
             self.rho_dual_pg = state.get('rho_dual_pg', state.get('rho_dual', self.rho_dual_pg))
             self.rho_dual_x = state.get('rho_dual_x', state.get('rho_dual', self.rho_dual_x))
@@ -4094,6 +4616,14 @@ class SubproblemSurrogateTrainer:
                 state.get('mu_group_lower_bound_round', self.mu_group_lower_bound_round),
                 self.mu_individual_lower_bound_round,
             )
+            self.mu_signed_round_interval = max(
+                int(state.get('mu_signed_round_interval', self.mu_signed_round_interval)),
+                0,
+            )
+            self.x_bound_dual_zero_rounds = max(
+                int(state.get('x_bound_dual_zero_rounds', self.x_bound_dual_zero_rounds)),
+                0,
+            )
             self.pg_cost_start_round = state.get('pg_cost_start_round', self.pg_cost_start_round)
             self.pg_cost_scale_multiplier = state.get(
                 'pg_cost_scale_multiplier',
@@ -4107,6 +4637,10 @@ class SubproblemSurrogateTrainer:
             self.cost_learning_rate = state.get('cost_learning_rate', self.cost_learning_rate)
             self.pg_cost_lr = state.get('pg_cost_lr', self.pg_cost_lr)
             self.pg_cost_surr_lr = state.get('pg_cost_surr_lr', self.pg_cost_surr_lr)
+            loaded_pg_cost_nn_epochs = state.get('pg_cost_nn_epochs', self.pg_cost_nn_epochs)
+            self.pg_cost_nn_epochs = (
+                None if loaded_pg_cost_nn_epochs is None else max(int(loaded_pg_cost_nn_epochs), 1)
+            )
             self.nn_batch_strategy = normalize_nn_batch_strategy(
                 state.get('nn_batch_strategy', self.nn_batch_strategy)
             )
@@ -4115,6 +4649,11 @@ class SubproblemSurrogateTrainer:
             self.loss_ratio_primal = float(state.get('loss_ratio_primal', self.loss_ratio_primal))
             self.loss_ratio_dual_pg = float(state.get('loss_ratio_dual_pg', self.loss_ratio_dual_pg))
             self.loss_ratio_dual_x = float(state.get('loss_ratio_dual_x', self.loss_ratio_dual_x))
+            loaded_nn_dual_term_interval = state.get('nn_dual_term_interval', self.nn_dual_term_interval)
+            if loaded_nn_dual_term_interval is None:
+                self.nn_dual_term_interval = None
+            else:
+                self.nn_dual_term_interval = max(int(loaded_nn_dual_term_interval), 1)
             self.loss_ratio_opt = float(state.get('loss_ratio_opt', self.loss_ratio_opt))
             self.loss_ratio_reg = float(state.get('loss_ratio_reg', self.loss_ratio_reg))
             self.pg_block_prox_weight = max(
@@ -4128,6 +4667,14 @@ class SubproblemSurrogateTrainer:
             self.pg_cost_reg_deadband = state.get(
                 'pg_cost_reg_deadband',
                 self.pg_cost_reg_deadband,
+            )
+            self.nn_smooth_abs_eps = max(
+                float(state.get('nn_smooth_abs_eps', self.nn_smooth_abs_eps)),
+                0.0,
+            )
+            self.pg_cost_smooth_abs_eps = max(
+                float(state.get('pg_cost_smooth_abs_eps', self.pg_cost_smooth_abs_eps)),
+                0.0,
             )
             self.template_rhs_jitter_scale = state.get(
                 'template_rhs_jitter_scale',
@@ -4157,6 +4704,7 @@ class SubproblemSurrogateTrainer:
             self.max_constraints = state.get('max_constraints', self.max_constraints)
             self.num_coupling_constraints = state.get('num_coupling_constraints', self.num_coupling_constraints)
             self.template_rhs_base_vector = self._build_template_rhs_base_vector(self.num_coupling_constraints)
+            self.surrogate_direction_signs = self._get_surrogate_direction_signs()
             if 'lambda_inherent' in state:
                 self.lambda_inherent = state['lambda_inherent']
             print(f"✓ V3三时段耦合代理约束模型已加载: {filepath}", flush=True)
@@ -4175,6 +4723,8 @@ def _load_surrogate_model_metadata(filepath: str, device=None) -> dict:
         'num_coupling_constraints': state.get('num_coupling_constraints'),
         'mu_individual_lower_bound_round': state.get('mu_individual_lower_bound_round'),
         'mu_group_lower_bound_round': state.get('mu_group_lower_bound_round'),
+        'mu_signed_round_interval': state.get('mu_signed_round_interval'),
+        'surrogate_direction_signs': state.get('surrogate_direction_signs'),
         'nn_hidden_dims': state.get('nn_hidden_dims'),
     }
 
@@ -4246,6 +4796,7 @@ def train_subproblem_surrogate_from_data(ppc, active_set_data: List[Dict], unit_
                                           loss_ratio_reg: float = 1.0,
                                           mu_individual_lower_bound_round: int = 3,
                                           mu_group_lower_bound_round: int = 50,
+                                          mu_signed_round_interval: int | None = None,
                                           pg_cost_start_round: int = 3,
                                           pg_cost_scale_multiplier: float = 1.2,
                                           nn_learning_rate: float = 1e-4,
@@ -4293,6 +4844,7 @@ def train_subproblem_surrogate_from_data(ppc, active_set_data: List[Dict], unit_
         loss_ratio_reg=loss_ratio_reg,
         mu_individual_lower_bound_round=mu_individual_lower_bound_round,
         mu_group_lower_bound_round=mu_group_lower_bound_round,
+        mu_signed_round_interval=mu_signed_round_interval,
         pg_cost_start_round=pg_cost_start_round,
         pg_cost_scale_multiplier=pg_cost_scale_multiplier,
         nn_learning_rate=nn_learning_rate,
@@ -4339,6 +4891,7 @@ def train_all_subproblem_surrogates(ppc, active_set_data: List[Dict], T_delta: f
                                       loss_ratio_reg: float = 1.0,
                                       mu_individual_lower_bound_round: int = 3,
                                       mu_group_lower_bound_round: int = 50,
+                                      mu_signed_round_interval: int | None = None,
                                        pg_cost_start_round: int = 3,
                                        pg_cost_scale_multiplier: float = 1.2,
                                        nn_learning_rate: float = 1e-4,
@@ -4396,6 +4949,7 @@ def train_all_subproblem_surrogates(ppc, active_set_data: List[Dict], T_delta: f
             loss_ratio_reg=loss_ratio_reg,
             mu_individual_lower_bound_round=mu_individual_lower_bound_round,
             mu_group_lower_bound_round=mu_group_lower_bound_round,
+            mu_signed_round_interval=mu_signed_round_interval,
             pg_cost_start_round=pg_cost_start_round,
             pg_cost_scale_multiplier=pg_cost_scale_multiplier,
             nn_learning_rate=nn_learning_rate,

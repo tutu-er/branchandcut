@@ -91,6 +91,8 @@ class ParallelSubproblemSurrogateTrainer(SubproblemSurrogateTrainer):
         mu_lower_bound_init: float = 0.1,
         mu_individual_lower_bound_round: int = 3,
         mu_group_lower_bound_round: int = 50,
+        mu_signed_round_interval: int | None = None,
+        x_bound_dual_zero_rounds: int = 0,
         pg_cost_start_round: int = 3,
         pg_cost_scale_multiplier: float = 1.2,
         nn_hidden_dims: list[int] | None = None,
@@ -101,12 +103,16 @@ class ParallelSubproblemSurrogateTrainer(SubproblemSurrogateTrainer):
         nn_batch_strategy: str = "full-batch",
         nn_batch_size: int = 4,
         nn_shuffle: bool = True,
+        pg_cost_nn_epochs: int | None = None,
         pg_cost_reg_deadband: float = 0.25,
+        nn_smooth_abs_eps: float = 1e-6,
+        pg_cost_smooth_abs_eps: float = 1e-6,
         iter_delta_reg_weight: float = 5e-5,
         iter_delta_reg_deadband: float = 0.10,
         loss_ratio_primal: float = 1.0,
         loss_ratio_dual_pg: float = 1.0,
         loss_ratio_dual_x: float = 1.0,
+        nn_dual_term_interval: int | None = 1,
         loss_ratio_opt: float = 1.0,
         loss_ratio_reg: float = 1.0,
         pg_block_prox_weight: float = 2e-2,
@@ -129,6 +135,8 @@ class ParallelSubproblemSurrogateTrainer(SubproblemSurrogateTrainer):
             mu_lower_bound_init=mu_lower_bound_init,
             mu_individual_lower_bound_round=mu_individual_lower_bound_round,
             mu_group_lower_bound_round=mu_group_lower_bound_round,
+            mu_signed_round_interval=mu_signed_round_interval,
+            x_bound_dual_zero_rounds=x_bound_dual_zero_rounds,
             pg_cost_start_round=pg_cost_start_round,
             pg_cost_scale_multiplier=pg_cost_scale_multiplier,
             nn_hidden_dims=nn_hidden_dims,
@@ -139,12 +147,16 @@ class ParallelSubproblemSurrogateTrainer(SubproblemSurrogateTrainer):
             nn_batch_strategy=nn_batch_strategy,
             nn_batch_size=nn_batch_size,
             nn_shuffle=nn_shuffle,
+            pg_cost_nn_epochs=pg_cost_nn_epochs,
             pg_cost_reg_deadband=pg_cost_reg_deadband,
+            nn_smooth_abs_eps=nn_smooth_abs_eps,
+            pg_cost_smooth_abs_eps=pg_cost_smooth_abs_eps,
             iter_delta_reg_weight=iter_delta_reg_weight,
             iter_delta_reg_deadband=iter_delta_reg_deadband,
             loss_ratio_primal=loss_ratio_primal,
             loss_ratio_dual_pg=loss_ratio_dual_pg,
             loss_ratio_dual_x=loss_ratio_dual_x,
+            nn_dual_term_interval=nn_dual_term_interval,
             loss_ratio_opt=loss_ratio_opt,
             loss_ratio_reg=loss_ratio_reg,
             pg_block_prox_weight=pg_block_prox_weight,
@@ -157,6 +169,7 @@ class ParallelSubproblemSurrogateTrainer(SubproblemSurrogateTrainer):
         self,
         max_iter: int = 20,
         nn_epochs: int = 10,
+        pg_cost_nn_epochs: int | None = None,
         nn_batch_strategy: str | None = None,
         nn_batch_size: int | None = None,
         nn_shuffle: bool | None = None,
@@ -180,6 +193,9 @@ class ParallelSubproblemSurrogateTrainer(SubproblemSurrogateTrainer):
         gamma = self.gamma_base / (self.n_samples * max_iter)
         gamma_dual = gamma * self.gamma_dual_component_scale
         self.gamma = gamma
+        resolved_pg_cost_nn_epochs = (
+            self.pg_cost_nn_epochs if pg_cost_nn_epochs is None else max(int(pg_cost_nn_epochs), 1)
+        )
 
         for i in range(max_iter):
             print(f"{prefix} 🔄 迭代 {i+1}/{max_iter}", flush=True)
@@ -273,11 +289,15 @@ class ParallelSubproblemSurrogateTrainer(SubproblemSurrogateTrainer):
             obj_primal, obj_dual_pg, obj_dual_x, obj_dual_coc, obj_dual, obj_opt = (
                 _z(obj_primal), _z(obj_dual_pg), _z(obj_dual_x), _z(obj_dual_coc), _z(obj_dual), _z(obj_opt)
             )
+            nn_metrics_pre = self.cal_nn_logging_components()
             print(
-                f"{prefix}   obj_primal={obj_primal:.6f}, "
-                f"obj_dual_pg={obj_dual_pg:.6f}, obj_dual_x={obj_dual_x:.6f}, "
-                f"obj_dual_coc={obj_dual_coc:.6f}, obj_dual={obj_dual:.6f}, "
-                f"obj_opt={obj_opt:.6f}",
+                f"{prefix}[NN-metric][before] "
+                f"obj_primal={nn_metrics_pre['obj_primal']:.6f}, "
+                f"obj_dual_pg={nn_metrics_pre['obj_dual_pg']:.6f}, "
+                f"obj_dual_x={nn_metrics_pre['obj_dual_x']:.6f}, "
+                f"obj_opt={nn_metrics_pre['obj_opt']:.6f}, "
+                f"reg_main={nn_metrics_pre['reg_main']:.6f}, "
+                f"reg_pg={nn_metrics_pre['reg_pg']:.6f}",
                 flush=True,
             )
 
@@ -291,7 +311,7 @@ class ParallelSubproblemSurrogateTrainer(SubproblemSurrogateTrainer):
                 cost_learning_rate=cost_learning_rate,
             )
             self.iter_with_c_pg_nn(
-                num_epochs=nn_epochs,
+                num_epochs=resolved_pg_cost_nn_epochs,
                 batch_size=nn_batch_size,
                 batch_strategy=nn_batch_strategy,
                 shuffle=nn_shuffle,
@@ -303,13 +323,37 @@ class ParallelSubproblemSurrogateTrainer(SubproblemSurrogateTrainer):
             obj_primal, obj_dual_pg, obj_dual_x, obj_dual_coc, obj_dual, obj_opt = (
                 _z(obj_primal), _z(obj_dual_pg), _z(obj_dual_x), _z(obj_dual_coc), _z(obj_dual), _z(obj_opt)
             )
+            nn_metrics_after = self.cal_nn_logging_components()
             print(
-                f"{prefix}   obj_primal={obj_primal:.6f}, "
-                f"obj_dual_pg={obj_dual_pg:.6f}, obj_dual_x={obj_dual_x:.6f}, "
-                f"obj_dual_coc={obj_dual_coc:.6f}, obj_dual={obj_dual:.6f}, "
-                f"obj_opt={obj_opt:.6f}",
+                f"{prefix}[NN-metric][after] "
+                f"obj_primal={nn_metrics_after['obj_primal']:.6f}, "
+                f"obj_dual_pg={nn_metrics_after['obj_dual_pg']:.6f}, "
+                f"obj_dual_x={nn_metrics_after['obj_dual_x']:.6f}, "
+                f"obj_opt={nn_metrics_after['obj_opt']:.6f}, "
+                f"reg_main={nn_metrics_after['reg_main']:.6f}, "
+                f"reg_pg={nn_metrics_after['reg_pg']:.6f}",
                 flush=True,
             )
+
+            if i == max_iter - 1:
+                obj_opt_breakdown = self.cal_obj_opt_breakdown()
+                print(
+                    f"{prefix}[full][final] obj_opt_breakdown: "
+                    f"surrogate={obj_opt_breakdown['surrogate']:.6f}, "
+                    f"pg_lower={obj_opt_breakdown['pg_lower']:.6f}, "
+                    f"pg_upper={obj_opt_breakdown['pg_upper']:.6f}, "
+                    f"x_lower={obj_opt_breakdown['x_lower']:.6f}, "
+                    f"x_upper={obj_opt_breakdown['x_upper']:.6f}, "
+                    f"ramp_up={obj_opt_breakdown['ramp_up']:.6f}, "
+                    f"ramp_down={obj_opt_breakdown['ramp_down']:.6f}, "
+                    f"min_on={obj_opt_breakdown['min_on']:.6f}, "
+                    f"min_off={obj_opt_breakdown['min_off']:.6f}, "
+                    f"start_cost={obj_opt_breakdown['start_cost']:.6f}, "
+                    f"shut_cost={obj_opt_breakdown['shut_cost']:.6f}, "
+                    f"coc_nonneg={obj_opt_breakdown['coc_nonneg']:.6f}, "
+                    f"total={obj_opt_breakdown['total']:.6f}",
+                    flush=True,
+                )
 
             if i >= 3:
                 self.rho_primal = min(self.rho_primal + gamma * obj_primal, self.rho_max)
@@ -366,6 +410,7 @@ def _train_unit_worker(args: dict) -> dict:
     gamma_base          = args.get('gamma_base', 1e-3)
     mu_individual_lower_bound_round = args.get('mu_individual_lower_bound_round', 3)
     mu_group_lower_bound_round = args.get('mu_group_lower_bound_round', 50)
+    mu_signed_round_interval = args.get('mu_signed_round_interval')
     sample_n_workers    = args.get('sample_n_workers', 4)
     use_sample_parallel = args.get('use_sample_parallel', True)
     save_dir            = args.get('save_dir')
@@ -388,6 +433,7 @@ def _train_unit_worker(args: dict) -> dict:
             gamma_base=gamma_base,
             mu_individual_lower_bound_round=mu_individual_lower_bound_round,
             mu_group_lower_bound_round=mu_group_lower_bound_round,
+            mu_signed_round_interval=mu_signed_round_interval,
             n_workers=sample_n_workers,
         )
     else:
@@ -397,6 +443,7 @@ def _train_unit_worker(args: dict) -> dict:
             gamma_base=gamma_base,
             mu_individual_lower_bound_round=mu_individual_lower_bound_round,
             mu_group_lower_bound_round=mu_group_lower_bound_round,
+            mu_signed_round_interval=mu_signed_round_interval,
         )
 
     trainer.iter(max_iter=max_iter, nn_epochs=nn_epochs)
@@ -558,6 +605,7 @@ def train_all_surrogates_parallel(
     gamma_base: float = 1e-3,
     mu_individual_lower_bound_round: int = 3,
     mu_group_lower_bound_round: int = 50,
+    mu_signed_round_interval: int | None = None,
     save_dir: Optional[str] = None,
     device=None,
     n_workers: Optional[int] = None,
@@ -641,6 +689,7 @@ def train_all_surrogates_parallel(
             'gamma_base':         gamma_base,
             'mu_individual_lower_bound_round': mu_individual_lower_bound_round,
             'mu_group_lower_bound_round': mu_group_lower_bound_round,
+            'mu_signed_round_interval': mu_signed_round_interval,
             'sample_n_workers':   sample_n_workers,
             'use_sample_parallel': use_sample_parallel,
             'save_dir':           save_dir,

@@ -86,6 +86,7 @@ JOINT_MAX_ITER = 10
 JOINT_NN_EPOCHS = 5
 JOINT_SURR_NN_EPOCHS = 5
 JOINT_DUAL_DECAY_ROUND = 0
+JOINT_DUAL_SIGN_RELAX_INTERVAL = 2
 ACTIVE_SETS_FILE = "result/active_set/active_sets_case3lite_T24_n1000_20260403_180137.json"  # None = 自动查找最新
 BCD_MODEL_FILE = "result/bcd_models/bcd_model_case3lite_20260403_225254.pth"
 BCD_CONTINUE_TRAINING = True
@@ -120,6 +121,7 @@ BCD_RESTORE_RHO_FROM_CHECKPOINT = False
 BCD_MAX_THETA_CONSTRAINTS_PER_TIME_SLOT = 20
 BCD_GAMMA_BASE = 1e-3
 DUAL_DECAY_ROUND = round(BCD_MAX_ITER/8)
+BCD_DUAL_SIGN_RELAX_INTERVAL = 2
 BCD_MU_DUAL_FLOOR_INIT = 0.1
 BCD_ITA_DUAL_FLOOR_INIT = 0.1
 SUBPROBLEM_RHO_PRIMAL_INIT = 0.1
@@ -137,17 +139,19 @@ SUBPROBLEM_GAMMA_BASE = 1e-3
 SUBPROBLEM_MU_DUAL_FLOOR_INIT = 1
 SUBPROBLEM_MU_DUAL_FLOOR_INDIVIDUAL_ROUND = round(SUBPROBLEM_MAX_ITER/10)
 SUBPROBLEM_MU_DUAL_FLOOR_DECAY_ROUND = round(SUBPROBLEM_MAX_ITER/8)
+SUBPROBLEM_MU_SIGNED_ROUND_INTERVAL = 2
+SUBPROBLEM_X_BOUND_DUAL_ZERO_ROUNDS = 0
 SUBPROBLEM_NN_BATCH_STRATEGY = 'full-batch'   # 'full-batch' / 'mini-batch'
 SUBPROBLEM_NN_SIZE = 'medium'   # 'small' / 'medium' / 'large'
 SUBPROBLEM_NN_BATCH_SIZE = 4
 SUBPROBLEM_NN_SHUFFLE = True
 SUBPROBLEM_NN_LR = 1e-4
 SUBPROBLEM_X_COST_NN_LR = 1e-5
-SUBPROBLEM_PG_COST_START_ROUND = round(SUBPROBLEM_MAX_ITER/10)
-SUBPROBLEM_PG_COST_SCALE_MULTIPLIER = 3
-SUBPROBLEM_PG_COST_LR = 2e-4
-SUBPROBLEM_PG_COST_SURR_LR = 5e-4
-SUBPROBLEM_PG_COST_REG_DEADBAND = 0.5
+SUBPROBLEM_PG_COST_START_ROUND = 0
+SUBPROBLEM_PG_COST_SCALE_MULTIPLIER = 4
+SUBPROBLEM_PG_COST_LR = 3e-4
+SUBPROBLEM_PG_COST_SURR_LR = 8e-4
+SUBPROBLEM_PG_COST_REG_DEADBAND = 1.0
 
 # ──────────────────────── 导入 ────────────────────────
 
@@ -408,6 +412,8 @@ def create_subproblem_trainer(ppc, all_samples, T_DELTA, unit_id: int, *,
                               mu_lower_bound_init: float = 0.1,
                               mu_individual_lower_bound_round: int = 3,
                               mu_group_lower_bound_round: int = 50,
+                              mu_signed_round_interval: int | None = None,
+                              x_bound_dual_zero_rounds: int = 0,
                               subproblem_nn_hidden_dims: list[int] | None = None,
                               subproblem_nn_batch_strategy: str = 'full-batch',
                               subproblem_nn_batch_size: int = 4,
@@ -434,10 +440,11 @@ def create_subproblem_trainer(ppc, all_samples, T_DELTA, unit_id: int, *,
         loss_ratio_opt=loss_ratio_opt,
         loss_ratio_reg=loss_ratio_reg,
         gamma_base=subproblem_gamma_base,
-        mu_lower_bound_init=mu_lower_bound_init,
-        mu_individual_lower_bound_round=mu_individual_lower_bound_round,
-        mu_group_lower_bound_round=mu_group_lower_bound_round,
-        nn_hidden_dims=subproblem_nn_hidden_dims,
+                mu_lower_bound_init=mu_lower_bound_init,
+                mu_individual_lower_bound_round=mu_individual_lower_bound_round,
+                mu_group_lower_bound_round=mu_group_lower_bound_round,
+                mu_signed_round_interval=mu_signed_round_interval,
+                nn_hidden_dims=subproblem_nn_hidden_dims,
         nn_batch_strategy=subproblem_nn_batch_strategy,
         nn_batch_size=subproblem_nn_batch_size,
         nn_shuffle=subproblem_nn_shuffle,
@@ -482,6 +489,8 @@ def run_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS,
                   mu_lower_bound_init: float = 0.1,
                   mu_individual_lower_bound_round: int = 3,
                   mu_group_lower_bound_round: int = 50,
+                  mu_signed_round_interval: int | None = None,
+                  x_bound_dual_zero_rounds: int = 0,
                   subproblem_nn_batch_strategy: str = 'full-batch',
                   subproblem_nn_batch_size: int = 4,
                   subproblem_nn_shuffle: bool = True,
@@ -584,6 +593,8 @@ def run_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS,
                 mu_lower_bound_init=mu_lower_bound_init,
                 mu_individual_lower_bound_round=mu_individual_lower_bound_round,
                 mu_group_lower_bound_round=mu_group_lower_bound_round,
+                mu_signed_round_interval=mu_signed_round_interval,
+                x_bound_dual_zero_rounds=x_bound_dual_zero_rounds,
                 nn_hidden_dims=subproblem_nn_hidden_dims,
                 nn_batch_strategy=subproblem_nn_batch_strategy,
                 nn_batch_size=subproblem_nn_batch_size,
@@ -617,6 +628,7 @@ def run_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS,
                 mu_lower_bound_init=mu_lower_bound_init,
                 mu_individual_lower_bound_round=mu_individual_lower_bound_round,
                 mu_group_lower_bound_round=mu_group_lower_bound_round,
+                mu_signed_round_interval=mu_signed_round_interval,
                 nn_hidden_dims=subproblem_nn_hidden_dims,
                 nn_batch_strategy=subproblem_nn_batch_strategy,
                 nn_batch_size=subproblem_nn_batch_size,
@@ -717,6 +729,7 @@ def print_surrogate_results(trainers, all_samples):
 
 def run_bcd(ppc, all_samples: list, T_DELTA, MAX_ITER, bcd_model_dir,
             case_name: str = 'case', timestamp: str = '', n_workers: int = 4, NN_EPOCHS: int = 10, DUAL_DECAY_ROUND: int = 10,
+            DUAL_SIGN_RELAX_INTERVAL: int | None = None,
             logger: 'TrainingLogger | None' = None,
             load_model_path: str | None = None,
             restore_rho_from_checkpoint: bool = False,
@@ -804,6 +817,7 @@ def run_bcd(ppc, all_samples: list, T_DELTA, MAX_ITER, bcd_model_dir,
             gamma_base=gamma_base,
             mu_dual_floor_init=mu_dual_floor_init,
             ita_dual_floor_init=ita_dual_floor_init,
+            dual_sign_relax_interval=DUAL_SIGN_RELAX_INTERVAL,
             nn_hidden_dims=nn_hidden_dims,
             nn_learning_rate=nn_learning_rate,
             nn_batch_strategy=nn_batch_strategy,
@@ -836,6 +850,7 @@ def run_bcd(ppc, all_samples: list, T_DELTA, MAX_ITER, bcd_model_dir,
             gamma_base=gamma_base,
             mu_dual_floor_init=mu_dual_floor_init,
             ita_dual_floor_init=ita_dual_floor_init,
+            dual_sign_relax_interval=DUAL_SIGN_RELAX_INTERVAL,
             nn_hidden_dims=nn_hidden_dims,
             nn_learning_rate=nn_learning_rate,
             nn_batch_strategy=nn_batch_strategy,
@@ -863,6 +878,7 @@ def run_bcd(ppc, all_samples: list, T_DELTA, MAX_ITER, bcd_model_dir,
     agent.iter(
         max_iter=MAX_ITER,
         dual_decay_round=DUAL_DECAY_ROUND,
+        dual_sign_relax_interval=DUAL_SIGN_RELAX_INTERVAL,
         nn_epochs=NN_EPOCHS,
         nn_batch_strategy=nn_batch_strategy,
         nn_batch_size=nn_batch_size,
@@ -928,6 +944,7 @@ def build_sparse_template_library_from_bcd_agent(
 def run_sparse_bcd(ppc, all_samples: list, T_DELTA, MAX_ITER, bcd_model_dir,
                    case_name: str = 'case', timestamp: str = '',
                    NN_EPOCHS: int = 10, DUAL_DECAY_ROUND: int = 10,
+                   DUAL_SIGN_RELAX_INTERVAL: int | None = None,
                    top_k_variables: int = 20, max_groups: int = 5, group_size: int = 3,
                    logger: 'TrainingLogger | None' = None,
                    lambda_init_strategy: str = 'lp_relaxation',
@@ -1023,6 +1040,7 @@ def run_sparse_bcd(ppc, all_samples: list, T_DELTA, MAX_ITER, bcd_model_dir,
         n_workers=1,
         NN_EPOCHS=NN_EPOCHS,
         DUAL_DECAY_ROUND=DUAL_DECAY_ROUND,
+        DUAL_SIGN_RELAX_INTERVAL=BCD_DUAL_SIGN_RELAX_INTERVAL,
         logger=logger,
         external_sparse_templates=template_library,
         lambda_init_strategy=lambda_init_strategy,
@@ -1139,6 +1157,7 @@ def main():
     BCD_GAMMA_BASE_VALUE = BCD_GAMMA_BASE
     BCD_MU_DUAL_FLOOR_INIT_VALUE = BCD_MU_DUAL_FLOOR_INIT
     BCD_ITA_DUAL_FLOOR_INIT_VALUE = BCD_ITA_DUAL_FLOOR_INIT
+    BCD_DUAL_SIGN_RELAX_INTERVAL_VALUE = BCD_DUAL_SIGN_RELAX_INTERVAL
     SUBPROBLEM_RHO_PRIMAL_INIT_VALUE = SUBPROBLEM_RHO_PRIMAL_INIT
     SUBPROBLEM_RHO_DUAL_INIT_VALUE = SUBPROBLEM_RHO_DUAL_INIT
     SUBPROBLEM_RHO_DUAL_PG_INIT_VALUE = SUBPROBLEM_RHO_DUAL_PG_INIT
@@ -1154,6 +1173,7 @@ def main():
     SUBPROBLEM_MU_DUAL_FLOOR_INIT_VALUE = SUBPROBLEM_MU_DUAL_FLOOR_INIT
     SUBPROBLEM_MU_DUAL_FLOOR_INDIVIDUAL_ROUND_VALUE = SUBPROBLEM_MU_DUAL_FLOOR_INDIVIDUAL_ROUND
     SUBPROBLEM_MU_DUAL_FLOOR_DECAY_ROUND_VALUE = SUBPROBLEM_MU_DUAL_FLOOR_DECAY_ROUND
+    SUBPROBLEM_MU_SIGNED_ROUND_INTERVAL_VALUE = SUBPROBLEM_MU_SIGNED_ROUND_INTERVAL
     SUBPROBLEM_NN_BATCH_STRATEGY_VALUE = SUBPROBLEM_NN_BATCH_STRATEGY
     SUBPROBLEM_NN_BATCH_SIZE_VALUE = SUBPROBLEM_NN_BATCH_SIZE
     SUBPROBLEM_NN_SHUFFLE_VALUE = SUBPROBLEM_NN_SHUFFLE
@@ -1235,7 +1255,7 @@ def main():
                 log(f"  截取前 {MAX_SAMPLES} 个样本（共 {len(all_samples_bcd)}）")
                 all_samples_bcd = all_samples_bcd[:MAX_SAMPLES]
             run_bcd(ppc, all_samples_bcd, T_DELTA, BCD_MAX_ITER_VALUE, bcd_model_dir,
-                    case_name=CASE_NAME, timestamp=timestamp, n_workers=N_WORKERS_BCD, NN_EPOCHS=NN_EPOCHS, DUAL_DECAY_ROUND=DUAL_DECAY_ROUND,
+                    case_name=CASE_NAME, timestamp=timestamp, n_workers=N_WORKERS_BCD, NN_EPOCHS=NN_EPOCHS, DUAL_DECAY_ROUND=DUAL_DECAY_ROUND, DUAL_SIGN_RELAX_INTERVAL=BCD_DUAL_SIGN_RELAX_INTERVAL_VALUE,
                     logger=logger,
                     load_model_path=str(resolve_existing_path(BCD_MODEL_FILE, 'BCD model file')) if BCD_CONTINUE_TRAINING and BCD_MODEL_FILE is not None else None,
                     restore_rho_from_checkpoint=BCD_RESTORE_RHO_FROM_CHECKPOINT,
@@ -1288,6 +1308,7 @@ def main():
                 timestamp=timestamp,
                 NN_EPOCHS=NN_EPOCHS,
                 DUAL_DECAY_ROUND=DUAL_DECAY_ROUND,
+                DUAL_SIGN_RELAX_INTERVAL=BCD_DUAL_SIGN_RELAX_INTERVAL,
                 top_k_variables=SPARSE_TOP_K_VARIABLES,
                 max_groups=SPARSE_MAX_GROUPS,
                 group_size=SPARSE_GROUP_SIZE,
@@ -1361,6 +1382,8 @@ def main():
                     mu_lower_bound_init=SUBPROBLEM_MU_DUAL_FLOOR_INIT_VALUE,
                     mu_individual_lower_bound_round=SUBPROBLEM_MU_DUAL_FLOOR_INDIVIDUAL_ROUND_VALUE,
                     mu_group_lower_bound_round=SUBPROBLEM_MU_DUAL_FLOOR_DECAY_ROUND_VALUE,
+                    mu_signed_round_interval=SUBPROBLEM_MU_SIGNED_ROUND_INTERVAL_VALUE,
+                    x_bound_dual_zero_rounds=SUBPROBLEM_X_BOUND_DUAL_ZERO_ROUNDS,
                     subproblem_nn_size=SUBPROBLEM_NN_SIZE_VALUE,
                     subproblem_nn_hidden_dims=SUBPROBLEM_NN_HIDDEN_DIMS_VALUE,
                     subproblem_nn_batch_strategy=SUBPROBLEM_NN_BATCH_STRATEGY_VALUE,
@@ -1534,6 +1557,7 @@ def main():
                     n_workers=N_WORKERS_BCD if not ENABLE_SPARSE_SUPPORTS else 1,
                     NN_EPOCHS=NN_EPOCHS,
                     DUAL_DECAY_ROUND=DUAL_DECAY_ROUND,
+                    DUAL_SIGN_RELAX_INTERVAL=BCD_DUAL_SIGN_RELAX_INTERVAL_VALUE,
                     logger=logger,
                     load_model_path=str(resolve_existing_path(BCD_MODEL_FILE, 'BCD model file')) if BCD_CONTINUE_TRAINING and BCD_MODEL_FILE is not None else None,
                     restore_rho_from_checkpoint=BCD_RESTORE_RHO_FROM_CHECKPOINT,
@@ -1607,6 +1631,8 @@ def main():
                     mu_lower_bound_init=SUBPROBLEM_MU_DUAL_FLOOR_INIT_VALUE,
                     mu_individual_lower_bound_round=SUBPROBLEM_MU_DUAL_FLOOR_INDIVIDUAL_ROUND_VALUE,
                     mu_group_lower_bound_round=SUBPROBLEM_MU_DUAL_FLOOR_DECAY_ROUND_VALUE,
+                    mu_signed_round_interval=SUBPROBLEM_MU_SIGNED_ROUND_INTERVAL_VALUE,
+                    x_bound_dual_zero_rounds=SUBPROBLEM_X_BOUND_DUAL_ZERO_ROUNDS,
                     subproblem_nn_size=SUBPROBLEM_NN_SIZE_VALUE,
                     subproblem_nn_hidden_dims=SUBPROBLEM_NN_HIDDEN_DIMS_VALUE,
                     subproblem_nn_batch_strategy=SUBPROBLEM_NN_BATCH_STRATEGY_VALUE,
