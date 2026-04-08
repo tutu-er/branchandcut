@@ -112,6 +112,7 @@ class ParallelAgent_NN_BCD(Agent_NN_BCD):
         self,
         max_iter: int = 20,
         dual_decay_round: int = 10,
+        dual_sign_relax_interval: int | None = None,
         nn_epochs: int = 10,
         union_analysis=None,
         nn_batch_strategy: str | None = None,
@@ -125,6 +126,8 @@ class ParallelAgent_NN_BCD(Agent_NN_BCD):
         eps = 1e-10
         gamma = self.gamma_base / (self.n_samples * max_iter)
         self.dual_decay_round = dual_decay_round
+        if dual_sign_relax_interval is not None:
+            self.dual_sign_relax_interval = max(int(dual_sign_relax_interval), 0)
 
         print(
             f"[ParallelBCD] Start parallel BCD (n_workers={self.n_workers}, max_iter={max_iter})",
@@ -134,6 +137,7 @@ class ParallelAgent_NN_BCD(Agent_NN_BCD):
         for i in range(max_iter):
             print(f"[ParallelBCD] Iteration {i+1}/{max_iter}", flush=True)
             self.iter_number = i
+            self._sync_parametric_direction_strategy_state()
 
             theta_snap_list = self.theta_values_list
             zeta_snap_list = self.zeta_values_list

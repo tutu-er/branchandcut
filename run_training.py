@@ -61,7 +61,7 @@ if not check_and_install_dependencies():
 #   'sparse'    - 稀疏支持集发现 → sparse BCD 训练
 #   'both'      - BCD 训练 → surrogate 训练 → 联合 BCD 训练
 #
-MODE = 'surrogate'
+MODE = 'both'
 ENABLE_SPARSE_SUPPORTS = False
 RUN_FP = False
 
