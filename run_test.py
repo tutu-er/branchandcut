@@ -694,16 +694,22 @@ def plot_surrogate_analysis(trainers: dict, all_samples: list,
             timestep_map, offset_map = _resolve_surrogate_display_layout(tr, sample_s, nc_common)
             for t in range(nc_common):
                 ts = timestep_map[t]
+                a_t, b_t, g_t, d_t = tr._apply_surrogate_direction_to_params(
+                    np.array([tr.alpha_values[s, t]], dtype=float),
+                    np.array([tr.beta_values[s, t]], dtype=float),
+                    np.array([tr.gamma_values[s, t]], dtype=float),
+                    np.array([tr.delta_values[s, t]], dtype=float),
+                )
                 lhs = build_surrogate_constraint_expression(
                     x_s,
                     ts,
                     offset_map[t],
-                    tr.alpha_values[s, t],
-                    tr.beta_values[s, t],
-                    tr.gamma_values[s, t],
+                    a_t[0],
+                    b_t[0],
+                    g_t[0],
                     tr.T,
                 )
-                viol_matrix[gi, t] += max(0.0, lhs - tr.delta_values[s, t])
+                viol_matrix[gi, t] += max(0.0, lhs - d_t[0])
         viol_matrix[gi] /= ns
 
     fig2, ax2 = plt.subplots(figsize=(min(14, nc_common * 0.55 + 2), max(3, n_units * 0.5 + 1.5)))
@@ -1193,10 +1199,16 @@ def print_surrogate_results(trainers: dict, all_samples: list) -> None:
         print(f"  样本0 代理约束示例（最多10条）:")
         for k in range(min(10, nc)):
             ts = timestep_map[k]
-            a = trainer.alpha_values[0, k]
-            b = trainer.beta_values[0, k]
-            g = trainer.gamma_values[0, k]
-            d = trainer.delta_values[0, k]
+            a_arr, b_arr, g_arr, d_arr = trainer._apply_surrogate_direction_to_params(
+                np.array([trainer.alpha_values[0, k]], dtype=float),
+                np.array([trainer.beta_values[0, k]], dtype=float),
+                np.array([trainer.gamma_values[0, k]], dtype=float),
+                np.array([trainer.delta_values[0, k]], dtype=float),
+            )
+            a = a_arr[0]
+            b = b_arr[0]
+            g = g_arr[0]
+            d = d_arr[0]
             lhs = build_surrogate_constraint_expression(
                 x0,
                 ts,

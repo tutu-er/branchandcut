@@ -428,10 +428,16 @@ class TrainingVisualizer:
             viols = []
             for k in range(nc):
                 t = trainer.sensitive_timesteps[sample][k] if hasattr(trainer, "sensitive_timesteps") else k
-                lhs = (trainer.alpha_values[sample, k] * x0[t]
-                       + trainer.beta_values[sample, k] * x0[min(t + 1, len(x0) - 1)]
-                       + trainer.gamma_values[sample, k] * x0[min(t + 2, len(x0) - 1)])
-                viols.append(max(0.0, lhs - trainer.delta_values[sample, k]))
+                alpha_k, beta_k, gamma_k, delta_k = trainer._apply_surrogate_direction_to_params(
+                    np.array([trainer.alpha_values[sample, k]], dtype=float),
+                    np.array([trainer.beta_values[sample, k]], dtype=float),
+                    np.array([trainer.gamma_values[sample, k]], dtype=float),
+                    np.array([trainer.delta_values[sample, k]], dtype=float),
+                )
+                lhs = (alpha_k[0] * x0[t]
+                       + beta_k[0] * x0[min(t + 1, len(x0) - 1)]
+                       + gamma_k[0] * x0[min(t + 2, len(x0) - 1)])
+                viols.append(max(0.0, lhs - delta_k[0]))
             viol_rows.append(viols)
 
         mat = np.zeros((len(unit_ids), max_nc))

@@ -253,6 +253,9 @@ class UnifiedSurrogateManager:
             betas = trainer.beta_values[sample_id]
             gammas = trainer.gamma_values[sample_id]
             deltas = trainer.delta_values[sample_id]
+            alphas, betas, gammas, deltas = trainer._apply_surrogate_direction_to_params(
+                alphas, betas, gammas, deltas
+            )
             constraint_timesteps = trainer.sensitive_timesteps[sample_id]
             constraint_offsets = resolve_constraint_offsets_from_trainer(
                 trainer,

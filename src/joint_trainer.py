@@ -991,10 +991,20 @@ class JointLPTrainer:
                                   device=trainer.device).unsqueeze(0)
             a, b, c, d, costs, pg_costs = self._forward_surrogate_outputs(trainer, feat_t)
             nc = trainer.num_coupling_constraints
-            params[g] = (a.cpu().numpy().flatten()[:nc],
-                         b.cpu().numpy().flatten()[:nc],
-                         c.cpu().numpy().flatten()[:nc],
-                         d.cpu().numpy().flatten()[:nc],
+            a_np = a.cpu().numpy().flatten()[:nc]
+            b_np = b.cpu().numpy().flatten()[:nc]
+            c_np = c.cpu().numpy().flatten()[:nc]
+            d_np = d.cpu().numpy().flatten()[:nc]
+            a_np, b_np, c_np, d_np = trainer._apply_surrogate_direction_to_params(
+                a_np,
+                b_np,
+                c_np,
+                d_np,
+            )
+            params[g] = (a_np,
+                         b_np,
+                         c_np,
+                         d_np,
                          costs.cpu().numpy().flatten()[:trainer.T],
                          pg_costs.cpu().numpy().flatten()[:trainer.T])
         return params
