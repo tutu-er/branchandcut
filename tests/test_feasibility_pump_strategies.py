@@ -271,6 +271,70 @@ def test_collect_integer_solutions_combines_all_strategies(monkeypatch):
     assert np.all(np.logical_or(x_init_k_m == 0, x_init_k_m == 1))
 
 
+def test_collect_integer_solutions_returns_subproblem_milp_candidates(monkeypatch):
+    active_set_data = [
+        {
+            'load_data': np.full((2, 3), 10.0),
+            'renewable_data': np.full((2, 3), 1.0),
+        },
+    ]
+    trainers = {
+        0: _DummyTrainer(0, active_set_data),
+        1: _DummyTrainer(1, active_set_data),
+    }
+
+    def _fake_unit_lp(
+        _trainer,
+        _lambda_val,
+        alphas,
+        betas,
+        gammas,
+        deltas,
+        costs=None,
+        pg_costs=None,
+        scenario_sample=None,
+    ):
+        return np.array([0.4, 0.6, 0.4], dtype=float), 2, {'status_name': 'OPTIMAL'}
+
+    def _fake_unit_milp(
+        _trainer,
+        _lambda_val,
+        alphas,
+        betas,
+        gammas,
+        deltas,
+        costs=None,
+        pg_costs=None,
+        scenario_sample=None,
+    ):
+        return np.array([1.0, 1.0, 0.0], dtype=float), 2, {'status_name': 'OPTIMAL'}
+
+    monkeypatch.setattr(fp, '_solve_unit_LP_with_surrogate', _fake_unit_lp)
+    monkeypatch.setattr(fp, '_solve_unit_MILP_with_surrogate', _fake_unit_milp)
+
+    x_surr_lp, x_init_k, x_init_k_m, details = fp.collect_integer_solutions(
+        pd_data=active_set_data[0],
+        lambda_val=np.array([1.0, 1.0, 1.0], dtype=float),
+        trainers=trainers,
+        n_perturbations=1,
+        n_similar_scenarios=0,
+        n_load_perturbations=0,
+        rng=np.random.default_rng(11),
+        use_milp_candidate=True,
+        milp_for_perturbations=True,
+        return_details=True,
+    )
+
+    assert x_surr_lp.shape == (2, 3)
+    assert x_init_k.shape == (2, 3)
+    assert x_init_k_m.shape == (2, 1, 3)
+    np.testing.assert_array_equal(details['x_init_k_milp'], np.array([[1, 1, 0], [1, 1, 0]], dtype=int))
+    np.testing.assert_array_equal(
+        details['x_init_k_m_milp'],
+        np.array([[[1, 1, 0]], [[1, 1, 0]]], dtype=int),
+    )
+
+
 def test_select_pool_restart_candidate_prefers_free_variable_difference():
     x_reference = np.array([[1, 0, 1], [0, 1, 0]], dtype=int)
     trusted_mask = np.array([[True, False, True], [False, False, False]])

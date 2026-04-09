@@ -112,6 +112,7 @@ BCD_RHO_DUAL_INIT = 1e-3
 BCD_RHO_DUAL_PG_INIT = 1
 BCD_RHO_DUAL_X_INIT = 1e-3
 BCD_RHO_DUAL_COC_INIT = 1e1
+BCD_RHO_BINARY_INIT = 1.0
 BCD_RHO_OPT_INIT = 1e-3
 BCD_LOSS_RATIO_PRIMAL = 1.0
 BCD_LOSS_RATIO_DUAL_X = 2e0
@@ -354,6 +355,7 @@ def create_bcd_agent(ppc, all_samples, T_DELTA, *,
                      rho_dual_pg_init: float | None = None,
                      rho_dual_x_init: float | None = None,
                      rho_dual_coc_init: float | None = None,
+                     rho_binary_init: float = 1.0,
                      rho_opt_init: float = 1e-2,
                      loss_ratio_primal: float = 1.0,
                      loss_ratio_dual_x: float = 1.0,
@@ -389,6 +391,7 @@ def create_bcd_agent(ppc, all_samples, T_DELTA, *,
         rho_dual_pg_init=rho_dual_pg_init,
         rho_dual_x_init=rho_dual_x_init,
         rho_dual_coc_init=rho_dual_coc_init,
+        rho_binary_init=rho_binary_init,
         rho_opt_init=rho_opt_init,
         gamma_base=gamma_base,
         mu_dual_floor_init=mu_dual_floor_init,
@@ -854,6 +857,7 @@ def run_bcd(ppc, all_samples: list, T_DELTA, MAX_ITER, bcd_model_dir,
             rho_dual_pg_init: float | None = None,
             rho_dual_x_init: float | None = None,
             rho_dual_coc_init: float | None = None,
+            rho_binary_init: float = 1.0,
             rho_opt_init: float = 1e-2,
             loss_ratio_primal: float = 1.0,
             loss_ratio_dual_x: float = 1.0,
@@ -890,7 +894,7 @@ def run_bcd(ppc, all_samples: list, T_DELTA, MAX_ITER, bcd_model_dir,
         f"dual_pg={rho_dual_pg_init if rho_dual_pg_init is not None else rho_dual_init}, "
         f"dual_x={rho_dual_x_init if rho_dual_x_init is not None else rho_dual_init}, "
         f"dual_coc={rho_dual_coc_init if rho_dual_coc_init is not None else rho_dual_init}, "
-        f"opt={rho_opt_init}"
+        f"binary={rho_binary_init}, opt={rho_opt_init}"
     )
     log(
         f"bcd_loss_ratio: primal={loss_ratio_primal}, dual_x={loss_ratio_dual_x}, "
@@ -935,6 +939,7 @@ def run_bcd(ppc, all_samples: list, T_DELTA, MAX_ITER, bcd_model_dir,
             rho_dual_pg_init=rho_dual_pg_init,
             rho_dual_x_init=rho_dual_x_init,
             rho_dual_coc_init=rho_dual_coc_init,
+            rho_binary_init=rho_binary_init,
             rho_opt_init=rho_opt_init,
             gamma_base=gamma_base,
             mu_dual_floor_init=mu_dual_floor_init,
@@ -973,6 +978,7 @@ def run_bcd(ppc, all_samples: list, T_DELTA, MAX_ITER, bcd_model_dir,
             rho_dual_pg_init=rho_dual_pg_init,
             rho_dual_x_init=rho_dual_x_init,
             rho_dual_coc_init=rho_dual_coc_init,
+            rho_binary_init=rho_binary_init,
             rho_opt_init=rho_opt_init,
             gamma_base=gamma_base,
             mu_dual_floor_init=mu_dual_floor_init,
@@ -1091,6 +1097,7 @@ def run_sparse_bcd(ppc, all_samples: list, T_DELTA, MAX_ITER, bcd_model_dir,
                    rho_dual_pg_init: float | None = None,
                    rho_dual_x_init: float | None = None,
                    rho_dual_coc_init: float | None = None,
+                   rho_binary_init: float = 1.0,
                    rho_opt_init: float = 1e-2,
                    loss_ratio_primal: float = 1.0,
                    loss_ratio_dual_x: float = 1.0,
@@ -1137,6 +1144,7 @@ def run_sparse_bcd(ppc, all_samples: list, T_DELTA, MAX_ITER, bcd_model_dir,
         rho_dual_pg_init=rho_dual_pg_init,
         rho_dual_x_init=rho_dual_x_init,
         rho_dual_coc_init=rho_dual_coc_init,
+        rho_binary_init=rho_binary_init,
         rho_opt_init=rho_opt_init,
         loss_ratio_primal=loss_ratio_primal,
         loss_ratio_dual_x=loss_ratio_dual_x,
@@ -1195,6 +1203,7 @@ def run_sparse_bcd(ppc, all_samples: list, T_DELTA, MAX_ITER, bcd_model_dir,
         rho_dual_pg_init=rho_dual_pg_init,
         rho_dual_x_init=rho_dual_x_init,
         rho_dual_coc_init=rho_dual_coc_init,
+        rho_binary_init=rho_binary_init,
         rho_opt_init=rho_opt_init,
         loss_ratio_primal=loss_ratio_primal,
         loss_ratio_dual_x=loss_ratio_dual_x,
@@ -1292,6 +1301,7 @@ def main():
     BCD_RHO_DUAL_PG_INIT_VALUE = BCD_RHO_DUAL_PG_INIT
     BCD_RHO_DUAL_X_INIT_VALUE = BCD_RHO_DUAL_X_INIT
     BCD_RHO_DUAL_COC_INIT_VALUE = BCD_RHO_DUAL_COC_INIT
+    BCD_RHO_BINARY_INIT_VALUE = BCD_RHO_BINARY_INIT
     BCD_RHO_OPT_INIT_VALUE = BCD_RHO_OPT_INIT
     BCD_LOSS_RATIO_PRIMAL_VALUE = BCD_LOSS_RATIO_PRIMAL
     BCD_LOSS_RATIO_DUAL_X_VALUE = BCD_LOSS_RATIO_DUAL_X
@@ -1427,6 +1437,7 @@ def main():
                     rho_dual_pg_init=BCD_RHO_DUAL_PG_INIT_VALUE,
                     rho_dual_x_init=BCD_RHO_DUAL_X_INIT_VALUE,
                     rho_dual_coc_init=BCD_RHO_DUAL_COC_INIT_VALUE,
+                    rho_binary_init=BCD_RHO_BINARY_INIT_VALUE,
                     rho_opt_init=BCD_RHO_OPT_INIT_VALUE,
                     loss_ratio_primal=BCD_LOSS_RATIO_PRIMAL_VALUE,
                     loss_ratio_dual_x=BCD_LOSS_RATIO_DUAL_X_VALUE,
@@ -1485,6 +1496,7 @@ def main():
                 rho_dual_pg_init=BCD_RHO_DUAL_PG_INIT_VALUE,
                 rho_dual_x_init=BCD_RHO_DUAL_X_INIT_VALUE,
                 rho_dual_coc_init=BCD_RHO_DUAL_COC_INIT_VALUE,
+                rho_binary_init=BCD_RHO_BINARY_INIT_VALUE,
                 rho_opt_init=BCD_RHO_OPT_INIT_VALUE,
                 loss_ratio_primal=BCD_LOSS_RATIO_PRIMAL_VALUE,
                 loss_ratio_dual_x=BCD_LOSS_RATIO_DUAL_X_VALUE,
@@ -1604,6 +1616,7 @@ def main():
                     rho_dual_pg_init=BCD_RHO_DUAL_PG_INIT_VALUE,
                     rho_dual_x_init=BCD_RHO_DUAL_X_INIT_VALUE,
                     rho_dual_coc_init=BCD_RHO_DUAL_COC_INIT_VALUE,
+                    rho_binary_init=BCD_RHO_BINARY_INIT_VALUE,
                     rho_opt_init=BCD_RHO_OPT_INIT_VALUE,
                     loss_ratio_primal=BCD_LOSS_RATIO_PRIMAL_VALUE,
                     loss_ratio_dual_x=BCD_LOSS_RATIO_DUAL_X_VALUE,
@@ -1651,6 +1664,7 @@ def main():
                         rho_dual_pg_init=BCD_RHO_DUAL_PG_INIT_VALUE,
                         rho_dual_x_init=BCD_RHO_DUAL_X_INIT_VALUE,
                         rho_dual_coc_init=BCD_RHO_DUAL_COC_INIT_VALUE,
+                        rho_binary_init=BCD_RHO_BINARY_INIT_VALUE,
                         rho_opt_init=BCD_RHO_OPT_INIT_VALUE,
                         loss_ratio_primal=BCD_LOSS_RATIO_PRIMAL_VALUE,
                         loss_ratio_dual_x=BCD_LOSS_RATIO_DUAL_X_VALUE,
@@ -1683,6 +1697,7 @@ def main():
                         rho_dual_pg_init=BCD_RHO_DUAL_PG_INIT_VALUE,
                         rho_dual_x_init=BCD_RHO_DUAL_X_INIT_VALUE,
                         rho_dual_coc_init=BCD_RHO_DUAL_COC_INIT_VALUE,
+                        rho_binary_init=BCD_RHO_BINARY_INIT_VALUE,
                         rho_opt_init=BCD_RHO_OPT_INIT_VALUE,
                         loss_ratio_primal=BCD_LOSS_RATIO_PRIMAL_VALUE,
                         loss_ratio_dual_x=BCD_LOSS_RATIO_DUAL_X_VALUE,
@@ -1713,6 +1728,7 @@ def main():
                         rho_dual_pg_init=BCD_RHO_DUAL_PG_INIT_VALUE,
                         rho_dual_x_init=BCD_RHO_DUAL_X_INIT_VALUE,
                         rho_dual_coc_init=BCD_RHO_DUAL_COC_INIT_VALUE,
+                        rho_binary_init=BCD_RHO_BINARY_INIT_VALUE,
                         rho_opt_init=BCD_RHO_OPT_INIT_VALUE,
                         loss_ratio_primal=BCD_LOSS_RATIO_PRIMAL_VALUE,
                         loss_ratio_dual_x=BCD_LOSS_RATIO_DUAL_X_VALUE,
@@ -1767,6 +1783,7 @@ def main():
                     rho_dual_pg_init=BCD_RHO_DUAL_PG_INIT_VALUE,
                     rho_dual_x_init=BCD_RHO_DUAL_X_INIT_VALUE,
                     rho_dual_coc_init=BCD_RHO_DUAL_COC_INIT_VALUE,
+                    rho_binary_init=BCD_RHO_BINARY_INIT_VALUE,
                     rho_opt_init=BCD_RHO_OPT_INIT_VALUE,
                     loss_ratio_primal=BCD_LOSS_RATIO_PRIMAL_VALUE,
                     loss_ratio_dual_x=BCD_LOSS_RATIO_DUAL_X_VALUE,

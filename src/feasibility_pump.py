@@ -1867,8 +1867,11 @@ def collect_integer_solutions(
     perturb_std: float = 0.1,
     neighborhood_weight: float = 0.35,
     lambda_predictor=None,
-    rng: Optional[np.random.Generator] = None
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    rng: Optional[np.random.Generator] = None,
+    use_milp_candidate: bool = False,
+    milp_for_perturbations: bool = False,
+    return_details: bool = False,
+):
     """
     收集多组整数解（来自子问�?LP + 代理参数扰动）�?
 
@@ -1902,6 +1905,12 @@ def collect_integer_solutions(
     x_surr_lp = np.full((ng, T), np.nan, dtype=float)
     x_init_k = np.zeros((ng, T), dtype=int)
     x_init_k_m = np.zeros((ng, n_candidates, T), dtype=int)
+    x_init_k_milp = np.zeros((ng, T), dtype=int) if use_milp_candidate else None
+    x_init_k_m_milp = (
+        np.zeros((ng, n_candidates, T), dtype=int)
+        if (use_milp_candidate and milp_for_perturbations and n_candidates > 0)
+        else None
+    )
 
     for g in unit_ids:
         trainer = trainers[g]
@@ -1941,6 +1950,27 @@ def collect_integer_solutions(
             )
         x_surr_lp[g] = x_LP_k
         x_init_k[g] = round_to_integer(x_LP_k)
+        if x_init_k_milp is not None:
+            x_MILP_k, status_milp_k, _details_milp_k = _solve_unit_MILP_with_surrogate(
+                trainer,
+                lambda_val,
+                alphas,
+                betas,
+                gammas,
+                deltas,
+                costs=costs,
+                pg_costs=pg_costs,
+                scenario_sample=base_scenario,
+            )
+            if status_milp_k == GRB.OPTIMAL:
+                x_init_k_milp[g] = round_to_integer(x_MILP_k)
+            else:
+                print(
+                    f"  Warning: unit {g} base surrogate MILP failed "
+                    f"(status={_gurobi_status_name(status_milp_k)}); reuse LP candidate",
+                    flush=True,
+                )
+                x_init_k_milp[g] = x_init_k[g]
 
         # Solve additional unit LPs from perturbed / retrieved surrogate parameters.
         for m, (
@@ -1973,6 +2003,33 @@ def collect_integer_solutions(
                     flush=True,
                 )
                 x_init_k_m[g, m] = x_init_k[g]
+            if x_init_k_m_milp is not None:
+                x_MILP_m, status_milp_m, _details_milp_m = _solve_unit_MILP_with_surrogate(
+                    trainer,
+                    lambda_val,
+                    alphas_m,
+                    betas_m,
+                    gammas_m,
+                    deltas_m,
+                    costs=costs_m,
+                    pg_costs=pg_costs_m,
+                    scenario_sample=scenario_m,
+                )
+                if status_milp_m == GRB.OPTIMAL:
+                    x_init_k_m_milp[g, m] = round_to_integer(x_MILP_m)
+                else:
+                    x_init_k_m_milp[g, m] = x_init_k_m[g, m]
+
+    if return_details:
+        details = {
+            'use_milp_candidate': bool(use_milp_candidate),
+            'milp_for_perturbations': bool(milp_for_perturbations),
+            'x_init_k_milp': None if x_init_k_milp is None else np.asarray(x_init_k_milp, dtype=int),
+            'x_init_k_m_milp': (
+                None if x_init_k_m_milp is None else np.asarray(x_init_k_m_milp, dtype=int)
+            ),
+        }
+        return x_surr_lp, x_init_k, x_init_k_m, details
 
     return x_surr_lp, x_init_k, x_init_k_m
 
@@ -3100,6 +3157,8 @@ def recover_integer_solution(
     surrogate_screen_candidate_violation_tol: float = 0.02,
     surrogate_screen_soft_penalty: float = 25.0,
     projection_objective_tau = 'adaptive',
+    use_subproblem_milp_candidate: bool = True,
+    subproblem_milp_for_perturbations: bool = False,
     return_details: bool = False,
 ):
     """
@@ -3180,7 +3239,7 @@ def recover_integer_solution(
     # Step 3：收集多组整数解
     if verbose:
         print("Step 3: 收集多组整数解（子问�?LP + 扰动�?..", flush=True)
-    x_surr_lp, x_init_k, x_init_k_m = collect_integer_solutions(
+    x_surr_lp, x_init_k, x_init_k_m, candidate_details = collect_integer_solutions(
         scenario_input, lambda_val, trainers,
         n_perturbations=n_perturbations,
         n_similar_scenarios=n_similar_scenarios,
@@ -3190,8 +3249,13 @@ def recover_integer_solution(
         perturb_std=perturb_std,
         neighborhood_weight=neighborhood_weight,
         lambda_predictor=lambda_predictor,
-        rng=rng
+        rng=rng,
+        use_milp_candidate=use_subproblem_milp_candidate,
+        milp_for_perturbations=subproblem_milp_for_perturbations,
+        return_details=True,
     )
+    x_init_k_milp = candidate_details.get('x_init_k_milp')
+    x_init_k_m_milp = candidate_details.get('x_init_k_m_milp')
 
     # Step 4：识别高可信度变�?
     if verbose:
@@ -3293,11 +3357,54 @@ def recover_integer_solution(
             trusted_mask,
             nearby_commitment_candidates=nearby_commitment_candidates,
         )
+        if x_init_k_milp is not None:
+            vote_majority = _compute_vote_majority(x_init_k, x_init_k_m)
+            nearby_commitment_pool = None
+            if nearby_commitment_candidates:
+                nearby_commitment_pool = np.stack(
+                    [np.asarray(candidate, dtype=int) for _name, candidate in nearby_commitment_candidates],
+                    axis=0,
+                )
+            support_reference = _compute_hot_start_support_reference(
+                x_LP,
+                x_surr_lp,
+                x_init_k,
+                x_init_k_m,
+                nearby_commitment_pool=nearby_commitment_pool,
+            )
+            milp_hot_start_specs = [("subproblem_milp_base", np.asarray(x_init_k_milp, dtype=int))]
+            if x_init_k_m_milp is not None and x_init_k_m_milp.ndim == 3:
+                milp_hot_start_specs.extend(
+                    (f"subproblem_milp_perturb_{m + 1}", np.asarray(x_init_k_m_milp[:, m, :], dtype=int))
+                    for m in range(x_init_k_m_milp.shape[1])
+                )
+            for name, candidate in milp_hot_start_specs:
+                repaired = _repair_min_up_down_heuristic(candidate, T_delta)
+                score = _score_hot_start_candidate(
+                    repaired,
+                    x_LP,
+                    x_surr_lp,
+                    vote_majority,
+                    trusted_mask,
+                    support_reference=support_reference,
+                    nearby_commitment_pool=nearby_commitment_pool,
+                )
+                hot_start_candidates.append((name, repaired, float(score) + 0.25))
+            hot_start_candidates.sort(key=lambda item: item[2], reverse=True)
     else:
         hot_start_candidates = [
             ("lp_round", x_init, 0.0),
             ("surrogate_lp_round", _repair_min_up_down_heuristic(x_init_k, T_delta), -1.0),
         ]
+        if x_init_k_milp is not None:
+            hot_start_candidates.insert(
+                1,
+                (
+                    "subproblem_milp_base",
+                    _repair_min_up_down_heuristic(np.asarray(x_init_k_milp, dtype=int), T_delta),
+                    -0.5,
+                ),
+            )
 
     sanitized_hot_start_specs, rejected_hot_start_specs = _sanitize_named_commitment_candidates(
         [(name, x_start) for name, x_start, _score in hot_start_candidates],
@@ -3350,10 +3457,17 @@ def recover_integer_solution(
 
     # 构建整数解池：子问题整数�?+ 扰动�?+ 热启动候选，�?FP 投影阶段使用
     x_pool_specs: List[Tuple[str, np.ndarray]] = [("subproblem_base", x_init_k)]
+    if x_init_k_milp is not None:
+        x_pool_specs.append(("subproblem_milp_base", np.asarray(x_init_k_milp, dtype=int)))
     x_pool_specs.extend(
         (f"subproblem_perturb_{m + 1}", x_init_k_m[:, m, :])
         for m in range(x_init_k_m.shape[1])
     )
+    if x_init_k_m_milp is not None and x_init_k_m_milp.ndim == 3:
+        x_pool_specs.extend(
+            (f"subproblem_milp_perturb_{m + 1}", x_init_k_m_milp[:, m, :])
+            for m in range(x_init_k_m_milp.shape[1])
+        )
     x_pool_specs.extend((name, x_start) for name, x_start, _score in hot_start_candidates)
     sanitized_x_pool_specs, rejected_x_pool_specs = _sanitize_named_commitment_candidates(
         x_pool_specs,
@@ -3395,6 +3509,8 @@ def recover_integer_solution(
         'x_init': np.asarray(x_init, dtype=int),
         'x_init_k': np.asarray(x_init_k, dtype=int),
         'x_init_k_m': np.asarray(x_init_k_m, dtype=int),
+        'x_init_k_milp': None if x_init_k_milp is None else np.asarray(x_init_k_milp, dtype=int),
+        'x_init_k_m_milp': None if x_init_k_m_milp is None else np.asarray(x_init_k_m_milp, dtype=int),
         'trusted_mask': np.asarray(trusted_mask, dtype=bool),
         'nearby_commitment_candidates': list(nearby_commitment_candidates),
         'surrogate_screen_constraints': surrogate_screen_constraints,

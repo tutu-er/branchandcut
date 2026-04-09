@@ -980,6 +980,8 @@ def recover_integer_solution_case3lite(
     plot_dir: Optional[str | Path] = None,
     sample_tag: str = "sample",
     max_global_combinations: int = 24,
+    use_subproblem_milp_candidate: bool = True,
+    subproblem_milp_for_perturbations: bool = False,
 ) -> Tuple[Optional[np.ndarray], bool, dict]:
     sample = normalize_sample_arrays(dict(_coerce_scenario_sample(pd_data)))
     pd_matrix = get_sample_net_load(sample)
@@ -1021,7 +1023,7 @@ def recover_integer_solution_case3lite(
 
     if verbose:
         print("Case3lite custom FP: Step 3/6 collect surrogate candidates", flush=True)
-    x_surr_lp, x_init_k, x_init_k_m = collect_integer_solutions(
+    x_surr_lp, x_init_k, x_init_k_m, candidate_details = collect_integer_solutions(
         sample,
         lambda_val,
         trainers,
@@ -1034,7 +1036,12 @@ def recover_integer_solution_case3lite(
         neighborhood_weight=neighborhood_weight,
         lambda_predictor=lambda_predictor,
         rng=rng,
+        use_milp_candidate=use_subproblem_milp_candidate,
+        milp_for_perturbations=subproblem_milp_for_perturbations,
+        return_details=True,
     )
+    x_init_k_milp = candidate_details.get("x_init_k_milp")
+    x_init_k_m_milp = candidate_details.get("x_init_k_m_milp")
 
     base_trusted_mask = identify_trusted_mask(
         x_lp,
@@ -1096,6 +1103,55 @@ def recover_integer_solution_case3lite(
         nearby_commitment_candidates,
         max_global_combinations=max_global_combinations,
     )
+    if x_init_k_milp is not None:
+        vote_majority = _compute_vote_majority(x_init_k, x_init_k_m)
+        nearby_pool = None
+        if nearby_commitment_candidates:
+            nearby_pool = np.stack(
+                [np.asarray(candidate, dtype=int) for _name, candidate in nearby_commitment_candidates],
+                axis=0,
+            )
+        extra_combo_specs = [("subproblem_milp_base_combo", np.asarray(x_init_k_milp, dtype=int))]
+        if x_init_k_m_milp is not None and x_init_k_m_milp.ndim == 3:
+            extra_combo_specs.extend(
+                (f"subproblem_milp_perturb_{m + 1}_combo", np.asarray(x_init_k_m_milp[:, m, :], dtype=int))
+                for m in range(x_init_k_m_milp.shape[1])
+            )
+        next_combo_id = len(global_combinations) + 1
+        for combo_name, combo_candidate in extra_combo_specs:
+            repaired = _repair_and_validate_case3lite_candidate(combo_candidate, ppc, T_delta)
+            if repaired is None:
+                continue
+            combo_score = float(
+                _score_hot_start_candidate(
+                    repaired,
+                    x_lp,
+                    x_surr_lp,
+                    vote_majority,
+                    trusted_mask,
+                    support_reference=support_reference,
+                    nearby_commitment_pool=nearby_pool,
+                ) + 0.25
+            )
+            global_combinations.append(
+                {
+                    "id": next_combo_id,
+                    "candidate": repaired,
+                    "score": combo_score,
+                    "objective_estimate": float(
+                        _estimate_commitment_primal_objective(repaired, ppc, pd_matrix, T_delta)
+                    ),
+                    "unit_choice_names": [combo_name] * repaired.shape[0],
+                    "unit_choice_weights": [0.0] * repaired.shape[0],
+                    "unit_option_scores": [combo_score] * repaired.shape[0],
+                }
+            )
+            next_combo_id += 1
+        global_combinations.sort(key=lambda item: item["score"], reverse=True)
+        global_combinations = global_combinations[: max(1, int(max_global_combinations))]
+        combo_weights = _softmax_weights([item["score"] for item in global_combinations], temperature=4.0)
+        for combo, weight in zip(global_combinations, combo_weights):
+            combo["weight"] = float(weight)
     _print_global_combo_weights(global_combinations)
 
     x_pool = _build_case3lite_x_pool(
@@ -1214,6 +1270,8 @@ def recover_integer_solution_case3lite(
         "x_surr_lp": x_surr_lp,
         "x_init_k": x_init_k,
         "x_init_k_m": x_init_k_m,
+        "x_init_k_milp": x_init_k_milp,
+        "x_init_k_m_milp": x_init_k_m_milp,
         "unit_options": unit_options,
         "global_combinations": global_combinations,
         "trusted_mask": trusted_mask,
