@@ -71,6 +71,7 @@ MODE      = 'surrogate'
 RUN_FP    = True       # surrogate / both 模式：是否运行可行性泵测试
 CASE_NAME = 'case3lite'   # 'case3' / 'case3lite' / 'case14' / 'case30' / 'case39' / 'case118'
 SURROGATE_CONSTRAINT_STRATEGY = 'all_single_time'  # 'auto' / 'sensitive' / 'all' / 'all_templates_sign4' / 'all_single_time'
+SUBPROBLEM_IGNORE_STARTUP_SHUTDOWN_COSTS = False
 BCD_LAMBDA_INIT_STRATEGY = 'lp_relaxation'   # 'lp_relaxation' / 'ed_on_x_opt'
 THETA_HOT_START_STRATEGY = 'dcpf_relative'   # 'dcpf_relative' / 'gaussian'
 ZETA_HOT_START_STRATEGY = 'zero'             # 'zero' / 'gaussian'
@@ -389,44 +390,103 @@ def _load_saved_surrogate_strategy(model_dir: str, unit_ids) -> str | None:
     return discovered[0]
 
 
+def _load_saved_subproblem_ignore_startup_shutdown_costs(model_dir: str, unit_ids) -> bool | None:
+    if unit_ids is None:
+        unit_candidates = list(range(256))
+    else:
+        unit_candidates = list(unit_ids)
+
+    discovered = []
+    for g in unit_candidates:
+        surrogate_path = Path(model_dir) / f"surrogate_unit_{g}.pth"
+        if not surrogate_path.exists():
+            continue
+        metadata = _load_surrogate_model_metadata(str(surrogate_path))
+        discovered.append(bool(metadata.get("ignore_startup_shutdown_costs", False)))
+
+    if not discovered:
+        return None
+    if len(set(discovered)) > 1:
+        raise ValueError(
+            f"Inconsistent surrogate startup/shutdown-cost settings found in {model_dir}: "
+            f"{sorted(set(discovered))}"
+        )
+    return discovered[0]
+
+
 def load_trained_models_for_test(ppc, all_samples: list, T_DELTA: float,
                                  model_dir: str, unit_ids,
-                                 requested_strategy: str | None):
+                                 requested_strategy: str | None,
+                                 requested_ignore_startup_shutdown_costs: bool | None = None):
     resolved_strategy = _resolve_requested_surrogate_strategy(requested_strategy)
+    resolved_ignore_startup_shutdown_costs = (
+        None
+        if requested_ignore_startup_shutdown_costs is None
+        else bool(requested_ignore_startup_shutdown_costs)
+    )
     if resolved_strategy is None:
         saved_strategy = _load_saved_surrogate_strategy(model_dir, unit_ids)
         if saved_strategy is not None:
             log(f"约束生成策略: 使用模型保存值 {saved_strategy}")
-        return load_trained_models(
-            ppc, all_samples, T_DELTA,
-            load_dir=model_dir,
-            unit_ids=unit_ids,
-            constraint_generation_strategy=None,
-        )
+        saved_ignore = _load_saved_subproblem_ignore_startup_shutdown_costs(model_dir, unit_ids)
+        if saved_ignore is not None:
+            log(f"subproblem 忽略启停成本: 使用模型保存值 {saved_ignore}")
+        try:
+            return load_trained_models(
+                ppc, all_samples, T_DELTA,
+                load_dir=model_dir,
+                unit_ids=unit_ids,
+                constraint_generation_strategy=None,
+                ignore_startup_shutdown_costs=resolved_ignore_startup_shutdown_costs,
+            )
+        except ValueError as exc:
+            if "Surrogate model startup/shutdown-cost setting mismatch" not in str(exc):
+                raise
+            log(
+                "subproblem 启停成本配置与模型不一致，自动回退到保存值: "
+                f"requested={resolved_ignore_startup_shutdown_costs}, saved={saved_ignore}"
+            )
+            return load_trained_models(
+                ppc, all_samples, T_DELTA,
+                load_dir=model_dir,
+                unit_ids=unit_ids,
+                constraint_generation_strategy=None,
+                ignore_startup_shutdown_costs=None,
+            )
 
     try:
         log(f"约束生成策略: {resolved_strategy}")
+        if resolved_ignore_startup_shutdown_costs is not None:
+            log(f"subproblem 忽略启停成本: {resolved_ignore_startup_shutdown_costs}")
         return load_trained_models(
             ppc, all_samples, T_DELTA,
             load_dir=model_dir,
             unit_ids=unit_ids,
             constraint_generation_strategy=resolved_strategy,
+            ignore_startup_shutdown_costs=resolved_ignore_startup_shutdown_costs,
         )
     except ValueError as exc:
-        if "Surrogate model strategy mismatch" not in str(exc):
+        if (
+            "Surrogate model strategy mismatch" not in str(exc)
+            and "Surrogate model startup/shutdown-cost setting mismatch" not in str(exc)
+        ):
             raise
         saved_strategy = _load_saved_surrogate_strategy(model_dir, unit_ids)
-        if saved_strategy is None:
+        saved_ignore = _load_saved_subproblem_ignore_startup_shutdown_costs(model_dir, unit_ids)
+        if saved_strategy is None and saved_ignore is None:
             raise
         log(
-            f"约束生成策略与模型不一致，自动回退到保存值: "
-            f"requested={resolved_strategy}, saved={saved_strategy}"
+            "surrogate 配置与模型不一致，自动回退到保存值: "
+            f"requested_strategy={resolved_strategy}, saved_strategy={saved_strategy}, "
+            f"requested_ignore_startup_shutdown_costs={resolved_ignore_startup_shutdown_costs}, "
+            f"saved_ignore_startup_shutdown_costs={saved_ignore}"
         )
         return load_trained_models(
             ppc, all_samples, T_DELTA,
             load_dir=model_dir,
             unit_ids=unit_ids,
             constraint_generation_strategy=None,
+            ignore_startup_shutdown_costs=None,
         )
 
 
@@ -1836,6 +1896,7 @@ def test_surrogate(ppc, all_samples: list, T_DELTA: float,
         model_dir=model_dir,
         unit_ids=unit_ids,
         requested_strategy=constraint_generation_strategy,
+        requested_ignore_startup_shutdown_costs=SUBPROBLEM_IGNORE_STARTUP_SHUTDOWN_COSTS,
     )
 
     log(
@@ -2798,6 +2859,7 @@ def test_both(ppc, data_file: Path, all_samples: list, T_DELTA: float,
         model_dir=model_dir,
         unit_ids=unit_ids,
         requested_strategy=constraint_generation_strategy,
+        requested_ignore_startup_shutdown_costs=SUBPROBLEM_IGNORE_STARTUP_SHUTDOWN_COSTS,
     )
     log(
         f"dual predictor loaded: legacy_mode={getattr(dual_predictor, '_legacy_mode', None)}, "

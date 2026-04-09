@@ -1580,6 +1580,7 @@ class SubproblemSurrogateTrainer:
                  loss_ratio_reg: float = 1.0,
                  pg_block_prox_weight: float = 2e-2,
                  dual_block_prox_weight: float = 1e-2,
+                 ignore_startup_shutdown_costs: bool = False,
                  device=None):
         """
         初始化单机组子问题代理约束训练器 - V3三时段版本
@@ -1719,6 +1720,7 @@ class SubproblemSurrogateTrainer:
         self.loss_ratio_reg = float(loss_ratio_reg)
         self.pg_block_prox_weight = max(float(pg_block_prox_weight), 0.0)
         self.dual_block_prox_weight = max(float(dual_block_prox_weight), 0.0)
+        self.ignore_startup_shutdown_costs = bool(ignore_startup_shutdown_costs)
         self.iter_number = 0
         self.x_cost_scale = 2.0
         self.pg_cost_scale = 1.0
@@ -1966,7 +1968,7 @@ class SubproblemSurrogateTrainer:
         prev_coc = self.coc[sample_id]
         g = self.unit_id
         pg_scale = max(float(self.gen[g, PMAX]), 1.0)
-        coc_scale = max(float(self.gencost[g, 1]), float(self.gencost[g, 2]), 1.0)
+        coc_scale = 1.0 if self.ignore_startup_shutdown_costs else max(float(self.gencost[g, 1]), float(self.gencost[g, 2]), 1.0)
 
         for t in range(self.T):
             prox_obj += self._add_squared_distance_term(
@@ -2465,8 +2467,8 @@ class SubproblemSurrogateTrainer:
         Rd_co = float(self.Rd_co_all[g])
         a     = self.gencost[g, -2] / self.T_delta
         b     = self.gencost[g, -1] / self.T_delta
-        sc    = self.gencost[g, 1]
-        shc   = self.gencost[g, 2]
+        sc    = 0.0 if self.ignore_startup_shutdown_costs else self.gencost[g, 1]
+        shc   = 0.0 if self.ignore_startup_shutdown_costs else self.gencost[g, 2]
         Ton   = min(4, self.T)
         Toff  = min(4, self.T)
 
@@ -2648,8 +2650,8 @@ class SubproblemSurrogateTrainer:
         Rd      = float(self.Rd_all[g])
         Ru_co   = float(self.Ru_co_all[g])
         Rd_co   = float(self.Rd_co_all[g])
-        sc      = self.gencost[g, 1]   # 启动成本
-        shc     = self.gencost[g, 2]   # 停机成本
+        sc      = 0.0 if self.ignore_startup_shutdown_costs else self.gencost[g, 1]
+        shc     = 0.0 if self.ignore_startup_shutdown_costs else self.gencost[g, 2]
         Ton     = min(4, self.T)
         Toff    = min(4, self.T)
 
@@ -2865,8 +2867,8 @@ class SubproblemSurrogateTrainer:
         Rd    = float(self.Rd_all[g])
         Ru_co = float(self.Ru_co_all[g])
         Rd_co = float(self.Rd_co_all[g])
-        start_cost = self.gencost[g, 1]
-        shut_cost  = self.gencost[g, 2]
+        start_cost = 0.0 if self.ignore_startup_shutdown_costs else self.gencost[g, 1]
+        shut_cost  = 0.0 if self.ignore_startup_shutdown_costs else self.gencost[g, 2]
         Ton  = min(4, self.T)
         Toff = min(4, self.T)
 
@@ -3198,8 +3200,8 @@ class SubproblemSurrogateTrainer:
             self.gencost[g, -2] / self.T_delta,                    # 边际成本 a
             self.gencost[g, -1] / self.T_delta / (Pmax + 1e-8),   # 归一化无负荷成本 b
             float(self.Ru_all[g]) / (Pmax + 1e-8),                # 归一化爬坡率 Ru
-            self.gencost[g, 1] / (Pmax + 1e-8),                   # 归一化启动成本
-            self.gencost[g, 2] / (Pmax + 1e-8),                   # 归一化停机成本
+            0.0 if self.ignore_startup_shutdown_costs else self.gencost[g, 1] / (Pmax + 1e-8),
+            0.0 if self.ignore_startup_shutdown_costs else self.gencost[g, 2] / (Pmax + 1e-8),
         ])
 
         return np.concatenate([pd_flat, lambda_val, unit_params])
@@ -3285,8 +3287,8 @@ class SubproblemSurrogateTrainer:
         Rd_v    = float(self.Rd_all[g])
         Ru_co_v = float(self.Ru_co_all[g])
         Rd_co_v = float(self.Rd_co_all[g])
-        start_c = float(self.gencost[g, 1])
-        shut_c  = float(self.gencost[g, 2])
+        start_c = 0.0 if self.ignore_startup_shutdown_costs else float(self.gencost[g, 1])
+        shut_c  = 0.0 if self.ignore_startup_shutdown_costs else float(self.gencost[g, 2])
         Ton_l   = min(4, self.T)
         Toff_l  = min(4, self.T)
         obj_dual_x = torch.tensor(0.0, device=device, requires_grad=True)
@@ -3841,8 +3843,8 @@ class SubproblemSurrogateTrainer:
             Rd_v    = float(self.Rd_all[g])
             Ru_co_v = float(self.Ru_co_all[g])
             Rd_co_v = float(self.Rd_co_all[g])
-            sc_v    = self.gencost[g, 1]
-            shc_v   = self.gencost[g, 2]
+            sc_v    = 0.0 if self.ignore_startup_shutdown_costs else self.gencost[g, 1]
+            shc_v   = 0.0 if self.ignore_startup_shutdown_costs else self.gencost[g, 2]
             Ton_v   = min(4, self.T)
             Toff_v  = min(4, self.T)
 
@@ -4055,8 +4057,8 @@ class SubproblemSurrogateTrainer:
             Rd_v = float(self.Rd_all[g])
             Ru_co_v = float(self.Ru_co_all[g])
             Rd_co_v = float(self.Rd_co_all[g])
-            sc_v = self.gencost[g, 1]
-            shc_v = self.gencost[g, 2]
+            sc_v = 0.0 if self.ignore_startup_shutdown_costs else self.gencost[g, 1]
+            shc_v = 0.0 if self.ignore_startup_shutdown_costs else self.gencost[g, 2]
             Ton_v = min(4, self.T)
             Toff_v = min(4, self.T)
 
@@ -4376,8 +4378,8 @@ class SubproblemSurrogateTrainer:
             self.gencost[g, -2] / self.T_delta,
             self.gencost[g, -1] / self.T_delta / (Pmax + 1e-8),
             float(self.Ru_all[g]) / (Pmax + 1e-8),
-            self.gencost[g, 1] / (Pmax + 1e-8),
-            self.gencost[g, 2] / (Pmax + 1e-8),
+            0.0 if self.ignore_startup_shutdown_costs else self.gencost[g, 1] / (Pmax + 1e-8),
+            0.0 if self.ignore_startup_shutdown_costs else self.gencost[g, 2] / (Pmax + 1e-8),
         ])
         expected_total_dim = int(self.surrogate_net.input_proj.in_features)
         expected_pd_dim = expected_total_dim - lambda_val.size - unit_params.size
@@ -4525,6 +4527,7 @@ class SubproblemSurrogateTrainer:
                 'max_constraints': self.max_constraints,
                 'requested_max_constraints': self.requested_max_constraints,
                 'constraint_generation_strategy': self.constraint_generation_strategy,
+                'ignore_startup_shutdown_costs': self.ignore_startup_shutdown_costs,
                 'mu_individual_lower_bound_round': self.mu_individual_lower_bound_round,
                 'mu_group_lower_bound_round': self.mu_group_lower_bound_round,
                 'mu_signed_round_interval': self.mu_signed_round_interval,
@@ -4603,6 +4606,9 @@ class SubproblemSurrogateTrainer:
             )
             saved_strategy = state.get('constraint_generation_strategy', 'sensitive')
             self.constraint_generation_strategy = normalize_constraint_generation_strategy(saved_strategy)
+            self.ignore_startup_shutdown_costs = bool(
+                state.get('ignore_startup_shutdown_costs', self.ignore_startup_shutdown_costs)
+            )
             self.all_mode_group_size = (
                 4
                 if self.constraint_generation_strategy == CONSTRAINT_STRATEGY_ALL_TEMPLATES_SIGN4
@@ -4718,6 +4724,7 @@ def _load_surrogate_model_metadata(filepath: str, device=None) -> dict:
     state = torch.load(filepath, map_location=device, weights_only=False)
     return {
         'constraint_generation_strategy': state.get('constraint_generation_strategy', 'sensitive'),
+        'ignore_startup_shutdown_costs': bool(state.get('ignore_startup_shutdown_costs', False)),
         'max_constraints': state.get('max_constraints'),
         'requested_max_constraints': state.get('requested_max_constraints'),
         'num_coupling_constraints': state.get('num_coupling_constraints'),
@@ -5093,6 +5100,7 @@ def train_complete_model(ppc, active_set_data: List[Dict], T_delta: float = 1.0,
 def load_trained_models(ppc, active_set_data: List[Dict], T_delta: float,
                          load_dir: str, unit_ids: List[int] = None,
                          constraint_generation_strategy: str | None = None,
+                         ignore_startup_shutdown_costs: bool | None = None,
                          device=None):
     """
     加载已训练的模型
@@ -5136,6 +5144,9 @@ def load_trained_models(ppc, active_set_data: List[Dict], T_delta: float,
         saved_strategy = normalize_constraint_generation_strategy(
             metadata.get('constraint_generation_strategy', 'sensitive')
         )
+        saved_ignore_startup_shutdown_costs = bool(
+            metadata.get('ignore_startup_shutdown_costs', False)
+        )
         requested_strategy = (
             saved_strategy
             if constraint_generation_strategy is None
@@ -5145,6 +5156,17 @@ def load_trained_models(ppc, active_set_data: List[Dict], T_delta: float,
             raise ValueError(
                 f"Surrogate model strategy mismatch for unit {g}: "
                 f"requested={requested_strategy}, saved={saved_strategy}"
+            )
+        requested_ignore_startup_shutdown_costs = (
+            saved_ignore_startup_shutdown_costs
+            if ignore_startup_shutdown_costs is None
+            else bool(ignore_startup_shutdown_costs)
+        )
+        if requested_ignore_startup_shutdown_costs != saved_ignore_startup_shutdown_costs:
+            raise ValueError(
+                f"Surrogate model startup/shutdown-cost setting mismatch for unit {g}: "
+                f"requested={requested_ignore_startup_shutdown_costs}, "
+                f"saved={saved_ignore_startup_shutdown_costs}"
             )
 
         requested_max_constraints = metadata.get('requested_max_constraints')
@@ -5164,6 +5186,7 @@ def load_trained_models(ppc, active_set_data: List[Dict], T_delta: float,
             lambda_predictor=dual_predictor,
             max_constraints=trainer_max_constraints,
             constraint_generation_strategy=requested_strategy,
+            ignore_startup_shutdown_costs=requested_ignore_startup_shutdown_costs,
             nn_hidden_dims=metadata.get('nn_hidden_dims'),
             device=device,
         )

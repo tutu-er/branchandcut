@@ -493,6 +493,7 @@ class Agent_NN_BCD:
         rho_dual_pg_init: float | None = None,
         rho_dual_x_init: float | None = None,
         rho_dual_coc_init: float | None = None,
+        rho_binary_init: float = 1.0,
         rho_opt_init: float = 1e-2,
         gamma_base: float = 1e-2,
         mu_dual_floor_init: float = 0.1,
@@ -544,6 +545,7 @@ class Agent_NN_BCD:
         
         # BCD迭代参数
         self.rho_primal = float(rho_primal_init)
+        self.rho_binary = float(rho_binary_init)
         self.rho_opt = float(rho_opt_init)
         self.gamma_base = float(gamma_base)   # gamma 缩放基准
         self.gamma_dual_component_scale = 3.0
@@ -2843,7 +2845,7 @@ class Agent_NN_BCD:
         # 设置目标函数
         obj_prox = self._build_pg_block_prox_obj(model, sample_id, pg, x, coc)
         total_objective = (
-            obj_binary
+            self.rho_binary * obj_binary
             + self.rho_primal * obj_primal
             + self.rho_opt * obj_opt
             + self.pg_block_prox_weight * obj_prox
@@ -3556,6 +3558,7 @@ class Agent_NN_BCD:
                 flush=True,
             )
             self.rho_primal = min(self.rho_primal + gamma * obj_primal, self.rho_max)
+            self.rho_binary = min(self.rho_binary + gamma * obj_binary, self.rho_max)
             gamma_dual = gamma * self.gamma_dual_component_scale
             self.rho_dual_pg = min(self.rho_dual_pg + gamma_dual * obj_dual_pg, self.rho_max)
             self.rho_dual_x = min(self.rho_dual_x + gamma_dual * obj_dual_x, self.rho_max)
@@ -5251,6 +5254,7 @@ class Agent_NN_BCD:
             "zeta_constraint_direction_signs": self.zeta_constraint_direction_signs,
             "dual_sign_relax_interval": self.dual_sign_relax_interval,
             "rho_primal": self.rho_primal,
+            "rho_binary": self.rho_binary,
             "rho_dual": self.rho_dual,
             "rho_dual_pg": self.rho_dual_pg,
             "rho_dual_x": self.rho_dual_x,
@@ -5389,6 +5393,7 @@ class Agent_NN_BCD:
         if restore_rho_state:
             if "rho_primal" in state:
                 self.rho_primal = state["rho_primal"]
+            self.rho_binary = state.get("rho_binary", self.rho_binary)
             self.rho_dual_pg = state.get("rho_dual_pg", state.get("rho_dual", self.rho_dual_pg))
             self.rho_dual_x = state.get("rho_dual_x", state.get("rho_dual", self.rho_dual_x))
             self.rho_dual_coc = state.get("rho_dual_coc", state.get("rho_dual", self.rho_dual_coc))

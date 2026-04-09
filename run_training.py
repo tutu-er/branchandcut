@@ -149,6 +149,7 @@ SUBPROBLEM_NN_SIZE = 'medium'   # 'small' / 'medium' / 'large'
 SUBPROBLEM_NN_BATCH_SIZE = 4
 SUBPROBLEM_NN_SHUFFLE = True
 SUBPROBLEM_NN_LR = 5e-4
+SUBPROBLEM_IGNORE_STARTUP_SHUTDOWN_COSTS = False
 SUBPROBLEM_X_COST_NN_LR = 1e-5
 SUBPROBLEM_PG_COST_NN_EPOCHS = 12
 SUBPROBLEM_PG_COST_START_ROUND = round(SUBPROBLEM_MAX_ITER/2)
@@ -446,6 +447,7 @@ def create_subproblem_trainer(ppc, all_samples, T_DELTA, unit_id: int, *,
                               subproblem_nn_batch_size: int = 4,
                               subproblem_nn_shuffle: bool = True,
                               subproblem_nn_learning_rate: float = 1e-4,
+                              ignore_startup_shutdown_costs: bool = False,
                               subproblem_cost_learning_rate: float = 1e-5,
                               subproblem_nn_smooth_abs_eps: float = SUBPROBLEM_NN_SMOOTH_ABS_EPS,
                               pg_cost_nn_epochs: int | None = None,
@@ -485,6 +487,7 @@ def create_subproblem_trainer(ppc, all_samples, T_DELTA, unit_id: int, *,
         nn_batch_size=subproblem_nn_batch_size,
         nn_shuffle=subproblem_nn_shuffle,
         nn_learning_rate=subproblem_nn_learning_rate,
+        ignore_startup_shutdown_costs=ignore_startup_shutdown_costs,
         cost_learning_rate=subproblem_cost_learning_rate,
         nn_smooth_abs_eps=subproblem_nn_smooth_abs_eps,
         pg_cost_nn_epochs=pg_cost_nn_epochs,
@@ -539,6 +542,7 @@ def run_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS,
                   subproblem_nn_batch_size: int = 4,
                   subproblem_nn_shuffle: bool = True,
                   subproblem_nn_learning_rate: float = 1e-4,
+                  ignore_startup_shutdown_costs: bool = False,
                   subproblem_cost_learning_rate: float = 1e-5,
                   subproblem_nn_smooth_abs_eps: float = SUBPROBLEM_NN_SMOOTH_ABS_EPS,
                   pg_cost_nn_epochs: int | None = None,
@@ -574,6 +578,7 @@ def run_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS,
         f"subproblem_nn: batch_strategy={subproblem_nn_batch_strategy}, "
         f"batch_size={subproblem_nn_batch_size}, shuffle={subproblem_nn_shuffle}, "
         f"size={subproblem_nn_size}, hidden_dims={subproblem_nn_hidden_dims}, "
+        f"ignore_startup_shutdown_costs={ignore_startup_shutdown_costs}, "
         f"main_lr={subproblem_nn_learning_rate}, x_cost_lr={subproblem_cost_learning_rate}, "
         f"nn_smooth_eps={subproblem_nn_smooth_abs_eps}, "
         f"c_pg_epochs={pg_cost_nn_epochs}, c_pg_surr_lr={pg_cost_surr_lr}, "
@@ -606,6 +611,7 @@ def run_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS,
             load_dir=str(load_path),
             unit_ids=[],
             constraint_generation_strategy=constraint_generation_strategy,
+            ignore_startup_shutdown_costs=ignore_startup_shutdown_costs,
         )[0]
         dual_predictor.train(
             num_epochs=DUAL_EPOCHS,
@@ -662,6 +668,7 @@ def run_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS,
                 nn_batch_size=subproblem_nn_batch_size,
                 nn_shuffle=subproblem_nn_shuffle,
                 nn_learning_rate=subproblem_nn_learning_rate,
+                ignore_startup_shutdown_costs=ignore_startup_shutdown_costs,
                 cost_learning_rate=subproblem_cost_learning_rate,
                 nn_smooth_abs_eps=subproblem_nn_smooth_abs_eps,
                 pg_cost_start_round=pg_cost_start_round,
@@ -705,6 +712,7 @@ def run_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS,
                 nn_batch_size=subproblem_nn_batch_size,
                 nn_shuffle=subproblem_nn_shuffle,
                 nn_learning_rate=subproblem_nn_learning_rate,
+                ignore_startup_shutdown_costs=ignore_startup_shutdown_costs,
                 cost_learning_rate=subproblem_cost_learning_rate,
                 nn_smooth_abs_eps=subproblem_nn_smooth_abs_eps,
                 pg_cost_start_round=pg_cost_start_round,
@@ -747,7 +755,8 @@ def run_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS,
 
 def load_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS, load_dir,
                    logger: 'TrainingLogger | None' = None,
-                   constraint_generation_strategy: str | None = None):
+                   constraint_generation_strategy: str | None = None,
+                   ignore_startup_shutdown_costs: bool | None = None):
     """加载已有 dual_predictor 和 subproblem surrogate 模型。"""
     load_path = Path(load_dir)
     if not load_path.is_absolute():
@@ -763,6 +772,7 @@ def load_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS, load_dir,
         load_dir=str(load_path),
         unit_ids=UNIT_IDS,
         constraint_generation_strategy=constraint_generation_strategy,
+        ignore_startup_shutdown_costs=ignore_startup_shutdown_costs,
     )
     if logger is not None:
         for trainer in trainers.values():
@@ -1318,6 +1328,7 @@ def main():
     SUBPROBLEM_NN_BATCH_SIZE_VALUE = SUBPROBLEM_NN_BATCH_SIZE
     SUBPROBLEM_NN_SHUFFLE_VALUE = SUBPROBLEM_NN_SHUFFLE
     SUBPROBLEM_NN_LR_VALUE = SUBPROBLEM_NN_LR
+    SUBPROBLEM_IGNORE_STARTUP_SHUTDOWN_COSTS_VALUE = SUBPROBLEM_IGNORE_STARTUP_SHUTDOWN_COSTS
     SUBPROBLEM_NN_SIZE_VALUE, SUBPROBLEM_NN_HIDDEN_DIMS_VALUE = resolve_nn_hidden_dims(
         SUBPROBLEM_NN_SIZE,
         SUBPROBLEM_NN_HIDDEN_DIM_OPTIONS,
@@ -1509,6 +1520,7 @@ def main():
                     ppc, all_samples, T_DELTA, UNIT_IDS,
                     SURROGATE_MODEL_DIR, logger=logger,
                     constraint_generation_strategy=CONSTRAINT_GENERATION_STRATEGY,
+                    ignore_startup_shutdown_costs=SUBPROBLEM_IGNORE_STARTUP_SHUTDOWN_COSTS_VALUE,
                 )
             else:
                 dual_predictor, trainers = run_surrogate(
@@ -1544,6 +1556,7 @@ def main():
                     subproblem_nn_batch_size=SUBPROBLEM_NN_BATCH_SIZE_VALUE,
                     subproblem_nn_shuffle=SUBPROBLEM_NN_SHUFFLE_VALUE,
                     subproblem_nn_learning_rate=SUBPROBLEM_NN_LR_VALUE,
+                    ignore_startup_shutdown_costs=SUBPROBLEM_IGNORE_STARTUP_SHUTDOWN_COSTS_VALUE,
                     subproblem_cost_learning_rate=SUBPROBLEM_X_COST_NN_LR_VALUE,
                     subproblem_nn_smooth_abs_eps=SUBPROBLEM_NN_SMOOTH_ABS_EPS_VALUE,
                     pg_cost_nn_epochs=SUBPROBLEM_PG_COST_NN_EPOCHS_VALUE,
@@ -1790,6 +1803,7 @@ def main():
                     ppc, all_samples, T_DELTA, UNIT_IDS,
                     SURROGATE_MODEL_DIR, logger=logger,
                     constraint_generation_strategy=CONSTRAINT_GENERATION_STRATEGY,
+                    ignore_startup_shutdown_costs=SUBPROBLEM_IGNORE_STARTUP_SHUTDOWN_COSTS_VALUE,
                 )
             else:
                 dual_predictor, trainers = run_surrogate(
@@ -1825,6 +1839,7 @@ def main():
                     subproblem_nn_batch_size=SUBPROBLEM_NN_BATCH_SIZE_VALUE,
                     subproblem_nn_shuffle=SUBPROBLEM_NN_SHUFFLE_VALUE,
                     subproblem_nn_learning_rate=SUBPROBLEM_NN_LR_VALUE,
+                    ignore_startup_shutdown_costs=SUBPROBLEM_IGNORE_STARTUP_SHUTDOWN_COSTS_VALUE,
                     subproblem_cost_learning_rate=SUBPROBLEM_X_COST_NN_LR_VALUE,
                     subproblem_nn_smooth_abs_eps=SUBPROBLEM_NN_SMOOTH_ABS_EPS_VALUE,
                     pg_cost_nn_epochs=SUBPROBLEM_PG_COST_NN_EPOCHS_VALUE,
