@@ -1549,6 +1549,7 @@ class SubproblemSurrogateTrainer:
                  rho_dual_pg_init: float | None = None,
                  rho_dual_x_init: float | None = None,
                  rho_dual_coc_init: float | None = None,
+                 rho_binary_init: float = 1.0,
                  rho_opt_init: float = 1e-3,
                  gamma_base: float = 1e-3,
                  mu_lower_bound_init: float = 0.1,
@@ -1668,6 +1669,7 @@ class SubproblemSurrogateTrainer:
         # BCD迭代参数
         self.rho_primal = float(rho_primal_init)
         self.rho_dual = float(rho_dual_init)
+        self.rho_binary = float(rho_binary_init)
         self.rho_opt = float(rho_opt_init)
         self.gamma_base = float(gamma_base)
         self.gamma = self.gamma_base
@@ -2801,7 +2803,7 @@ class SubproblemSurrogateTrainer:
         model.setObjective(
             self.rho_primal * obj_primal
             + self.rho_opt  * obj_opt
-            + obj_binary
+            + self.rho_binary * obj_binary
             + self.pg_block_prox_weight * obj_prox,
             GRB.MINIMIZE,
         )
@@ -4293,6 +4295,7 @@ class SubproblemSurrogateTrainer:
                 self.rho_dual_x = min(self.rho_dual_x + gamma_dual * obj_dual_x, self.rho_max)
                 self.rho_dual_coc = min(self.rho_dual_coc + gamma_dual * obj_dual_coc, self.rho_max)
                 self._sync_rho_dual_summary()
+                self.rho_binary = min(self.rho_binary + gamma * obj_binary, self.rho_max)
                 self.rho_opt    = min(self.rho_opt    + gamma * obj_opt,    self.rho_max)
 
             print(
@@ -4521,6 +4524,7 @@ class SubproblemSurrogateTrainer:
                 'rho_dual_pg': self.rho_dual_pg,
                 'rho_dual_x': self.rho_dual_x,
                 'rho_dual_coc': self.rho_dual_coc,
+                'rho_binary': self.rho_binary,
                 'rho_opt': self.rho_opt,
                 'gamma_dual_component_scale': self.gamma_dual_component_scale,
                 'num_coupling_constraints': self.num_coupling_constraints,
@@ -4599,6 +4603,7 @@ class SubproblemSurrogateTrainer:
             self.rho_dual_x = state.get('rho_dual_x', state.get('rho_dual', self.rho_dual_x))
             self.rho_dual_coc = state.get('rho_dual_coc', state.get('rho_dual', self.rho_dual_coc))
             self._sync_rho_dual_summary()
+            self.rho_binary = state.get('rho_binary', self.rho_binary)
             self.rho_opt = state['rho_opt']
             self.gamma_dual_component_scale = state.get(
                 'gamma_dual_component_scale',
