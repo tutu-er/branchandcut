@@ -1165,6 +1165,7 @@ class SubproblemSurrogateNet(nn.Module):
         T: int,
         max_constraints: int = 20,
         hidden_dims: List[int] = None,
+        pg_cost_hidden_dims: List[int] = None,
         x_cost_scale: float = 1.0,
         pg_cost_scale: float = 1.0,
         coupling_coeff_scale: float = 2.0,
@@ -1183,6 +1184,8 @@ class SubproblemSurrogateNet(nn.Module):
 
         if hidden_dims is None:
             hidden_dims = [512, 256, 256]
+        if pg_cost_hidden_dims is None:
+            pg_cost_hidden_dims = list(hidden_dims)
 
         # 输入投影 + 残差块
         self.input_proj = nn.Linear(input_dim, hidden_dims[0])
@@ -1196,6 +1199,19 @@ class SubproblemSurrogateNet(nn.Module):
         feat_dim = prev_dim
         head_hidden = max(feat_dim // 2, 64)
         head_mid = max(head_hidden // 2, 32)
+
+        # c_pg 使用独立网络，不共享主 surrogate backbone
+        self.pg_input_proj = nn.Linear(input_dim, pg_cost_hidden_dims[0])
+        pg_res_blocks = []
+        prev_pg_dim = pg_cost_hidden_dims[0]
+        for hd in pg_cost_hidden_dims:
+            pg_res_blocks.append(ResBlock(prev_pg_dim, hd))
+            prev_pg_dim = hd
+        self.pg_res_blocks = nn.ModuleList(pg_res_blocks)
+
+        pg_feat_dim = prev_pg_dim
+        pg_head_hidden = max(pg_feat_dim // 2, 64)
+        pg_head_mid = max(pg_head_hidden // 2, 32)
 
         # 四个参数头（每个带两个隐层 + LayerNorm）
         self.alpha_net = nn.Sequential(
@@ -1227,9 +1243,9 @@ class SubproblemSurrogateNet(nn.Module):
         )
         # pg 调整项头：输出 T 个值，后续经 tanh 缩放到边际成本量级
         self.pg_cost_net = nn.Sequential(
-            nn.Linear(feat_dim, head_hidden), nn.LayerNorm(head_hidden), nn.LeakyReLU(0.01),
-            nn.Linear(head_hidden, head_mid), nn.LayerNorm(head_mid), nn.LeakyReLU(0.01),
-            nn.Linear(head_mid, self.T)
+            nn.Linear(pg_feat_dim, pg_head_hidden), nn.LayerNorm(pg_head_hidden), nn.LeakyReLU(0.01),
+            nn.Linear(pg_head_hidden, pg_head_mid), nn.LayerNorm(pg_head_mid), nn.LeakyReLU(0.01),
+            nn.Linear(pg_head_mid, self.T)
         )
 
         self._init_weights()
@@ -1254,6 +1270,12 @@ class SubproblemSurrogateNet(nn.Module):
             features = block(features)
         return features
 
+    def encode_pg_features(self, x):
+        features = self.pg_input_proj(x)
+        for block in self.pg_res_blocks:
+            features = block(features)
+        return features
+
     def forward_main(self, x):
         """
         主代理网络前向传播。
@@ -1271,7 +1293,7 @@ class SubproblemSurrogateNet(nn.Module):
 
     def forward_pg_cost(self, x):
         """c_pg 单独前向传播。"""
-        features = self.encode_features(x)
+        features = self.encode_pg_features(x)
         pg_costs = torch.tanh(self.pg_cost_net(features)) * self.pg_cost_scale
         return pg_costs
 
@@ -1556,10 +1578,13 @@ class SubproblemSurrogateTrainer:
                  mu_individual_lower_bound_round: int = 3,
                  mu_group_lower_bound_round: int = 50,
                  mu_signed_round_interval: int | None = None,
+                 mu_sign_hysteresis_rounds: int = 2,
+                 mu_sign_flip_min_share: float = 0.67,
                  x_bound_dual_zero_rounds: int = 0,
                  pg_cost_start_round: int = 3,
                  pg_cost_scale_multiplier: float = 1.2,
                  nn_hidden_dims: List[int] = None,
+                 pg_cost_hidden_dims: List[int] = None,
                  nn_learning_rate: float = 1e-4,
                  cost_learning_rate: float = 1e-5,
                  pg_cost_lr: float = 2e-5,
@@ -1694,10 +1719,13 @@ class SubproblemSurrogateTrainer:
             self.mu_signed_round_interval = 2
         else:
             self.mu_signed_round_interval = max(int(mu_signed_round_interval), 0)
+        self.mu_sign_hysteresis_rounds = max(int(mu_sign_hysteresis_rounds), 1)
+        self.mu_sign_flip_min_share = min(max(float(mu_sign_flip_min_share), 0.5), 1.0)
         self.x_bound_dual_zero_rounds = max(int(x_bound_dual_zero_rounds), 0)
         self.pg_cost_start_round = max(int(pg_cost_start_round), 0)
         self.pg_cost_scale_multiplier = max(float(pg_cost_scale_multiplier), 1e-6)
         self.nn_hidden_dims = normalize_nn_hidden_dims(nn_hidden_dims, [256, 256])
+        self.pg_cost_hidden_dims = normalize_nn_hidden_dims(pg_cost_hidden_dims, self.nn_hidden_dims)
         self.nn_learning_rate = max(float(nn_learning_rate), 1e-8)
         self.cost_learning_rate = max(float(cost_learning_rate), 1e-8)
         self.pg_cost_lr = max(float(pg_cost_lr), 1e-8)
@@ -1739,6 +1767,8 @@ class SubproblemSurrogateTrainer:
         self.num_coupling_constraints = self.max_constraints
         self.template_rhs_base_vector = self._build_template_rhs_base_vector(self.num_coupling_constraints)
         self.surrogate_direction_signs = np.ones(self.num_coupling_constraints, dtype=float)
+        self.surrogate_direction_pending_signs = np.zeros(self.num_coupling_constraints, dtype=float)
+        self.surrogate_direction_pending_counts = np.zeros(self.num_coupling_constraints, dtype=int)
         self.mu = np.ones((self.n_samples, self.num_coupling_constraints), dtype=float) * self.mu_lower_bound
 
         # 固有约束的对偶变量（由dual block更新，用于NN loss的完整KKT驻点条件）
@@ -1870,6 +1900,7 @@ class SubproblemSurrogateTrainer:
             T=self.T,
             max_constraints=self.max_constraints,
             hidden_dims=self.nn_hidden_dims,
+            pg_cost_hidden_dims=self.pg_cost_hidden_dims,
             x_cost_scale=self.x_cost_scale,
             pg_cost_scale=self.pg_cost_scale,
             delta_base=delta_base,
@@ -1877,21 +1908,21 @@ class SubproblemSurrogateTrainer:
         ).to(self.device)
 
         # 分离参数组：主优化器管理 backbone + alpha/beta/gamma/delta 头
-        aux_params = set(self.surrogate_net.cost_net.parameters()) | set(self.surrogate_net.pg_cost_net.parameters())
-        main_params = [p for p in self.surrogate_net.parameters() if p not in aux_params]
+        main_params = self._main_network_parameters()
         self.optimizer = optim.Adam(main_params, lr=self.nn_learning_rate)
         # x / pg 调整项头拆分优化，便于仅对 c_pg 提高学习率并延迟启用
         self.cost_optimizer = optim.Adam(
-            self.surrogate_net.cost_net.parameters(),
+            self._cost_network_parameters(),
             lr=self.cost_learning_rate,
         )
         self.pg_cost_optimizer = optim.Adam(
-            self.surrogate_net.pg_cost_net.parameters(),
+            self._pg_network_parameters(),
             lr=self.pg_cost_lr,
         )
 
         print(f"  - 代理约束网络输入维度: {input_dim}", flush=True)
-        print(f"  - 隐藏层: {self.nn_hidden_dims}", flush=True)
+        print(f"  - main隐藏层: {self.nn_hidden_dims}", flush=True)
+        print(f"  - c_pg隐藏层: {self.pg_cost_hidden_dims}", flush=True)
         print(f"  - 约束生成策略: {self.constraint_generation_strategy}", flush=True)
         print(f"  - 最大约束数量: {self.max_constraints}", flush=True)
         print(f"  - x_cost_scale={self.x_cost_scale:.4f}, pg_cost_scale={self.pg_cost_scale:.4f}", flush=True)
@@ -1911,6 +1942,23 @@ class SubproblemSurrogateTrainer:
             flush=True,
         )
         print(f"  - nn_dual_term_interval={self.nn_dual_term_interval}", flush=True)
+
+    def _cost_network_parameters(self) -> list:
+        return list(self.surrogate_net.cost_net.parameters())
+
+    def _pg_network_parameters(self) -> list:
+        return (
+            list(self.surrogate_net.pg_input_proj.parameters())
+            + list(self.surrogate_net.pg_res_blocks.parameters())
+            + list(self.surrogate_net.pg_cost_net.parameters())
+        )
+
+    def _main_network_parameters(self) -> list:
+        aux_param_ids = {
+            id(param)
+            for param in (self._cost_network_parameters() + self._pg_network_parameters())
+        }
+        return [param for param in self.surrogate_net.parameters() if id(param) not in aux_param_ids]
 
     def _pg_costs_active(self) -> bool:
         return self.iter_number >= self.pg_cost_start_round
@@ -2187,7 +2235,7 @@ class SubproblemSurrogateTrainer:
         for param in self.surrogate_net.parameters():
             param.requires_grad_(not enabled)
         if enabled:
-            for param in self.surrogate_net.pg_cost_net.parameters():
+            for param in self._pg_network_parameters():
                 param.requires_grad_(True)
 
     def _resolve_nn_batch_config(
@@ -2368,6 +2416,22 @@ class SubproblemSurrogateTrainer:
             and ((self.iter_number + 1) % interval == 0)
         )
 
+    def _ensure_surrogate_direction_hysteresis_buffers(self) -> tuple[np.ndarray, np.ndarray]:
+        n_constraints = int(self.num_coupling_constraints)
+        pending_signs = getattr(self, 'surrogate_direction_pending_signs', None)
+        pending_counts = getattr(self, 'surrogate_direction_pending_counts', None)
+        if pending_signs is None or np.asarray(pending_signs).shape != (n_constraints,):
+            pending_signs = np.zeros(n_constraints, dtype=float)
+        else:
+            pending_signs = np.asarray(pending_signs, dtype=float).copy()
+        if pending_counts is None or np.asarray(pending_counts).shape != (n_constraints,):
+            pending_counts = np.zeros(n_constraints, dtype=int)
+        else:
+            pending_counts = np.asarray(pending_counts, dtype=int).copy()
+        self.surrogate_direction_pending_signs = pending_signs
+        self.surrogate_direction_pending_counts = pending_counts
+        return pending_signs, pending_counts
+
     def _resolve_surrogate_direction_signs_from_mu(
         self,
         mu_values_by_sample: np.ndarray,
@@ -2385,8 +2449,52 @@ class SubproblemSurrogateTrainer:
         pos_count = np.sum(mu_arr > tol, axis=0)
         neg_count = np.sum(mu_arr < -tol, axis=0)
         resolved = base_signs.copy()
-        resolved[pos_count > neg_count] = 1.0
-        resolved[neg_count > pos_count] = -1.0
+        pending_signs, pending_counts = self._ensure_surrogate_direction_hysteresis_buffers()
+        hysteresis_rounds = max(int(getattr(self, 'mu_sign_hysteresis_rounds', 1) or 1), 1)
+        flip_min_share = min(max(float(getattr(self, 'mu_sign_flip_min_share', 0.5) or 0.5), 0.5), 1.0)
+        desired = base_signs.copy()
+        desired[pos_count > neg_count] = 1.0
+        desired[neg_count > pos_count] = -1.0
+
+        for k in range(self.num_coupling_constraints):
+            current_sign = 1.0 if float(base_signs[k]) >= 0.0 else -1.0
+            desired_sign = 1.0 if float(desired[k]) >= 0.0 else -1.0
+            if desired_sign == current_sign:
+                pending_signs[k] = 0.0
+                pending_counts[k] = 0
+                resolved[k] = current_sign
+                continue
+
+            decisive_votes = int(pos_count[k] + neg_count[k])
+            desired_votes = int(pos_count[k] if desired_sign > 0.0 else neg_count[k])
+            desired_share = (float(desired_votes) / float(decisive_votes)) if decisive_votes > 0 else 0.0
+            if desired_share < flip_min_share:
+                pending_signs[k] = 0.0
+                pending_counts[k] = 0
+                resolved[k] = current_sign
+                continue
+
+            if hysteresis_rounds <= 1:
+                resolved[k] = desired_sign
+                pending_signs[k] = 0.0
+                pending_counts[k] = 0
+                continue
+
+            if float(pending_signs[k]) == desired_sign:
+                pending_counts[k] += 1
+            else:
+                pending_signs[k] = desired_sign
+                pending_counts[k] = 1
+
+            if int(pending_counts[k]) >= hysteresis_rounds:
+                resolved[k] = desired_sign
+                pending_signs[k] = 0.0
+                pending_counts[k] = 0
+            else:
+                resolved[k] = current_sign
+
+        self.surrogate_direction_pending_signs = pending_signs
+        self.surrogate_direction_pending_counts = pending_counts
         return resolved
 
     def _apply_surrogate_direction_to_params(
@@ -3623,12 +3731,11 @@ class SubproblemSurrogateTrainer:
             or current_cost_lr != resolved_cost_learning_rate
         ):
             # 分离 x/pg 辅助成本头参数，主优化器不管理这些低学习率头
-            aux_params = set(self.surrogate_net.cost_net.parameters()) | set(self.surrogate_net.pg_cost_net.parameters())
-            main_params = [p for p in self.surrogate_net.parameters() if p not in aux_params]
+            main_params = self._main_network_parameters()
             self._surr_optimizer = optim.Adam(
                 main_params, lr=resolved_learning_rate, weight_decay=1e-4)
             self._surr_cost_optimizer = optim.Adam(
-                self.surrogate_net.cost_net.parameters(),
+                self._cost_network_parameters(),
                 lr=resolved_cost_learning_rate,
                 weight_decay=1e-4,
             )
@@ -3735,7 +3842,7 @@ class SubproblemSurrogateTrainer:
             or current_pg_cost_lr != resolved_learning_rate
         ):
             self._surr_pg_cost_optimizer = optim.Adam(
-                self.surrogate_net.pg_cost_net.parameters(),
+                self._pg_network_parameters(),
                 lr=resolved_learning_rate,
                 weight_decay=1e-4,
             )
@@ -3780,7 +3887,7 @@ class SubproblemSurrogateTrainer:
 
                     if batch_count == resolved_batch_size or sample_pos == self.n_samples - 1:
                         torch.nn.utils.clip_grad_norm_(
-                            self.surrogate_net.pg_cost_net.parameters(),
+                            self._pg_network_parameters(),
                             max_norm=1.0,
                         )
                         self._surr_pg_cost_optimizer.step()
@@ -4519,6 +4626,8 @@ class SubproblemSurrogateTrainer:
                 'pg_cost_scale': self.pg_cost_scale,
                 'mu': self.mu,
                 'surrogate_direction_signs': self._get_surrogate_direction_signs(),
+                'surrogate_direction_pending_signs': self.surrogate_direction_pending_signs,
+                'surrogate_direction_pending_counts': self.surrogate_direction_pending_counts,
                 'rho_primal': self.rho_primal,
                 'rho_dual': self.rho_dual,
                 'rho_dual_pg': self.rho_dual_pg,
@@ -4535,11 +4644,14 @@ class SubproblemSurrogateTrainer:
                 'mu_individual_lower_bound_round': self.mu_individual_lower_bound_round,
                 'mu_group_lower_bound_round': self.mu_group_lower_bound_round,
                 'mu_signed_round_interval': self.mu_signed_round_interval,
+                'mu_sign_hysteresis_rounds': self.mu_sign_hysteresis_rounds,
+                'mu_sign_flip_min_share': self.mu_sign_flip_min_share,
                 'x_bound_dual_zero_rounds': self.x_bound_dual_zero_rounds,
                 'pg_cost_start_round': self.pg_cost_start_round,
                 'pg_cost_scale_multiplier': self.pg_cost_scale_multiplier,
                 'nn_learning_rate': self.nn_learning_rate,
                 'nn_hidden_dims': self.nn_hidden_dims,
+                'pg_cost_hidden_dims': self.pg_cost_hidden_dims,
                 'cost_learning_rate': self.cost_learning_rate,
                 'pg_cost_lr': self.pg_cost_lr,
                 'pg_cost_surr_lr': self.pg_cost_surr_lr,
@@ -4576,13 +4688,35 @@ class SubproblemSurrogateTrainer:
         """加载V3模型"""
         if TORCH_AVAILABLE:
             state = torch.load(filepath, map_location=self.device, weights_only=False)
+            rebuild_network = False
             saved_hidden_dims = state.get('nn_hidden_dims')
             if saved_hidden_dims is not None:
                 resolved_hidden_dims = normalize_nn_hidden_dims(saved_hidden_dims, self.nn_hidden_dims)
                 if resolved_hidden_dims != self.nn_hidden_dims:
                     self.nn_hidden_dims = resolved_hidden_dims
-                    self._init_neural_network()
-            self.surrogate_net.load_state_dict(state['surrogate_net_state_dict'], strict=False)
+                    rebuild_network = True
+            saved_pg_cost_hidden_dims = state.get('pg_cost_hidden_dims')
+            if saved_pg_cost_hidden_dims is not None:
+                resolved_pg_cost_hidden_dims = normalize_nn_hidden_dims(
+                    saved_pg_cost_hidden_dims,
+                    self.pg_cost_hidden_dims,
+                )
+                if resolved_pg_cost_hidden_dims != self.pg_cost_hidden_dims:
+                    self.pg_cost_hidden_dims = resolved_pg_cost_hidden_dims
+                    rebuild_network = True
+            if rebuild_network:
+                self._init_neural_network()
+            surrogate_state_dict = dict(state['surrogate_net_state_dict'])
+            if 'pg_input_proj.weight' not in surrogate_state_dict and 'input_proj.weight' in surrogate_state_dict:
+                surrogate_state_dict['pg_input_proj.weight'] = surrogate_state_dict['input_proj.weight'].clone()
+                surrogate_state_dict['pg_input_proj.bias'] = surrogate_state_dict['input_proj.bias'].clone()
+                for block_idx in range(len(self.surrogate_net.pg_res_blocks)):
+                    for suffix in ('fc1.weight', 'fc1.bias', 'ln1.weight', 'ln1.bias', 'fc2.weight', 'fc2.bias', 'ln2.weight', 'ln2.bias'):
+                        main_key = f'res_blocks.{block_idx}.{suffix}'
+                        pg_key = f'pg_res_blocks.{block_idx}.{suffix}'
+                        if main_key in surrogate_state_dict and pg_key not in surrogate_state_dict:
+                            surrogate_state_dict[pg_key] = surrogate_state_dict[main_key].clone()
+            self.surrogate_net.load_state_dict(surrogate_state_dict, strict=False)
             self.optimizer.load_state_dict(state['optimizer_state_dict'])
             self.alpha_values = state['alpha_values']
             self.beta_values = state['beta_values']
@@ -4598,6 +4732,16 @@ class SubproblemSurrogateTrainer:
                 self.surrogate_direction_signs = np.ones(self.num_coupling_constraints, dtype=float)
             else:
                 self.surrogate_direction_signs = np.asarray(loaded_direction_signs, dtype=float).reshape(-1)
+            loaded_pending_signs = state.get('surrogate_direction_pending_signs')
+            if loaded_pending_signs is None:
+                self.surrogate_direction_pending_signs = np.zeros(self.num_coupling_constraints, dtype=float)
+            else:
+                self.surrogate_direction_pending_signs = np.asarray(loaded_pending_signs, dtype=float).reshape(-1)
+            loaded_pending_counts = state.get('surrogate_direction_pending_counts')
+            if loaded_pending_counts is None:
+                self.surrogate_direction_pending_counts = np.zeros(self.num_coupling_constraints, dtype=int)
+            else:
+                self.surrogate_direction_pending_counts = np.asarray(loaded_pending_counts, dtype=int).reshape(-1)
             self.rho_primal = state['rho_primal']
             self.rho_dual_pg = state.get('rho_dual_pg', state.get('rho_dual', self.rho_dual_pg))
             self.rho_dual_x = state.get('rho_dual_x', state.get('rho_dual', self.rho_dual_x))
@@ -4631,6 +4775,14 @@ class SubproblemSurrogateTrainer:
                 int(state.get('mu_signed_round_interval', self.mu_signed_round_interval)),
                 0,
             )
+            self.mu_sign_hysteresis_rounds = max(
+                int(state.get('mu_sign_hysteresis_rounds', self.mu_sign_hysteresis_rounds)),
+                1,
+            )
+            self.mu_sign_flip_min_share = min(
+                max(float(state.get('mu_sign_flip_min_share', self.mu_sign_flip_min_share)), 0.5),
+                1.0,
+            )
             self.x_bound_dual_zero_rounds = max(
                 int(state.get('x_bound_dual_zero_rounds', self.x_bound_dual_zero_rounds)),
                 0,
@@ -4644,6 +4796,10 @@ class SubproblemSurrogateTrainer:
             self.nn_hidden_dims = normalize_nn_hidden_dims(
                 state.get('nn_hidden_dims'),
                 self.nn_hidden_dims,
+            )
+            self.pg_cost_hidden_dims = normalize_nn_hidden_dims(
+                state.get('pg_cost_hidden_dims'),
+                self.pg_cost_hidden_dims,
             )
             self.cost_learning_rate = state.get('cost_learning_rate', self.cost_learning_rate)
             self.pg_cost_lr = state.get('pg_cost_lr', self.pg_cost_lr)
@@ -4716,6 +4872,7 @@ class SubproblemSurrogateTrainer:
             self.num_coupling_constraints = state.get('num_coupling_constraints', self.num_coupling_constraints)
             self.template_rhs_base_vector = self._build_template_rhs_base_vector(self.num_coupling_constraints)
             self.surrogate_direction_signs = self._get_surrogate_direction_signs()
+            self._ensure_surrogate_direction_hysteresis_buffers()
             if 'lambda_inherent' in state:
                 self.lambda_inherent = state['lambda_inherent']
             print(f"✓ V3三时段耦合代理约束模型已加载: {filepath}", flush=True)
@@ -4736,8 +4893,11 @@ def _load_surrogate_model_metadata(filepath: str, device=None) -> dict:
         'mu_individual_lower_bound_round': state.get('mu_individual_lower_bound_round'),
         'mu_group_lower_bound_round': state.get('mu_group_lower_bound_round'),
         'mu_signed_round_interval': state.get('mu_signed_round_interval'),
+        'mu_sign_hysteresis_rounds': state.get('mu_sign_hysteresis_rounds'),
+        'mu_sign_flip_min_share': state.get('mu_sign_flip_min_share'),
         'surrogate_direction_signs': state.get('surrogate_direction_signs'),
         'nn_hidden_dims': state.get('nn_hidden_dims'),
+        'pg_cost_hidden_dims': state.get('pg_cost_hidden_dims', state.get('nn_hidden_dims')),
     }
 
 
@@ -4809,6 +4969,8 @@ def train_subproblem_surrogate_from_data(ppc, active_set_data: List[Dict], unit_
                                           mu_individual_lower_bound_round: int = 3,
                                           mu_group_lower_bound_round: int = 50,
                                           mu_signed_round_interval: int | None = None,
+                                          mu_sign_hysteresis_rounds: int = 2,
+                                          mu_sign_flip_min_share: float = 0.67,
                                           pg_cost_start_round: int = 3,
                                           pg_cost_scale_multiplier: float = 1.2,
                                           nn_learning_rate: float = 1e-4,
@@ -4857,6 +5019,8 @@ def train_subproblem_surrogate_from_data(ppc, active_set_data: List[Dict], unit_
         mu_individual_lower_bound_round=mu_individual_lower_bound_round,
         mu_group_lower_bound_round=mu_group_lower_bound_round,
         mu_signed_round_interval=mu_signed_round_interval,
+        mu_sign_hysteresis_rounds=mu_sign_hysteresis_rounds,
+        mu_sign_flip_min_share=mu_sign_flip_min_share,
         pg_cost_start_round=pg_cost_start_round,
         pg_cost_scale_multiplier=pg_cost_scale_multiplier,
         nn_learning_rate=nn_learning_rate,
@@ -4904,6 +5068,8 @@ def train_all_subproblem_surrogates(ppc, active_set_data: List[Dict], T_delta: f
                                       mu_individual_lower_bound_round: int = 3,
                                       mu_group_lower_bound_round: int = 50,
                                       mu_signed_round_interval: int | None = None,
+                                      mu_sign_hysteresis_rounds: int = 2,
+                                      mu_sign_flip_min_share: float = 0.67,
                                        pg_cost_start_round: int = 3,
                                        pg_cost_scale_multiplier: float = 1.2,
                                        nn_learning_rate: float = 1e-4,
@@ -4962,6 +5128,8 @@ def train_all_subproblem_surrogates(ppc, active_set_data: List[Dict], T_delta: f
             mu_individual_lower_bound_round=mu_individual_lower_bound_round,
             mu_group_lower_bound_round=mu_group_lower_bound_round,
             mu_signed_round_interval=mu_signed_round_interval,
+            mu_sign_hysteresis_rounds=mu_sign_hysteresis_rounds,
+            mu_sign_flip_min_share=mu_sign_flip_min_share,
             pg_cost_start_round=pg_cost_start_round,
             pg_cost_scale_multiplier=pg_cost_scale_multiplier,
             nn_learning_rate=nn_learning_rate,
@@ -5193,6 +5361,7 @@ def load_trained_models(ppc, active_set_data: List[Dict], T_delta: float,
             constraint_generation_strategy=requested_strategy,
             ignore_startup_shutdown_costs=requested_ignore_startup_shutdown_costs,
             nn_hidden_dims=metadata.get('nn_hidden_dims'),
+            pg_cost_hidden_dims=metadata.get('pg_cost_hidden_dims'),
             device=device,
         )
         trainer.load(surrogate_path)

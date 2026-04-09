@@ -92,10 +92,13 @@ class ParallelSubproblemSurrogateTrainer(SubproblemSurrogateTrainer):
         mu_individual_lower_bound_round: int = 3,
         mu_group_lower_bound_round: int = 50,
         mu_signed_round_interval: int | None = None,
+        mu_sign_hysteresis_rounds: int = 2,
+        mu_sign_flip_min_share: float = 0.67,
         x_bound_dual_zero_rounds: int = 0,
         pg_cost_start_round: int = 3,
         pg_cost_scale_multiplier: float = 1.2,
         nn_hidden_dims: list[int] | None = None,
+        pg_cost_hidden_dims: list[int] | None = None,
         nn_learning_rate: float = 1e-4,
         cost_learning_rate: float = 1e-5,
         pg_cost_lr: float = 2e-5,
@@ -137,10 +140,13 @@ class ParallelSubproblemSurrogateTrainer(SubproblemSurrogateTrainer):
             mu_individual_lower_bound_round=mu_individual_lower_bound_round,
             mu_group_lower_bound_round=mu_group_lower_bound_round,
             mu_signed_round_interval=mu_signed_round_interval,
+            mu_sign_hysteresis_rounds=mu_sign_hysteresis_rounds,
+            mu_sign_flip_min_share=mu_sign_flip_min_share,
             x_bound_dual_zero_rounds=x_bound_dual_zero_rounds,
             pg_cost_start_round=pg_cost_start_round,
             pg_cost_scale_multiplier=pg_cost_scale_multiplier,
             nn_hidden_dims=nn_hidden_dims,
+            pg_cost_hidden_dims=pg_cost_hidden_dims,
             nn_learning_rate=nn_learning_rate,
             cost_learning_rate=cost_learning_rate,
             pg_cost_lr=pg_cost_lr,
@@ -413,6 +419,8 @@ def _train_unit_worker(args: dict) -> dict:
     mu_individual_lower_bound_round = args.get('mu_individual_lower_bound_round', 3)
     mu_group_lower_bound_round = args.get('mu_group_lower_bound_round', 50)
     mu_signed_round_interval = args.get('mu_signed_round_interval')
+    mu_sign_hysteresis_rounds = args.get('mu_sign_hysteresis_rounds', 2)
+    mu_sign_flip_min_share = args.get('mu_sign_flip_min_share', 0.67)
     sample_n_workers    = args.get('sample_n_workers', 4)
     use_sample_parallel = args.get('use_sample_parallel', True)
     save_dir            = args.get('save_dir')
@@ -436,6 +444,8 @@ def _train_unit_worker(args: dict) -> dict:
             mu_individual_lower_bound_round=mu_individual_lower_bound_round,
             mu_group_lower_bound_round=mu_group_lower_bound_round,
             mu_signed_round_interval=mu_signed_round_interval,
+            mu_sign_hysteresis_rounds=mu_sign_hysteresis_rounds,
+            mu_sign_flip_min_share=mu_sign_flip_min_share,
             n_workers=sample_n_workers,
         )
     else:
@@ -446,6 +456,8 @@ def _train_unit_worker(args: dict) -> dict:
             mu_individual_lower_bound_round=mu_individual_lower_bound_round,
             mu_group_lower_bound_round=mu_group_lower_bound_round,
             mu_signed_round_interval=mu_signed_round_interval,
+            mu_sign_hysteresis_rounds=mu_sign_hysteresis_rounds,
+            mu_sign_flip_min_share=mu_sign_flip_min_share,
         )
 
     trainer.iter(max_iter=max_iter, nn_epochs=nn_epochs)
@@ -608,6 +620,8 @@ def train_all_surrogates_parallel(
     mu_individual_lower_bound_round: int = 3,
     mu_group_lower_bound_round: int = 50,
     mu_signed_round_interval: int | None = None,
+    mu_sign_hysteresis_rounds: int = 2,
+    mu_sign_flip_min_share: float = 0.67,
     save_dir: Optional[str] = None,
     device=None,
     n_workers: Optional[int] = None,
@@ -692,6 +706,8 @@ def train_all_surrogates_parallel(
             'mu_individual_lower_bound_round': mu_individual_lower_bound_round,
             'mu_group_lower_bound_round': mu_group_lower_bound_round,
             'mu_signed_round_interval': mu_signed_round_interval,
+            'mu_sign_hysteresis_rounds': mu_sign_hysteresis_rounds,
+            'mu_sign_flip_min_share': mu_sign_flip_min_share,
             'sample_n_workers':   sample_n_workers,
             'use_sample_parallel': use_sample_parallel,
             'save_dir':           save_dir,

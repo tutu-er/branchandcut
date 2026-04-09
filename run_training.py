@@ -145,9 +145,12 @@ SUBPROBLEM_MU_DUAL_FLOOR_INIT = 3
 SUBPROBLEM_MU_DUAL_FLOOR_INDIVIDUAL_ROUND = round(SUBPROBLEM_MAX_ITER-10)
 SUBPROBLEM_MU_DUAL_FLOOR_DECAY_ROUND = round(SUBPROBLEM_MAX_ITER-10)
 SUBPROBLEM_MU_SIGNED_ROUND_INTERVAL = 4
+SUBPROBLEM_MU_SIGN_HYSTERESIS_ROUNDS = 2
+SUBPROBLEM_MU_SIGN_FLIP_MIN_SHARE = 0.67
 SUBPROBLEM_X_BOUND_DUAL_ZERO_ROUNDS = 0
 SUBPROBLEM_NN_BATCH_STRATEGY = 'full-batch'   # 'full-batch' / 'mini-batch'
 SUBPROBLEM_NN_SIZE = 'medium'   # 'small' / 'medium' / 'large'
+SUBPROBLEM_C_PG_NN_SIZE = 'medium'   # 'small' / 'medium' / 'large'
 SUBPROBLEM_NN_BATCH_SIZE = 4
 SUBPROBLEM_NN_SHUFFLE = True
 SUBPROBLEM_NN_LR = 5e-4
@@ -446,8 +449,11 @@ def create_subproblem_trainer(ppc, all_samples, T_DELTA, unit_id: int, *,
                               mu_individual_lower_bound_round: int = 3,
                               mu_group_lower_bound_round: int = 50,
                               mu_signed_round_interval: int | None = None,
+                              mu_sign_hysteresis_rounds: int = 2,
+                              mu_sign_flip_min_share: float = 0.67,
                               x_bound_dual_zero_rounds: int = 0,
                               subproblem_nn_hidden_dims: list[int] | None = None,
+                              subproblem_c_pg_nn_hidden_dims: list[int] | None = None,
                               subproblem_nn_batch_strategy: str = 'full-batch',
                               subproblem_nn_batch_size: int = 4,
                               subproblem_nn_shuffle: bool = True,
@@ -487,8 +493,11 @@ def create_subproblem_trainer(ppc, all_samples, T_DELTA, unit_id: int, *,
                 mu_individual_lower_bound_round=mu_individual_lower_bound_round,
                 mu_group_lower_bound_round=mu_group_lower_bound_round,
                 mu_signed_round_interval=mu_signed_round_interval,
+                mu_sign_hysteresis_rounds=mu_sign_hysteresis_rounds,
+                mu_sign_flip_min_share=mu_sign_flip_min_share,
                 x_bound_dual_zero_rounds=x_bound_dual_zero_rounds,
                 nn_hidden_dims=subproblem_nn_hidden_dims,
+                pg_cost_hidden_dims=subproblem_c_pg_nn_hidden_dims,
         nn_batch_strategy=subproblem_nn_batch_strategy,
         nn_batch_size=subproblem_nn_batch_size,
         nn_shuffle=subproblem_nn_shuffle,
@@ -525,6 +534,8 @@ def run_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS,
                   dual_learning_rate: float = 5e-4,
                   subproblem_nn_size: str = 'medium',
                   subproblem_nn_hidden_dims: list[int] | None = None,
+                  subproblem_c_pg_nn_size: str = 'medium',
+                  subproblem_c_pg_nn_hidden_dims: list[int] | None = None,
                   constraint_generation_strategy: str = 'sensitive',
                   rho_primal_init: float = 1e-3,
                   rho_dual_init: float = 1e-3,
@@ -544,6 +555,8 @@ def run_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS,
                   mu_individual_lower_bound_round: int = 3,
                   mu_group_lower_bound_round: int = 50,
                   mu_signed_round_interval: int | None = None,
+                  mu_sign_hysteresis_rounds: int = 2,
+                  mu_sign_flip_min_share: float = 0.67,
                   x_bound_dual_zero_rounds: int = 0,
                   subproblem_nn_batch_strategy: str = 'full-batch',
                   subproblem_nn_batch_size: int = 4,
@@ -585,6 +598,7 @@ def run_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS,
         f"subproblem_nn: batch_strategy={subproblem_nn_batch_strategy}, "
         f"batch_size={subproblem_nn_batch_size}, shuffle={subproblem_nn_shuffle}, "
         f"size={subproblem_nn_size}, hidden_dims={subproblem_nn_hidden_dims}, "
+        f"c_pg_size={subproblem_c_pg_nn_size}, c_pg_hidden_dims={subproblem_c_pg_nn_hidden_dims}, "
         f"ignore_startup_shutdown_costs={ignore_startup_shutdown_costs}, "
         f"main_lr={subproblem_nn_learning_rate}, x_cost_lr={subproblem_cost_learning_rate}, "
         f"nn_smooth_eps={subproblem_nn_smooth_abs_eps}, "
@@ -670,8 +684,11 @@ def run_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS,
                 mu_individual_lower_bound_round=mu_individual_lower_bound_round,
                 mu_group_lower_bound_round=mu_group_lower_bound_round,
                 mu_signed_round_interval=mu_signed_round_interval,
+                mu_sign_hysteresis_rounds=mu_sign_hysteresis_rounds,
+                mu_sign_flip_min_share=mu_sign_flip_min_share,
                 x_bound_dual_zero_rounds=x_bound_dual_zero_rounds,
                 nn_hidden_dims=subproblem_nn_hidden_dims,
+                pg_cost_hidden_dims=subproblem_c_pg_nn_hidden_dims,
                 nn_batch_strategy=subproblem_nn_batch_strategy,
                 nn_batch_size=subproblem_nn_batch_size,
                 nn_shuffle=subproblem_nn_shuffle,
@@ -714,8 +731,11 @@ def run_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS,
                 mu_individual_lower_bound_round=mu_individual_lower_bound_round,
                 mu_group_lower_bound_round=mu_group_lower_bound_round,
                 mu_signed_round_interval=mu_signed_round_interval,
+                mu_sign_hysteresis_rounds=mu_sign_hysteresis_rounds,
+                mu_sign_flip_min_share=mu_sign_flip_min_share,
                 x_bound_dual_zero_rounds=x_bound_dual_zero_rounds,
                 nn_hidden_dims=subproblem_nn_hidden_dims,
+                pg_cost_hidden_dims=subproblem_c_pg_nn_hidden_dims,
                 nn_batch_strategy=subproblem_nn_batch_strategy,
                 nn_batch_size=subproblem_nn_batch_size,
                 nn_shuffle=subproblem_nn_shuffle,
@@ -1339,6 +1359,8 @@ def main():
     SUBPROBLEM_MU_DUAL_FLOOR_INDIVIDUAL_ROUND_VALUE = SUBPROBLEM_MU_DUAL_FLOOR_INDIVIDUAL_ROUND
     SUBPROBLEM_MU_DUAL_FLOOR_DECAY_ROUND_VALUE = SUBPROBLEM_MU_DUAL_FLOOR_DECAY_ROUND
     SUBPROBLEM_MU_SIGNED_ROUND_INTERVAL_VALUE = SUBPROBLEM_MU_SIGNED_ROUND_INTERVAL
+    SUBPROBLEM_MU_SIGN_HYSTERESIS_ROUNDS_VALUE = SUBPROBLEM_MU_SIGN_HYSTERESIS_ROUNDS
+    SUBPROBLEM_MU_SIGN_FLIP_MIN_SHARE_VALUE = SUBPROBLEM_MU_SIGN_FLIP_MIN_SHARE
     SUBPROBLEM_X_BOUND_DUAL_ZERO_ROUNDS_VALUE = SUBPROBLEM_X_BOUND_DUAL_ZERO_ROUNDS
     SUBPROBLEM_NN_BATCH_STRATEGY_VALUE = SUBPROBLEM_NN_BATCH_STRATEGY
     SUBPROBLEM_NN_BATCH_SIZE_VALUE = SUBPROBLEM_NN_BATCH_SIZE
@@ -1349,6 +1371,11 @@ def main():
         SUBPROBLEM_NN_SIZE,
         SUBPROBLEM_NN_HIDDEN_DIM_OPTIONS,
         'SUBPROBLEM_NN_SIZE',
+    )
+    SUBPROBLEM_C_PG_NN_SIZE_VALUE, SUBPROBLEM_C_PG_NN_HIDDEN_DIMS_VALUE = resolve_nn_hidden_dims(
+        SUBPROBLEM_C_PG_NN_SIZE,
+        SUBPROBLEM_NN_HIDDEN_DIM_OPTIONS,
+        'SUBPROBLEM_C_PG_NN_SIZE',
     )
     SUBPROBLEM_X_COST_NN_LR_VALUE = SUBPROBLEM_X_COST_NN_LR
     SUBPROBLEM_PG_COST_NN_EPOCHS_VALUE = SUBPROBLEM_PG_COST_NN_EPOCHS
@@ -1385,7 +1412,8 @@ def main():
     log(f"  {n_units} 机组，{n_buses} 节点")
     log(
         f"NN size config: BCD={BCD_NN_SIZE_VALUE} {BCD_NN_HIDDEN_DIMS_VALUE}, "
-        f"subproblem={SUBPROBLEM_NN_SIZE_VALUE} {SUBPROBLEM_NN_HIDDEN_DIMS_VALUE}"
+        f"subproblem={SUBPROBLEM_NN_SIZE_VALUE} {SUBPROBLEM_NN_HIDDEN_DIMS_VALUE}, "
+        f"subproblem_c_pg={SUBPROBLEM_C_PG_NN_SIZE_VALUE} {SUBPROBLEM_C_PG_NN_HIDDEN_DIMS_VALUE}"
     )
     log(
         f"Loss ratio config: BCD(primal={BCD_LOSS_RATIO_PRIMAL_VALUE}, dual_x={BCD_LOSS_RATIO_DUAL_X_VALUE}, "
@@ -1568,9 +1596,13 @@ def main():
                     mu_individual_lower_bound_round=SUBPROBLEM_MU_DUAL_FLOOR_INDIVIDUAL_ROUND_VALUE,
                     mu_group_lower_bound_round=SUBPROBLEM_MU_DUAL_FLOOR_DECAY_ROUND_VALUE,
                     mu_signed_round_interval=SUBPROBLEM_MU_SIGNED_ROUND_INTERVAL_VALUE,
+                    mu_sign_hysteresis_rounds=SUBPROBLEM_MU_SIGN_HYSTERESIS_ROUNDS_VALUE,
+                    mu_sign_flip_min_share=SUBPROBLEM_MU_SIGN_FLIP_MIN_SHARE_VALUE,
                     x_bound_dual_zero_rounds=SUBPROBLEM_X_BOUND_DUAL_ZERO_ROUNDS_VALUE,
                     subproblem_nn_size=SUBPROBLEM_NN_SIZE_VALUE,
                     subproblem_nn_hidden_dims=SUBPROBLEM_NN_HIDDEN_DIMS_VALUE,
+                    subproblem_c_pg_nn_size=SUBPROBLEM_C_PG_NN_SIZE_VALUE,
+                    subproblem_c_pg_nn_hidden_dims=SUBPROBLEM_C_PG_NN_HIDDEN_DIMS_VALUE,
                     subproblem_nn_batch_strategy=SUBPROBLEM_NN_BATCH_STRATEGY_VALUE,
                     subproblem_nn_batch_size=SUBPROBLEM_NN_BATCH_SIZE_VALUE,
                     subproblem_nn_shuffle=SUBPROBLEM_NN_SHUFFLE_VALUE,
@@ -1857,9 +1889,13 @@ def main():
                     mu_individual_lower_bound_round=SUBPROBLEM_MU_DUAL_FLOOR_INDIVIDUAL_ROUND_VALUE,
                     mu_group_lower_bound_round=SUBPROBLEM_MU_DUAL_FLOOR_DECAY_ROUND_VALUE,
                     mu_signed_round_interval=SUBPROBLEM_MU_SIGNED_ROUND_INTERVAL_VALUE,
+                    mu_sign_hysteresis_rounds=SUBPROBLEM_MU_SIGN_HYSTERESIS_ROUNDS_VALUE,
+                    mu_sign_flip_min_share=SUBPROBLEM_MU_SIGN_FLIP_MIN_SHARE_VALUE,
                     x_bound_dual_zero_rounds=SUBPROBLEM_X_BOUND_DUAL_ZERO_ROUNDS_VALUE,
                     subproblem_nn_size=SUBPROBLEM_NN_SIZE_VALUE,
                     subproblem_nn_hidden_dims=SUBPROBLEM_NN_HIDDEN_DIMS_VALUE,
+                    subproblem_c_pg_nn_size=SUBPROBLEM_C_PG_NN_SIZE_VALUE,
+                    subproblem_c_pg_nn_hidden_dims=SUBPROBLEM_C_PG_NN_HIDDEN_DIMS_VALUE,
                     subproblem_nn_batch_strategy=SUBPROBLEM_NN_BATCH_STRATEGY_VALUE,
                     subproblem_nn_batch_size=SUBPROBLEM_NN_BATCH_SIZE_VALUE,
                     subproblem_nn_shuffle=SUBPROBLEM_NN_SHUFFLE_VALUE,
