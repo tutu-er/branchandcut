@@ -131,6 +131,7 @@ SUBPROBLEM_RHO_DUAL_INIT = 1e-3
 SUBPROBLEM_RHO_DUAL_PG_INIT = 1e-1
 SUBPROBLEM_RHO_DUAL_X_INIT = 1e-1
 SUBPROBLEM_RHO_DUAL_COC_INIT = 1e1
+SUBPROBLEM_RHO_BINARY_INIT = 1.0
 SUBPROBLEM_RHO_OPT_INIT = 1e-1
 SUBPROBLEM_LOSS_RATIO_PRIMAL = 1.0
 SUBPROBLEM_LOSS_RATIO_DUAL_PG = 1.0
@@ -432,6 +433,7 @@ def create_subproblem_trainer(ppc, all_samples, T_DELTA, unit_id: int, *,
                               rho_dual_pg_init: float | None = None,
                               rho_dual_x_init: float | None = None,
                               rho_dual_coc_init: float | None = None,
+                              rho_binary_init: float = 1.0,
                               rho_opt_init: float = 1e-3,
                               loss_ratio_primal: float = 1.0,
                               loss_ratio_dual_pg: float = 1.0,
@@ -472,6 +474,7 @@ def create_subproblem_trainer(ppc, all_samples, T_DELTA, unit_id: int, *,
         rho_dual_pg_init=rho_dual_pg_init,
         rho_dual_x_init=rho_dual_x_init,
         rho_dual_coc_init=rho_dual_coc_init,
+        rho_binary_init=rho_binary_init,
         rho_opt_init=rho_opt_init,
         loss_ratio_primal=loss_ratio_primal,
         loss_ratio_dual_pg=loss_ratio_dual_pg,
@@ -528,6 +531,7 @@ def run_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS,
                   rho_dual_pg_init: float | None = None,
                   rho_dual_x_init: float | None = None,
                   rho_dual_coc_init: float | None = None,
+                  rho_binary_init: float = 1.0,
                   rho_opt_init: float = 1e-3,
                   loss_ratio_primal: float = 1.0,
                   loss_ratio_dual_pg: float = 1.0,
@@ -649,11 +653,12 @@ def run_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS,
                 lambda_predictor=dual_predictor,
                 constraint_generation_strategy=constraint_generation_strategy,
                 rho_primal_init=rho_primal_init,
-                rho_dual_init=rho_dual_init,
-                rho_dual_pg_init=rho_dual_pg_init,
-                rho_dual_x_init=rho_dual_x_init,
-                rho_dual_coc_init=rho_dual_coc_init,
-                rho_opt_init=rho_opt_init,
+        rho_dual_init=rho_dual_init,
+        rho_dual_pg_init=rho_dual_pg_init,
+        rho_dual_x_init=rho_dual_x_init,
+        rho_dual_coc_init=rho_dual_coc_init,
+        rho_binary_init=rho_binary_init,
+        rho_opt_init=rho_opt_init,
                 loss_ratio_primal=loss_ratio_primal,
                 loss_ratio_dual_pg=loss_ratio_dual_pg,
                 loss_ratio_dual_x=loss_ratio_dual_x,
@@ -1320,6 +1325,7 @@ def main():
     SUBPROBLEM_RHO_DUAL_PG_INIT_VALUE = SUBPROBLEM_RHO_DUAL_PG_INIT
     SUBPROBLEM_RHO_DUAL_X_INIT_VALUE = SUBPROBLEM_RHO_DUAL_X_INIT
     SUBPROBLEM_RHO_DUAL_COC_INIT_VALUE = SUBPROBLEM_RHO_DUAL_COC_INIT
+    SUBPROBLEM_RHO_BINARY_INIT_VALUE = SUBPROBLEM_RHO_BINARY_INIT
     SUBPROBLEM_RHO_OPT_INIT_VALUE = SUBPROBLEM_RHO_OPT_INIT
     SUBPROBLEM_LOSS_RATIO_PRIMAL_VALUE = SUBPROBLEM_LOSS_RATIO_PRIMAL
     SUBPROBLEM_LOSS_RATIO_DUAL_PG_VALUE = SUBPROBLEM_LOSS_RATIO_DUAL_PG
@@ -1549,6 +1555,7 @@ def main():
                     rho_dual_pg_init=SUBPROBLEM_RHO_DUAL_PG_INIT_VALUE,
                     rho_dual_x_init=SUBPROBLEM_RHO_DUAL_X_INIT_VALUE,
                     rho_dual_coc_init=SUBPROBLEM_RHO_DUAL_COC_INIT_VALUE,
+                    rho_binary_init=SUBPROBLEM_RHO_BINARY_INIT_VALUE,
                     rho_opt_init=SUBPROBLEM_RHO_OPT_INIT_VALUE,
                     loss_ratio_primal=SUBPROBLEM_LOSS_RATIO_PRIMAL_VALUE,
                     loss_ratio_dual_pg=SUBPROBLEM_LOSS_RATIO_DUAL_PG_VALUE,
@@ -1837,6 +1844,7 @@ def main():
                     rho_dual_pg_init=SUBPROBLEM_RHO_DUAL_PG_INIT_VALUE,
                     rho_dual_x_init=SUBPROBLEM_RHO_DUAL_X_INIT_VALUE,
                     rho_dual_coc_init=SUBPROBLEM_RHO_DUAL_COC_INIT_VALUE,
+                    rho_binary_init=SUBPROBLEM_RHO_BINARY_INIT_VALUE,
                     rho_opt_init=SUBPROBLEM_RHO_OPT_INIT_VALUE,
                     loss_ratio_primal=SUBPROBLEM_LOSS_RATIO_PRIMAL_VALUE,
                     loss_ratio_dual_pg=SUBPROBLEM_LOSS_RATIO_DUAL_PG_VALUE,
