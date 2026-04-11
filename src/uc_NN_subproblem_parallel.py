@@ -86,6 +86,7 @@ class ParallelSubproblemSurrogateTrainer(SubproblemSurrogateTrainer):
         rho_dual_pg_init: float | None = None,
         rho_dual_x_init: float | None = None,
         rho_dual_coc_init: float | None = None,
+        rho_binary_init: float = 1.0,
         rho_opt_init: float = 1e-3,
         gamma_base: float = 1e-3,
         mu_lower_bound_init: float = 0.1,
@@ -134,6 +135,7 @@ class ParallelSubproblemSurrogateTrainer(SubproblemSurrogateTrainer):
             rho_dual_pg_init=rho_dual_pg_init,
             rho_dual_x_init=rho_dual_x_init,
             rho_dual_coc_init=rho_dual_coc_init,
+            rho_binary_init=rho_binary_init,
             rho_opt_init=rho_opt_init,
             gamma_base=gamma_base,
             mu_lower_bound_init=mu_lower_bound_init,
@@ -415,6 +417,13 @@ def _train_unit_worker(args: dict) -> dict:
     T_delta             = args['T_delta']
     max_iter            = args['max_iter']
     nn_epochs           = args['nn_epochs']
+    rho_primal_init     = args.get('rho_primal_init', 1e-3)
+    rho_dual_init       = args.get('rho_dual_init', 1e-3)
+    rho_dual_pg_init    = args.get('rho_dual_pg_init')
+    rho_dual_x_init     = args.get('rho_dual_x_init')
+    rho_dual_coc_init   = args.get('rho_dual_coc_init')
+    rho_binary_init     = args.get('rho_binary_init', 1.0)
+    rho_opt_init        = args.get('rho_opt_init', 1e-3)
     gamma_base          = args.get('gamma_base', 1e-3)
     mu_individual_lower_bound_round = args.get('mu_individual_lower_bound_round', 3)
     mu_group_lower_bound_round = args.get('mu_group_lower_bound_round', 50)
@@ -440,6 +449,13 @@ def _train_unit_worker(args: dict) -> dict:
         trainer = ParallelSubproblemSurrogateTrainer(
             ppc, active_set_data, T_delta, unit_id,
             lambda_predictor=None,
+            rho_primal_init=rho_primal_init,
+            rho_dual_init=rho_dual_init,
+            rho_dual_pg_init=rho_dual_pg_init,
+            rho_dual_x_init=rho_dual_x_init,
+            rho_dual_coc_init=rho_dual_coc_init,
+            rho_binary_init=rho_binary_init,
+            rho_opt_init=rho_opt_init,
             gamma_base=gamma_base,
             mu_individual_lower_bound_round=mu_individual_lower_bound_round,
             mu_group_lower_bound_round=mu_group_lower_bound_round,
@@ -452,6 +468,13 @@ def _train_unit_worker(args: dict) -> dict:
         trainer = SubproblemSurrogateTrainer(
             ppc, active_set_data, T_delta, unit_id,
             lambda_predictor=None,
+            rho_primal_init=rho_primal_init,
+            rho_dual_init=rho_dual_init,
+            rho_dual_pg_init=rho_dual_pg_init,
+            rho_dual_x_init=rho_dual_x_init,
+            rho_dual_coc_init=rho_dual_coc_init,
+            rho_binary_init=rho_binary_init,
+            rho_opt_init=rho_opt_init,
             gamma_base=gamma_base,
             mu_individual_lower_bound_round=mu_individual_lower_bound_round,
             mu_group_lower_bound_round=mu_group_lower_bound_round,
@@ -616,6 +639,13 @@ def train_all_surrogates_parallel(
     unit_ids: Optional[List[int]] = None,
     max_iter: int = 20,
     nn_epochs: int = 10,
+    rho_primal_init: float = 1e-3,
+    rho_dual_init: float = 1e-3,
+    rho_dual_pg_init: float | None = None,
+    rho_dual_x_init: float | None = None,
+    rho_dual_coc_init: float | None = None,
+    rho_binary_init: float = 1.0,
+    rho_opt_init: float = 1e-3,
     gamma_base: float = 1e-3,
     mu_individual_lower_bound_round: int = 3,
     mu_group_lower_bound_round: int = 50,
@@ -702,6 +732,13 @@ def train_all_surrogates_parallel(
             'T_delta':            T_delta,
             'max_iter':           max_iter,
             'nn_epochs':          nn_epochs,
+            'rho_primal_init':    rho_primal_init,
+            'rho_dual_init':      rho_dual_init,
+            'rho_dual_pg_init':   rho_dual_pg_init,
+            'rho_dual_x_init':    rho_dual_x_init,
+            'rho_dual_coc_init':  rho_dual_coc_init,
+            'rho_binary_init':    rho_binary_init,
+            'rho_opt_init':       rho_opt_init,
             'gamma_base':         gamma_base,
             'mu_individual_lower_bound_round': mu_individual_lower_bound_round,
             'mu_group_lower_bound_round': mu_group_lower_bound_round,

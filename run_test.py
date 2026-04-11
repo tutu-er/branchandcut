@@ -89,11 +89,11 @@ BCD_GAMMA_BASE = 1e-2
 
 # surrogate / both 模式：已训练 surrogate 模型目录（训练时输出的带时间戳路径）
 # 设为 None 则自动查找 result/surrogate_models/ 下最新的匹配目录
-MODEL_DIR = "result/surrogate_models/subproblem_models_case3lite_20260408_202756"
+MODEL_DIR = None
 
 # bcd / both 模式：已训练 BCD 模型 .pth 文件路径
 # 设为 None 则自动查找 result/bcd_models/ 下最新的匹配文件
-BCD_MODEL_PATH = "result/bcd_models/bcd_model_case3lite_20260405_001203.pth"
+BCD_MODEL_PATH = None
 
 
 def _auto_discover_model_path(directory, glob_pattern, label):
@@ -215,6 +215,38 @@ if MODE in ('surrogate', 'both'):
 def log(msg: str) -> None:
     ts = datetime.now().strftime("%H:%M:%S")
     print(f"[{ts}] {msg}", flush=True)
+
+
+SECTION_WIDTH = 70
+
+
+def log_section(title: str, char: str = "=", width: int = SECTION_WIDTH) -> None:
+    print("\n" + char * width)
+    log(title)
+    print(char * width)
+
+
+def log_rule(char: str = "-", width: int = SECTION_WIDTH) -> None:
+    print("\n" + char * width)
+
+
+def _fmt_sample_tag(index: int, total: int, pd_shape) -> str:
+    return f"样本 {index + 1}/{total} | pd_shape={tuple(pd_shape)}"
+
+
+def _fmt_masked_commitment_metrics(label: str, metrics: dict) -> str:
+    hamming = metrics.get('hamming')
+    hamming_text = "n/a" if hamming is None else str(hamming)
+    return (
+        f"{label}: coverage={metrics['covered']}/{metrics['total']} | "
+        f"integ={metrics['integrality_gap']:.4f} | "
+        f"Hamming={hamming_text}"
+    )
+
+
+def _fmt_distance_metrics(label: str, l1: float, hamming: int | None) -> str:
+    hamming_text = "n/a" if hamming is None else str(hamming)
+    return f"{label}: L1={l1:.4f} | Hamming={hamming_text}"
 
 
 def _log_solution_similarity_summary(
@@ -1598,9 +1630,7 @@ def run_lp_compare_test(ppc, all_samples: list, dual_predictor, trainers: dict,
         [(x_LP, x_true), ...] 列表，每项对应一个样本�?
     """
     test_n = min(n_test, len(all_samples))
-    print("\n" + "=" * 70)
-    log(f"LP 松弛解质量评估: {test_n} 个样本")
-    print("=" * 70)
+    log_section(f"LP 松弛解质量评估 | samples={test_n}")
 
     x_LP_plain_list, x_LP_surr_list, x_true_list = [], [], []
     first_plot_payload = None
@@ -1608,7 +1638,7 @@ def run_lp_compare_test(ppc, all_samples: list, dual_predictor, trainers: dict,
     for i in range(test_n):
         sample = all_samples[i]
         pd_data = sample['pd_data']
-        log(f"  样本 {i + 1}/{test_n}，pd_data shape={pd_data.shape}")
+        log(_fmt_sample_tag(i, test_n, pd_data.shape))
         if i == 0:
             _log_lambda_prediction_summary(dual_predictor, sample, ppc['gen'].shape[0], pd_data.shape[1], "LP compare")
 
@@ -1618,7 +1648,7 @@ def run_lp_compare_test(ppc, all_samples: list, dual_predictor, trainers: dict,
             x_lp_surr = solve_global_LP_relaxation(ppc, sample, T_DELTA, trainers, lambda_val,
                                                    agent=agent)
         except Exception as e:
-            log(f"    LP 求解失败: {e}")
+            log(f"  LP 求解失败: {e}")
             continue
 
         x_true = _extract_true_solution(sample, x_lp_surr.shape)
@@ -1631,8 +1661,8 @@ def run_lp_compare_test(ppc, all_samples: list, dual_predictor, trainers: dict,
         integ_plain = float(np.mean(np.minimum(x_lp_plain, 1.0 - x_lp_plain)))
         integ_surr = float(np.mean(np.minimum(x_lp_surr, 1.0 - x_lp_surr)))
         log(
-            f"    LP: integ={integ_plain:.4f}  Hamming={hamming_plain} | "
-            f"Surrogate LP: integ={integ_surr:.4f}  Hamming={hamming_surr}"
+            f"  LP: integ={integ_plain:.4f} | Hamming={hamming_plain} | "
+            f"Surrogate LP: integ={integ_surr:.4f} | Hamming={hamming_surr}"
         )
 
         x_LP_plain_list.append(x_lp_plain)
@@ -1641,19 +1671,18 @@ def run_lp_compare_test(ppc, all_samples: list, dual_predictor, trainers: dict,
         if first_plot_payload is None:
             first_plot_payload = (i, x_true, x_lp_plain, x_lp_surr, x_sub)
 
-    print("\n" + "=" * 70)
+    log_section("LP 松弛解质量评估汇总")
     if x_LP_plain_list:
         mean_hamming = np.mean([int(np.sum((x_LP_plain_list[i] >= 0.5).astype(int)
                                            != x_true_list[i].astype(int)))
                                 for i in range(len(x_LP_plain_list))])
-        log(f"LP 评估完成: 平均 Hamming 距离 = {mean_hamming:.1f} bits")
+        log(f"LP 汇总: mean_hamming={mean_hamming:.1f} bits")
         _log_solution_similarity_summary(
             "Standard LP",
             x_LP_plain_list,
             "Surrogate LP",
             x_LP_surr_list,
         )
-        print("=" * 70)
         plot_lp_vs_true(x_LP_plain_list, x_true_list, fig_dir, CASE_NAME)
         if first_plot_payload is not None:
             sample_id, x_true, x_lp_plain, x_lp_surr, x_sub = first_plot_payload
@@ -1682,9 +1711,9 @@ def run_subproblem_milp_test(
         for unit_id in trainers
         if 0 <= int(unit_id) < int(ppc['gen'].shape[0])
     )
-    print("\n" + "=" * 70)
-    log(f"Subproblem surrogate MILP 测试: {test_n} 个样本, active_units={active_units}")
-    print("=" * 70)
+    log_section(
+        f"Subproblem surrogate LP/MILP 对比 | samples={test_n} | active_units={active_units}"
+    )
 
     if not active_units:
         log("未加载任何机组 surrogate 模型，跳过 subproblem MILP 测试")
@@ -1697,11 +1726,11 @@ def run_subproblem_milp_test(
     for i in range(test_n):
         sample = all_samples[i]
         pd_data = sample['pd_data']
-        log(f"  样本 {i + 1}/{test_n}，pd_data shape={pd_data.shape}")
+        log(_fmt_sample_tag(i, test_n, pd_data.shape))
         try:
             lambda_val = dual_predictor.predict(sample)
         except Exception as exc:
-            log(f"    dual predictor 失败，跳过 ({exc})")
+            log(f"  dual predictor 失败，跳过: {exc}")
             continue
 
         x_true_full = _extract_true_solution(sample, (ppc['gen'].shape[0], pd_data.shape[1]))
@@ -1741,21 +1770,18 @@ def run_subproblem_milp_test(
         milp_solutions.append(x_sub_milp)
 
         log(
-            "    LP: "
-            f"coverage={lp_metrics['covered']}/{lp_metrics['total']}, "
-            f"integ={lp_metrics['integrality_gap']:.4f}, "
-            f"Hamming={lp_metrics['hamming']} | "
-            "MILP: "
-            f"coverage={milp_metrics['covered']}/{milp_metrics['total']}, "
-            f"integ={milp_metrics['integrality_gap']:.4f}, "
-            f"Hamming={milp_metrics['hamming']} | "
-            "LP vs MILP: "
-            f"L1={lp_vs_milp['l1']:.4f}, "
-            f"Hamming={lp_vs_milp['hamming']}"
+            "  "
+            + " | ".join(
+                [
+                    _fmt_masked_commitment_metrics("LP", lp_metrics),
+                    _fmt_masked_commitment_metrics("MILP", milp_metrics),
+                    _fmt_distance_metrics("LP vs MILP", lp_vs_milp['l1'], lp_vs_milp['hamming']),
+                ]
+            )
         )
 
     if results:
-        print("\n" + "=" * 70)
+        log_section("Subproblem surrogate LP/MILP 汇总")
         valid_lp = [r['lp'] for r in results if r['lp']['hamming'] is not None]
         valid_milp = [r['milp'] for r in results if r['milp']['hamming'] is not None]
         valid_diff = [r['lp_vs_milp'] for r in results if r['lp_vs_milp']['hamming'] is not None]
@@ -1780,7 +1806,6 @@ def run_subproblem_milp_test(
             "Subproblem MILP",
             milp_solutions,
         )
-        print("=" * 70)
 
     return results
 
@@ -1791,9 +1816,7 @@ def run_fp_test(ppc, all_samples: list, dual_predictor, trainers: dict,
                 fig_dir: Path | None = None) -> list:
     """对多个样本运行可行性泵并汇总结果。"""
     test_n = min(n_test, len(all_samples))
-    print("\n" + "=" * 70)
-    log(f"可行性泵测试: {test_n} 个样本")
-    print("=" * 70)
+    log_section(f"可行性泵测试 | samples={test_n}")
 
     results = []
     screening_records = []
@@ -1803,11 +1826,11 @@ def run_fp_test(ppc, all_samples: list, dual_predictor, trainers: dict,
     if CASE_NAME == 'case3lite' and USE_CASE3LITE_CUSTOM_FP:
         custom_fp_plot_dir = (Path(__file__).parent / CASE3LITE_CUSTOM_FP_PLOT_DIR).resolve()
         custom_fp_plot_dir.mkdir(parents=True, exist_ok=True)
-        log(f"  case3lite custom FP plots -> {custom_fp_plot_dir}")
+        log(f"case3lite custom FP plots | dir={custom_fp_plot_dir}")
     for i in range(test_n):
         sample = all_samples[i]
         pd_data = sample['pd_data']
-        log(f"  样本 {i + 1}/{test_n}，pd_data shape={pd_data.shape}")
+        log(_fmt_sample_tag(i, test_n, pd_data.shape))
         if i == 0:
             _log_lambda_prediction_summary(dual_predictor, sample, ppc['gen'].shape[0], pd_data.shape[1], "FP")
         try:
@@ -1861,28 +1884,26 @@ def run_fp_test(ppc, all_samples: list, dual_predictor, trainers: dict,
                         }
                     )
                     log(
-                        "    FP筛选对比: "
-                        f"hot_starts {screen_summary.get('hot_starts_before', 0)} -> {screen_summary.get('hot_starts_after', 0)}, "
-                        f"x_pool {screen_summary.get('x_pool_before', 0)} -> {screen_summary.get('x_pool_after', 0)}, "
-                        f"stable_rows={screen_summary.get('n_constraints', 0)}, "
-                        f"soft_penalty={fp_details.get('surrogate_screen_soft_penalty', 0.0):.2f}, "
+                        "  FP筛选: "
+                        f"hot_starts {screen_summary.get('hot_starts_before', 0)} -> {screen_summary.get('hot_starts_after', 0)} | "
+                        f"x_pool {screen_summary.get('x_pool_before', 0)} -> {screen_summary.get('x_pool_after', 0)} | "
+                        f"stable_rows={screen_summary.get('n_constraints', 0)} | "
+                        f"soft_penalty={fp_details.get('surrogate_screen_soft_penalty', 0.0):.2f} | "
                         f"tau={fp_details.get('projection_objective_tau', 'adaptive')}"
                     )
         except Exception as e:
-            log(f"    异常: {e}")
+            log(f"  异常: {e}")
             import traceback
             traceback.print_exc()
             results.append((i, False, None))
             continue
 
         status = "成功" if success else "失败"
-        log(f"    可行性泵结果: {status}")
+        log(f"  可行性泵结果: {status}")
         results.append((i, success, x_result))
 
     n_success = sum(1 for _, s, _ in results if s)
-    print("\n" + "=" * 70)
-    log(f"可行性泵完成: {n_success}/{test_n} 样本找到可行解")
-    print("=" * 70)
+    log_section(f"可行性泵汇总 | success={n_success}/{test_n}")
     if fig_dir is not None and screening_records:
         plot_fp_screening_comparison(screening_records, fig_dir, CASE_NAME)
     return results
@@ -1893,9 +1914,7 @@ def test_surrogate(ppc, all_samples: list, T_DELTA: float,
                    scenario_bank: list | None = None,
                    constraint_generation_strategy: str | None = None) -> None:
     """加载 surrogate 模型，打印参数摘要，绘图，并可选运行 FP。"""
-    print("\n" + "=" * 70)
-    log(f"加载 surrogate 模型: {model_dir}")
-    print("=" * 70)
+    log_section(f"加载 surrogate 模型 | dir={model_dir}")
     log("说明: surrogate 模式分析 `Standard LP` 与 `Surrogate LP`，并可选运行 FP 恢复整数解。")
 
     if not Path(model_dir).exists():
@@ -1924,19 +1943,15 @@ def test_surrogate(ppc, all_samples: list, T_DELTA: float,
         log(f"FP gate: disabled ({fp_gate_reason})")
     print_surrogate_results(trainers, all_samples[:TEST_SAMPLES])
 
-    print("\n" + "=" * 70)
-    log("生成 surrogate 分析图表...")
-    print("=" * 70)
+    log_section("生成 surrogate 分析图表")
     plot_surrogate_analysis(trainers, all_samples, fig_dir, CASE_NAME)
 
-    print("\n" + "=" * 70)
     if RUN_FP and can_run_fp:
-        log("LP 松弛解质量评估（FP 前置分析）...")
+        log_section("LP 松弛解质量评估 | mode=FP 前置分析")
     elif RUN_FP:
-        log(f"LP 松弛解质量评估（仅分析，不运行 FP；{fp_gate_reason}）...")
+        log_section(f"LP 松弛解质量评估 | mode=仅分析 | reason={fp_gate_reason}")
     else:
-        log("LP 松弛解质量评估（RUN_FP=False）...")
-    print("=" * 70)
+        log_section("LP 松弛解质量评估 | mode=RUN_FP=False")
     run_lp_compare_test(ppc, all_samples, dual_predictor, trainers,
                         T_DELTA, TEST_SAMPLES, fig_dir)
     if RUN_SUBPROBLEM_MILP_TEST:
@@ -1982,9 +1997,7 @@ def test_surrogate(ppc, all_samples: list, T_DELTA: float,
 
 def _print_bcd_stats(agent) -> None:
     """打印 BCD agent 模型参数统计摘要（辅助函数）。"""
-    print("\n" + "=" * 70)
-    log("BCD 模型参数统计")
-    print("=" * 70)
+    log_section("BCD 模型参数统计")
 
     if hasattr(agent, 'theta_net') and agent.theta_net is not None:
         total_params = sum(p.numel() for p in agent.theta_net.parameters())
@@ -2449,9 +2462,7 @@ def summarize_lp_surrogate_fp_totals(
     if n <= 0:
         return
 
-    print("\n" + "=" * 70)
-    log(f"LP / Surrogate / FP 总距离汇总: {n} 个样本")
-    print("=" * 70)
+    log_section(f"LP / Surrogate / FP 总距离汇总 | samples={n}")
 
     fp_result_map = {}
     if fp_results:
@@ -2490,7 +2501,7 @@ def summarize_lp_surrogate_fp_totals(
                 agent=agent,
             )
         except Exception as exc:
-            log(f"  样本 {i}: LP / Surrogate 求解失败，跳过 ({exc})")
+            log(f"样本 {i + 1}/{n} | LP / Surrogate 求解失败，跳过: {exc}")
             continue
 
         x_true = _extract_true_solution(sample, x_surr.shape)
@@ -2520,7 +2531,7 @@ def summarize_lp_surrogate_fp_totals(
                 fp_msg = f"FP shape mismatch={x_fp.shape}"
 
         log(
-            f"  样本 {i}: "
+            f"样本 {i + 1}/{n} | "
             f"LP(L1={l1_lp:.2f}, Hamming={hamming_lp}) | "
             f"Surrogate(L1={l1_surr:.2f}, Hamming={hamming_surr}) | "
             f"{fp_msg}"
@@ -2536,7 +2547,7 @@ def summarize_lp_surrogate_fp_totals(
         display_l1['Surrogate+FP'] = fp_totals_l1
         display_hamming['Surrogate+FP'] = fp_totals_hamming
 
-    print("\n" + "-" * 70)
+    log_rule("-")
     log(f"总量汇总: valid_samples={valid_samples}/{n}")
     log(f"  LP:            L1_sum={totals_l1['LP']:.2f}, Hamming_sum={totals_hamming['LP']}")
     log(
@@ -2567,7 +2578,7 @@ def summarize_lp_surrogate_fp_totals(
             )
         else:
             log("  Surrogate+FP: 没有可用输出，无法统计总距离")
-    print("-" * 70)
+    print("-" * SECTION_WIDTH)
 
     if fig_dir is not None:
         plot_lp_surrogate_fp_total_bar(display_l1, display_hamming, fig_dir, case_name)
@@ -2585,9 +2596,7 @@ def summarize_fp_economicity(
     if not fp_results:
         return
 
-    print("\n" + "=" * 70)
-    log("FP 经济性评估")
-    print("=" * 70)
+    log_section("FP 经济性评估")
 
     sample_ids: list[int] = []
     optimal_costs: list[float] = []
@@ -2643,7 +2652,7 @@ def summarize_fp_economicity(
     abs_gap_arr = np.asarray(abs_gaps, dtype=float)
     rel_gap_arr = np.asarray(rel_gaps_pct, dtype=float)
 
-    print("\n" + "-" * 70)
+    log_rule("-")
     log(f"经济性汇总: evaluated={len(sample_ids)}/{len(fp_results)}")
     log(f"  Optimal cost mean={float(np.mean(optimal_arr)):.2f}, sum={float(np.sum(optimal_arr)):.2f}")
     log(f"  FP cost mean={float(np.mean(fp_arr)):.2f}, sum={float(np.sum(fp_arr)):.2f}")
@@ -2656,7 +2665,7 @@ def summarize_fp_economicity(
         f"median={float(np.median(rel_gap_arr)):.2f}%, max={float(np.max(rel_gap_arr)):.2f}%"
     )
     log(f"  FP exact optimal count={exact_match_count}/{len(sample_ids)}")
-    print("-" * 70)
+    print("-" * SECTION_WIDTH)
 
     if fig_dir is not None:
         plot_fp_economicity_bar(
@@ -2792,9 +2801,7 @@ def test_bcd(ppc, data_file: Path, bcd_model_path: str,
              sample_range: tuple[int, int] | None = None,
              test_samples: int = TEST_SAMPLES_DEFAULT) -> None:
     """加载 BCD 模型，初始化 agent，报告参数统计，绘图，并分析 LP 距离。"""
-    print("\n" + "=" * 70)
-    log(f"加载 BCD 模型: {bcd_model_path}")
-    print("=" * 70)
+    log_section(f"加载 BCD 模型 | path={bcd_model_path}")
     log("说明: bcd 模式只分析 `Standard LP` 与 `BCD LP`，不加载 surrogate 模型，也不运行 FP 恢复整数解。")
 
     agent = _load_bcd_agent(
@@ -2807,9 +2814,7 @@ def test_bcd(ppc, data_file: Path, bcd_model_path: str,
     )
     _print_bcd_stats(agent)
 
-    print("\n" + "=" * 70)
-    log("生成 BCD 分析图表...")
-    print("=" * 70)
+    log_section("生成 BCD 分析图表")
     plot_bcd_analysis(agent, fig_dir, CASE_NAME)
 
     analyse_lp_distance(agent, test_samples, fig_dir, CASE_NAME)
@@ -2843,9 +2848,7 @@ def test_both(ppc, data_file: Path, all_samples: list, T_DELTA: float,
         unit_ids:       机组 ID 列表（None = 全部）�?
         fig_dir:        图像输出目录�?
     """
-    print("\n" + "=" * 70)
-    log("模式: both - 联合评估 BCD 神经网络 + 全体 V3 代理约束")
-    print("=" * 70)
+    log_section("模式=both | 联合评估 BCD 神经网络 + 全体 V3 代理约束")
 
     # ── Step 1: 加载 BCD 模型 ──────────────────────────────
     log("── Step 1/4  加载 BCD 模型")
@@ -2888,19 +2891,13 @@ def test_both(ppc, data_file: Path, all_samples: list, T_DELTA: float,
 
     # ── Step 3: 绘图 ───────────────────────────────────────
     log("── Step 3/4  生成分析图表")
-    print("\n" + "=" * 70)
-    log("生成 surrogate 分析图表...")
-    print("=" * 70)
+    log_section("生成 surrogate 分析图表")
     plot_surrogate_analysis(trainers, all_samples, fig_dir, CASE_NAME)
 
-    print("\n" + "=" * 70)
-    log("生成 BCD 分析图表...")
-    print("=" * 70)
+    log_section("生成 BCD 分析图表")
     plot_bcd_analysis(agent, fig_dir, CASE_NAME)
 
-    print("\n" + "=" * 70)
-    log("生成 BCD-Surrogate 联合约束表征图...")
-    print("=" * 70)
+    log_section("生成 BCD-Surrogate 联合约束表征图")
     plot_both_analysis(agent, trainers, fig_dir, CASE_NAME)
 
     # ── Step 4: LP 评估 + 可行性泵（全体代理约束） ────────
@@ -2969,9 +2966,9 @@ def test_both(ppc, data_file: Path, all_samples: list, T_DELTA: float,
 def main():
     start_time = time.time()
 
-    print("=" * 70)
-    print(f"测试脚本  模式: {MODE}  算例: {CASE_NAME}")
-    print("=" * 70)
+    print("=" * SECTION_WIDTH)
+    print(f"run_test.py | mode={MODE} | case={CASE_NAME}")
+    print("=" * SECTION_WIDTH)
 
     test_samples = TEST_SAMPLES
     sample_range = parse_sample_range(SAMPLE_RANGE)
@@ -2990,7 +2987,7 @@ def main():
     ppc = get_case_ppc(CASE_NAME)
     n_units = ppc['gen'].shape[0]
     n_buses = ppc['bus'].shape[0]
-    log(f"  {n_units} 机组，{n_buses} 节点")
+    log(f"case summary | units={n_units} | buses={n_buses}")
 
     # ── 查找数据文件 ─────────────────────────────────────
     if ACTIVE_SETS_FILE is not None:
@@ -3034,10 +3031,13 @@ def main():
             full_samples = load_json_data(data_file)
             all_samples = apply_sample_range(full_samples, sample_range)
             if MAX_SAMPLES and len(all_samples) > MAX_SAMPLES:
-                log(f"  截取 {MAX_SAMPLES} 个样本（原 {len(all_samples)}）")
+                log(f"sample cap | kept={MAX_SAMPLES} | original={len(all_samples)}")
                 all_samples = all_samples[:MAX_SAMPLES]
             T_from_data = all_samples[0]['pd_data'].shape[1]
-            log(f"  样本 T={T_from_data}，评估使用 {len(all_samples)} 个样本，历史库 {len(full_samples)} 个样本")
+            log(
+                f"sample summary | T={T_from_data} | eval_samples={len(all_samples)} | "
+                f"scenario_bank={len(full_samples)}"
+            )
 
             model_dir = str((Path(__file__).parent / resolved_model_dir).resolve())
             test_surrogate(
@@ -3063,10 +3063,13 @@ def main():
             full_samples = load_json_data(data_file)
             all_samples = apply_sample_range(full_samples, sample_range)
             if MAX_SAMPLES and len(all_samples) > MAX_SAMPLES:
-                log(f"  截取 {MAX_SAMPLES} 个样本（原 {len(all_samples)}）")
+                log(f"sample cap | kept={MAX_SAMPLES} | original={len(all_samples)}")
                 all_samples = all_samples[:MAX_SAMPLES]
             T_from_data = all_samples[0]['pd_data'].shape[1]
-            log(f"  样本 T={T_from_data}，评估使用 {len(all_samples)} 个样本，历史库 {len(full_samples)} 个样本")
+            log(
+                f"sample summary | T={T_from_data} | eval_samples={len(all_samples)} | "
+                f"scenario_bank={len(full_samples)}"
+            )
 
             model_dir  = str((Path(__file__).parent / resolved_model_dir).resolve())
             bcd_path   = str((Path(__file__).parent / resolved_bcd_path).resolve())
@@ -3088,9 +3091,7 @@ def main():
 
     # ── 汇总 ─────────────────────────────────────────────
     total_time = time.time() - start_time
-    print("\n" + "=" * 70)
-    log(f"完成！模式 {MODE}，耗时 {total_time / 60:.1f} 分钟")
-    print("=" * 70)
+    log_section(f"完成 | mode={MODE} | elapsed_min={total_time / 60:.1f}")
 
 
 if __name__ == '__main__':
