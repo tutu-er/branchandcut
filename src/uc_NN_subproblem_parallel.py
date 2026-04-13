@@ -28,6 +28,7 @@ import time
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Dict, List, Optional
+from types import SimpleNamespace
 
 import numpy as np
 from scenario_utils import normalize_sample_arrays
@@ -40,14 +41,31 @@ for _p in [str(_SRC_DIR), str(_ROOT_DIR)]:
         sys.path.insert(0, _p)
 
 from uc_NN_subproblem import (
+    LP_BACKEND_CVXPY_HIGHS,
+    LP_BACKEND_GUROBI,
     SubproblemSurrogateTrainer,
     _extract_pg_electricity_price_matrix,
     _get_sample_pg_electricity_price_matrix,
     _recover_unit_commitment_matrix,
     _solve_pg_electricity_price_from_ed,
     generate_test_data,
+    normalize_lp_backend,
     train_all_subproblem_surrogates,
 )
+try:
+    from subproblem_lp_solver import (
+        solve_dual_block as solve_dual_block_backend,
+        solve_primal_block as solve_primal_block_backend,
+    )
+except ImportError:
+    from src.subproblem_lp_solver import (
+        solve_dual_block as solve_dual_block_backend,
+        solve_primal_block as solve_primal_block_backend,
+    )
+
+def _strict_cvxpy_highs_diagnostics_enabled() -> bool:
+    flag = os.environ.get("STRICT_CVXPY_HIGHS", "0")
+    return str(flag).strip().lower() in ("1", "true", "yes", "on")
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -80,6 +98,7 @@ class ParallelSubproblemSurrogateTrainer(SubproblemSurrogateTrainer):
         unit_id: int,
         lambda_predictor=None,
         max_constraints: int = 20,
+        lp_backend: str = LP_BACKEND_GUROBI,
         constraint_generation_strategy: str = "sensitive",
         rho_primal_init: float = 1e-3,
         rho_dual_init: float = 1e-3,
@@ -121,6 +140,7 @@ class ParallelSubproblemSurrogateTrainer(SubproblemSurrogateTrainer):
         loss_ratio_reg: float = 1.0,
         pg_block_prox_weight: float = 2e-2,
         dual_block_prox_weight: float = 1e-2,
+        enable_nn_rollback: bool = True,
         ignore_startup_shutdown_costs: bool = False,
         device=None,
         n_workers: int = 4,
@@ -129,6 +149,7 @@ class ParallelSubproblemSurrogateTrainer(SubproblemSurrogateTrainer):
             ppc, active_set_data, T_delta, unit_id,
             lambda_predictor=lambda_predictor,
             max_constraints=max_constraints,
+            lp_backend=lp_backend,
             constraint_generation_strategy=constraint_generation_strategy,
             rho_primal_init=rho_primal_init,
             rho_dual_init=rho_dual_init,
@@ -170,10 +191,88 @@ class ParallelSubproblemSurrogateTrainer(SubproblemSurrogateTrainer):
             loss_ratio_reg=loss_ratio_reg,
             pg_block_prox_weight=pg_block_prox_weight,
             dual_block_prox_weight=dual_block_prox_weight,
+            enable_nn_rollback=enable_nn_rollback,
             ignore_startup_shutdown_costs=ignore_startup_shutdown_costs,
             device=device,
         )
         self.n_workers = min(n_workers, self.n_samples)
+
+    def _build_sample_worker_state(self, sample_id: int) -> dict:
+        return {
+            # For cvxpy_highs worker process: proxy only contains a single-sample view
+            # (lists with length 1), so the solver must be called with local sample_id=0.
+            # We keep the original/global sample id here for logging parity with the
+            # non-parallel trainer.
+            'display_sample_id': int(sample_id),
+            'unit_id': self.unit_id,
+            'T': self.T,
+            'T_delta': self.T_delta,
+            'gen': np.asarray(self.gen, dtype=float).copy(),
+            'gencost': np.asarray(self.gencost, dtype=float).copy(),
+            'Ru_all': np.asarray(self.Ru_all, dtype=float).copy(),
+            'Rd_all': np.asarray(self.Rd_all, dtype=float).copy(),
+            'Ru_co_all': np.asarray(self.Ru_co_all, dtype=float).copy(),
+            'Rd_co_all': np.asarray(self.Rd_co_all, dtype=float).copy(),
+            'ignore_startup_shutdown_costs': bool(self.ignore_startup_shutdown_costs),
+            'rho_primal': float(self.rho_primal),
+            'rho_opt': float(self.rho_opt),
+            'rho_binary': float(self.rho_binary),
+            'rho_dual_pg': float(self.rho_dual_pg),
+            'rho_dual_x': float(self.rho_dual_x),
+            'rho_dual_coc': float(self.rho_dual_coc),
+            'pg_block_prox_weight': float(self.pg_block_prox_weight),
+            'dual_block_prox_weight': float(self.dual_block_prox_weight),
+            'num_coupling_constraints': int(self.num_coupling_constraints),
+            'all_mode_group_size': int(self.all_mode_group_size),
+            'mu_lower_bound': float(self.mu_lower_bound),
+            'mu_individual_lower_bound_round': int(self.mu_individual_lower_bound_round),
+            'mu_group_lower_bound_round': int(self.mu_group_lower_bound_round),
+            'mu_signed_round_interval': int(self.mu_signed_round_interval),
+            'x_bound_dual_zero_rounds': int(self.x_bound_dual_zero_rounds),
+            'iter_number': int(self.iter_number),
+            'use_group_mu_lower_bound': bool(self._uses_group_mu_lower_bound()),
+            'surrogate_direction_signs': self._get_surrogate_direction_signs(),
+            'pg': [np.asarray(self.pg[sample_id], dtype=float).copy()],
+            'x': [np.asarray(self.x[sample_id], dtype=float).copy()],
+            'coc': [np.asarray(self.coc[sample_id], dtype=float).copy()],
+            'mu': [np.asarray(self.mu[sample_id], dtype=float).copy()],
+            'lambda_vals': [np.asarray(self.lambda_vals[sample_id], dtype=float).copy()],
+            'lambda_inherent': [copy.deepcopy(self.lambda_inherent[sample_id])],
+            'sensitive_timesteps': [list(self.sensitive_timesteps[sample_id])],
+            'surrogate_constraint_offsets': [copy.deepcopy(self.surrogate_constraint_offsets[sample_id])],
+            'active_set_data': [{'x_true': copy.deepcopy(self.active_set_data[sample_id].get('x_true'))}],
+        }
+
+    def _run_cvxpy_highs_sample_pool(self, block: str, block_args: list[tuple], prefix: str) -> Dict[int, tuple]:
+        results: Dict[int, tuple] = {}
+        with ProcessPoolExecutor(max_workers=self.n_workers) as executor:
+            future_to_sid = {}
+            for s, alphas, betas, gammas, deltas, costs, pg_costs in block_args:
+                task = {
+                    'block': block,
+                    'sample_id': s,
+                    'trainer_state': self._build_sample_worker_state(s),
+                    'alphas': np.asarray(alphas, dtype=float).copy(),
+                    'betas': np.asarray(betas, dtype=float).copy(),
+                    'gammas': np.asarray(gammas, dtype=float).copy(),
+                    'deltas': np.asarray(deltas, dtype=float).copy(),
+                    'costs': None if costs is None else np.asarray(costs, dtype=float).copy(),
+                    'pg_costs': None if pg_costs is None else np.asarray(pg_costs, dtype=float).copy(),
+                }
+                future = executor.submit(_solve_sample_block_worker, task)
+                future_to_sid[future] = s
+
+            for future in as_completed(future_to_sid):
+                s = future_to_sid[future]
+                try:
+                    payload = future.result()
+                    results[s] = payload['result']
+                except Exception as exc:
+                    print(f"{prefix} {block}_block sample={s} 寮傚父: {exc}", flush=True)
+                    if _strict_cvxpy_highs_diagnostics_enabled():
+                        raise
+                    results[s] = (None, None, None, None) if block == 'primal' else (None, None)
+        return results
 
     def iter(
         self,
@@ -207,9 +306,13 @@ class ParallelSubproblemSurrogateTrainer(SubproblemSurrogateTrainer):
             self.pg_cost_nn_epochs if pg_cost_nn_epochs is None else max(int(pg_cost_nn_epochs), 1)
         )
 
+        # 统计 NN 更新是否频繁回滚（用于排查训练停滞）
+        rollback_count = 0
+
         for i in range(max_iter):
             print(f"{prefix} 🔄 迭代 {i+1}/{max_iter}", flush=True)
             self.iter_number = i
+            self._sync_surrogate_direction_strategy_state()
 
             # ── 1. Primal block（线程并行） ──────────────────────────
             # 提前复制参数，避免线程间共享可变数组
@@ -227,21 +330,26 @@ class ParallelSubproblemSurrogateTrainer(SubproblemSurrogateTrainer):
             ]
 
             primal_results: Dict[int, tuple] = {}
-            with ThreadPoolExecutor(max_workers=self.n_workers) as executor:
-                future_to_sid = {
-                    executor.submit(
-                        self.iter_with_primal_block,
-                        s, alphas, betas, gammas, deltas, costs, pg_costs,
-                    ): s
-                    for s, alphas, betas, gammas, deltas, costs, pg_costs in primal_args
-                }
-                for future in as_completed(future_to_sid):
-                    s = future_to_sid[future]
-                    try:
-                        primal_results[s] = future.result()
-                    except Exception as exc:
-                        print(f"{prefix} primal_block sample={s} 异常: {exc}", flush=True)
-                        primal_results[s] = (None, None, None, None)
+            if self._lp_backend == LP_BACKEND_CVXPY_HIGHS and self.n_workers > 1:
+                primal_results = self._run_cvxpy_highs_sample_pool('primal', primal_args, prefix)
+            else:
+                with ThreadPoolExecutor(max_workers=self.n_workers) as executor:
+                    future_to_sid = {
+                        executor.submit(
+                            self.iter_with_primal_block,
+                            s, alphas, betas, gammas, deltas, costs, pg_costs,
+                        ): s
+                        for s, alphas, betas, gammas, deltas, costs, pg_costs in primal_args
+                    }
+                    for future in as_completed(future_to_sid):
+                        s = future_to_sid[future]
+                        try:
+                            primal_results[s] = future.result()
+                        except Exception as exc:
+                            print(f"{prefix} primal_block sample={s} 异常: {exc}", flush=True)
+                            if _strict_cvxpy_highs_diagnostics_enabled():
+                                raise
+                            primal_results[s] = (None, None, None, None)
 
             # 顺序写入状态（避免并发写）
             for s in range(self.n_samples):
@@ -270,21 +378,26 @@ class ParallelSubproblemSurrogateTrainer(SubproblemSurrogateTrainer):
             ]
 
             dual_results: Dict[int, tuple] = {}
-            with ThreadPoolExecutor(max_workers=self.n_workers) as executor:
-                future_to_sid = {
-                    executor.submit(
-                        self.iter_with_dual_block,
-                        s, alphas, betas, gammas, deltas, costs, pg_costs,
-                    ): s
-                    for s, alphas, betas, gammas, deltas, costs, pg_costs in dual_args
-                }
-                for future in as_completed(future_to_sid):
-                    s = future_to_sid[future]
-                    try:
-                        dual_results[s] = future.result()
-                    except Exception as exc:
-                        print(f"{prefix} dual_block sample={s} 异常: {exc}", flush=True)
-                        dual_results[s] = (None, None)
+            if self._lp_backend == LP_BACKEND_CVXPY_HIGHS and self.n_workers > 1:
+                dual_results = self._run_cvxpy_highs_sample_pool('dual', dual_args, prefix)
+            else:
+                with ThreadPoolExecutor(max_workers=self.n_workers) as executor:
+                    future_to_sid = {
+                        executor.submit(
+                            self.iter_with_dual_block,
+                            s, alphas, betas, gammas, deltas, costs, pg_costs,
+                        ): s
+                        for s, alphas, betas, gammas, deltas, costs, pg_costs in dual_args
+                    }
+                    for future in as_completed(future_to_sid):
+                        s = future_to_sid[future]
+                        try:
+                            dual_results[s] = future.result()
+                        except Exception as exc:
+                            print(f"{prefix} dual_block sample={s} 异常: {exc}", flush=True)
+                            if _strict_cvxpy_highs_diagnostics_enabled():
+                                raise
+                            dual_results[s] = (None, None)
 
             # 顺序写入状态
             for s in range(self.n_samples):
@@ -310,8 +423,18 @@ class ParallelSubproblemSurrogateTrainer(SubproblemSurrogateTrainer):
                 f"reg_pg={nn_metrics_pre['reg_pg']:.6f}",
                 flush=True,
             )
+            merit_before_nn = self._weighted_violation_merit(
+                (obj_primal, obj_dual_pg, obj_dual_x, obj_dual_coc, obj_dual, obj_opt)
+            )
 
             # ── 3. NN block（串行，批次化训练） ──────────────────────
+            self._prev_alpha_values = self.alpha_values.copy()
+            self._prev_beta_values = self.beta_values.copy()
+            self._prev_gamma_values = self.gamma_values.copy()
+            self._prev_delta_values = self.delta_values.copy()
+            self._prev_cost_values = self.cost_values.copy()
+            self._prev_pg_cost_values = self.pg_cost_values.copy()
+            nn_snapshot = self._capture_nn_update_state()
             self.iter_with_surrogate_nn(
                 num_epochs=nn_epochs,
                 batch_size=nn_batch_size,
@@ -327,12 +450,29 @@ class ParallelSubproblemSurrogateTrainer(SubproblemSurrogateTrainer):
                 shuffle=nn_shuffle,
                 learning_rate=pg_cost_surr_learning_rate,
             )
+            self._refresh_cached_surrogate_outputs()
 
             # ── 计算违反量（NN更新后） ──────────────────────────────
             obj_primal, obj_dual_pg, obj_dual_x, obj_dual_coc, obj_dual, obj_opt = self.cal_viol_components()
             obj_primal, obj_dual_pg, obj_dual_x, obj_dual_coc, obj_dual, obj_opt = (
                 _z(obj_primal), _z(obj_dual_pg), _z(obj_dual_x), _z(obj_dual_coc), _z(obj_dual), _z(obj_opt)
             )
+            merit_after_nn = self._weighted_violation_merit(
+                (obj_primal, obj_dual_pg, obj_dual_x, obj_dual_coc, obj_dual, obj_opt)
+            )
+            merit_tol = max(1e-8, 1e-4 * max(1.0, abs(merit_before_nn)))
+            if self.enable_nn_rollback and (merit_after_nn > merit_before_nn + merit_tol):
+                self._restore_nn_update_state(nn_snapshot)
+                rollback_count += 1
+                obj_primal, obj_dual_pg, obj_dual_x, obj_dual_coc, obj_dual, obj_opt = self.cal_viol_components()
+                obj_primal, obj_dual_pg, obj_dual_x, obj_dual_coc, obj_dual, obj_opt = (
+                    _z(obj_primal), _z(obj_dual_pg), _z(obj_dual_x), _z(obj_dual_coc), _z(obj_dual), _z(obj_opt)
+                )
+                merit_after_nn = self._weighted_violation_merit(
+                    (obj_primal, obj_dual_pg, obj_dual_x, obj_dual_coc, obj_dual, obj_opt)
+                )
+            else:
+                pass
             nn_metrics_after = self.cal_nn_logging_components()
             print(
                 f"{prefix}[NN-metric][after] "
@@ -379,6 +519,12 @@ class ParallelSubproblemSurrogateTrainer(SubproblemSurrogateTrainer):
                 f"ρ_dual={self.rho_dual:.4f}, ρ_opt={self.rho_opt:.4f}",
                 flush=True,
             )
+            # 与非并行版(`uc_NN_subproblem.py`)保持一致的分隔线输出格式
+            print("  " + "-" * 40, flush=True)
+
+            # 低频输出回滚计数（避免刷屏）
+            if i < 5 or ((i + 1) % 25 == 0):
+                print(f"{prefix} rollback_count={rollback_count}/{i+1}", flush=True)
 
         print(f"{prefix} ✓ 样本级并行训练完成", flush=True)
 
@@ -386,6 +532,86 @@ class ParallelSubproblemSurrogateTrainer(SubproblemSurrogateTrainer):
 # ════════════════════════════════════════════════════════════════════
 # Level 1：机组级并行（进程）
 # ════════════════════════════════════════════════════════════════════
+
+class _SampleWorkerTrainerProxy(SimpleNamespace):
+    def _get_surrogate_direction_signs(self, size: int | None = None) -> np.ndarray:
+        signs = np.asarray(self.surrogate_direction_signs, dtype=float)
+        if size is None:
+            return signs.copy()
+        return signs[: int(size)].copy()
+
+    def _apply_surrogate_direction_to_params(
+        self,
+        alphas: np.ndarray,
+        betas: np.ndarray,
+        gammas: np.ndarray,
+        deltas: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        signs = self._get_surrogate_direction_signs(len(alphas))
+        return (
+            np.asarray(alphas, dtype=float) * signs,
+            np.asarray(betas, dtype=float) * signs,
+            np.asarray(gammas, dtype=float) * signs,
+            np.asarray(deltas, dtype=float) * signs,
+        )
+
+    def _constraint_offsets_for_sample(self, sample_id: int) -> list[tuple[int, ...]]:
+        return list(self.surrogate_constraint_offsets[sample_id])
+
+    def _uses_group_mu_lower_bound(self) -> bool:
+        return bool(self.use_group_mu_lower_bound)
+
+    def _get_mu_lower_bound_phase(self) -> str:
+        if self.iter_number < self.mu_individual_lower_bound_round:
+            return "individual"
+        if self.iter_number < self.mu_group_lower_bound_round:
+            return "group" if self._uses_group_mu_lower_bound() else "individual"
+        return "none"
+
+    def _current_mu_lower_bound_value(self) -> float:
+        return self.mu_lower_bound if self._get_mu_lower_bound_phase() != "none" else 0.0
+
+    def _is_mu_sign_relaxation_round(self) -> bool:
+        interval = int(getattr(self, 'mu_signed_round_interval', 0) or 0)
+        lb = float(self._current_mu_lower_bound_value())
+        return interval > 0 and lb > 0.0 and ((self.iter_number + 1) % interval == 0)
+
+    def _force_zero_x_bound_duals(self) -> bool:
+        return self.iter_number < self.x_bound_dual_zero_rounds
+
+
+def _solve_sample_block_worker(task: dict) -> dict:
+    proxy = _SampleWorkerTrainerProxy(**task['trainer_state'])
+    sample_id = 0
+    if task['block'] == 'primal':
+        result = solve_primal_block_backend(
+            proxy,
+            sample_id,
+            task['alphas'],
+            task['betas'],
+            task['gammas'],
+            task['deltas'],
+            costs=task.get('costs'),
+            pg_costs=task.get('pg_costs'),
+        )
+    elif task['block'] == 'dual':
+        result = solve_dual_block_backend(
+            proxy,
+            sample_id,
+            task['alphas'],
+            task['betas'],
+            task['gammas'],
+            task['deltas'],
+            costs=task.get('costs'),
+            pg_costs=task.get('pg_costs'),
+        )
+    else:
+        raise ValueError(f"Unsupported sample worker block: {task['block']}")
+    return {
+        'sample_id': int(task['sample_id']),
+        'result': result,
+    }
+
 
 def _train_unit_worker(args: dict) -> dict:
     """顶层可 pickle 的 worker 函数（供 ProcessPoolExecutor 调用）。
@@ -432,6 +658,7 @@ def _train_unit_worker(args: dict) -> dict:
     mu_sign_flip_min_share = args.get('mu_sign_flip_min_share', 0.67)
     sample_n_workers    = args.get('sample_n_workers', 4)
     use_sample_parallel = args.get('use_sample_parallel', True)
+    lp_backend          = args.get('lp_backend', LP_BACKEND_GUROBI)
     save_dir            = args.get('save_dir')
 
     prefix = f"[Unit-{unit_id}]"
@@ -449,6 +676,7 @@ def _train_unit_worker(args: dict) -> dict:
         trainer = ParallelSubproblemSurrogateTrainer(
             ppc, active_set_data, T_delta, unit_id,
             lambda_predictor=None,
+            lp_backend=lp_backend,
             rho_primal_init=rho_primal_init,
             rho_dual_init=rho_dual_init,
             rho_dual_pg_init=rho_dual_pg_init,
@@ -468,6 +696,7 @@ def _train_unit_worker(args: dict) -> dict:
         trainer = SubproblemSurrogateTrainer(
             ppc, active_set_data, T_delta, unit_id,
             lambda_predictor=None,
+            lp_backend=lp_backend,
             rho_primal_init=rho_primal_init,
             rho_dual_init=rho_dual_init,
             rho_dual_pg_init=rho_dual_pg_init,
@@ -509,7 +738,7 @@ def _train_unit_worker(args: dict) -> dict:
     }
 
 
-def _precompute_lambda_vals(
+def _precompute_global_lambda_payloads(
     ppc,
     active_set_data: List[Dict],
     T_delta: float,
@@ -579,6 +808,7 @@ def _precompute_lambda_vals(
     active_set_data: List[Dict],
     T_delta: float,
     lambda_predictor=None,
+    lp_backend: str = LP_BACKEND_GUROBI,
 ) -> List[object]:
     """Precompute per-unit electricity-price matrices for all samples."""
     n_samples = len(active_set_data)
@@ -589,7 +819,7 @@ def _precompute_lambda_vals(
     T = tmp.T
     ng = tmp.ng
 
-    if lambda_predictor is not None:
+    if False and lambda_predictor is not None:
         predicted_vals: List[np.ndarray] = []
         all_resolved = True
         for sample in active_set_data:
@@ -626,6 +856,7 @@ def _precompute_lambda_vals(
             x_sol,
             renewable_data=sample.get('renewable_data'),
             verbose=False,
+            lp_backend=lp_backend,
         )
         price_vals.append(payload['lambda_pg_electricity_price'])
     return price_vals
@@ -636,6 +867,7 @@ def train_all_surrogates_parallel(
     active_set_data: List[Dict],
     T_delta: float = 1.0,
     lambda_predictor=None,
+    lp_backend: str = LP_BACKEND_GUROBI,
     unit_ids: Optional[List[int]] = None,
     max_iter: int = 20,
     nn_epochs: int = 10,
@@ -683,6 +915,7 @@ def train_all_surrogates_parallel(
     from pypower.ext2int import ext2int
     ppc_int = ext2int(ppc)
     ng = ppc_int['gen'].shape[0]
+    lp_backend = normalize_lp_backend(lp_backend)
 
     if unit_ids is None:
         unit_ids = list(range(ng))
@@ -690,8 +923,27 @@ def train_all_surrogates_parallel(
     # Gurobi 许可证限制：默认并发进程上限 4
     MAX_GUROBI_CONCURRENT = 4
     if n_workers is None:
-        n_workers = min(len(unit_ids), MAX_GUROBI_CONCURRENT)
+        if lp_backend == LP_BACKEND_CVXPY_HIGHS:
+            n_workers = min(len(unit_ids), os.cpu_count() or 4)
+        else:
+            n_workers = min(len(unit_ids), MAX_GUROBI_CONCURRENT)
     n_workers = max(1, n_workers)
+    sample_n_workers = max(1, int(sample_n_workers))
+    use_sample_parallel = bool(use_sample_parallel)
+
+    if (
+        lp_backend == LP_BACKEND_CVXPY_HIGHS
+        and use_sample_parallel
+        and n_workers > 1
+        and sample_n_workers > 1
+    ):
+        print(
+            "cvxpy_highs detected nested process parallelism; "
+            "disabling sample-level parallelism for multi-unit execution.",
+            flush=True,
+        )
+        use_sample_parallel = False
+        sample_n_workers = 1
 
     print("=" * 60, flush=True)
     print(
@@ -713,7 +965,7 @@ def train_all_surrogates_parallel(
             flush=True,
         )
     else:
-        lambda_vals = _precompute_lambda_vals(ppc, active_set_data, T_delta)
+        lambda_vals = None
 
     # 构造每个 worker 的参数 dict
     lambda_vals = _precompute_lambda_vals(
@@ -721,6 +973,7 @@ def train_all_surrogates_parallel(
         active_set_data,
         T_delta,
         lambda_predictor=lambda_predictor,
+        lp_backend=lp_backend,
     )
 
     worker_args = [
@@ -747,6 +1000,7 @@ def train_all_surrogates_parallel(
             'mu_sign_flip_min_share': mu_sign_flip_min_share,
             'sample_n_workers':   sample_n_workers,
             'use_sample_parallel': use_sample_parallel,
+            'lp_backend':         lp_backend,
             'save_dir':           save_dir,
         }
         for g in unit_ids

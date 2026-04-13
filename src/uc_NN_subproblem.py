@@ -31,6 +31,28 @@ from pypower.makePTDF import makePTDF
 from pypower.idx_gen import GEN_BUS, PMIN, PMAX
 from pypower.idx_brch import RATE_A
 try:
+    from subproblem_lp_solver import (
+        LP_BACKEND_CVXPY_HIGHS,
+        LP_BACKEND_GUROBI,
+        assert_lp_backend_available,
+        normalize_lp_backend,
+        solve_dual_block as solve_dual_block_backend,
+        solve_ed_electricity_price,
+        solve_init_lp as solve_init_lp_backend,
+        solve_primal_block as solve_primal_block_backend,
+    )
+except ImportError:
+    from src.subproblem_lp_solver import (
+        LP_BACKEND_CVXPY_HIGHS,
+        LP_BACKEND_GUROBI,
+        assert_lp_backend_available,
+        normalize_lp_backend,
+        solve_dual_block as solve_dual_block_backend,
+        solve_ed_electricity_price,
+        solve_init_lp as solve_init_lp_backend,
+        solve_primal_block as solve_primal_block_backend,
+    )
+try:
     from scenario_utils import (
         get_feature_vector,
         get_feature_vector_from_sample,
@@ -605,182 +627,17 @@ def _solve_pg_electricity_price_from_ed(
     x_sol: np.ndarray,
     renewable_data: np.ndarray | None = None,
     verbose: bool = False,
+    lp_backend: str = LP_BACKEND_GUROBI,
 ) -> Dict[str, np.ndarray]:
-    """
-    Solve ED with fixed commitment and recover the full pg stationarity price.
-
-    The returned electricity price includes every dual term that enters the pg
-    KKT condition in the fixed-x ED:
-      - power balance
-      - pg lower / upper bounds
-      - ramp up / down
-      - DC flow upper / lower
-    """
-    ppc_int = ext2int(ppc)
-    gen = ppc_int['gen']
-    bus = ppc_int['bus']
-    branch = ppc_int['branch']
-    gencost = ppc_int['gencost']
-
-    ng = gen.shape[0]
-    nb = bus.shape[0]
-    nl = branch.shape[0]
-    T = Pd.shape[1]
-
-    load_data = np.asarray(Pd, dtype=float)
-    renewable_arr = None if renewable_data is None else np.asarray(renewable_data, dtype=float)
-    if renewable_arr is not None and renewable_arr.shape != load_data.shape:
-        raise ValueError(
-            f"renewable_data shape {renewable_arr.shape} does not match load shape {load_data.shape}"
-        )
-
-    renewable_bus_ids = (
-        np.where(np.any(renewable_arr > 1e-9, axis=1))[0]
-        if renewable_arr is not None else np.array([], dtype=int)
+    return solve_ed_electricity_price(
+        ppc,
+        Pd,
+        T_delta,
+        x_sol,
+        renewable_data=renewable_data,
+        verbose=verbose,
+        lp_backend=lp_backend,
     )
-    nr = len(renewable_bus_ids)
-    R = np.zeros((nb, nr), dtype=float)
-    for r, bus_idx in enumerate(renewable_bus_ids):
-        R[bus_idx, r] = 1.0
-
-    G = np.zeros((nb, ng), dtype=float)
-    for g in range(ng):
-        bus_idx = int(gen[g, GEN_BUS])
-        if 0 <= bus_idx < nb:
-            G[bus_idx, g] = 1.0
-
-    PTDF = makePTDF(ppc_int['baseMVA'], bus, branch)
-    PTDF_G = PTDF @ G
-    branch_limit = branch[:, RATE_A]
-    Ru, Rd, Ru_co, Rd_co = _get_ramp_limits_from_ppc(ppc, gen, T_delta)
-
-    model = gp.Model("subproblem_ed_price")
-    model.Params.OutputFlag = 1 if verbose else 0
-    model.Params.LogToConsole = 1 if verbose else 0
-
-    pg = model.addVars(ng, T, lb=0.0, name='pg')
-    cpower = model.addVars(ng, T, lb=0.0, name='cpower')
-    p_ren = model.addVars(nr, T, lb=0.0, name='p_ren') if nr > 0 else None
-
-    for t in range(T):
-        renewable_supply = gp.quicksum(p_ren[r, t] for r in range(nr)) if nr > 0 else 0.0
-        model.addConstr(
-            gp.quicksum(pg[g, t] for g in range(ng)) + renewable_supply == float(np.sum(load_data[:, t])),
-            name=f'power_balance_{t}',
-        )
-        for g in range(ng):
-            model.addConstr(
-                pg[g, t] >= float(gen[g, PMIN] * x_sol[g, t]),
-                name=f'pg_lower_{g}_{t}',
-            )
-            model.addConstr(
-                pg[g, t] <= float(gen[g, PMAX] * x_sol[g, t]),
-                name=f'pg_upper_{g}_{t}',
-            )
-            model.addConstr(
-                cpower[g, t] >= float(gencost[g, -2] / T_delta) * pg[g, t]
-                + float(gencost[g, -1] / T_delta * x_sol[g, t]),
-                name=f'cpower_{g}_{t}',
-            )
-        for r, bus_idx in enumerate(renewable_bus_ids):
-            model.addConstr(
-                p_ren[r, t] <= float(renewable_arr[bus_idx, t]),
-                name=f'ren_upper_{r}_{t}',
-            )
-
-    for t in range(1, T):
-        for g in range(ng):
-            model.addConstr(
-                pg[g, t] - pg[g, t - 1]
-                <= float(Ru[g] * x_sol[g, t - 1] + Ru_co[g] * (1 - x_sol[g, t - 1])),
-                name=f'ramp_up_{g}_{t}',
-            )
-            model.addConstr(
-                pg[g, t - 1] - pg[g, t]
-                <= float(Rd[g] * x_sol[g, t] + Rd_co[g] * (1 - x_sol[g, t])),
-                name=f'ramp_down_{g}_{t}',
-            )
-
-    for t in range(T):
-        thermal_injection = G @ np.array([pg[g, t] for g in range(ng)], dtype=object)
-        renewable_injection = (
-            R @ np.array([p_ren[r, t] for r in range(nr)], dtype=object)
-            if nr > 0 else 0.0
-        )
-        flow = PTDF @ (thermal_injection + renewable_injection - load_data[:, t])
-        for l in range(nl):
-            model.addConstr(flow[l] <= float(branch_limit[l]), name=f'flow_upper_{l}_{t}')
-            model.addConstr(flow[l] >= -float(branch_limit[l]), name=f'flow_lower_{l}_{t}')
-
-    model.setObjective(
-        gp.quicksum(cpower[g, t] for g in range(ng) for t in range(T)),
-        GRB.MINIMIZE,
-    )
-    model.optimize()
-
-    if model.status != GRB.OPTIMAL:
-        raise RuntimeError(f"ED solve for electricity price failed with status={model.status}")
-
-    lambda_power_balance = np.zeros(T, dtype=float)
-    lambda_pg_lower = np.zeros((ng, T), dtype=float)
-    lambda_pg_upper = np.zeros((ng, T), dtype=float)
-    lambda_ramp_up = np.zeros((ng, T - 1), dtype=float)
-    lambda_ramp_down = np.zeros((ng, T - 1), dtype=float)
-    lambda_flow_upper = np.zeros((nl, T), dtype=float)
-    lambda_flow_lower = np.zeros((nl, T), dtype=float)
-
-    for t in range(T):
-        lambda_power_balance[t] = float(model.getConstrByName(f'power_balance_{t}').Pi)
-        for g in range(ng):
-            lambda_pg_lower[g, t] = float(model.getConstrByName(f'pg_lower_{g}_{t}').Pi)
-            lambda_pg_upper[g, t] = float(model.getConstrByName(f'pg_upper_{g}_{t}').Pi)
-        for l in range(nl):
-            lambda_flow_upper[l, t] = float(model.getConstrByName(f'flow_upper_{l}_{t}').Pi)
-            lambda_flow_lower[l, t] = float(model.getConstrByName(f'flow_lower_{l}_{t}').Pi)
-
-    for t in range(1, T):
-        for g in range(ng):
-            lambda_ramp_up[g, t - 1] = float(model.getConstrByName(f'ramp_up_{g}_{t}').Pi)
-            lambda_ramp_down[g, t - 1] = float(model.getConstrByName(f'ramp_down_{g}_{t}').Pi)
-
-    effective = np.zeros((ng, T), dtype=float)
-    lambda_ramp_contrib = np.zeros((ng, T), dtype=float)
-    lambda_flow_contrib = np.zeros((ng, T), dtype=float)
-    for g in range(ng):
-        for t in range(T):
-            ramp_contrib = 0.0
-            if t > 0:
-                ramp_contrib += lambda_ramp_up[g, t - 1]
-                ramp_contrib -= lambda_ramp_down[g, t - 1]
-            if t < T - 1:
-                ramp_contrib -= lambda_ramp_up[g, t]
-                ramp_contrib += lambda_ramp_down[g, t]
-
-            flow_contrib = float(
-                np.dot(PTDF_G[:, g], lambda_flow_upper[:, t] + lambda_flow_lower[:, t])
-            )
-            effective[g, t] = (
-                lambda_power_balance[t]
-                + lambda_pg_lower[g, t]
-                + lambda_pg_upper[g, t]
-                + ramp_contrib
-                + flow_contrib
-            )
-            lambda_ramp_contrib[g, t] = ramp_contrib
-            lambda_flow_contrib[g, t] = flow_contrib
-
-    return {
-        'lambda_pg_electricity_price': effective,
-        'lambda_power_balance': lambda_power_balance,
-        'lambda_pg_lower': lambda_pg_lower,
-        'lambda_pg_upper': lambda_pg_upper,
-        'lambda_ramp_up': lambda_ramp_up,
-        'lambda_ramp_down': lambda_ramp_down,
-        'lambda_flow_upper': lambda_flow_upper,
-        'lambda_flow_lower': lambda_flow_lower,
-        'lambda_ramp_contrib': lambda_ramp_contrib,
-        'lambda_flow_contrib': lambda_flow_contrib,
-    }
 
 
 def load_active_set_from_json(json_filepath: str, sample_id: Optional[int] = None):
@@ -1565,6 +1422,7 @@ class SubproblemSurrogateTrainer:
     def __init__(self, ppc, active_set_data, T_delta, unit_id: int, 
                  lambda_predictor: DualVariablePredictorTrainer = None, 
                  max_constraints: int = 20,
+                 lp_backend: str = LP_BACKEND_GUROBI,
                  constraint_generation_strategy: str = "sensitive",
                  rho_primal_init: float = 1e-3,
                  rho_dual_init: float = 1e-3,
@@ -1606,6 +1464,7 @@ class SubproblemSurrogateTrainer:
                  loss_ratio_reg: float = 1.0,
                  pg_block_prox_weight: float = 2e-2,
                  dual_block_prox_weight: float = 1e-2,
+                 enable_nn_rollback: bool = True,
                  ignore_startup_shutdown_costs: bool = False,
                  device=None):
         """
@@ -1631,6 +1490,9 @@ class SubproblemSurrogateTrainer:
         self.n_samples = len(active_set_data)
         self.T_delta = T_delta
         self.unit_id = unit_id
+        self._lp_backend = normalize_lp_backend(lp_backend)
+        if self._lp_backend == LP_BACKEND_CVXPY_HIGHS:
+            assert_lp_backend_available(self._lp_backend)
         self.Ru_all, self.Rd_all, self.Ru_co_all, self.Rd_co_all = _get_ramp_limits_from_ppc(
             self.ppc_raw, self.gen, self.T_delta
         )
@@ -1750,6 +1612,7 @@ class SubproblemSurrogateTrainer:
         self.loss_ratio_reg = float(loss_ratio_reg)
         self.pg_block_prox_weight = max(float(pg_block_prox_weight), 0.0)
         self.dual_block_prox_weight = max(float(dual_block_prox_weight), 0.0)
+        self.enable_nn_rollback = bool(enable_nn_rollback)
         self.ignore_startup_shutdown_costs = bool(ignore_startup_shutdown_costs)
         self.iter_number = 0
         self.x_cost_scale = 2.0
@@ -2589,6 +2452,31 @@ class SubproblemSurrogateTrainer:
             except Exception:
                 return 0.0
 
+        if self._lp_backend == LP_BACKEND_CVXPY_HIGHS:
+            assert_lp_backend_available(self._lp_backend)
+            for sample_id in range(self.n_samples):
+                result = solve_init_lp_backend(self, sample_id)
+                if result is None:
+                    continue
+                x_lp = result['x_sol']
+                self.pg[sample_id] = result['pg_sol']
+                self.x[sample_id] = x_lp
+                self.active_set_data[sample_id]['x_true'] = result['x_true']
+                (
+                    self.sensitive_timesteps[sample_id],
+                    self.surrogate_constraint_offsets[sample_id],
+                ) = select_constraint_layout(
+                    x_lp,
+                    strategy=self.constraint_generation_strategy,
+                    threshold_low=0.1,
+                    threshold_high=0.9,
+                    max_constraints=self.max_constraints,
+                )
+                self.coc[sample_id] = result['coc_sol']
+                self.cpower[sample_id] = result['cpower_sol']
+                self.lambda_inherent[sample_id] = result['lambda_inherent']
+            return
+
         for sample_id in range(self.n_samples):
             lambda_val = self.lambda_vals[sample_id]
 
@@ -2764,6 +2652,19 @@ class SubproblemSurrogateTrainer:
         shc     = 0.0 if self.ignore_startup_shutdown_costs else self.gencost[g, 2]
         Ton     = min(4, self.T)
         Toff    = min(4, self.T)
+
+        if self._lp_backend == LP_BACKEND_CVXPY_HIGHS:
+            assert_lp_backend_available(self._lp_backend)
+            return solve_primal_block_backend(
+                self,
+                sample_id,
+                alphas,
+                betas,
+                gammas,
+                deltas,
+                costs=costs,
+                pg_costs=pg_costs,
+            )
 
         model = gp.Model('primal_block_temporal')
         model.Params.OutputFlag = 0
@@ -2992,6 +2893,19 @@ class SubproblemSurrogateTrainer:
             gammas,
             deltas,
         )
+
+        if self._lp_backend == LP_BACKEND_CVXPY_HIGHS:
+            assert_lp_backend_available(self._lp_backend)
+            return solve_dual_block_backend(
+                self,
+                sample_id,
+                alphas,
+                betas,
+                gammas,
+                deltas,
+                costs=costs,
+                pg_costs=pg_costs,
+            )
 
         model = gp.Model('dual_block_v3')
         model.Params.OutputFlag = 0
@@ -4246,6 +4160,9 @@ class SubproblemSurrogateTrainer:
         resolved_pg_cost_nn_epochs = (
             self.pg_cost_nn_epochs if pg_cost_nn_epochs is None else max(int(pg_cost_nn_epochs), 1)
         )
+
+        # 统计 NN 更新是否频繁回滚（用于排查训练停滞）
+        rollback_count = 0
         
         for i in range(max_iter):
             print(f"🔄 迭代 {i+1}/{max_iter}", flush=True)
@@ -4363,8 +4280,9 @@ class SubproblemSurrogateTrainer:
                 (obj_primal, obj_dual_pg, obj_dual_x, obj_dual_coc, obj_dual, obj_opt)
             )
             merit_tol = max(1e-8, 1e-4 * max(1.0, abs(merit_before_nn)))
-            if merit_after_nn > merit_before_nn + merit_tol:
+            if self.enable_nn_rollback and (merit_after_nn > merit_before_nn + merit_tol):
                 self._restore_nn_update_state(nn_snapshot)
+                rollback_count += 1
                 obj_primal, obj_dual_pg, obj_dual_x, obj_dual_coc, obj_dual, obj_opt = self.cal_viol_components()
                 obj_primal, obj_dual_pg, obj_dual_x, obj_dual_coc, obj_dual, obj_opt = (
                     _z(obj_primal), _z(obj_dual_pg), _z(obj_dual_x), _z(obj_dual_coc), _z(obj_dual), _z(obj_opt)
@@ -4372,17 +4290,8 @@ class SubproblemSurrogateTrainer:
                 merit_after_nn = self._weighted_violation_merit(
                     (obj_primal, obj_dual_pg, obj_dual_x, obj_dual_coc, obj_dual, obj_opt)
                 )
-                print(
-                    f"[Unit-{self.unit_id}]   rollback NN update: "
-                    f"merit_before={merit_before_nn:.6f}, merit_after={merit_after_nn:.6f}",
-                    flush=True,
-                )
             else:
-                print(
-                    f"[Unit-{self.unit_id}]   accept NN update: "
-                    f"merit_before={merit_before_nn:.6f}, merit_after={merit_after_nn:.6f}",
-                    flush=True,
-                )
+                pass
             nn_metrics_after = self.cal_nn_logging_components()
             print(
                 f"[Unit-{self.unit_id}][NN-metric][after] "
@@ -4412,6 +4321,10 @@ class SubproblemSurrogateTrainer:
                 flush=True,
             )
             print("  " + "-" * 40, flush=True)
+
+            # 低频输出回滚计数（避免刷屏）
+            if i < 5 or ((i + 1) % 25 == 0):
+                print(f"[Unit-{self.unit_id}] rollback_count={rollback_count}/{i+1}", flush=True)
 
             # logger 钩子
             if i == max_iter - 1:
@@ -4640,6 +4553,7 @@ class SubproblemSurrogateTrainer:
                 'max_constraints': self.max_constraints,
                 'requested_max_constraints': self.requested_max_constraints,
                 'constraint_generation_strategy': self.constraint_generation_strategy,
+                'lp_backend': self._lp_backend,
                 'ignore_startup_shutdown_costs': self.ignore_startup_shutdown_costs,
                 'mu_individual_lower_bound_round': self.mu_individual_lower_bound_round,
                 'mu_group_lower_bound_round': self.mu_group_lower_bound_round,
@@ -4755,6 +4669,7 @@ class SubproblemSurrogateTrainer:
             )
             saved_strategy = state.get('constraint_generation_strategy', 'sensitive')
             self.constraint_generation_strategy = normalize_constraint_generation_strategy(saved_strategy)
+            self._lp_backend = normalize_lp_backend(state.get('lp_backend', self._lp_backend))
             self.ignore_startup_shutdown_costs = bool(
                 state.get('ignore_startup_shutdown_costs', self.ignore_startup_shutdown_costs)
             )
@@ -4886,6 +4801,7 @@ def _load_surrogate_model_metadata(filepath: str, device=None) -> dict:
     state = torch.load(filepath, map_location=device, weights_only=False)
     return {
         'constraint_generation_strategy': state.get('constraint_generation_strategy', 'sensitive'),
+        'lp_backend': state.get('lp_backend', LP_BACKEND_GUROBI),
         'ignore_startup_shutdown_costs': bool(state.get('ignore_startup_shutdown_costs', False)),
         'max_constraints': state.get('max_constraints'),
         'requested_max_constraints': state.get('requested_max_constraints'),
@@ -4957,6 +4873,7 @@ def train_dual_predictor_from_data(ppc, active_set_data: List[Dict], T_delta: fl
 def train_subproblem_surrogate_from_data(ppc, active_set_data: List[Dict], unit_id: int,
                                           T_delta: float = 1.0, lambda_predictor=None,
                                           max_iter: int = 20, nn_epochs: int = 10,
+                                          lp_backend: str = LP_BACKEND_GUROBI,
                                           constraint_generation_strategy: str = "sensitive",
                                           rho_dual_pg_init: float | None = None,
                                           rho_dual_x_init: float | None = None,
@@ -5007,6 +4924,7 @@ def train_subproblem_surrogate_from_data(ppc, active_set_data: List[Dict], unit_
     trainer = SubproblemSurrogateTrainer(
         ppc, active_set_data, T_delta, unit_id,
         lambda_predictor=lambda_predictor,
+        lp_backend=lp_backend,
         constraint_generation_strategy=constraint_generation_strategy,
         rho_dual_pg_init=rho_dual_pg_init,
         rho_dual_x_init=rho_dual_x_init,
@@ -5055,6 +4973,7 @@ def train_subproblem_surrogate_from_data(ppc, active_set_data: List[Dict], unit_
 
 def train_all_subproblem_surrogates(ppc, active_set_data: List[Dict], T_delta: float = 1.0,
                                       lambda_predictor=None, unit_ids: List[int] = None,
+                                      lp_backend: str = LP_BACKEND_GUROBI,
                                       max_iter: int = 20, nn_epochs: int = 10,
                                       constraint_generation_strategy: str = "sensitive",
                                       rho_dual_pg_init: float | None = None,
@@ -5116,6 +5035,7 @@ def train_all_subproblem_surrogates(ppc, active_set_data: List[Dict], T_delta: f
         trainer = SubproblemSurrogateTrainer(
             ppc, active_set_data, T_delta, g,
             lambda_predictor=lambda_predictor,
+            lp_backend=lp_backend,
             constraint_generation_strategy=constraint_generation_strategy,
             rho_dual_pg_init=rho_dual_pg_init,
             rho_dual_x_init=rho_dual_x_init,
@@ -5272,6 +5192,7 @@ def train_complete_model(ppc, active_set_data: List[Dict], T_delta: float = 1.0,
 
 def load_trained_models(ppc, active_set_data: List[Dict], T_delta: float,
                          load_dir: str, unit_ids: List[int] = None,
+                         lp_backend: str | None = None,
                          constraint_generation_strategy: str | None = None,
                          ignore_startup_shutdown_costs: bool | None = None,
                          device=None):
@@ -5317,6 +5238,7 @@ def load_trained_models(ppc, active_set_data: List[Dict], T_delta: float,
         saved_strategy = normalize_constraint_generation_strategy(
             metadata.get('constraint_generation_strategy', 'sensitive')
         )
+        saved_lp_backend = normalize_lp_backend(metadata.get('lp_backend', LP_BACKEND_GUROBI))
         saved_ignore_startup_shutdown_costs = bool(
             metadata.get('ignore_startup_shutdown_costs', False)
         )
@@ -5341,6 +5263,14 @@ def load_trained_models(ppc, active_set_data: List[Dict], T_delta: float,
                 f"requested={requested_ignore_startup_shutdown_costs}, "
                 f"saved={saved_ignore_startup_shutdown_costs}"
             )
+        requested_lp_backend = (
+            saved_lp_backend if lp_backend is None else normalize_lp_backend(lp_backend)
+        )
+        if requested_lp_backend != saved_lp_backend:
+            raise ValueError(
+                f"Surrogate model lp_backend mismatch for unit {g}: "
+                f"requested={requested_lp_backend}, saved={saved_lp_backend}"
+            )
 
         requested_max_constraints = metadata.get('requested_max_constraints')
         saved_max_constraints = metadata.get('max_constraints')
@@ -5358,6 +5288,7 @@ def load_trained_models(ppc, active_set_data: List[Dict], T_delta: float,
             ppc, active_set_data, T_delta, g,
             lambda_predictor=dual_predictor,
             max_constraints=trainer_max_constraints,
+            lp_backend=requested_lp_backend,
             constraint_generation_strategy=requested_strategy,
             ignore_startup_shutdown_costs=requested_ignore_startup_shutdown_costs,
             nn_hidden_dims=metadata.get('nn_hidden_dims'),

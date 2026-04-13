@@ -13,6 +13,7 @@
 修改顶部的 MODE / RUN_FP 变量切换执行模式。
 """
 
+import os
 import sys
 import subprocess
 import time
@@ -23,7 +24,7 @@ from pathlib import Path
 
 # ──────────────────────── 依赖检查 ────────────────────────
 
-def check_and_install_dependencies():
+def check_and_install_dependencies(required_subproblem_backend: str | None = None):
     dependencies = {
         'numpy': 'numpy',
         'torch': 'torch',
@@ -49,10 +50,24 @@ def check_and_install_dependencies():
         else:
             print("请手动安装后重试")
             return False
+    backend = "gurobi" if required_subproblem_backend is None else str(required_subproblem_backend).strip().lower()
+    if backend == "cvxpy_highs":
+        optional_missing = []
+        for import_name, package_name in {"cvxpy": "cvxpy", "highspy": "highspy"}.items():
+            try:
+                __import__(import_name)
+                print(f"[OK] {import_name}")
+            except ImportError:
+                optional_missing.append(package_name)
+                print(f"[MISS] {import_name}")
+        if optional_missing:
+            print(
+                "\ncvxpy_highs backend requires optional packages: "
+                + ", ".join(optional_missing)
+            )
+            print(f"Install command: {sys.executable} -m pip install {' '.join(optional_missing)}")
+            return False
     return True
-
-if not check_and_install_dependencies():
-    sys.exit(1)
 
 # ──────────────────────── 模式配置 ────────────────────────
 #
@@ -61,13 +76,13 @@ if not check_and_install_dependencies():
 #   'sparse'    - 稀疏支持集发现 → sparse BCD 训练
 #   'both'      - BCD 训练 → surrogate 训练 → 联合 BCD 训练
 #
-MODE = 'both'
+MODE = 'surrogate'
 ENABLE_SPARSE_SUPPORTS = False
 RUN_FP = False
 
 # 顶部集中配置区：训练相关参数统一在这里调整
 CASE_NAME = 'case3lite'      # 'case3' / 'case3lite' / 'case14' / 'case30' / 'case39' / 'case118'
-MAX_SAMPLES = 100            # None = 使用全部样本
+MAX_SAMPLES = 10            # None = 使用全部样本
 T_DELTA = 1.0
 DUAL_EPOCHS = 200
 DUAL_BATCH_SIZE = 8
@@ -81,7 +96,15 @@ NN_EPOCHS = 4
 UNIT_IDS = [1]              # None = 所有机组；或如 [0, 1, 2]
 FP_TEST_SAMPLES = 3
 N_WORKERS_BCD = 4
-N_WORKERS_SUBPROBLEM = 4
+# subproblem 并行参数（建议只开一层：要么机组级，要么样本级）
+# - N_WORKERS_UNIT:   机组级并行（跨进程），>1 时启用 `train_all_surrogates_parallel`
+# - N_WORKERS_SAMPLE: 样本级并行（机组内），>1 时使用 `ParallelSubproblemSurrogateTrainer`
+N_WORKERS_UNIT = 1
+N_WORKERS_SAMPLE = 4
+# 兼容旧变量名（历史配置仍可用）
+N_WORKERS_SUBPROBLEM = N_WORKERS_SAMPLE
+SUBPROBLEM_LP_BACKEND = 'cvxpy_highs'   # 'gurobi' / 'cvxpy_highs'
+SUBPROBLEM_SOLVER_BIN_PREPEND = None
 JOINT_MAX_ITER = 10
 JOINT_NN_EPOCHS = 5
 JOINT_SURR_NN_EPOCHS = 5
@@ -154,6 +177,7 @@ SUBPROBLEM_C_PG_NN_SIZE = 'medium'   # 'small' / 'medium' / 'large'
 SUBPROBLEM_NN_BATCH_SIZE = 4
 SUBPROBLEM_NN_SHUFFLE = True
 SUBPROBLEM_NN_LR = 5e-4
+SUBPROBLEM_ENABLE_NN_ROLLBACK = False  # 关闭可避免训练被回滚机制锁死（但可能更不稳定）
 SUBPROBLEM_IGNORE_STARTUP_SHUTDOWN_COSTS = False
 SUBPROBLEM_X_COST_NN_LR = 1e-5
 SUBPROBLEM_PG_COST_NN_EPOCHS = 12
@@ -173,6 +197,23 @@ BCD_PG_BLOCK_PROX_WEIGHT = 0
 BCD_DUAL_BLOCK_PROX_WEIGHT = 1e-2
 SUBPROBLEM_PG_BLOCK_PROX_WEIGHT = 0
 SUBPROBLEM_DUAL_BLOCK_PROX_WEIGHT = 1e-3
+
+SUBPROBLEM_SOLVER_PATH_PREPENDED = False
+def _bootstrap_runtime_environment() -> None:
+    """Run-once bootstrap for the main process only.
+
+    IMPORTANT: keep this out of module top-level so Windows multiprocessing
+    (spawn) won't repeatedly run dependency checks in every worker process.
+    """
+    global SUBPROBLEM_SOLVER_PATH_PREPENDED
+    if SUBPROBLEM_SOLVER_BIN_PREPEND:
+        prepend_path = str(Path(SUBPROBLEM_SOLVER_BIN_PREPEND))
+        current_path = os.environ.get("PATH", "")
+        os.environ["PATH"] = prepend_path + (os.pathsep + current_path if current_path else "")
+        SUBPROBLEM_SOLVER_PATH_PREPENDED = True
+
+    if not check_and_install_dependencies(SUBPROBLEM_LP_BACKEND):
+        sys.exit(1)
 
 # ──────────────────────── 导入 ────────────────────────
 
@@ -198,6 +239,7 @@ try:
     from case_registry import get_case_ppc
     from mti118_data_loader import load_case118_ppc_with_mti_limits
     from scenario_utils import has_meaningful_renewable_data, normalize_sample_arrays
+    from subproblem_lp_solver import get_cvxpy_highs_status, is_lp_backend_available
     from training_logger import TrainingLogger
     from training_visualizer import TrainingVisualizer
 except ImportError as e:
@@ -430,6 +472,7 @@ def create_bcd_agent(ppc, all_samples, T_DELTA, *,
 def create_subproblem_trainer(ppc, all_samples, T_DELTA, unit_id: int, *,
                               n_workers: int = 4,
                               lambda_predictor=None,
+                              lp_backend: str = 'gurobi',
                               constraint_generation_strategy: str = 'sensitive',
                               rho_primal_init: float = 1e-3,
                               rho_dual_init: float = 1e-3,
@@ -470,10 +513,12 @@ def create_subproblem_trainer(ppc, all_samples, T_DELTA, unit_id: int, *,
                               pg_cost_smooth_abs_eps: float = 1e-6,
                               pg_block_prox_weight: float = SUBPROBLEM_PG_BLOCK_PROX_WEIGHT,
                               dual_block_prox_weight: float = SUBPROBLEM_DUAL_BLOCK_PROX_WEIGHT,
+                              enable_nn_rollback: bool = True,
                               iter_delta_reg_weight: float = SUBPROBLEM_ITER_DELTA_REG_WEIGHT,
                               iter_delta_reg_deadband: float = SUBPROBLEM_ITER_DELTA_REG_DEADBAND):
     trainer_kwargs = dict(
         lambda_predictor=lambda_predictor,
+        lp_backend=lp_backend,
         constraint_generation_strategy=constraint_generation_strategy,
         rho_primal_init=rho_primal_init,
         rho_dual_init=rho_dual_init,
@@ -514,6 +559,7 @@ def create_subproblem_trainer(ppc, all_samples, T_DELTA, unit_id: int, *,
         pg_cost_smooth_abs_eps=pg_cost_smooth_abs_eps,
         pg_block_prox_weight=pg_block_prox_weight,
         dual_block_prox_weight=dual_block_prox_weight,
+        enable_nn_rollback=enable_nn_rollback,
         iter_delta_reg_weight=iter_delta_reg_weight,
         iter_delta_reg_deadband=iter_delta_reg_deadband,
     )
@@ -529,6 +575,7 @@ def run_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS,
                   DUAL_EPOCHS, DUAL_BATCH_SIZE, SUBPROBLEM_MAX_ITER, NN_EPOCHS, save_dir,
                   n_workers: int = 4, logger: 'TrainingLogger | None' = None,
                   load_dir: str | None = None,
+                  lp_backend: str = 'gurobi',
                   dual_batch_strategy: str = 'full-batch',
                   dual_shuffle: bool = True,
                   dual_learning_rate: float = 5e-4,
@@ -583,6 +630,11 @@ def run_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS,
     ppc_int = ext2int(ppc)
     ng = ppc_int['gen'].shape[0]
     unit_ids = UNIT_IDS if UNIT_IDS is not None else list(range(ng))
+    lp_backend = str(lp_backend).strip().lower()
+
+    # 在 cvxpy+HiGHS 路径下，启用“失败样本强诊断并中断”，便于一次定位根因。
+    if lp_backend == "cvxpy_highs":
+        os.environ.setdefault("STRICT_CVXPY_HIGHS", "1")
 
     n_samples = len(all_samples)
     print("\n" + "=" * 70)
@@ -613,6 +665,18 @@ def run_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS,
         f"subproblem_prox: pg_block={pg_block_prox_weight}, "
         f"dual_block={dual_block_prox_weight}"
     )
+    backend_status = get_cvxpy_highs_status()
+    log(
+        f"subproblem_lp_backend={lp_backend}, "
+        f"path_prepended={SUBPROBLEM_SOLVER_PATH_PREPENDED}, "
+        f"cvxpy={backend_status['cvxpy_available']}, "
+        f"highspy={backend_status['highspy_available']}, "
+        f"highs_solver={backend_status['highs_solver_available']}"
+    )
+    if lp_backend == 'cvxpy_highs' and not is_lp_backend_available(lp_backend):
+        raise RuntimeError(
+            "SUBPROBLEM_LP_BACKEND='cvxpy_highs' but cvxpy/highspy/HiGHS is unavailable."
+        )
     log(
         f"subproblem_loss_ratio: primal={loss_ratio_primal}, dual_pg={loss_ratio_dual_pg}, "
         f"dual_x={loss_ratio_dual_x}, opt={loss_ratio_opt}, reg={loss_ratio_reg}"
@@ -631,6 +695,7 @@ def run_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS,
             T_DELTA,
             load_dir=str(load_path),
             unit_ids=[],
+            lp_backend=lp_backend,
             constraint_generation_strategy=constraint_generation_strategy,
             ignore_startup_shutdown_costs=ignore_startup_shutdown_costs,
         )[0]
@@ -654,9 +719,61 @@ def run_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS,
             save_path=dual_save_path,
         )
 
-    # 步骤 2：逐机组训练代理约束（n_workers<=1 串行，否则样本级并行）
+    # 步骤 2：训练代理约束（支持机组级并行或样本级并行）
     if save_dir:
         os.makedirs(save_dir, exist_ok=True)
+
+    # B1：机组级并行（Level 1）
+    if N_WORKERS_UNIT > 1:
+        from uc_NN_subproblem_parallel import train_all_surrogates_parallel
+
+        log(
+            f"  启用机组级并行: unit_workers={N_WORKERS_UNIT}, sample_workers={N_WORKERS_SAMPLE}"
+        )
+        _ = train_all_surrogates_parallel(
+            ppc,
+            all_samples,
+            T_delta=T_DELTA,
+            lambda_predictor=dual_predictor,
+            lp_backend=lp_backend,
+            unit_ids=unit_ids,
+            max_iter=SUBPROBLEM_MAX_ITER,
+            nn_epochs=NN_EPOCHS,
+            rho_primal_init=rho_primal_init,
+            rho_dual_init=rho_dual_init,
+            rho_dual_pg_init=rho_dual_pg_init,
+            rho_dual_x_init=rho_dual_x_init,
+            rho_dual_coc_init=rho_dual_coc_init,
+            rho_binary_init=rho_binary_init,
+            rho_opt_init=rho_opt_init,
+            gamma_base=subproblem_gamma_base,
+            mu_individual_lower_bound_round=mu_individual_lower_bound_round,
+            mu_group_lower_bound_round=mu_group_lower_bound_round,
+            mu_signed_round_interval=mu_signed_round_interval,
+            mu_sign_hysteresis_rounds=mu_sign_hysteresis_rounds,
+            mu_sign_flip_min_share=mu_sign_flip_min_share,
+            save_dir=save_dir,
+            n_workers=N_WORKERS_UNIT,
+            sample_n_workers=N_WORKERS_SAMPLE,
+            use_sample_parallel=(N_WORKERS_SAMPLE > 1),
+        )
+
+        # train_all_surrogates_parallel 返回的是 state_dict；为了保持 run_surrogate 的返回形态
+        # （trainer 对象，用于 print_surrogate_results / 下游流程），这里从 save_dir 重新加载。
+        dual_predictor_loaded, trainers = load_trained_models(
+            ppc,
+            all_samples,
+            T_DELTA,
+            load_dir=str(save_dir),
+            unit_ids=unit_ids,
+            lp_backend=lp_backend,
+            constraint_generation_strategy=constraint_generation_strategy,
+            ignore_startup_shutdown_costs=ignore_startup_shutdown_costs,
+        )
+        if logger is not None:
+            for trainer in trainers.values():
+                trainer.logger = logger
+        return dual_predictor_loaded, trainers
 
     trainers = {}
     for i, g in enumerate(unit_ids):
@@ -665,6 +782,7 @@ def run_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS,
             trainer = SubproblemSurrogateTrainer(
                 ppc, all_samples, T_DELTA, g,
                 lambda_predictor=dual_predictor,
+                lp_backend=lp_backend,
                 constraint_generation_strategy=constraint_generation_strategy,
                 rho_primal_init=rho_primal_init,
         rho_dual_init=rho_dual_init,
@@ -705,6 +823,7 @@ def run_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS,
                 pg_cost_smooth_abs_eps=pg_cost_smooth_abs_eps,
                 pg_block_prox_weight=pg_block_prox_weight,
                 dual_block_prox_weight=dual_block_prox_weight,
+                enable_nn_rollback=SUBPROBLEM_ENABLE_NN_ROLLBACK,
                 iter_delta_reg_weight=iter_delta_reg_weight,
                 iter_delta_reg_deadband=iter_delta_reg_deadband,
             )
@@ -713,6 +832,7 @@ def run_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS,
             trainer = ParallelSubproblemSurrogateTrainer(
                 ppc, all_samples, T_DELTA, g,
                 lambda_predictor=dual_predictor,
+                lp_backend=lp_backend,
                 constraint_generation_strategy=constraint_generation_strategy,
                 rho_primal_init=rho_primal_init,
                 rho_dual_init=rho_dual_init,
@@ -753,6 +873,7 @@ def run_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS,
                 pg_cost_smooth_abs_eps=pg_cost_smooth_abs_eps,
                 pg_block_prox_weight=pg_block_prox_weight,
                 dual_block_prox_weight=dual_block_prox_weight,
+                enable_nn_rollback=SUBPROBLEM_ENABLE_NN_ROLLBACK,
                 iter_delta_reg_weight=iter_delta_reg_weight,
                 iter_delta_reg_deadband=iter_delta_reg_deadband,
                 n_workers=n_workers,
@@ -784,6 +905,7 @@ def run_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS,
 
 def load_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS, load_dir,
                    logger: 'TrainingLogger | None' = None,
+                   lp_backend: str | None = None,
                    constraint_generation_strategy: str | None = None,
                    ignore_startup_shutdown_costs: bool | None = None):
     """加载已有 dual_predictor 和 subproblem surrogate 模型。"""
@@ -800,6 +922,7 @@ def load_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS, load_dir,
         T_DELTA,
         load_dir=str(load_path),
         unit_ids=UNIT_IDS,
+        lp_backend=lp_backend,
         constraint_generation_strategy=constraint_generation_strategy,
         ignore_startup_shutdown_costs=ignore_startup_shutdown_costs,
     )
@@ -1293,6 +1416,7 @@ def run_feasibility_pump_test(ppc, all_samples, dual_predictor, trainers,
 # ──────────────────────── 主函数 ────────────────────────
 
 def main():
+    _bootstrap_runtime_environment()
     start_time = time.time()
 
     print("=" * 70)
@@ -1566,6 +1690,7 @@ def main():
                 dual_predictor, trainers = load_surrogate(
                     ppc, all_samples, T_DELTA, UNIT_IDS,
                     SURROGATE_MODEL_DIR, logger=logger,
+                    lp_backend=SUBPROBLEM_LP_BACKEND,
                     constraint_generation_strategy=CONSTRAINT_GENERATION_STRATEGY,
                     ignore_startup_shutdown_costs=SUBPROBLEM_IGNORE_STARTUP_SHUTDOWN_COSTS_VALUE,
                 )
@@ -1573,8 +1698,9 @@ def main():
                 dual_predictor, trainers = run_surrogate(
                     ppc, all_samples, T_DELTA, UNIT_IDS,
                     DUAL_EPOCHS, DUAL_BATCH_SIZE, SUBPROBLEM_MAX_ITER_VALUE, NN_EPOCHS, save_dir,
-                    n_workers=N_WORKERS_SUBPROBLEM, logger=logger,
+                    n_workers=N_WORKERS_SAMPLE, logger=logger,
                     load_dir=str(resolve_existing_path(SURROGATE_MODEL_DIR, 'surrogate model dir')) if SURROGATE_CONTINUE_TRAINING and SURROGATE_MODEL_DIR is not None else None,
+                    lp_backend=SUBPROBLEM_LP_BACKEND,
                     dual_batch_strategy=DUAL_BATCH_STRATEGY_VALUE,
                     dual_shuffle=DUAL_SHUFFLE_VALUE,
                     dual_learning_rate=DUAL_LR_VALUE,
@@ -1859,6 +1985,7 @@ def main():
                 dual_predictor, trainers = load_surrogate(
                     ppc, all_samples, T_DELTA, UNIT_IDS,
                     SURROGATE_MODEL_DIR, logger=logger,
+                    lp_backend=SUBPROBLEM_LP_BACKEND,
                     constraint_generation_strategy=CONSTRAINT_GENERATION_STRATEGY,
                     ignore_startup_shutdown_costs=SUBPROBLEM_IGNORE_STARTUP_SHUTDOWN_COSTS_VALUE,
                 )
@@ -1866,8 +1993,9 @@ def main():
                 dual_predictor, trainers = run_surrogate(
                     ppc, all_samples, T_DELTA, UNIT_IDS,
                     DUAL_EPOCHS, DUAL_BATCH_SIZE, SUBPROBLEM_MAX_ITER_VALUE, NN_EPOCHS, save_dir,
-                    n_workers=N_WORKERS_SUBPROBLEM, logger=logger,
+                    n_workers=N_WORKERS_SAMPLE, logger=logger,
                     load_dir=str(resolve_existing_path(SURROGATE_MODEL_DIR, 'surrogate model dir')) if SURROGATE_CONTINUE_TRAINING and SURROGATE_MODEL_DIR is not None else None,
+                    lp_backend=SUBPROBLEM_LP_BACKEND,
                     dual_batch_strategy=DUAL_BATCH_STRATEGY_VALUE,
                     dual_shuffle=DUAL_SHUFFLE_VALUE,
                     dual_learning_rate=DUAL_LR_VALUE,
