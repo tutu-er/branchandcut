@@ -102,8 +102,14 @@ except ImportError:
     print("警告: pypower未安装，测试代码可能无法运行", flush=True)
 
 # 设置输出缓冲（用 reconfigure 原地修改，避免替换 stdout 导致 buffer 被 GC 关闭）
-if hasattr(sys.stdout, 'reconfigure'):
-    sys.stdout.reconfigure(encoding='utf-8', line_buffering=True)
+# 额外启用 write_through，尽量确保重定向/管道下也能及时落盘。
+try:
+    if hasattr(sys.stdout, 'reconfigure'):
+        sys.stdout.reconfigure(encoding='utf-8', line_buffering=True, write_through=True)
+    if hasattr(sys.stderr, 'reconfigure'):
+        sys.stderr.reconfigure(encoding='utf-8', line_buffering=True, write_through=True)
+except Exception:
+    pass
 
 
 def _load_demo_ppc(case_name: str):
@@ -3238,15 +3244,20 @@ class SubproblemSurrogateTrainer:
             }
             mu_sol = np.array([mu[k].X for k in range(self.num_coupling_constraints)])
 
-            if sample_id <= 2:
-                print(f"  dual_block sample={sample_id}: "
-                      f"obj_dual_pg={obj_dual_pg.getValue():.4f}, "
-                      f"obj_dual_x={obj_dual_x.getValue():.4f}, "
-                      f"obj_dual_coc={obj_dual_coc.getValue():.4f}, "
-                      f"obj_dual={obj_dual.getValue():.4f}, "
-                      f"obj_opt={obj_opt.getValue() if hasattr(obj_opt, 'getValue') else obj_opt:.4f}, "
-                      f"obj_dual_prox={obj_dual_prox.getValue() if hasattr(obj_dual_prox, 'getValue') else 0.0:.4f}",
-                      flush=True)
+            # Logging: keep parity with primal_block style and avoid flooding.
+            # Show only the first 3 units and the first 3 samples by default.
+            if self.unit_id < 3 and sample_id <= 2:
+                print(
+                    f"[Unit-{self.unit_id}] dual_block, sample_id: {sample_id}, "
+                    f"status: optimal, "
+                    f"obj_dual_pg: {obj_dual_pg.getValue():.6f}, "
+                    f"obj_dual_x: {obj_dual_x.getValue():.6f}, "
+                    f"obj_dual_coc: {obj_dual_coc.getValue():.6f}, "
+                    f"obj_dual: {obj_dual.getValue():.6f}, "
+                    f"obj_opt: {(obj_opt.getValue() if hasattr(obj_opt, 'getValue') else obj_opt):.6f}, "
+                    f"obj_dual_prox: {(obj_dual_prox.getValue() if hasattr(obj_dual_prox, 'getValue') else 0.0):.6f}",
+                    flush=True,
+                )
 
             return lambda_inherent_sol, mu_sol
         else:

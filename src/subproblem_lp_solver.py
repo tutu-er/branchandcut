@@ -1448,7 +1448,8 @@ def solve_dual_block(
         return None, None
 
     display_sample_id = int(getattr(trainer, "display_sample_id", sample_id))
-    if display_sample_id <= 2:
+    # Logging parity with the Gurobi path: show only the first 3 units and first 3 samples.
+    if g < 3 and display_sample_id <= 2:
         try:
             obj_dual_pg_v = float(np.asarray(obj_dual_pg.value).reshape(-1)[0]) if obj_dual_pg is not None else 0.0
             obj_dual_x_v = float(np.asarray(obj_dual_x.value).reshape(-1)[0]) if obj_dual_x is not None else 0.0
@@ -1456,14 +1457,16 @@ def solve_dual_block(
             obj_dual_v = obj_dual_pg_v + obj_dual_x_v + obj_dual_coc_v
             obj_opt_v = float(np.asarray(obj_opt.value).reshape(-1)[0]) if obj_opt is not None else 0.0
             obj_dual_prox_v = float(np.asarray(obj_dual_prox.value).reshape(-1)[0]) if obj_dual_prox is not None else 0.0
+            status = getattr(problem, "status", None)
             print(
-                f"  dual_block sample={display_sample_id}: "
-                f"obj_dual_pg={obj_dual_pg_v:.4f}, "
-                f"obj_dual_x={obj_dual_x_v:.4f}, "
-                f"obj_dual_coc={obj_dual_coc_v:.4f}, "
-                f"obj_dual={obj_dual_v:.4f}, "
-                f"obj_opt={obj_opt_v:.4f}, "
-                f"obj_dual_prox={obj_dual_prox_v:.4f}",
+                f"[Unit-{g}] dual_block, sample_id: {display_sample_id}, "
+                f"status: {status}, "
+                f"obj_dual_pg: {obj_dual_pg_v:.6f}, "
+                f"obj_dual_x: {obj_dual_x_v:.6f}, "
+                f"obj_dual_coc: {obj_dual_coc_v:.6f}, "
+                f"obj_dual: {obj_dual_v:.6f}, "
+                f"obj_opt: {obj_opt_v:.6f}, "
+                f"obj_dual_prox: {obj_dual_prox_v:.6f}",
                 flush=True,
             )
         except Exception:

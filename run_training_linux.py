@@ -653,7 +653,7 @@ def run_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS,
         os.environ.setdefault("STRICT_CVXPY_HIGHS", "1")
 
     n_samples = len(all_samples)
-    print("\n" + "=" * 70)
+    print("\n" + "=" * 70, flush=True)
     log(f"开始并行代理训练: {n_samples} 样本，{len(unit_ids)} 机组，"
         f"n_workers={n_workers}，dual_epochs={DUAL_EPOCHS}，"
         f"subproblem_iter={SUBPROBLEM_MAX_ITER}，nn_epochs={NN_EPOCHS}，"
@@ -697,7 +697,7 @@ def run_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS,
         f"subproblem_loss_ratio: primal={loss_ratio_primal}, dual_pg={loss_ratio_dual_pg}, "
         f"dual_x={loss_ratio_dual_x}, opt={loss_ratio_opt}, reg={loss_ratio_reg}"
     )
-    print("=" * 70)
+    print("=" * 70, flush=True)
 
     # 步骤 1：对偶变量预测器（串行，NN 训练无需并行化）
     dual_save_path = os.path.join(save_dir, 'dual_predictor.pth') if save_dir else None
