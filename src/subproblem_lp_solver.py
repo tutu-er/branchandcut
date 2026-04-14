@@ -290,6 +290,17 @@ def _sum_scalar_terms(terms) -> object:
     return cp.sum(cp.hstack(normalized))
 
 
+def _sum_pos(expr) -> object:
+    return cp.sum(cp.pos(expr))
+
+
+def _weighted_abs_sum(expr, weights) -> object:
+    weights_arr = np.asarray(weights, dtype=float).reshape(-1)
+    if weights_arr.size == 0:
+        return cp.Constant(0.0)
+    return cp.sum(cp.multiply(weights_arr, cp.abs(expr)))
+
+
 def _build_primal_block_prox_expr(trainer, sample_id: int, pg, x, coc):
     if trainer.pg_block_prox_weight <= 0:
         return 0.0
@@ -303,13 +314,11 @@ def _build_primal_block_prox_expr(trainer, sample_id: int, pg, x, coc):
         if trainer.ignore_startup_shutdown_costs
         else max(float(trainer.gencost[g, 1]), float(trainer.gencost[g, 2]), 1.0)
     )
-    terms = []
-    for t in range(trainer.T):
-        terms.append(_abs_distance(pg[t], prev_pg[t], pg_scale))
-        terms.append(_abs_distance(x[t], prev_x[t], 1.0))
-    for t in range(trainer.T - 1):
-        terms.append(_abs_distance(coc[t], prev_coc[t], coc_scale))
-    return _sum_scalar_terms(terms)
+    expr = cp.sum(cp.abs((pg - prev_pg) / pg_scale))
+    expr += cp.sum(cp.abs(x - prev_x))
+    if trainer.T > 1:
+        expr += cp.sum(cp.abs((coc - prev_coc) / coc_scale))
+    return expr
 
 
 def _empty_lambda_inherent(trainer, Ton: int, Toff: int) -> dict:
@@ -1011,55 +1020,62 @@ def solve_primal_block(
         x_true = trainer.x[sample_id]
 
     obj_binary = cp.sum(cp.abs(x - x_true))
+    lam_pg_lower = np.abs(np.asarray(lam_inh["lambda_pg_lower"], dtype=float))
+    lam_pg_upper = np.abs(np.asarray(lam_inh["lambda_pg_upper"], dtype=float))
+    lam_x_lower = np.abs(np.asarray(lam_inh["lambda_x_lower"], dtype=float))
+    lam_x_upper = np.abs(np.asarray(lam_inh["lambda_x_upper"], dtype=float))
 
     obj_primal_terms = []
     obj_opt_terms = []
 
-    for t in range(trainer.T):
-        pg_lower_expr = Pmin * x[t] - pg[t]
-        obj_primal_terms.append(cp.pos(pg_lower_expr))
-        obj_opt_terms.append(cp.abs(pg_lower_expr) * abs(float(lam_inh["lambda_pg_lower"][t])))
+    pg_lower_expr = Pmin * x - pg
+    obj_primal_terms.append(_sum_pos(pg_lower_expr))
+    obj_opt_terms.append(_weighted_abs_sum(pg_lower_expr, lam_pg_lower))
 
-        pg_upper_expr = pg[t] - Pmax * x[t]
-        obj_primal_terms.append(cp.pos(pg_upper_expr))
-        obj_opt_terms.append(cp.abs(pg_upper_expr) * abs(float(lam_inh["lambda_pg_upper"][t])))
+    pg_upper_expr = pg - Pmax * x
+    obj_primal_terms.append(_sum_pos(pg_upper_expr))
+    obj_opt_terms.append(_weighted_abs_sum(pg_upper_expr, lam_pg_upper))
 
-        obj_opt_terms.append(x[t] * abs(float(lam_inh["lambda_x_lower"][t])))
-        obj_opt_terms.append((1 - x[t]) * abs(float(lam_inh["lambda_x_upper"][t])))
+    obj_opt_terms.append(cp.sum(cp.multiply(lam_x_lower, x)))
+    obj_opt_terms.append(cp.sum(cp.multiply(lam_x_upper, 1 - x)))
 
-    for t in range(1, trainer.T):
-        ramp_up_expr = pg[t] - pg[t - 1] - Ru * x[t - 1] - Ru_co * (1 - x[t - 1])
-        obj_primal_terms.append(cp.pos(ramp_up_expr))
-        obj_opt_terms.append(cp.abs(ramp_up_expr) * abs(float(lam_inh["lambda_ramp_up"][t - 1])))
+    if trainer.T > 1:
+        lam_ramp_up = np.abs(np.asarray(lam_inh["lambda_ramp_up"], dtype=float))
+        lam_ramp_down = np.abs(np.asarray(lam_inh["lambda_ramp_down"], dtype=float))
+        ramp_up_expr = pg[1:] - pg[:-1] - Ru * x[:-1] - Ru_co * (1 - x[:-1])
+        obj_primal_terms.append(_sum_pos(ramp_up_expr))
+        obj_opt_terms.append(_weighted_abs_sum(ramp_up_expr, lam_ramp_up))
 
-        ramp_down_expr = pg[t - 1] - pg[t] - Rd * x[t] - Rd_co * (1 - x[t])
-        obj_primal_terms.append(cp.pos(ramp_down_expr))
-        obj_opt_terms.append(cp.abs(ramp_down_expr) * abs(float(lam_inh["lambda_ramp_down"][t - 1])))
+        ramp_down_expr = pg[:-1] - pg[1:] - Rd * x[1:] - Rd_co * (1 - x[1:])
+        obj_primal_terms.append(_sum_pos(ramp_down_expr))
+        obj_opt_terms.append(_weighted_abs_sum(ramp_down_expr, lam_ramp_down))
 
     for tau in range(1, Ton + 1):
-        for t1 in range(trainer.T - tau):
-            min_on_expr = x[t1 + 1] - x[t1] - x[t1 + tau]
-            obj_primal_terms.append(cp.pos(min_on_expr))
-            obj_opt_terms.append(cp.abs(min_on_expr) * abs(float(lam_inh["lambda_min_on"][tau - 1][t1])))
+        min_on_expr = x[1:trainer.T - tau + 1] - x[:trainer.T - tau] - x[tau:]
+        lam_min_on = np.abs(np.asarray(lam_inh["lambda_min_on"][tau - 1], dtype=float))
+        obj_primal_terms.append(_sum_pos(min_on_expr))
+        obj_opt_terms.append(_weighted_abs_sum(min_on_expr, lam_min_on))
 
     for tau in range(1, Toff + 1):
-        for t1 in range(trainer.T - tau):
-            min_off_expr = -x[t1 + 1] + x[t1] - (1 - x[t1 + tau])
-            obj_primal_terms.append(cp.pos(min_off_expr))
-            obj_opt_terms.append(cp.abs(min_off_expr) * abs(float(lam_inh["lambda_min_off"][tau - 1][t1])))
+        min_off_expr = -x[1:trainer.T - tau + 1] + x[:trainer.T - tau] - (1 - x[tau:])
+        lam_min_off = np.abs(np.asarray(lam_inh["lambda_min_off"][tau - 1], dtype=float))
+        obj_primal_terms.append(_sum_pos(min_off_expr))
+        obj_opt_terms.append(_weighted_abs_sum(min_off_expr, lam_min_off))
 
-    for t in range(1, trainer.T):
-        start_expr = sc * (x[t] - x[t - 1]) - coc[t - 1]
-        obj_primal_terms.append(cp.pos(start_expr))
-        obj_opt_terms.append(cp.abs(start_expr) * abs(float(lam_inh["lambda_start_cost"][t - 1])))
+    if trainer.T > 1:
+        lam_start_cost = np.abs(np.asarray(lam_inh["lambda_start_cost"], dtype=float))
+        lam_shut_cost = np.abs(np.asarray(lam_inh["lambda_shut_cost"], dtype=float))
+        lam_coc_nonneg = np.abs(np.asarray(lam_inh["lambda_coc_nonneg"], dtype=float))
+        start_expr = sc * (x[1:] - x[:-1]) - coc
+        obj_primal_terms.append(_sum_pos(start_expr))
+        obj_opt_terms.append(_weighted_abs_sum(start_expr, lam_start_cost))
 
-        shut_expr = shc * (x[t - 1] - x[t]) - coc[t - 1]
-        obj_primal_terms.append(cp.pos(shut_expr))
-        obj_opt_terms.append(cp.abs(shut_expr) * abs(float(lam_inh["lambda_shut_cost"][t - 1])))
-        obj_opt_terms.append(coc[t - 1] * abs(float(lam_inh["lambda_coc_nonneg"][t - 1])))
+        shut_expr = shc * (x[:-1] - x[1:]) - coc
+        obj_primal_terms.append(_sum_pos(shut_expr))
+        obj_opt_terms.append(_weighted_abs_sum(shut_expr, lam_shut_cost))
+        obj_opt_terms.append(cp.sum(cp.multiply(lam_coc_nonneg, coc)))
 
-    for t in range(trainer.T):
-        constraints.append(cpower[t] == a * pg[t] + b * x[t])
+    constraints.append(cpower == a * pg + b * x)
 
     sensitive_t = trainer.sensitive_timesteps[sample_id]
     constraint_offsets = trainer._constraint_offsets_for_sample(sample_id)
@@ -1250,54 +1266,60 @@ def solve_dual_block(
     obj_opt_terms = []
 
     for t in range(trainer.T):
-        expr = a + (pg_costs[t] if pg_costs is not None else 0) - lambda_val[t]
-        expr -= lam_pg_lower[t]
-        expr += lam_pg_upper[t]
+        expr_terms = [
+            a + (pg_costs[t] if pg_costs is not None else 0) - lambda_val[t],
+            -lam_pg_lower[t],
+            lam_pg_upper[t],
+        ]
         if t > 0:
-            expr += lam_ramp_up[t - 1]
-            expr -= lam_ramp_down[t - 1]
+            expr_terms.extend([lam_ramp_up[t - 1], -lam_ramp_down[t - 1]])
         if t < trainer.T - 1:
-            expr -= lam_ramp_up[t]
-            expr += lam_ramp_down[t]
-        obj_dual_pg_terms.append(cp.abs(expr))
+            expr_terms.extend([-lam_ramp_up[t], lam_ramp_down[t]])
+        obj_dual_pg_terms.append(cp.abs(_sum_scalar_terms(expr_terms)))
 
     sensitive_t = trainer.sensitive_timesteps[sample_id]
     constraint_offsets = trainer._constraint_offsets_for_sample(sample_id)
     for t in range(trainer.T):
-        expr = b + (costs[t] if costs is not None else 0)
-        expr += Pmin * lam_pg_lower[t]
-        expr -= Pmax * lam_pg_upper[t]
+        expr_terms = [
+            b + (costs[t] if costs is not None else 0),
+            Pmin * lam_pg_lower[t],
+            -Pmax * lam_pg_upper[t],
+        ]
         if t < trainer.T - 1:
-            expr += (Ru_co - Ru) * lam_ramp_up[t]
+            expr_terms.append((Ru_co - Ru) * lam_ramp_up[t])
         if t > 0:
-            expr += (Rd_co - Rd) * lam_ramp_down[t - 1]
+            expr_terms.append((Rd_co - Rd) * lam_ramp_down[t - 1])
 
         for tau in range(1, Ton + 1):
             for t1 in range(trainer.T - tau):
                 k = lam_min_on[tau - 1, t1]
                 if t == t1 + 1:
-                    expr += k
+                    expr_terms.append(k)
                 if t == t1:
-                    expr -= k
+                    expr_terms.append(-k)
                 if t == t1 + tau:
-                    expr -= k
+                    expr_terms.append(-k)
 
         for tau in range(1, Toff + 1):
             for t1 in range(trainer.T - tau):
                 k = lam_min_off[tau - 1, t1]
                 if t == t1 + 1:
-                    expr -= k
+                    expr_terms.append(-k)
                 if t == t1:
-                    expr += k
+                    expr_terms.append(k)
                 if t == t1 + tau:
-                    expr += k
+                    expr_terms.append(k)
 
         if t > 0:
-            expr += start_cost * lam_start_cost[t - 1]
-            expr -= shut_cost * lam_shut_cost[t - 1]
+            expr_terms.extend([
+                start_cost * lam_start_cost[t - 1],
+                -shut_cost * lam_shut_cost[t - 1],
+            ])
         if t < trainer.T - 1:
-            expr -= start_cost * lam_start_cost[t]
-            expr += shut_cost * lam_shut_cost[t]
+            expr_terms.extend([
+                -start_cost * lam_start_cost[t],
+                shut_cost * lam_shut_cost[t],
+            ])
 
         for k, ts in enumerate(sensitive_t):
             for time_idx, coeff in iterate_surrogate_constraint_terms(
@@ -1309,10 +1331,10 @@ def solve_dual_block(
                 trainer.T,
             ):
                 if time_idx == t:
-                    expr += coeff * mu[k]
+                    expr_terms.append(coeff * mu[k])
 
-        expr += lam_x_upper[t] - lam_x_lower[t]
-        obj_dual_x_terms.append(cp.abs(expr))
+        expr_terms.extend([lam_x_upper[t], -lam_x_lower[t]])
+        obj_dual_x_terms.append(cp.abs(_sum_scalar_terms(expr_terms)))
 
     for t in range(trainer.T - 1):
         expr = 1 - lam_start_cost[t] - lam_shut_cost[t] - lam_coc_nonneg[t]

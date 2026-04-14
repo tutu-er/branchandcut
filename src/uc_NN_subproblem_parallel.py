@@ -812,14 +812,13 @@ def _precompute_lambda_vals(
 ) -> List[object]:
     """Precompute per-unit electricity-price matrices for all samples."""
     n_samples = len(active_set_data)
-    tmp = SubproblemSurrogateTrainer(
-        ppc, active_set_data, T_delta, unit_id=0,
-        lambda_predictor=None,
-    )
-    T = tmp.T
-    ng = tmp.ng
+    if n_samples == 0:
+        return []
+    ppc_int = ext2int(ppc)
+    ng = ppc_int["gen"].shape[0]
+    T = int(np.asarray(active_set_data[0]["pd_data"]).shape[1])
 
-    if False and lambda_predictor is not None:
+    if lambda_predictor is not None:
         predicted_vals: List[np.ndarray] = []
         all_resolved = True
         for sample in active_set_data:
@@ -832,7 +831,7 @@ def _precompute_lambda_vals(
         if all_resolved and len(predicted_vals) == n_samples:
             print(f"✓ 从 lambda_predictor 提取 {n_samples} 个样本的 electricity prices", flush=True)
             return predicted_vals
-        print("⚠ lambda_predictor 未提供新的电价格式，回退到手动 ED 预计算", flush=True)
+        print("⚠ lambda_predictor 未提供可直接解析的 electricity prices，回退到缓存/ED 预计算", flush=True)
 
     cached_vals = [
         _get_sample_pg_electricity_price_matrix(sample, T, ng)
@@ -952,20 +951,6 @@ def train_all_surrogates_parallel(
         flush=True,
     )
     print("=" * 60, flush=True)
-
-    # 预计算 lambda_vals（主进程一次，避免每个 worker 重复计算）
-    if lambda_predictor is not None:
-        n_samples = len(active_set_data)
-        lambda_vals = [
-            lambda_predictor.predict(normalize_sample_arrays(active_set_data[i]))
-            for i in range(n_samples)
-        ]
-        print(
-            f"✓ 从 lambda_predictor 提取 {len(lambda_vals)} 个样本的 global lambda payloads",
-            flush=True,
-        )
-    else:
-        lambda_vals = None
 
     # 构造每个 worker 的参数 dict
     lambda_vals = _precompute_lambda_vals(

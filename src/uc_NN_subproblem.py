@@ -620,6 +620,29 @@ def _get_sample_pg_electricity_price_matrix(sample: Dict, T: int, ng: int) -> Op
     return _extract_pg_electricity_price_matrix(sample.get('lambda'), T, ng)
 
 
+def _get_effective_pg_prices_from_sample_or_dual_payload(
+    sample: Dict,
+    T: int,
+    ng: int,
+    nl: int,
+    generator_injection_sensitivity: np.ndarray,
+) -> Optional[np.ndarray]:
+    """Resolve per-unit electricity prices from any cached sample payload."""
+    direct = _get_sample_pg_electricity_price_matrix(sample, T, ng)
+    if direct is not None:
+        return np.asarray(direct, dtype=float)
+    lambda_field = sample.get("lambda")
+    if _has_complete_effective_pg_dual(lambda_field, T, ng, nl):
+        return _extract_effective_pg_dual(
+            lambda_field,
+            T,
+            ng,
+            nl,
+            generator_injection_sensitivity,
+        )
+    return None
+
+
 def _solve_pg_electricity_price_from_ed(
     ppc,
     Pd: np.ndarray,
@@ -6241,7 +6264,13 @@ def _dual_predictor_trainer_solve_true(self) -> np.ndarray:
     lambda_payloads = {}
     for sample_id in range(self.n_samples):
         sample = self.active_set_data[sample_id]
-        effective = _get_sample_pg_electricity_price_matrix(sample, self.T, self.ng)
+        effective = _get_effective_pg_prices_from_sample_or_dual_payload(
+            sample,
+            self.T,
+            self.ng,
+            self.nl,
+            self.generator_injection_sensitivity,
+        )
         if effective is None:
             x_sol = _recover_unit_commitment_matrix(sample, self.ng, self.T)
             payload = _solve_pg_electricity_price_from_ed(
@@ -6491,7 +6520,13 @@ def _subproblem_solve_for_lambda(self) -> np.ndarray:
     lambda_vals = {}
     for sample_id in range(self.n_samples):
         sample = self.active_set_data[sample_id]
-        effective = _get_sample_pg_electricity_price_matrix(sample, self.T, self.ng)
+        effective = _get_effective_pg_prices_from_sample_or_dual_payload(
+            sample,
+            self.T,
+            self.ng,
+            self.nl,
+            self.generator_injection_sensitivity,
+        )
         if effective is None:
             x_sol = _recover_unit_commitment_matrix(sample, self.ng, self.T)
             payload = _solve_pg_electricity_price_from_ed(
