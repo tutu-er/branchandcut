@@ -14,7 +14,6 @@ from pypower.idx_bus import PD
 
 from src.case3_uc_data import get_case3_uc_ppc, get_case3lite_uc_ppc
 from src.case30_uc_data import get_case30_uc_ppc
-from src.mti118_data_loader import load_case118_ppc_with_mti_limits
 
 
 CASE3_LOAD_SCALE = 1.40
@@ -65,13 +64,17 @@ def build_case30_base_load(horizon: int, scale: float = CASE30_LOAD_SCALE) -> tu
 
 
 def get_case_ppc(case_name: str) -> dict:
+    if case_name == "case118":
+        from src.mti118_data_loader import load_case118_ppc_with_mti_limits
+
+        return load_case118_ppc_with_mti_limits()
+
     ppc_map = {
         "case3": get_case3_uc_ppc,
         "case3lite": get_case3lite_uc_ppc,
         "case14": pypower.case14.case14,
         "case30": get_case30_uc_ppc,
         "case39": pypower.case39.case39,
-        "case118": load_case118_ppc_with_mti_limits,
     }
     if case_name not in ppc_map:
         raise ValueError(f"Unsupported case_name: {case_name}")

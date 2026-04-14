@@ -24,6 +24,8 @@ LP_BACKEND_GUROBI = "gurobi"
 LP_BACKEND_CVXPY_HIGHS = "cvxpy_highs"
 SUPPORTED_LP_BACKENDS = (LP_BACKEND_GUROBI, LP_BACKEND_CVXPY_HIGHS)
 SURROGATE_TRIPLE_WINDOW_OFFSETS = (0, 1, 2)
+_CVXPY_HIGHS_INSTALLED_CACHE = None
+_CVXPY_HIGHS_STATUS_CACHE = None
 
 
 def normalize_lp_backend(lp_backend: str | None) -> str:
@@ -36,21 +38,31 @@ def normalize_lp_backend(lp_backend: str | None) -> str:
     return resolved
 
 
-def _cvxpy_highs_installed() -> bool:
+def _cvxpy_highs_installed(force_refresh: bool = False) -> bool:
+    global _CVXPY_HIGHS_INSTALLED_CACHE
+    if _CVXPY_HIGHS_INSTALLED_CACHE is not None and not force_refresh:
+        return _CVXPY_HIGHS_INSTALLED_CACHE
     if not CVXPY_AVAILABLE:
+        _CVXPY_HIGHS_INSTALLED_CACHE = False
         return False
     try:
-        return "HIGHS" in cp.installed_solvers()
+        _CVXPY_HIGHS_INSTALLED_CACHE = "HIGHS" in cp.installed_solvers()
     except Exception:
-        return False
+        _CVXPY_HIGHS_INSTALLED_CACHE = False
+    return _CVXPY_HIGHS_INSTALLED_CACHE
 
 
-def get_cvxpy_highs_status() -> dict:
-    return {
+def get_cvxpy_highs_status(force_refresh: bool = False) -> dict:
+    global _CVXPY_HIGHS_STATUS_CACHE
+    if _CVXPY_HIGHS_STATUS_CACHE is not None and not force_refresh:
+        return dict(_CVXPY_HIGHS_STATUS_CACHE)
+    status = {
         "cvxpy_available": CVXPY_AVAILABLE,
         "highspy_available": HIGHSPY_AVAILABLE,
-        "highs_solver_available": _cvxpy_highs_installed(),
+        "highs_solver_available": _cvxpy_highs_installed(force_refresh=force_refresh),
     }
+    _CVXPY_HIGHS_STATUS_CACHE = dict(status)
+    return status
 
 
 def is_lp_backend_available(lp_backend: str | None) -> bool:

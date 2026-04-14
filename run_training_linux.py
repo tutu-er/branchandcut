@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 训练脚本（多模式）
@@ -96,14 +96,14 @@ SUBPROBLEM_MAX_ITER = MAX_ITER
 NN_EPOCHS = 4
 UNIT_IDS = [1]              # None = 所有机组；或如 [0, 1, 2]
 FP_TEST_SAMPLES = 3
-# Windows 本地默认使用更保守的线程并发，优先稳定性和内存占用。
-LOCAL_CPU_COUNT = max(1, os.cpu_count() or 1)
-N_WORKERS_BCD = min(4, max(1, LOCAL_CPU_COUNT // 2))
+# Linux CPU server defaults favor throughput while keeping each subproblem solve single-threaded.
+LINUX_CPU_COUNT = max(1, os.cpu_count() or 1)
+N_WORKERS_BCD = min(8, LINUX_CPU_COUNT, max(2, LINUX_CPU_COUNT // 4))
 # subproblem 并行参数（建议只开一层：要么机组级，要么样本级）
 # - N_WORKERS_UNIT:   机组级并行（跨进程），>1 时启用 `train_all_surrogates_parallel`
 # - N_WORKERS_SAMPLE: 样本级并行（机组内），>1 时使用 `ParallelSubproblemSurrogateTrainer`
 N_WORKERS_UNIT = 1
-N_WORKERS_SAMPLE = min(6, LOCAL_CPU_COUNT, max(2, LOCAL_CPU_COUNT // 2))
+N_WORKERS_SAMPLE = min(16, LINUX_CPU_COUNT, max(8, LINUX_CPU_COUNT // 2))
 # 兼容旧变量名（历史配置仍可用）
 N_WORKERS_SUBPROBLEM = N_WORKERS_SAMPLE
 SUBPROBLEM_LP_BACKEND = 'cvxpy_highs'   # 'gurobi' / 'cvxpy_highs'
@@ -157,7 +157,7 @@ SUBPROBLEM_RHO_DUAL_INIT = 1e-3
 SUBPROBLEM_RHO_DUAL_PG_INIT = 1e-1
 SUBPROBLEM_RHO_DUAL_X_INIT = 1e-1
 SUBPROBLEM_RHO_DUAL_COC_INIT = 1e1
-SUBPROBLEM_RHO_BINARY_INIT = 1.0
+SUBPROBLEM_RHO_BINARY_INIT = 1e3
 SUBPROBLEM_RHO_OPT_INIT = 1e-1
 SUBPROBLEM_LOSS_RATIO_PRIMAL = 1.0
 SUBPROBLEM_LOSS_RATIO_DUAL_PG = 1.0

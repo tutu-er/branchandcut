@@ -245,7 +245,11 @@ class ParallelSubproblemSurrogateTrainer(SubproblemSurrogateTrainer):
 
     def _run_cvxpy_highs_sample_pool(self, block: str, block_args: list[tuple], prefix: str) -> Dict[int, tuple]:
         results: Dict[int, tuple] = {}
-        with ProcessPoolExecutor(max_workers=self.n_workers) as executor:
+        # Use threads for cvxpy_highs sample-level parallelism on Windows.
+        # Process spawning re-imports the whole training entrypoint in each child,
+        # which is expensive and can fail when optional heavy modules (for example
+        # pandas via case118 loaders) are imported under tight virtual-memory limits.
+        with ThreadPoolExecutor(max_workers=self.n_workers) as executor:
             future_to_sid = {}
             for s, alphas, betas, gammas, deltas, costs, pg_costs in block_args:
                 task = {

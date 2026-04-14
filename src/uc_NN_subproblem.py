@@ -1,6 +1,14 @@
 import numpy as np
-import gurobipy as gp
-from gurobipy import GRB
+try:
+    import gurobipy as gp
+    from gurobipy import GRB
+    GUROBI_AVAILABLE = True
+    GUROBI_IMPORT_ERROR = None
+except Exception as exc:
+    gp = None
+    GRB = None
+    GUROBI_AVAILABLE = False
+    GUROBI_IMPORT_ERROR = exc
 import sys
 import io
 import time
@@ -13,6 +21,15 @@ import warnings
 
 import os
 import matplotlib.pyplot as plt
+
+
+def _require_gurobi_available(context: str = "Gurobi code path") -> None:
+    if GUROBI_AVAILABLE:
+        return
+    raise RuntimeError(
+        f"{context} requires gurobipy, but gurobipy could not be imported: "
+        f"{GUROBI_IMPORT_ERROR!r}"
+    )
 
 # 尝试导入PyTorch
 try:
@@ -1516,6 +1533,8 @@ class SubproblemSurrogateTrainer:
         self._lp_backend = normalize_lp_backend(lp_backend)
         if self._lp_backend == LP_BACKEND_CVXPY_HIGHS:
             assert_lp_backend_available(self._lp_backend)
+        else:
+            _require_gurobi_available("SubproblemSurrogateTrainer with lp_backend='gurobi'")
         self.Ru_all, self.Rd_all, self.Ru_co_all, self.Rd_co_all = _get_ramp_limits_from_ppc(
             self.ppc_raw, self.gen, self.T_delta
         )
