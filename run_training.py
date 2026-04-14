@@ -82,14 +82,14 @@ RUN_FP = False
 
 # 顶部集中配置区：训练相关参数统一在这里调整
 CASE_NAME = 'case3lite'      # 'case3' / 'case3lite' / 'case14' / 'case30' / 'case39' / 'case118'
-MAX_SAMPLES = 10            # None = 使用全部样本
+MAX_SAMPLES = 200            # None = 使用全部样本
 T_DELTA = 1.0
 DUAL_EPOCHS = 200
 DUAL_BATCH_SIZE = 8
 DUAL_BATCH_STRATEGY = 'full-batch'   # 'full-batch' / 'mini-batch'
 DUAL_SHUFFLE = True
 DUAL_LR = 5e-4
-MAX_ITER = 300             # backward-compatible shared fallback
+MAX_ITER = 800             # backward-compatible shared fallback
 BCD_MAX_ITER = MAX_ITER
 SUBPROBLEM_MAX_ITER = MAX_ITER
 NN_EPOCHS = 4
@@ -100,7 +100,7 @@ N_WORKERS_BCD = 4
 # - N_WORKERS_UNIT:   机组级并行（跨进程），>1 时启用 `train_all_surrogates_parallel`
 # - N_WORKERS_SAMPLE: 样本级并行（机组内），>1 时使用 `ParallelSubproblemSurrogateTrainer`
 N_WORKERS_UNIT = 1
-N_WORKERS_SAMPLE = 4
+N_WORKERS_SAMPLE = 12
 # 兼容旧变量名（历史配置仍可用）
 N_WORKERS_SUBPROBLEM = N_WORKERS_SAMPLE
 SUBPROBLEM_LP_BACKEND = 'cvxpy_highs'   # 'gurobi' / 'cvxpy_highs'
@@ -118,7 +118,7 @@ SURROGATE_CONTINUE_TRAINING = False
 SPARSE_TOP_K_VARIABLES = 20
 SPARSE_MAX_GROUPS = 5
 SPARSE_GROUP_SIZE = 3
-SURROGATE_CONSTRAINT_STRATEGY = 'all_single_time'  # 'sensitive' / 'all' / 'all_templates_sign4' / 'all_single_time' / 'all_templates_sign4_plus_single'
+SURROGATE_CONSTRAINT_STRATEGY = 'all_templates_sign4_plus_single'  # 'sensitive' / 'all' / 'all_templates_sign4' / 'all_single_time' / 'all_templates_sign4_plus_single'
 BCD_LAMBDA_INIT_STRATEGY = 'ed_on_x_opt'   # 'lp_relaxation' / 'ed_on_x_opt'
 THETA_HOT_START_STRATEGY = 'dcpf_relative'   # 'dcpf_relative' / 'gaussian'
 ZETA_HOT_START_STRATEGY = 'zero'             # 'zero' / 'gaussian'
@@ -164,10 +164,10 @@ SUBPROBLEM_NN_DUAL_TERM_INTERVAL = 1  # None=NN训练时完全屏蔽dual项；k=
 SUBPROBLEM_LOSS_RATIO_OPT = 1.0
 SUBPROBLEM_LOSS_RATIO_REG = 1.0
 SUBPROBLEM_GAMMA_BASE = 1e-3
-SUBPROBLEM_MU_DUAL_FLOOR_INIT = 3
-SUBPROBLEM_MU_DUAL_FLOOR_INDIVIDUAL_ROUND = round(SUBPROBLEM_MAX_ITER-10)
-SUBPROBLEM_MU_DUAL_FLOOR_DECAY_ROUND = round(SUBPROBLEM_MAX_ITER-10)
-SUBPROBLEM_MU_SIGNED_ROUND_INTERVAL = 4
+SUBPROBLEM_MU_DUAL_FLOOR_INIT = 2
+SUBPROBLEM_MU_DUAL_FLOOR_INDIVIDUAL_ROUND = round(SUBPROBLEM_MAX_ITER/4)
+SUBPROBLEM_MU_DUAL_FLOOR_DECAY_ROUND = round(SUBPROBLEM_MAX_ITER/2)
+SUBPROBLEM_MU_SIGNED_ROUND_INTERVAL = 10
 SUBPROBLEM_MU_SIGN_HYSTERESIS_ROUNDS = 2
 SUBPROBLEM_MU_SIGN_FLIP_MIN_SHARE = 0.67
 SUBPROBLEM_X_BOUND_DUAL_ZERO_ROUNDS = 0
@@ -178,7 +178,7 @@ SUBPROBLEM_NN_BATCH_SIZE = 4
 SUBPROBLEM_NN_SHUFFLE = True
 SUBPROBLEM_NN_LR = 5e-4
 SUBPROBLEM_ENABLE_NN_ROLLBACK = False  # 关闭可避免训练被回滚机制锁死（但可能更不稳定）
-SUBPROBLEM_IGNORE_STARTUP_SHUTDOWN_COSTS = False
+SUBPROBLEM_IGNORE_STARTUP_SHUTDOWN_COSTS = True
 SUBPROBLEM_X_COST_NN_LR = 1e-5
 SUBPROBLEM_PG_COST_NN_EPOCHS = 12
 SUBPROBLEM_PG_COST_START_ROUND = round(SUBPROBLEM_MAX_ITER/2)
