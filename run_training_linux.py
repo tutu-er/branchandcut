@@ -37,36 +37,37 @@ def check_and_install_dependencies(required_subproblem_backend: str | None = Non
     for import_name, package_name in dependencies.items():
         try:
             __import__(import_name)
-            print(f"[OK] {import_name}")
+            print(f"[OK] {import_name}", flush=True)
         except ImportError:
             missing.append(package_name)
-            print(f"[MISS] {import_name} 未安装")
+            print(f"[MISS] {import_name} 未安装", flush=True)
 
     if missing:
-        print(f"\n缺少依赖: {', '.join(missing)}")
+        print(f"\n缺少依赖: {', '.join(missing)}", flush=True)
         response = input("是否自动安装? (y/n): ")
         if response.strip().lower() == 'y':
             subprocess.check_call([sys.executable, '-m', 'pip', 'install'] + missing)
-            print("[OK] 安装完成")
+            print("[OK] 安装完成", flush=True)
             return True
         else:
-            print("请手动安装后重试")
+            print("请手动安装后重试", flush=True)
             return False
     if backend == "cvxpy_highs":
         optional_missing = []
         for import_name, package_name in {"cvxpy": "cvxpy", "highspy": "highspy"}.items():
             try:
                 __import__(import_name)
-                print(f"[OK] {import_name}")
+                print(f"[OK] {import_name}", flush=True)
             except ImportError:
                 optional_missing.append(package_name)
-                print(f"[MISS] {import_name}")
+                print(f"[MISS] {import_name}", flush=True)
         if optional_missing:
             print(
                 "\ncvxpy_highs backend requires optional packages: "
                 + ", ".join(optional_missing)
+                , flush=True
             )
-            print(f"Install command: {sys.executable} -m pip install {' '.join(optional_missing)}")
+            print(f"Install command: {sys.executable} -m pip install {' '.join(optional_missing)}", flush=True)
             return False
     return True
 
@@ -209,6 +210,18 @@ def _bootstrap_runtime_environment() -> None:
     (spawn) won't repeatedly run dependency checks in every worker process.
     """
     global SUBPROBLEM_SOLVER_PATH_PREPENDED
+    # Ensure realtime logs even when stdout is redirected (e.g. nohup / piping).
+    # Best-effort: older Python/streams may not support reconfigure().
+    os.environ.setdefault("PYTHONUNBUFFERED", "1")
+    try:
+        if hasattr(sys.stdout, "reconfigure"):
+            sys.stdout.reconfigure(line_buffering=True, write_through=True)
+        if hasattr(sys.stderr, "reconfigure"):
+            sys.stderr.reconfigure(line_buffering=True, write_through=True)
+    except Exception:
+        # If reconfigure fails, flushing prints (see log()) still keeps output timely.
+        pass
+
     if SUBPROBLEM_SOLVER_BIN_PREPEND:
         prepend_path = str(Path(SUBPROBLEM_SOLVER_BIN_PREPEND))
         current_path = os.environ.get("PATH", "")
@@ -246,8 +259,8 @@ try:
     from training_logger import TrainingLogger
     from training_visualizer import TrainingVisualizer
 except ImportError as e:
-    print(f"模块导入失败: {e}")
-    print("请确保在项目根目录运行此脚本，且 src/ 目录存在")
+    print(f"模块导入失败: {e}", flush=True)
+    print("请确保在项目根目录运行此脚本，且 src/ 目录存在", flush=True)
     sys.exit(1)
 
 # BCD 模式额外导入
@@ -256,7 +269,7 @@ if MODE in ('bcd', 'sparse', 'both'):
         from uc_NN_BCD import load_active_set_from_json, Agent_NN_BCD
         from uc_NN_BCD_parallel import ParallelAgent_NN_BCD
     except ImportError as e:
-        print(f"BCD 模块导入失败: {e}")
+        print(f"BCD 模块导入失败: {e}", flush=True)
         sys.exit(1)
 
 # 可行性泵额外导入
@@ -264,7 +277,7 @@ if RUN_FP:
     try:
         from feasibility_pump import recover_integer_solution
     except ImportError as e:
-        print(f"feasibility_pump 模块导入失败: {e}")
+        print(f"feasibility_pump 模块导入失败: {e}", flush=True)
         sys.exit(1)
 
 # ──────────────────────── 工具函数 / 辅助函数 ────────────────────────
@@ -1422,9 +1435,9 @@ def main():
     _bootstrap_runtime_environment()
     start_time = time.time()
 
-    print("=" * 70)
-    print(f"训练脚本  模式: {MODE}")
-    print("=" * 70)
+    print("=" * 70, flush=True)
+    print(f"训练脚本  模式: {MODE}", flush=True)
+    print("=" * 70, flush=True)
 
     # ── 配置 ──────────────────────────────────────────────
     # 顶部集中配置区：本函数内只做派生值整理
@@ -1532,7 +1545,7 @@ def main():
     log(f"加载 PyPower 案例: {CASE_NAME}")
     supported_cases = ['case3', 'case3lite', 'case14', 'case30', 'case39', 'case118']
     if CASE_NAME not in supported_cases:
-        print(f"未知案例: {CASE_NAME}，可选: {supported_cases}")
+        print(f"未知案例: {CASE_NAME}，可选: {supported_cases}", flush=True)
         sys.exit(1)
     ppc = get_case_ppc(CASE_NAME)
     n_units = ppc['gen'].shape[0]
