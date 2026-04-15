@@ -22,6 +22,29 @@ import re
 from datetime import datetime
 from pathlib import Path
 
+load_active_set_from_json = None
+Agent_NN_BCD = None
+ParallelAgent_NN_BCD = None
+
+
+def ensure_bcd_modules_imported() -> None:
+    global load_active_set_from_json, Agent_NN_BCD, ParallelAgent_NN_BCD
+    if (
+        load_active_set_from_json is not None
+        and Agent_NN_BCD is not None
+        and ParallelAgent_NN_BCD is not None
+    ):
+        return
+    try:
+        from uc_NN_BCD import load_active_set_from_json as _load_active_set_from_json, Agent_NN_BCD as _Agent_NN_BCD
+        from uc_NN_BCD_parallel import ParallelAgent_NN_BCD as _ParallelAgent_NN_BCD
+    except ImportError as e:
+        print(f"BCD 模块导入失败: {e}")
+        sys.exit(1)
+    load_active_set_from_json = _load_active_set_from_json
+    Agent_NN_BCD = _Agent_NN_BCD
+    ParallelAgent_NN_BCD = _ParallelAgent_NN_BCD
+
 # ──────────────────────── 依赖检查 ────────────────────────
 
 def check_and_install_dependencies(required_subproblem_backend: str | None = None):
@@ -424,6 +447,7 @@ def create_bcd_agent(ppc, all_samples, T_DELTA, *,
                      dual_block_prox_weight: float = BCD_DUAL_BLOCK_PROX_WEIGHT,
                      iter_delta_reg_weight: float = BCD_ITER_DELTA_REG_WEIGHT,
                      iter_delta_reg_deadband: float = BCD_ITER_DELTA_REG_DEADBAND):
+    ensure_bcd_modules_imported()
     if external_sparse_templates is not None and n_workers > 1:
         log("璀﹀憡: external_sparse_templates 褰撳墠浠呮敮鎸佷覆琛?Agent_NN_BCD锛屽皢蹇界暐 n_workers > 1")
         n_workers = 1
@@ -1031,6 +1055,7 @@ def run_bcd(ppc, all_samples: list, T_DELTA, MAX_ITER, bcd_model_dir,
             nn_smooth_abs_eps: float = BCD_NN_SMOOTH_ABS_EPS,
             pg_block_prox_weight: float = BCD_PG_BLOCK_PROX_WEIGHT,
             dual_block_prox_weight: float = BCD_DUAL_BLOCK_PROX_WEIGHT):
+    ensure_bcd_modules_imported()
     """BCD 主代理训练（样本级并行），返回 ParallelAgent_NN_BCD 实例。"""
     log("模式: BCD 主代理训练（Agent_NN_BCD）")
     log(f"使用 {len(all_samples)} 个样本")
@@ -1584,6 +1609,7 @@ def main():
         if MODE == 'bcd':
             # BCD 通过 ActiveSetReader 加载（含 unit_commitment_matrix）
             log(f"通过 ActiveSetReader 加载数据: {data_file.name}")
+            ensure_bcd_modules_imported()
             all_samples_bcd = load_active_set_from_json(str(data_file))
             if MAX_SAMPLES and len(all_samples_bcd) > MAX_SAMPLES:
                 log(f"  截取前 {MAX_SAMPLES} 个样本（共 {len(all_samples_bcd)}）")
@@ -1631,6 +1657,7 @@ def main():
 
         elif MODE == 'sparse':
             log(f"通过 ActiveSetReader 加载数据: {data_file.name}")
+            ensure_bcd_modules_imported()
             all_samples_bcd = load_active_set_from_json(str(data_file))
             if MAX_SAMPLES and len(all_samples_bcd) > MAX_SAMPLES:
                 log(f"  截取前 {MAX_SAMPLES} 个样本（共 {len(all_samples_bcd)}）")
@@ -1770,6 +1797,7 @@ def main():
         elif MODE == 'both':
             # Step 1: BCD 训练（或从已有模型加载跳过）
             log(f"通过 ActiveSetReader 加载数据: {data_file.name}")
+            ensure_bcd_modules_imported()
             all_samples_bcd = load_active_set_from_json(str(data_file))
             if MAX_SAMPLES and len(all_samples_bcd) > MAX_SAMPLES:
                 log(f"  截取前 {MAX_SAMPLES} 个样本（共 {len(all_samples_bcd)}）")
