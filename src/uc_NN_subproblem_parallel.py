@@ -32,6 +32,7 @@ from types import SimpleNamespace
 
 import numpy as np
 from scenario_utils import normalize_sample_arrays
+from pypower.ext2int import ext2int
 
 # ── 路径设置（worker 进程也需要能 import src.*）──────────────
 _SRC_DIR = Path(__file__).resolve().parent

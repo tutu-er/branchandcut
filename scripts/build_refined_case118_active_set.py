@@ -14,10 +14,251 @@ from __future__ import annotations
 
 import argparse
 import copy
+import csv
 import json
+import re
+import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Sequence
+
+import numpy as np
+
+ROOT = Path(__file__).resolve().parent.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+# Embedded defaults for direct execution without CLI args.
+DEFAULT_ACTIVE_SET_LIKE_JSON = (
+    r"result/commitment_clustering/pattern_library_case118_K10_20260408_132932_active_set_like.json"
+)
+DEFAULT_PATTERN_LIBRARY_JSON = (
+    r"result/commitment_clustering/pattern_library_case118_K10_20260408_132932.json"
+)
+DEFAULT_REFINEMENT_JSON = (
+    r"result/commitment_clustering/sample_refinement_case118_batch.json"
+)
+DEFAULT_OUTPUT_JSON = (
+    r"result/commitment_clustering/pattern_library_case118_K10_20260408_132932_active_set_like_refined.json"
+)
+
+
+def _load_case118_ppc():
+    try:
+        from src.mti118_data_loader import load_case118_ppc_with_mti_limits
+
+        return load_case118_ppc_with_mti_limits(aggregate_thermal_by_bus=True)
+    except ModuleNotFoundError as exc:
+        if exc.name != "pandas":
+            raise
+
+    from pypower.api import case118
+    from pypower.idx_brch import F_BUS, RATE_A, T_BUS
+    from pypower.idx_gen import GEN_BUS, GEN_STATUS, MBASE, PG, PMAX, PMIN, QG, QMAX, QMIN, VG
+
+    def safe_float(value, default: float = 0.0) -> float:
+        if value is None:
+            return default
+        text = str(value).strip()
+        if not text:
+            return default
+        try:
+            return float(text)
+        except ValueError:
+            return default
+
+    def bus_token_to_number(token: str) -> int | None:
+        match = re.fullmatch(r"bus0*([0-9]+)", str(token).strip().lower())
+        return None if match is None else int(match.group(1))
+
+    def infer_fuel_key(generator_name: str) -> str | None:
+        name = str(generator_name).strip()
+        if name.startswith(("Solar ", "Wind ", "Hydro ", "Geo ")):
+            return None
+        if "Biomass" in name:
+            return "biomass"
+        if "Oil" in name:
+            return "oil"
+        if "Coal" in name:
+            return "coal"
+        if "NG" in name or "Natural Gas" in name:
+            return "natural gas"
+        return "natural gas"
+
+    data_root = ROOT / "data"
+    addl_dir = data_root / "additional-files-mti-118" / "Additional Files MTI 118"
+    generators_path = addl_dir / "Generators.csv"
+    lines_path = addl_dir / "Lines.csv"
+    fuels_path = addl_dir / "Fuels and emission rates.csv"
+
+    ppc = case118()
+
+    limits_by_edge: dict[tuple[int, int], list[float]] = {}
+    with lines_path.open("r", encoding="utf-8-sig", newline="") as f:
+        for row in csv.DictReader(f):
+            bus_from = bus_token_to_number(row.get("Bus from "))
+            bus_to = bus_token_to_number(row.get("Bus to"))
+            limit = safe_float(row.get("Max Flow (MW)"))
+            if bus_from is None or bus_to is None or limit <= 0:
+                continue
+            limits_by_edge.setdefault(tuple(sorted((bus_from, bus_to))), []).append(limit)
+
+    for branch_idx in range(ppc["branch"].shape[0]):
+        bus_from = int(ppc["branch"][branch_idx, F_BUS])
+        bus_to = int(ppc["branch"][branch_idx, T_BUS])
+        limits = limits_by_edge.get(tuple(sorted((bus_from, bus_to))))
+        if limits:
+            ppc["branch"][branch_idx, RATE_A] = limits.pop(0)
+
+    fuels: dict[str, float] = {}
+    with fuels_path.open("r", encoding="utf-8-sig", newline="") as f:
+        reader = csv.DictReader(f)
+        name_col = reader.fieldnames[0] if reader.fieldnames else ""
+        for row in reader:
+            fuel_name = str(row.get(name_col, "")).strip().lower()
+            if fuel_name:
+                fuels[fuel_name] = safe_float(row.get("Fue price ($/MMBTU)"))
+
+    grouped: dict[str, dict] = {}
+    with generators_path.open("r", encoding="utf-8-sig", newline="") as f:
+        for row in csv.DictReader(f):
+            generator_name = str(row["Generator Name"]).strip()
+            fuel_key = infer_fuel_key(generator_name)
+            if fuel_key is None:
+                continue
+
+            bus_name = str(row["bus of connection"]).strip().lower()
+            bus_number = bus_token_to_number(bus_name)
+            if bus_number is None:
+                continue
+
+            pmax = safe_float(row["Max Capacity (MW)"])
+            pmin = min(max(safe_float(row["Min Stable Level (MW)"]), 0.0), pmax)
+            startup_cost = safe_float(row["Start Cost ($)"])
+            shutdown_cost = 0.1 * startup_cost
+            vom = safe_float(row["VO&M Charge ($/MWh)"])
+            fuel_price = fuels.get(fuel_key, 0.0)
+            heat_rate_base = safe_float(row["Heat Rate Base (MMBTU/hr)"])
+            heat_rate_inc = safe_float(row["Heat Rate Inc Band 1 (BTU/kWh)"])
+            variable_fuel_cost = fuel_price * (heat_rate_inc / 1000.0)
+            linear_cost = max(vom + variable_fuel_cost, 0.01)
+            no_load_cost = max(heat_rate_base * fuel_price + vom * pmin, 0.0)
+
+            item = grouped.setdefault(
+                bus_name,
+                {
+                    "bus_number": bus_number,
+                    "bus_name": bus_name,
+                    "pmax": 0.0,
+                    "pmin": 0.0,
+                    "startup_cost": 0.0,
+                    "shutdown_cost": 0.0,
+                    "no_load_cost": 0.0,
+                    "weighted_linear_cost": 0.0,
+                    "ramp_up": 0.0,
+                    "ramp_down": 0.0,
+                    "min_up": 1,
+                    "min_down": 1,
+                    "generator_names": [],
+                },
+            )
+            item["pmax"] += pmax
+            item["pmin"] += pmin
+            item["startup_cost"] += startup_cost
+            item["shutdown_cost"] += shutdown_cost
+            item["no_load_cost"] += no_load_cost
+            item["weighted_linear_cost"] += linear_cost * max(pmax, 0.0)
+            item["ramp_up"] += max(safe_float(row["Max Ramp Up (MW/min)"]) * 60.0, 0.0)
+            item["ramp_down"] += max(safe_float(row["Max Ramp Down (MW/min)"]) * 60.0, 0.0)
+            item["min_up"] = max(item["min_up"], max(int(round(safe_float(row["Min Up Time (h)"], 1.0))), 1))
+            item["min_down"] = max(item["min_down"], max(int(round(safe_float(row["Min Down Time (h)"], 1.0))), 1))
+            item["generator_names"].append(generator_name)
+
+    thermal_rows = []
+    gencost_rows = []
+    ramp_up_mw_per_h: list[float] = []
+    ramp_down_mw_per_h: list[float] = []
+    min_up_time_h: list[int] = []
+    min_down_time_h: list[int] = []
+    generator_names: list[str] = []
+    aggregated_unit_counts: list[int] = []
+
+    for group_key in sorted(grouped, key=lambda name: (grouped[name]["bus_number"], name)):
+        item = grouped[group_key]
+        pmax = item["pmax"]
+        pmin = min(item["pmin"], pmax)
+        linear_cost = item["weighted_linear_cost"] / max(pmax, 1e-9)
+
+        gen_row = np.zeros(21, dtype=float)
+        gen_row[GEN_BUS] = item["bus_number"]
+        gen_row[PG] = 0.0
+        gen_row[QG] = 0.0
+        gen_row[QMAX] = 0.0
+        gen_row[QMIN] = 0.0
+        gen_row[VG] = 1.0
+        gen_row[MBASE] = float(ppc["baseMVA"])
+        gen_row[GEN_STATUS] = 1.0
+        gen_row[PMAX] = pmax
+        gen_row[PMIN] = pmin
+        thermal_rows.append(gen_row)
+        gencost_rows.append(np.array([
+            2.0,
+            item["startup_cost"],
+            item["shutdown_cost"],
+            3.0,
+            0.0,
+            linear_cost,
+            item["no_load_cost"],
+        ], dtype=float))
+        ramp_up_mw_per_h.append(item["ramp_up"])
+        ramp_down_mw_per_h.append(item["ramp_down"])
+        min_up_time_h.append(item["min_up"])
+        min_down_time_h.append(item["min_down"])
+        aggregated_unit_counts.append(len(item["generator_names"]))
+        generator_names.append(f"{item['bus_name']}_thermal_agg[{len(item['generator_names'])}]")
+
+    ppc["gen"] = np.vstack(thermal_rows) if thermal_rows else np.zeros((0, 21), dtype=float)
+    ppc["gencost"] = np.vstack(gencost_rows) if gencost_rows else np.zeros((0, 7), dtype=float)
+    ppc["uc_ramp_up_mw_per_h"] = np.asarray(ramp_up_mw_per_h, dtype=float)
+    ppc["uc_ramp_down_mw_per_h"] = np.asarray(ramp_down_mw_per_h, dtype=float)
+    ppc["uc_min_up_time_h"] = np.asarray(min_up_time_h, dtype=int)
+    ppc["uc_min_down_time_h"] = np.asarray(min_down_time_h, dtype=int)
+    ppc["uc_generator_names"] = generator_names
+    ppc["uc_aggregated_unit_counts"] = np.asarray(aggregated_unit_counts, dtype=int)
+    ppc["uc_aggregate_by_bus"] = True
+    return ppc
+
+
+def _serialize_dual_payload(payload: Dict) -> Dict:
+    return {
+        key: np.asarray(value, dtype=float).tolist()
+        for key, value in payload.items()
+    }
+
+
+def _refresh_sample_dual_payload(sample: Dict, ppc, t_delta: float) -> None:
+    from src.uc_NN_subproblem import (
+        _build_generator_injection_sensitivity,
+        _solve_global_dual_payload_from_ed,
+    )
+
+    x_arr = np.asarray(sample["unit_commitment_matrix"], dtype=float)
+    pd_data = np.asarray(sample.get("pd_data", sample.get("load_data")), dtype=float)
+    renewable_data = sample.get("renewable_data")
+    renewable_arr = None if renewable_data is None else np.asarray(renewable_data, dtype=float)
+    generator_injection_sensitivity = _build_generator_injection_sensitivity(ppc)
+    payload = _solve_global_dual_payload_from_ed(
+        ppc,
+        pd_data,
+        float(t_delta),
+        x_arr,
+        generator_injection_sensitivity,
+        renewable_data=renewable_arr,
+    )
+    serialized = _serialize_dual_payload(payload)
+    sample["lambda"] = serialized
+    sample["lambda_pg_electricity_price"] = serialized["lambda_pg_effective"]
+    sample["lambda_refresh_source"] = "recomputed_from_ed_after_refinement"
 
 
 def _load_json(path: str | Path) -> Dict:
@@ -152,6 +393,9 @@ def build_refined_active_set(
     if not isinstance(all_samples, list) or not all_samples:
         raise ValueError("active_set_like JSON must contain a non-empty all_samples list")
 
+    t_delta = float(active_set_like.get("parameters", {}).get("T_delta", 1.0))
+    ppc = _load_case118_ppc()
+
     samples_by_id = _sample_index(all_samples)
     base_patterns = _pattern_library_lookup(pattern_library_data)
     refinement_rows = _normalize_refinement_rows(refinement_data)
@@ -189,6 +433,24 @@ def build_refined_active_set(
 
         refined_sample_ids.append(sample_id)
 
+    dual_refreshed_sample_ids: List[int] = []
+    for sample in all_samples:
+        current_x = sample.get("unit_commitment_matrix")
+        original_x = sample.get("original_unit_commitment_matrix")
+        conversion_status = str(sample.get("conversion_status", ""))
+        needs_refresh = False
+        if current_x is not None and original_x is not None:
+            needs_refresh = current_x != original_x
+        if not needs_refresh and conversion_status in {
+            "converted_from_pattern_library",
+            "refined_from_pattern_library_full_repair",
+        }:
+            needs_refresh = True
+        if not needs_refresh:
+            continue
+        _refresh_sample_dual_payload(sample, ppc, t_delta)
+        dual_refreshed_sample_ids.append(int(sample["sample_id"]))
+
     unique_active_sets: List[List[List[object]]] = []
     seen_active_sets = set()
     converted_active_sets: List[List[List[object]]] = []
@@ -212,6 +474,8 @@ def build_refined_active_set(
         "conversion_type": "pattern_library_active_set_like_refined",
         "refined_sample_count": len(refined_sample_ids),
         "refined_sample_ids": sorted(refined_sample_ids),
+        "dual_payload_refreshed_count": len(dual_refreshed_sample_ids),
+        "dual_payload_refreshed_sample_ids": sorted(dual_refreshed_sample_ids),
     }
     output["unique_active_sets"] = unique_active_sets
     output["all_samples"] = all_samples
@@ -231,17 +495,22 @@ def build_refined_active_set(
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--active-set-like-json", required=True, type=str)
-    parser.add_argument("--pattern-library-json", required=True, type=str)
-    parser.add_argument("--refinement-json", required=True, type=str)
-    parser.add_argument("--output", required=True, type=str)
+    parser.add_argument("--active-set-like-json", default=None, type=str)
+    parser.add_argument("--pattern-library-json", default=None, type=str)
+    parser.add_argument("--refinement-json", default=None, type=str)
+    parser.add_argument("--output", default=None, type=str)
     args = parser.parse_args()
 
+    active_set_like_json = args.active_set_like_json or DEFAULT_ACTIVE_SET_LIKE_JSON
+    pattern_library_json = args.pattern_library_json or DEFAULT_PATTERN_LIBRARY_JSON
+    refinement_json = args.refinement_json or DEFAULT_REFINEMENT_JSON
+    output_json = args.output or DEFAULT_OUTPUT_JSON
+
     output = build_refined_active_set(
-        active_set_like_json=args.active_set_like_json,
-        pattern_library_json=args.pattern_library_json,
-        refinement_json=args.refinement_json,
-        output_json=args.output,
+        active_set_like_json=active_set_like_json,
+        pattern_library_json=pattern_library_json,
+        refinement_json=refinement_json,
+        output_json=output_json,
     )
     print(f"Refined active-set JSON written to: {output}")
 
