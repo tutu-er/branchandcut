@@ -46,6 +46,9 @@
         --api-key-env OPENAI_API_KEY
 
 说明：
+- 若要用某次训练输出目录（如 `result/surrogate_models/subproblem_models_case3lite_20260414_191709`）做评估与 FP 调参，请传
+  `--surrogate-model-path`；脚本会向子进程注入 `RUN_TEST_SURROGATE_MODEL_DIR`，`run_test.py` 将固定加载该目录。
+  预置的 `configure_joint()` 也可通过环境变量 `AGENTIC_FP_SURROGATE_DIR`（或 `RUN_TEST_SURROGATE_MODEL_DIR`）指定同一目录。
 - cursor 模式下，使用 `cursor agent -p --force` headless 执行，无需额外配置。
 - claude-cli 模式下，使用 `claude -p --output-format text` 非交互执行。
 - command 模式下，agent 命令模板可使用占位符：{workspace} {prompt_file} {iteration}
@@ -692,12 +695,28 @@ def score_metrics(metrics: Metrics, return_code: int) -> float:
     return score
 
 
+def _path_for_run_test_env(workspace: Path, p: Optional[Path]) -> Optional[str]:
+    """将绝对路径转为相对 workspace 的路径字符串，供 run_test 环境变量使用。"""
+    if p is None:
+        return None
+    try:
+        ws = workspace.resolve()
+        rp = p.resolve().relative_to(ws)
+        return str(rp).replace("\\", "/")
+    except ValueError:
+        return str(p.resolve())
+
+
 def run_command(
     command: str,
     cwd: Path,
     timeout_sec: Optional[int] = None,
+    extra_env: Optional[Dict[str, str]] = None,
 ) -> tuple[int, str, str, float]:
     start = time.time()
+    env = os.environ.copy()
+    if extra_env:
+        env.update(extra_env)
     try:
         proc = subprocess.run(
             command,
@@ -708,6 +727,7 @@ def run_command(
             encoding="utf-8",
             errors="replace",
             timeout=timeout_sec,
+            env=env,
         )
     except subprocess.TimeoutExpired as exc:
         elapsed = time.time() - start
@@ -724,10 +744,20 @@ def run_command(
 
 def evaluate(config: Config, iteration_dir: Path, label: str) -> EvalResult:
     log(f"运行评估: {label}")
+    extra_env: Dict[str, str] = {}
+    if config.surrogate_model_path:
+        s = _path_for_run_test_env(config.workspace, config.surrogate_model_path)
+        extra_env["RUN_TEST_SURROGATE_MODEL_DIR"] = s
+        log(f"评估环境 RUN_TEST_SURROGATE_MODEL_DIR={s}")
+    if config.bcd_model_path:
+        b = _path_for_run_test_env(config.workspace, config.bcd_model_path)
+        extra_env["RUN_TEST_BCD_MODEL_PATH"] = b
+        log(f"评估环境 RUN_TEST_BCD_MODEL_PATH={b}")
     rc, stdout, stderr, elapsed = run_command(
         config.eval_command,
         config.workspace,
         timeout_sec=config.eval_timeout_sec,
+        extra_env=extra_env if extra_env else None,
     )
     output = stdout + ("\n[stderr]\n" + stderr if stderr else "")
     metrics = parse_metrics(output)
@@ -1620,7 +1650,11 @@ def parse_args() -> Config:
         "--surrogate-model-path",
         type=str,
         default=None,
-        help="Surrogate模型路径（训练好的模型目录或文件，用于V3/Joint模式）",
+        help=(
+            "Surrogate 训练输出目录（含 dual_predictor.pth、surrogate_unit_*.pth 等）。"
+            "设置后会在运行 eval-command 时注入环境变量 RUN_TEST_SURROGATE_MODEL_DIR，"
+            "使 run_test.py 固定加载该目录而非自动选最新。"
+        ),
     )
     parser.add_argument(
         "--bcd-model-path",
@@ -1821,7 +1855,19 @@ def configure_joint():
     surr_dir = root / "result" / "surrogate_models"
 
     bcd_path = _find_latest_file(bcd_dir, "bcd_model_case3lite_*.pth")
-    surr_path = _find_latest_file(surr_dir, "subproblem_models_case3lite_*")
+    surr_path = None
+    env_surr = os.environ.get("AGENTIC_FP_SURROGATE_DIR") or os.environ.get("RUN_TEST_SURROGATE_MODEL_DIR")
+    if env_surr and env_surr.strip():
+        p = Path(env_surr.strip())
+        if not p.is_absolute():
+            p = (root / p).resolve()
+        surr_path = p if p.is_dir() else None
+        if surr_path:
+            log(f"[configure_joint] 使用环境变量指定的 surrogate 目录: {surr_path.name}")
+        else:
+            log(f"[configure_joint] 警告: AGENTIC_FP_SURROGATE_DIR 不是有效目录: {env_surr!r}")
+    if surr_path is None:
+        surr_path = _find_latest_file(surr_dir, "subproblem_models_case3lite_*")
 
     if bcd_path:
         log(f"[configure_joint] 自动发现 BCD 模型: {bcd_path.name}")

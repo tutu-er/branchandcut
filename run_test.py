@@ -9,6 +9,7 @@
 修改顶部�?MODE / MODEL_DIR / BCD_MODEL_PATH 等变量切换执行模式�?
 """
 
+import os
 import sys
 import subprocess
 import time
@@ -89,10 +90,12 @@ BCD_GAMMA_BASE = 1e-2
 
 # surrogate / both 模式：已训练 surrogate 模型目录（训练时输出的带时间戳路径）
 # 设为 None 则自动查找 result/surrogate_models/ 下最新的匹配目录
+# 环境变量 RUN_TEST_SURROGATE_MODEL_DIR 可覆盖本常量（agentic_fp_optimizer 会注入）
 MODEL_DIR = None
 
 # bcd / both 模式：已训练 BCD 模型 .pth 文件路径
 # 设为 None 则自动查找 result/bcd_models/ 下最新的匹配文件
+# 环境变量 RUN_TEST_BCD_MODEL_PATH 可覆盖本常量
 BCD_MODEL_PATH = None
 
 
@@ -3009,6 +3012,13 @@ def main():
     # ── 自动发现模型路径（当顶部配置为 None 时） ────────────
     resolved_model_dir = MODEL_DIR
     resolved_bcd_path = BCD_MODEL_PATH
+    # 外部脚本（如 agentic_fp_optimizer）可通过环境变量固定某次训练输出目录，无需改本文件顶部常量
+    _env_surr = os.environ.get("RUN_TEST_SURROGATE_MODEL_DIR")
+    if _env_surr and _env_surr.strip():
+        resolved_model_dir = _env_surr.strip()
+    _env_bcd = os.environ.get("RUN_TEST_BCD_MODEL_PATH")
+    if _env_bcd and _env_bcd.strip():
+        resolved_bcd_path = _env_bcd.strip()
     if resolved_model_dir is None:
         resolved_model_dir = _auto_discover_model_path(
             'result/surrogate_models', f'subproblem_models_{CASE_NAME}_*', 'Surrogate 模型目录')
