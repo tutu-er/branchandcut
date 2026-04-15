@@ -580,6 +580,8 @@ class Agent_NN_BCD:
         self.nl = self.branch.shape[0]
         self.theta_constraint_direction_signs = np.ones((self.nl, self.T), dtype=float)
         self.zeta_constraint_direction_signs = np.ones((self.ng, self.T), dtype=float)
+        self._theta_limited_union_analysis_cache = {}
+        self._last_reported_theta_stage_signature = None
         
         self.active_set_data = active_set_data
         self.external_sparse_templates = external_sparse_templates
@@ -2030,6 +2032,140 @@ class Agent_NN_BCD:
             })
         
         return union_constraints
+
+    def _build_theta_limited_union_analysis(self, union_analysis, max_constraints_per_time_slot: int | None):
+        """Cache a union_analysis view that keeps only the first k theta constraints per time slot."""
+        if (
+            max_constraints_per_time_slot is None
+            or max_constraints_per_time_slot <= 0
+            or not union_analysis
+            or 'union_constraints' not in union_analysis
+        ):
+            return union_analysis
+
+        union_constraints = union_analysis['union_constraints']
+        if not union_constraints:
+            return union_analysis
+
+        cache_key = (id(union_analysis), int(max_constraints_per_time_slot))
+        cached = self._theta_limited_union_analysis_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        limited_constraints = []
+        per_time_slot_counts: dict[int, int] = {}
+        for constraint_info in union_constraints:
+            time_slot = int(constraint_info.get('time_slot', 0))
+            used = per_time_slot_counts.get(time_slot, 0)
+            if used >= max_constraints_per_time_slot:
+                continue
+            limited_constraints.append(constraint_info)
+            per_time_slot_counts[time_slot] = used + 1
+
+        if len(limited_constraints) == len(union_constraints):
+            self._theta_limited_union_analysis_cache[cache_key] = union_analysis
+            return union_analysis
+
+        limited_union_analysis = dict(union_analysis)
+        limited_union_analysis['union_constraints'] = limited_constraints
+        self._theta_limited_union_analysis_cache[cache_key] = limited_union_analysis
+        return limited_union_analysis
+
+    def _normalize_theta_training_stages(self, theta_training_stages, max_iter: int) -> list[dict] | None:
+        """Normalize staged theta-constraint curriculum definitions."""
+        if not theta_training_stages:
+            return None
+
+        normalized = []
+        unresolved_stage_indices = []
+        assigned_iterations = 0
+
+        for stage_idx, raw_stage in enumerate(theta_training_stages):
+            if isinstance(raw_stage, dict):
+                limit = raw_stage.get(
+                    'max_constraints_per_time_slot',
+                    raw_stage.get('constraint_limit', raw_stage.get('limit')),
+                )
+                iterations = raw_stage.get(
+                    'iterations',
+                    raw_stage.get('max_iter', raw_stage.get('iters')),
+                )
+            else:
+                limit = raw_stage
+                iterations = None
+
+            if limit is None:
+                raise ValueError(
+                    f"theta_training_stages[{stage_idx}] is missing max_constraints_per_time_slot"
+                )
+            limit = int(limit)
+            if limit <= 0:
+                raise ValueError(
+                    f"theta_training_stages[{stage_idx}] must have a positive constraint limit, got {limit}"
+                )
+
+            if iterations is None:
+                resolved_iterations = None
+                unresolved_stage_indices.append(stage_idx)
+            else:
+                resolved_iterations = int(iterations)
+                if resolved_iterations <= 0:
+                    raise ValueError(
+                        f"theta_training_stages[{stage_idx}] must have positive iterations, got {resolved_iterations}"
+                    )
+                assigned_iterations += resolved_iterations
+
+            normalized.append({
+                'stage_index': stage_idx,
+                'max_constraints_per_time_slot': limit,
+                'iterations': resolved_iterations,
+            })
+
+        if assigned_iterations > max_iter:
+            raise ValueError(
+                f"theta_training_stages assign {assigned_iterations} iterations, exceeding max_iter={max_iter}"
+            )
+
+        if unresolved_stage_indices:
+            remaining = max_iter - assigned_iterations
+            if remaining < len(unresolved_stage_indices):
+                raise ValueError(
+                    "theta_training_stages leaves too few iterations for stages without explicit durations"
+                )
+            base_iters = remaining // len(unresolved_stage_indices)
+            extra_iters = remaining % len(unresolved_stage_indices)
+            for offset, stage_idx in enumerate(unresolved_stage_indices):
+                normalized[stage_idx]['iterations'] = base_iters + (1 if offset < extra_iters else 0)
+        elif assigned_iterations < max_iter:
+            normalized[-1]['iterations'] += max_iter - assigned_iterations
+
+        iter_start = 0
+        for stage in normalized:
+            iter_end = iter_start + int(stage['iterations'])
+            stage['iter_start'] = iter_start
+            stage['iter_end'] = iter_end
+            iter_start = iter_end
+
+        return normalized
+
+    def _resolve_active_theta_stage(self, iter_index: int, max_iter: int, theta_training_stages):
+        normalized_stages = self._normalize_theta_training_stages(theta_training_stages, max_iter)
+        if not normalized_stages:
+            return None
+        for stage in normalized_stages:
+            if iter_index < stage['iter_end']:
+                return stage
+        return normalized_stages[-1]
+
+    def _resolve_active_union_analysis(self, iter_index: int, max_iter: int, union_analysis, theta_training_stages):
+        stage = self._resolve_active_theta_stage(iter_index, max_iter, theta_training_stages)
+        if stage is None:
+            return union_analysis, None
+        active_union_analysis = self._build_theta_limited_union_analysis(
+            union_analysis,
+            stage['max_constraints_per_time_slot'],
+        )
+        return active_union_analysis, stage
     
     def initialize_theta_values(self, union_analysis=None):
         """初始化theta值（直接优化系数，参考uc_NN.py）"""
@@ -3383,6 +3519,7 @@ class Agent_NN_BCD:
         dual_sign_relax_interval: int | None = None,
         nn_epochs=10,
         union_analysis=None,
+        theta_training_stages=None,
         nn_batch_strategy: str | None = None,
         nn_batch_size: int | None = None,
         nn_shuffle: bool | None = None,
@@ -3409,6 +3546,31 @@ class Agent_NN_BCD:
             print(f"🔄 迭代 {i+1}/{max_iter} 开始", flush=True)
             self.iter_number = i
             self._sync_parametric_direction_strategy_state()
+            active_union_analysis, active_theta_stage = self._resolve_active_union_analysis(
+                i,
+                max_iter,
+                union_analysis,
+                theta_training_stages,
+            )
+            if active_theta_stage is None:
+                self._last_reported_theta_stage_signature = None
+            else:
+                active_theta_count = len(active_union_analysis.get('union_constraints', []))
+                stage_signature = (
+                    int(active_theta_stage['stage_index']),
+                    int(active_theta_stage['max_constraints_per_time_slot']),
+                    int(active_theta_count),
+                )
+                if stage_signature != self._last_reported_theta_stage_signature:
+                    normalized_stages = self._normalize_theta_training_stages(theta_training_stages, max_iter) or []
+                    print(
+                        f"[BCD][theta-stage] stage={active_theta_stage['stage_index'] + 1}/{len(normalized_stages)}, "
+                        f"iter_range={active_theta_stage['iter_start'] + 1}-{active_theta_stage['iter_end']}, "
+                        f"active_limit_per_time={active_theta_stage['max_constraints_per_time_slot']}, "
+                        f"active_theta_constraints={active_theta_count}",
+                        flush=True,
+                    )
+                    self._last_reported_theta_stage_signature = stage_signature
 
             # 1. 迭代PG块
             EPS = 1e-10
@@ -3417,7 +3579,7 @@ class Agent_NN_BCD:
                     sample_id=sample_id,
                     theta_values=self.theta_values_list[sample_id],
                     zeta_values=self.zeta_values_list[sample_id],
-                    union_analysis=union_analysis
+                    union_analysis=active_union_analysis
                 )
                 if pg_sol is None:
                     print("❌ PG块迭代失败，终止迭代", flush=True)
@@ -3445,7 +3607,7 @@ class Agent_NN_BCD:
                     sample_id=sample_id,
                     theta_values=self.theta_values_list[sample_id],
                     zeta_values=self.zeta_values_list[sample_id],
-                    union_analysis=union_analysis
+                    union_analysis=active_union_analysis
                 )
                 if lambda_sol is None or mu_sol is None:
                     print("❌ 对偶块迭代失败，终止迭代", flush=True)
@@ -3490,7 +3652,7 @@ class Agent_NN_BCD:
                 obj_dual_coc_pre,
                 obj_dual_pre,
                 obj_opt_pre,
-            ) = self.cal_viol_components(union_analysis=union_analysis)
+            ) = self.cal_viol_components(union_analysis=active_union_analysis)
             EPS_PRE = 1e-12
             obj_primal_pre = obj_primal_pre if abs(obj_primal_pre) >= EPS_PRE else 0.0
             obj_dual_pg_pre = obj_dual_pg_pre if abs(obj_dual_pg_pre) >= EPS_PRE else 0.0
@@ -3498,7 +3660,7 @@ class Agent_NN_BCD:
             obj_dual_coc_pre = obj_dual_coc_pre if abs(obj_dual_coc_pre) >= EPS_PRE else 0.0
             obj_dual_pre = obj_dual_pre if abs(obj_dual_pre) >= EPS_PRE else 0.0
             obj_opt_pre = obj_opt_pre if abs(obj_opt_pre) >= EPS_PRE else 0.0
-            nn_metrics_pre = self.cal_nn_logging_components(union_analysis=union_analysis)
+            nn_metrics_pre = self.cal_nn_logging_components(union_analysis=active_union_analysis)
 
             # 4. 使用神经网络更新theta和zeta
             print(
@@ -3513,7 +3675,7 @@ class Agent_NN_BCD:
                 self._prev_theta_values_list = [dict(v) for v in self.theta_values_list]
                 self._prev_zeta_values_list = [dict(v) for v in self.zeta_values_list]
             theta_values_new, zeta_values_new = self.iter_with_theta_zeta_neural_network(
-                union_analysis=union_analysis,
+                union_analysis=active_union_analysis,
                 num_epochs=nn_epochs,
                 batch_strategy=nn_batch_strategy,
                 batch_size=nn_batch_size,
@@ -3538,7 +3700,7 @@ class Agent_NN_BCD:
                 obj_dual_coc,
                 obj_dual,
                 obj_opt,
-            ) = self.cal_viol_components(union_analysis=union_analysis)
+            ) = self.cal_viol_components(union_analysis=active_union_analysis)
             
             # 简单数值过滤：绝对值过小的值设为0
             EPS = 1e-12
@@ -3549,7 +3711,7 @@ class Agent_NN_BCD:
             obj_dual = obj_dual if abs(obj_dual) >= EPS else 0.0
             obj_opt = obj_opt if abs(obj_opt) >= EPS else 0.0
             
-            nn_metrics_after = self.cal_nn_logging_components(union_analysis=union_analysis)
+            nn_metrics_after = self.cal_nn_logging_components(union_analysis=active_union_analysis)
             print(
                 f"[BCD][NN-metric][after] obj_primal={nn_metrics_after['obj_primal']:.6f}, "
                 f"obj_dual_x={nn_metrics_after['obj_dual_x']:.6f}, "

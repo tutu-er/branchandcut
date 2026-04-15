@@ -147,6 +147,7 @@ BCD_LOSS_RATIO_REG = 1.0
 BCD_NN_SMOOTH_ABS_EPS = 1e-5
 BCD_RESTORE_RHO_FROM_CHECKPOINT = False
 BCD_MAX_THETA_CONSTRAINTS_PER_TIME_SLOT = 20
+BCD_THETA_TRAINING_STAGES = None
 BCD_GAMMA_BASE = 1e-3
 DUAL_DECAY_ROUND = round(BCD_MAX_ITER/8)
 BCD_DUAL_SIGN_RELAX_INTERVAL = 4
@@ -999,6 +1000,7 @@ def run_bcd(ppc, all_samples: list, T_DELTA, MAX_ITER, bcd_model_dir,
             external_sparse_templates=None,
             lambda_init_strategy: str = 'lp_relaxation',
             max_theta_constraints_per_time_slot: int = 10,
+            theta_training_stages=None,
             theta_hot_start_strategy: str = 'dcpf_relative',
             zeta_hot_start_strategy: str = 'zero',
             theta_gaussian_std: float = 0.01,
@@ -1060,6 +1062,8 @@ def run_bcd(ppc, all_samples: list, T_DELTA, MAX_ITER, bcd_model_dir,
         f"bcd_prox: pg_block={pg_block_prox_weight}, "
         f"dual_block={dual_block_prox_weight}"
     )
+    if theta_training_stages:
+        log(f"theta staged training: {theta_training_stages}")
 
     print("\n" + "=" * 70)
     if n_workers <= 1:
@@ -1170,6 +1174,7 @@ def run_bcd(ppc, all_samples: list, T_DELTA, MAX_ITER, bcd_model_dir,
         dual_decay_round=DUAL_DECAY_ROUND,
         dual_sign_relax_interval=DUAL_SIGN_RELAX_INTERVAL,
         nn_epochs=NN_EPOCHS,
+        theta_training_stages=theta_training_stages,
         nn_batch_strategy=nn_batch_strategy,
         nn_batch_size=nn_batch_size,
         nn_shuffle=nn_shuffle,
@@ -1462,6 +1467,7 @@ def main():
     BCD_LOSS_RATIO_REG_VALUE = BCD_LOSS_RATIO_REG
     BCD_NN_SMOOTH_ABS_EPS_VALUE = BCD_NN_SMOOTH_ABS_EPS
     BCD_MAX_THETA_CONSTRAINTS_PER_TIME_SLOT_VALUE = BCD_MAX_THETA_CONSTRAINTS_PER_TIME_SLOT
+    BCD_THETA_TRAINING_STAGES_VALUE = BCD_THETA_TRAINING_STAGES
     BCD_GAMMA_BASE_VALUE = BCD_GAMMA_BASE
     BCD_MU_DUAL_FLOOR_INIT_VALUE = BCD_MU_DUAL_FLOOR_INIT
     BCD_ITA_DUAL_FLOOR_INIT_VALUE = BCD_ITA_DUAL_FLOOR_INIT
@@ -1589,6 +1595,7 @@ def main():
                     restore_rho_from_checkpoint=BCD_RESTORE_RHO_FROM_CHECKPOINT,
                     lambda_init_strategy=BCD_LAMBDA_INIT_STRATEGY_VALUE,
                     max_theta_constraints_per_time_slot=BCD_MAX_THETA_CONSTRAINTS_PER_TIME_SLOT_VALUE,
+                    theta_training_stages=BCD_THETA_TRAINING_STAGES_VALUE,
                     theta_hot_start_strategy=THETA_WARM_START_STRATEGY,
                     zeta_hot_start_strategy=ZETA_WARM_START_STRATEGY,
                     theta_gaussian_std=THETA_WARM_START_GAUSSIAN_STD,
@@ -1942,6 +1949,7 @@ def main():
                     external_sparse_templates=sparse_template_library,
                     lambda_init_strategy=BCD_LAMBDA_INIT_STRATEGY_VALUE,
                     max_theta_constraints_per_time_slot=BCD_MAX_THETA_CONSTRAINTS_PER_TIME_SLOT_VALUE,
+                    theta_training_stages=BCD_THETA_TRAINING_STAGES_VALUE,
                     theta_hot_start_strategy=THETA_WARM_START_STRATEGY,
                     zeta_hot_start_strategy=ZETA_WARM_START_STRATEGY,
                     theta_gaussian_std=THETA_WARM_START_GAUSSIAN_STD,

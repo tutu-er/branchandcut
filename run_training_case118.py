@@ -47,6 +47,7 @@ def _configure_common() -> None:
     rt.BCD_CONTINUE_TRAINING = False
     rt.SURROGATE_MODEL_DIR = None
     rt.SURROGATE_CONTINUE_TRAINING = False
+    rt.BCD_THETA_TRAINING_STAGES = None
 
     rt.THETA_HOT_START_STRATEGY = "dcpf_relative"
     rt.ZETA_HOT_START_STRATEGY = "zero"
@@ -76,6 +77,11 @@ def _configure_main_bcd() -> None:
     rt.BCD_ENABLE_DROPOUT_DURING_NN_TRAINING = True
 
     rt.BCD_MAX_THETA_CONSTRAINTS_PER_TIME_SLOT = 24
+    rt.BCD_THETA_TRAINING_STAGES = [
+        {"max_constraints_per_time_slot": 8, "iterations": 40},
+        {"max_constraints_per_time_slot": 16, "iterations": 40},
+        {"max_constraints_per_time_slot": 24, "iterations": 40},
+    ]
     rt.BCD_GAMMA_BASE = 1e-3
     rt.BCD_RHO_PRIMAL_INIT = 1e-3
     rt.BCD_RHO_DUAL_INIT = 1e-3
