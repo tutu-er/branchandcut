@@ -95,6 +95,43 @@ def log(message: str) -> None:
     print(f"[{ts}] {message}", flush=True)
 
 
+# ==================== 辅助函数 ====================
+
+_ENV_ERROR_PATTERNS = [
+    "ModuleNotFoundError",
+    "ImportError",
+    "No module named",
+    "cannot import name",
+    "DLL load failed",
+]
+
+
+def _is_env_error(eval_result: "EvalResult") -> bool:
+    """判断评估失败是否由环境依赖缺失引起（而非代码 bug）。"""
+    combined = eval_result.stdout + eval_result.stderr
+    return any(p in combined for p in _ENV_ERROR_PATTERNS)
+
+
+def _is_meaningful_result(result: "EvalResult") -> bool:
+    """判断评估结果是否有意义：返回码为 0 且至少解析出一个业务指标。"""
+    m = result.metrics
+    return result.return_code == 0 and any(
+        v is not None for v in [m.feasible_rate, m.fp_success_rate, m.avg_gap_percent]
+    )
+
+
+def truncate_at_function_boundary(text: str, max_chars: int) -> str:
+    """在字符限制前按函数/类边界截断，避免切断函数中间。"""
+    if len(text) <= max_chars:
+        return text
+    cut = text.rfind("\ndef ", 0, max_chars)
+    if cut == -1:
+        cut = text.rfind("\nclass ", 0, max_chars)
+    if cut == -1:
+        cut = max_chars
+    return text[:cut] + "\n# ... [后续内容已截断]\n"
+
+
 # ==================== Dataclass 定义 ====================
 
 @dataclass
@@ -453,11 +490,12 @@ class Config:
     system_prompt_file: Optional[Path]
     accept_regressions: bool
 
-    # ---- Cursor / Claude CLI 配置 ----
+    # ---- Cursor / Claude CLI / Codex CLI 配置 ----
     cursor_model: Optional[str] = None
     cursor_interactive: bool = False
     claude_cli_model: Optional[str] = None
     claude_cli_allowed_tools: str = "Edit,Write,Read"
+    codex_cli_model: Optional[str] = None
 
     # === 新增：Surrogate模型与多策略FP优化器配置 ===
 
@@ -510,6 +548,10 @@ class Config:
     neighbor_solutions_path: Optional[Path] = None
     # 历史最优解存档路径
     historical_best_path: Optional[Path] = None
+
+    # ---- 评估模式 ----
+    # 传给 run_test.py 的 RUN_TEST_MODE 环境变量（both/surrogate/bcd）
+    eval_mode: str = "both"
 
 
 def read_text(path: Path) -> str:
@@ -745,6 +787,8 @@ def run_command(
 def evaluate(config: Config, iteration_dir: Path, label: str) -> EvalResult:
     log(f"运行评估: {label}")
     extra_env: Dict[str, str] = {}
+    # 自动化评估不需要绘图；禁用 run_test.py 的绘图可避免空数据触发 matplotlib 崩溃
+    extra_env["RUN_TEST_DISABLE_PLOTS"] = "1"
     if config.surrogate_model_path:
         s = _path_for_run_test_env(config.workspace, config.surrogate_model_path)
         extra_env["RUN_TEST_SURROGATE_MODEL_DIR"] = s
@@ -753,6 +797,9 @@ def evaluate(config: Config, iteration_dir: Path, label: str) -> EvalResult:
         b = _path_for_run_test_env(config.workspace, config.bcd_model_path)
         extra_env["RUN_TEST_BCD_MODEL_PATH"] = b
         log(f"评估环境 RUN_TEST_BCD_MODEL_PATH={b}")
+    if config.eval_mode and config.eval_mode != "both":
+        extra_env["RUN_TEST_MODE"] = config.eval_mode
+        log(f"评估环境 RUN_TEST_MODE={config.eval_mode}")
     rc, stdout, stderr, elapsed = run_command(
         config.eval_command,
         config.workspace,
@@ -799,7 +846,7 @@ def build_context_block(config: Config, max_chars_per_file: Optional[int] = None
         content = read_text(path) if path.exists() else ""
         chunks.append(
             f"### FILE: {rel}\n"
-            f"```python\n{truncate(content, limit)}\n```\n"
+            f"```python\n{truncate_at_function_boundary(content, limit)}\n```\n"
         )
     return "\n".join(chunks)
 
@@ -820,33 +867,31 @@ def build_history_block(history: List[IterationRecord], limit: int) -> str:
 
 
 def build_surrogate_profile_block(config: Config) -> str:
-    """构建代理模型特征配置块。"""
-    if not config.enable_surrogate_adaptation and not config.enable_strategy_adaptation:
+    """构建代理模型特征配置块。仅在启用适配且提供了有效的 profile 文件时生成内容。"""
+    if not config.enable_surrogate_adaptation:
         return ""
-    if config.surrogate_profile_path and not config.surrogate_profile_path.exists():
+    # 无 profile 文件时整块省略，避免输出无意义的空占位符
+    if config.surrogate_profile_path is None:
+        return ""
+    if not config.surrogate_profile_path.exists():
         return f"[警告: 代理模型配置文件不存在: {config.surrogate_profile_path}]"
     try:
-        profile = None
-        if config.surrogate_profile_path and config.surrogate_profile_path.exists():
-            profile = json.loads(read_text(config.surrogate_profile_path))
-        patterns = profile.get("bias_patterns", []) if profile else []
+        profile = json.loads(read_text(config.surrogate_profile_path))
+        patterns = profile.get("bias_patterns", [])
         patterns_str = "\n  - ".join([""] + patterns) if patterns else "未定义"
-        surrogate_name = profile.get('name', 'unknown') if profile else '未指定'
-        return textwrap.dedent(
-            f"""
-            === 代理模型定向适配配置 ===
-            代理模型名称: {surrogate_name}
-            已知系统性偏差模式:
-            {patterns_str}
-            启停时序偏差修正窗口: {config.startup_shift_window} 个时段
-
-            定向优化要求:
-            1. 在 `run_feasibility_pump()` 中添加对代理模型特定偏差的检测逻辑
-            2. 针对启停时序偏移，实现 `shift_correction_heuristic()` 启发式调整
-            3. 在 `identify_trusted_mask()` 中降低代理模型高偏差区域的可信度阈值
-            4. 实现 `adapt_priority_by_surrogate_bias()` 动态调整组合优先级
-            ===
-            """
+        surrogate_name = profile.get('name', 'unknown')
+        return (
+            "=== 代理模型定向适配配置 ===\n"
+            f"代理模型名称: {surrogate_name}\n"
+            f"已知系统性偏差模式:{patterns_str}\n"
+            f"启停时序偏差修正窗口: {config.startup_shift_window} 个时段\n"
+            "\n"
+            "定向优化要求:\n"
+            "1. 在 `run_feasibility_pump()` 中添加对代理模型特定偏差的检测逻辑\n"
+            "2. 针对启停时序偏移，实现 `shift_correction_heuristic()` 启发式调整\n"
+            "3. 在 `identify_trusted_mask()` 中降低代理模型高偏差区域的可信度阈值\n"
+            "4. 实现 `adapt_priority_by_surrogate_bias()` 动态调整组合优先级\n"
+            "==="
         )
     except Exception as e:
         return f"[错误: 无法解析代理模型配置文件: {e}]"
@@ -991,17 +1036,15 @@ def build_compact_strategy_block(config: Config) -> str:
 
     strategy_details = ", ".join(config.fp_strategy_pool)
     adaptation_mode = "enabled" if config.enable_strategy_adaptation else "disabled"
-    return textwrap.dedent(
-        f"""
-        === FP strategy guidance ===
-        available strategies: {strategy_details}
-        strategy adaptation: {adaptation_mode}
-        surrogate model type: {config.surrogate_model_type}
-        recommended default strategy: {recommended_strategy}
-        Keep this lightweight: prefer threshold tuning, simple fallbacks, and routing inside existing code paths.
-        Do not build a new multi-strategy framework unless the current files already have the needed hooks.
-        ===
-        """
+    return (
+        "=== FP 多策略指导 ===\n"
+        f"可用策略: {strategy_details}\n"
+        f"策略自适应: {adaptation_mode}\n"
+        f"Surrogate 模型类型: {config.surrogate_model_type}\n"
+        f"推荐默认策略: {recommended_strategy}\n"
+        "保持轻量：优先调整阈值、添加简单回退逻辑，在现有代码路径内路由。\n"
+        "除非目标文件已有对应接入点，否则不要新建多策略框架。\n"
+        "==="
     )
 
 
@@ -1041,20 +1084,19 @@ def build_prompt(
             " 这一轮只允许做一个小改动，先读必要片段，尽快直接编辑，不要长时间规划或运行耗时命令。\n"
         )
 
-    # 构建Surrogate模型配置说明
-    surrogate_config = textwrap.dedent(
-        f"""
-        === Surrogate模型配置 ===
-        模型类型: {config.surrogate_model_type}
-        案例名称: {config.case_name}
-        时间间隔: {config.t_delta} 小时
-        时段数: {config.time_periods}
-        机组IDs: {config.unit_ids if config.unit_ids else '全部'}
-        最大样本数: {config.max_samples if config.max_samples else '全部'}
-        数据文件: {config.active_sets_file if config.active_sets_file else '自动查找'}
-        模型路径: {config.surrogate_model_path if config.surrogate_model_path else '训练新模型'}
-        """
-    ).strip()
+    # 构建Surrogate模型配置说明（逐行 join，避免 textwrap.dedent 嵌入时缩进错位）
+    surrogate_config = "\n".join([
+        "=== Surrogate 模型配置 ===",
+        f"模型类型: {config.surrogate_model_type}",
+        f"案例名称: {config.case_name}",
+        f"时间间隔: {config.t_delta} 小时",
+        f"时段数: {config.time_periods}",
+        f"机组IDs: {config.unit_ids if config.unit_ids else '全部'}",
+        f"最大样本数: {config.max_samples if config.max_samples else '全部'}",
+        f"数据文件: {config.active_sets_file if config.active_sets_file else '自动查找'}",
+        f"模型路径: {config.surrogate_model_path if config.surrogate_model_path else '训练新模型'}",
+        "===",
+    ])
 
     # 构建核心优化目标说明
     optimization_focus = ""
@@ -1066,6 +1108,52 @@ def build_prompt(
         optimization_focus = "\n【核心优化方向】\n物理信息增强: 融合历史解和邻近场景信息的约束感知恢复\n"
     else:
         optimization_focus = "\n【核心优化方向】\n多策略FP: 基于场景特征自适应选择最优FP策略 (legacy/case3lite/guided)\n"
+
+    # Fix 5: 评估失败时注入诊断说明
+    eval_status_note = ""
+    if latest.return_code != 0:
+        if _is_env_error(latest):
+            eval_status_note = (
+                "\n[注意] 评估命令因环境依赖缺失失败（见下方 stderr），"
+                "这是运行环境问题，无法通过修改目标文件解决。"
+                "如果你确认代码没有引入新的 import，请保持代码不变并输出说明。\n"
+            )
+        else:
+            eval_status_note = (
+                "\n[注意] 评估命令以非零状态退出，请检查是否是代码 bug 导致，并尝试修复。\n"
+            )
+
+    # Fix 6: 三个指标块相同时去重，只展示一块
+    _baseline_metrics_json = json.dumps(asdict(baseline.metrics), ensure_ascii=False, indent=2)
+    _latest_metrics_json = json.dumps(asdict(latest.metrics), ensure_ascii=False, indent=2)
+    _best_metrics_json = json.dumps(asdict(best.metrics), ensure_ascii=False, indent=2)
+    _latest_same_as_baseline = (
+        latest.score == baseline.score and _latest_metrics_json == _baseline_metrics_json
+    )
+    _best_same_as_baseline = (
+        best.score == baseline.score and _best_metrics_json == _baseline_metrics_json
+    )
+    if _latest_same_as_baseline and _best_same_as_baseline:
+        metrics_block = (
+            f"当前分数（基线/当前/最佳均相同）：\n"
+            f"{baseline.score:.3f}\n"
+            f"当前指标：\n{_baseline_metrics_json}"
+        )
+    else:
+        metrics_block = (
+            f"基线分数：\n{baseline.score:.3f}\n"
+            f"基线指标：\n{_baseline_metrics_json}"
+        )
+        if not _latest_same_as_baseline:
+            metrics_block += (
+                f"\n\n当前工作树分数：\n{latest.score:.3f}\n"
+                f"当前指标：\n{_latest_metrics_json}"
+            )
+        if not _best_same_as_baseline:
+            metrics_block += (
+                f"\n\n当前最佳分数：\n{best.score:.3f}\n"
+                f"当前最佳指标：\n{_best_metrics_json}"
+            )
 
     return textwrap.dedent(
         f"""
@@ -1097,21 +1185,8 @@ def build_prompt(
         允许修改的文件：
         {chr(10).join(f"- {p.relative_to(config.workspace)}" for p in config.target_files)}
 
-        基线分数：
-        {baseline.score:.3f}
-        基线指标：
-        {json.dumps(asdict(baseline.metrics), ensure_ascii=False, indent=2)}
-
-        当前工作树分数：
-        {latest.score:.3f}
-        当前指标：
-        {json.dumps(asdict(latest.metrics), ensure_ascii=False, indent=2)}
-
-        当前最佳分数：
-        {best.score:.3f}
-        当前最佳指标：
-        {json.dumps(asdict(best.metrics), ensure_ascii=False, indent=2)}
-
+        {metrics_block}
+        {eval_status_note}
         最近评估输出：
         ```text
         {latest_output}
@@ -1516,6 +1591,89 @@ def run_claude_cli_agent(
     return command_display, proc.returncode, proc.stdout, proc.stderr
 
 
+def _find_codex_exe() -> Optional[str]:
+    """尝试在 PATH 中找到 codex 可执行文件（npm global install）。"""
+    import shutil
+    found = shutil.which("codex")
+    if found:
+        return found
+    if sys.platform == "win32":
+        appdata = os.environ.get("APPDATA", "")
+        p = Path(appdata) / "npm/codex.cmd"
+        if p.exists():
+            return str(p)
+    return None
+
+
+def run_codex_cli_agent(
+    config: Config,
+    prompt_file: Path,
+    iteration: int,
+) -> tuple[str, int, str, str]:
+    """使用 OpenAI Codex CLI 非交互模式执行代码修改。
+
+    调用方式: codex exec - --full-auto --sandbox danger-full-access
+    通过 stdin 管道传入 prompt（codex exec 的 '-' 表示从 stdin 读取完整 prompt）。
+
+    依赖:
+      - npm install -g @openai/codex
+      - 环境变量 OPENAI_API_KEY 已设置
+      - 设置 CODEX_QUIET_MODE=1 可消除交互式 UI 噪音
+    """
+    codex_exe = _find_codex_exe()
+    if not codex_exe:
+        return "codex exec ...", 1, "", (
+            "[错误] 找不到 codex 命令。\n"
+            "请先安装 OpenAI Codex CLI: npm install -g @openai/codex\n"
+            "然后运行: codex login（使用你的订阅账号登录）或设置 OPENAI_API_KEY。\n"
+            "安装说明: https://github.com/openai/codex"
+        )
+
+    prompt_content = read_text(prompt_file)
+
+    parts = [
+        codex_exe,
+        # 非交互：不请求审批，直接在沙盒内执行（这些是 codex 顶层参数，必须放在子命令 exec 之前）
+        "-a", "never",
+        "--sandbox", "danger-full-access",
+        # 让 Codex 执行命令时继承当前 shell/conda 环境（例如 poweropt）
+        "-c", "shell_environment_policy.inherit=all",
+        "exec", "-",
+    ]
+    if config.codex_cli_model:
+        parts.extend(["--model", config.codex_cli_model])
+
+    command_display = " ".join(parts) + f" (stdin from {prompt_file})"
+    log(f"[Codex CLI] 执行非交互模式 (prompt={len(prompt_content)}字符)")
+
+    # CODEX_QUIET_MODE=1 抑制交互式 UI 噪音，便于捕获纯文本输出
+    env = os.environ.copy()
+    env["CODEX_QUIET_MODE"] = "1"
+
+    start = time.time()
+    try:
+        proc = subprocess.run(
+            parts,
+            cwd=str(config.workspace),
+            input=prompt_content,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=config.agent_timeout_sec,
+            env=env,
+        )
+    except subprocess.TimeoutExpired as exc:
+        elapsed = time.time() - start
+        return (
+            command_display, 124,
+            getattr(exc, "stdout", None) or "",
+            (getattr(exc, "stderr", None) or "") + f"\n[timeout] Codex CLI 超时 ({config.agent_timeout_sec}s)\n",
+        )
+
+    return command_display, proc.returncode, proc.stdout, proc.stderr
+
+
 def parse_args() -> Config:
     parser = argparse.ArgumentParser(
         description="让外部 agent / 大模型 API 自动迭代优化 feasibility pump"
@@ -1551,9 +1709,9 @@ def parse_args() -> Config:
     )
     parser.add_argument(
         "--agent-kind",
-        choices=["cursor", "claude-cli", "command", "openai-compatible"],
+        choices=["cursor", "claude-cli", "codex-cli", "command", "openai-compatible"],
         default="cursor",
-        help="agent 调用方式: cursor(推荐)/claude-cli/command/openai-compatible",
+        help="agent 调用方式: cursor/claude-cli/codex-cli/command/openai-compatible",
     )
     parser.add_argument(
         "--agent-command-template",
@@ -1573,6 +1731,11 @@ def parse_args() -> Config:
         "--claude-cli-model",
         default=None,
         help="claude-cli 模式下使用的模型名称，如 claude-sonnet-4-20250514",
+    )
+    parser.add_argument(
+        "--codex-cli-model",
+        default=None,
+        help="codex-cli 模式下使用的模型名称，如 codex-1（默认使用 OPENAI_API_KEY 对应账号的默认模型）",
     )
     parser.add_argument("--api-base-url", help="OpenAI 兼容 chat completions URL")
     parser.add_argument("--api-model", help="OpenAI 兼容模型名")
@@ -1800,10 +1963,11 @@ def parse_args() -> Config:
         if args.system_prompt_file
         else None,
         accept_regressions=args.accept_regressions,
-        # Cursor / Claude CLI
+        # Cursor / Claude CLI / Codex CLI
         cursor_model=args.cursor_model,
         cursor_interactive=args.cursor_interactive,
         claude_cli_model=args.claude_cli_model,
+        codex_cli_model=args.codex_cli_model,
         # === 新增：Surrogate模型与多策略FP优化器配置 ===
         # Surrogate模型配置
         surrogate_model_type=args.surrogate_model_type,
@@ -1881,9 +2045,9 @@ def configure_joint():
             "请先运行 run_training.py MODE='both' 生成模型")
 
     eval_mode = "both" if bcd_path and surr_path else "surrogate" if surr_path else "both"
-    eval_command = f"python run_test.py"
+    eval_command = "python run_test.py"
     if eval_mode != "both":
-        log(f"[configure_joint] BCD 模型缺失，评估将使用 MODE='{eval_mode}'")
+        log(f"[configure_joint] BCD 模型缺失，评估将使用 MODE='{eval_mode}'，已注入环境变量 RUN_TEST_MODE")
 
     config = Config(
         workspace=root,
@@ -1894,7 +2058,7 @@ def configure_joint():
             root / "src/feasibility_pump_case3lite.py",
         ],
         eval_command=eval_command,
-        agent_kind="cursor",
+        agent_kind="codex-cli",
         cursor_interactive=False,
         agent_command_template=None,
         api_base_url=None,
@@ -1925,7 +2089,9 @@ def configure_joint():
         fp_strategy_pool=["legacy", "case3lite", "guided"],
         default_fp_strategy="guided",
         enable_strategy_adaptation=True,
-        enable_surrogate_adaptation=True,
+        # 无 surrogate_profile_path 时禁用适配，避免生成空洞的提示块
+        enable_surrogate_adaptation=False,
+        eval_mode=eval_mode,
     )
     return config
 
@@ -1988,6 +2154,13 @@ def _run_optimization_loop(config: Config) -> int:
             max_chars=1500,
         )
         log(f"[警告] 基线评估失败 (return_code={baseline_eval.return_code})，评估输出尾部:\n{eval_tail}")
+        if _is_env_error(baseline_eval):
+            log(
+                "[中止] 基线评估因环境依赖缺失失败（ModuleNotFoundError/ImportError），"
+                "无法通过修改代码解决，请先检查并修复运行环境后重试。"
+            )
+            restore_snapshot(original_snapshot)
+            return 1
 
     history: List[IterationRecord] = []
     no_improve_rounds = 0
@@ -2010,11 +2183,13 @@ def _run_optimization_loop(config: Config) -> int:
         summary = ""
 
         try:
-            if config.agent_kind in ("cursor", "claude-cli", "command"):
+            if config.agent_kind in ("cursor", "claude-cli", "codex-cli", "command"):
                 if config.agent_kind == "cursor":
                     command, rc, stdout, stderr = run_cursor_agent(config, prompt_path, iteration)
                 elif config.agent_kind == "claude-cli":
                     command, rc, stdout, stderr = run_claude_cli_agent(config, prompt_path, iteration)
+                elif config.agent_kind == "codex-cli":
+                    command, rc, stdout, stderr = run_codex_cli_agent(config, prompt_path, iteration)
                 else:
                     command, rc, stdout, stderr = run_command_agent(config, prompt_path, iteration)
                 write_text(iter_dir / "agent_command.txt", command)
@@ -2097,7 +2272,12 @@ def _run_optimization_loop(config: Config) -> int:
         latest_eval = evaluate(config, iter_dir, f"iter_{iteration:02d}")
         previous_best_score = best_eval.score
         improved = latest_eval.score > previous_best_score + config.min_score_improvement
-        accepted = improved or config.accept_regressions
+        # 当基线本身无意义（eval 崩溃）时，要求本轮至少有有意义的结果才能接受
+        # 避免仅因"让 eval 跑起来"而接受无实际改善的修改
+        if not _is_meaningful_result(baseline_eval):
+            accepted = _is_meaningful_result(latest_eval) or config.accept_regressions
+        else:
+            accepted = improved or config.accept_regressions
 
         if improved:
             best_eval = copy.deepcopy(latest_eval)
@@ -2107,6 +2287,20 @@ def _run_optimization_loop(config: Config) -> int:
                 f"第 {iteration} 轮提升成功: "
                 f"score {latest_eval.score:.3f} > {previous_best_score:.3f}"
             )
+        elif accepted and not improved:
+            # 基线无意义时首轮有意义结果被接受，但分数未必超过 best（best=baseline=-1000）
+            # 此时应更新 best，不回滚
+            if _is_meaningful_result(latest_eval) and not _is_meaningful_result(baseline_eval):
+                best_eval = copy.deepcopy(latest_eval)
+                best_snapshot = snapshot_files(config.target_files)
+                no_improve_rounds = 0
+                log(
+                    f"第 {iteration} 轮：基线无意义，本轮首次获得有意义结果 "
+                    f"(score={latest_eval.score:.3f})，接受并更新最佳"
+                )
+            else:
+                no_improve_rounds += 1
+                log(f"第 {iteration} 轮未提升，但按配置保留修改")
         else:
             no_improve_rounds += 1
             if not config.accept_regressions:

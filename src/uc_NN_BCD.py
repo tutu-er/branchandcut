@@ -25,6 +25,13 @@ import matplotlib.patches as mpatches
 import seaborn as sns
 from matplotlib.colors import ListedColormap
 
+try:
+    import cvxpy as cp
+    CVXPY_AVAILABLE = True
+except ImportError:
+    cp = None
+    CVXPY_AVAILABLE = False
+
 # 尝试导入PyTorch
 try:
     import torch
@@ -80,6 +87,29 @@ try:
     from sparse_constraint_templates import template_library_to_bcd_union_constraints
 except ImportError:
     from src.sparse_constraint_templates import template_library_to_bcd_union_constraints
+
+try:
+    from subproblem_lp_solver import (
+        LP_BACKEND_GUROBI,
+        LP_BACKEND_CVXPY_HIGHS,
+        assert_lp_backend_available,
+        normalize_lp_backend,
+        _cvxpy_pi_to_gurobi_pi,
+        _problem_is_optimal,
+        _solve_with_cvxpy_highs,
+        _sum_scalar_terms,
+    )
+except ImportError:
+    from src.subproblem_lp_solver import (
+        LP_BACKEND_GUROBI,
+        LP_BACKEND_CVXPY_HIGHS,
+        assert_lp_backend_available,
+        normalize_lp_backend,
+        _cvxpy_pi_to_gurobi_pi,
+        _problem_is_optimal,
+        _solve_with_cvxpy_highs,
+        _sum_scalar_terms,
+    )
 
 # 设置输出缓冲
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', line_buffering=True)
@@ -216,6 +246,7 @@ class ActiveSetReader:
             'renewable_data' in sample and np.any(np.abs(np.asarray(sample['renewable_data'], dtype=float)) > 1e-9)
             for sample in raw_samples
         )
+        print(f"[ActiveSet] Loading {total_samples} samples...", flush=True)
         
         print(f"开始加载 {total_samples} 个样本的数据...", flush=True)
         
@@ -250,6 +281,7 @@ class ActiveSetReader:
                 all_samples_data.append(sample_data)
                 
                 if (sample_id + 1) % 10 == 0:
+                    print(f"[ActiveSet] loaded_samples={sample_id + 1}/{total_samples}", flush=True)
                     print(f"已加载 {sample_id + 1}/{total_samples} 个样本", flush=True)
                     
             except Exception as e:
@@ -267,6 +299,7 @@ class ActiveSetReader:
                 })
         
         print(f"✓ 完成加载所有样本数据", flush=True)
+        print("[ActiveSet] Finished loading all samples", flush=True)
         return all_samples_data
     
     def extract_active_constraints_and_variables(self, sample_id: int) -> Tuple[List, List, np.ndarray]:
@@ -370,6 +403,10 @@ def load_active_set_from_json(json_filepath: str, sample_id: Optional[int] = Non
         # 加载单个样本
         active_constraints, active_variables, pd_data = reader.extract_active_constraints_and_variables(sample_id)
         unit_commitment = reader.get_unit_commitment_matrix(sample_id)
+        print(f"[ActiveSet] Loaded sample {sample_id}", flush=True)
+        print(f"[ActiveSet] active_constraints={len(active_constraints)}", flush=True)
+        print(f"[ActiveSet] active_variables={len(active_variables)}", flush=True)
+        print(f"[ActiveSet] pd_shape={pd_data.shape}", flush=True)
         
         print(f"=== 加载活动集数据 (样本 {sample_id}) ===", flush=True)
         print(f"活动约束数量: {len(active_constraints)}", flush=True)
@@ -394,6 +431,8 @@ def load_active_set_from_json(json_filepath: str, sample_id: Optional[int] = Non
     else:
         # 加载所有样本
         all_samples_data = reader.load_all_samples()
+        print("=== Loaded all active-set samples ===", flush=True)
+        print(f"[ActiveSet] total_samples={len(all_samples_data)}", flush=True)
         
         print(f"=== 加载所有活动集数据 ===", flush=True)
         print(f"总样本数量: {len(all_samples_data)}", flush=True)
@@ -499,6 +538,8 @@ class Agent_NN_BCD:
         mu_dual_floor_init: float = 0.1,
         ita_dual_floor_init: float = 0.1,
         dual_sign_relax_interval: int | None = None,
+        lp_backend: str = LP_BACKEND_GUROBI,
+        gurobi_threads: int | None = None,
         nn_hidden_dims: List[int] | None = None,
         nn_learning_rate: float = 5e-5,
         nn_batch_strategy: str = "full-batch",
@@ -578,11 +619,19 @@ class Agent_NN_BCD:
             
         self.ng = self.gen.shape[0]
         self.nl = self.branch.shape[0]
+        self._generator_incidence_matrix = self._build_generator_incidence_matrix()
+        self._ptdf_matrix = makePTDF(self.baseMVA, self.bus, self.branch)
+        self._branch_limit = np.asarray(self.branch[:, RATE_A], dtype=float)
+        self._ptdf_g = self._ptdf_matrix @ self._generator_incidence_matrix
         self.theta_constraint_direction_signs = np.ones((self.nl, self.T), dtype=float)
         self.zeta_constraint_direction_signs = np.ones((self.ng, self.T), dtype=float)
         self._theta_limited_union_analysis_cache = {}
         self._last_reported_theta_stage_signature = None
-        
+        self._lp_backend = normalize_lp_backend(lp_backend)
+        self.gurobi_threads = None if gurobi_threads is None else max(1, int(gurobi_threads))
+        if self._lp_backend == LP_BACKEND_CVXPY_HIGHS:
+            assert_lp_backend_available(self._lp_backend)
+
         self.active_set_data = active_set_data
         self.external_sparse_templates = external_sparse_templates
         self.lambda_init_strategy = normalize_lambda_init_strategy(lambda_init_strategy)
@@ -653,6 +702,17 @@ class Agent_NN_BCD:
             self.device = None
             # 回退：用随机初始化填充占位值
         self._apply_hot_start_initial_values(self._current_union_analysis)
+
+        # ----- Persistent Gurobi model cache -----
+        # 每个样本只建一次模型，后续迭代通过 setObjective / chgCoeff 更新
+        self._pg_models: dict = {}          # sample_id -> gp.Model
+        self._pg_vars: dict = {}            # sample_id -> vars_dict
+        self._pg_model_union_id: dict = {}  # sample_id -> id(union_analysis)
+
+        self._dual_models: dict = {}          # sample_id -> gp.Model
+        self._dual_vars: dict = {}            # sample_id -> vars_dict
+        self._dual_model_state: dict = {}     # sample_id -> (floor_active, sign_relax_round)
+        self._dual_model_union_id: dict = {}  # sample_id -> id(union_analysis)
 
     def _sync_rho_dual_summary(self) -> None:
         self.rho_dual = float(np.mean([
@@ -859,9 +919,16 @@ class Agent_NN_BCD:
         Returns:
             (pg_sol, coc_sol, cpower_sol, lambda_dict) 或 (None, None, None, None) 若失败
         """
+        if self._lp_backend == LP_BACKEND_CVXPY_HIGHS:
+            try:
+                return self._solve_lp_with_fixed_x_cvxpy_highs(Pd, x_vals)
+            except Exception as e:
+                print(f"[ActiveSet] sample {sample_id} failed to load: {e}", flush=True)
+                print(f"❌ _solve_lp_with_fixed_x cvxpy_highs 失败: {e}", flush=True)
+                return None, None, None, None
         try:
             lp = gp.Model('lp_fixed_x')
-            lp.Params.OutputFlag = 0
+            self._apply_fast_gurobi_tolerances(lp, mip=False)
 
             pg = lp.addVars(self.ng, self.T, lb=0, name='pg')
             coc = lp.addVars(self.ng, self.T - 1, lb=0, name='coc')
@@ -937,9 +1004,15 @@ class Agent_NN_BCD:
         Returns:
             (x_lp, pg_sol, coc_sol, cpower_sol, lambda_dict) 或全 None（若失败）
         """
+        if self._lp_backend == LP_BACKEND_CVXPY_HIGHS:
+            try:
+                return self._solve_lp_relaxation_cvxpy_highs(Pd)
+            except Exception as e:
+                print(f"❌ _solve_lp_relaxation cvxpy_highs 失败: {e}", flush=True)
+                return None, None, None, None, None
         try:
             lp = gp.Model('lp_relaxation')
-            lp.Params.OutputFlag = 0
+            self._apply_fast_gurobi_tolerances(lp, mip=False)
 
             pg = lp.addVars(self.ng, self.T, lb=0, name='pg')
             x = lp.addVars(self.ng, self.T, vtype=GRB.CONTINUOUS, lb=0, ub=1, name='x')
@@ -1134,7 +1207,7 @@ class Agent_NN_BCD:
         """
         try:
             model = gp.Model('milp_x_opt')
-            model.Params.OutputFlag = 0
+            self._apply_fast_gurobi_tolerances(model, mip=True)
 
             pg = model.addVars(self.ng, self.T, lb=0, name='pg')
             x = model.addVars(self.ng, self.T, vtype=GRB.BINARY, name='x')
@@ -1223,7 +1296,8 @@ class Agent_NN_BCD:
             x_lp, pg_s, coc_s, cpower_s, lp_lambda = self._solve_lp_relaxation(Pd)
 
             if x_lp is None:
-                print(f"警告: 样本 {sample_id} LP 松弛失败，使用零值回退", flush=True)
+                print(f"[BCD:init] sample {sample_id} LP relaxation failed; using zero fallback", flush=True)
+                print(f"[BCD:init] sample {sample_id} LP relaxation failed; using zero fallback", flush=True)
                 pg_sol.append(np.zeros((self.ng, self.T)))
                 x_sol.append(np.zeros((self.ng, self.T)))
                 x_opt_sol.append(np.zeros((self.ng, self.T), dtype=np.float64))
@@ -1268,6 +1342,11 @@ class Agent_NN_BCD:
         coc_sol = []
         cpower_sol = []
         lambda_sol = []
+        print(
+            f"[BCD:init] Starting initial LP/MILP solves for {self.n_samples} samples "
+            f"(backend={self._lp_backend}, gurobi_threads={self.gurobi_threads})",
+            flush=True,
+        )
 
         for sample_id in range(self.n_samples):
             Pd = self.active_set_data[sample_id]['pd_data']
@@ -1275,7 +1354,7 @@ class Agent_NN_BCD:
             x_lp, pg_s, coc_s, cpower_s, lp_lambda = self._solve_lp_relaxation(Pd)
 
             if x_lp is None:
-                print(f"警告: 样本 {sample_id} LP 松弛失败，使用零值回退", flush=True)
+                print(f"[BCD:init] sample {sample_id} LP relaxation failed; using zero fallback", flush=True)
                 pg_sol.append(np.zeros((self.ng, self.T)))
                 x_sol.append(np.zeros((self.ng, self.T)))
                 x_opt_sol.append(np.zeros((self.ng, self.T), dtype=np.float64))
@@ -1298,12 +1377,18 @@ class Agent_NN_BCD:
             coc_sol.append(coc_s)
             cpower_sol.append(cpower_s)
             lambda_sol.append(lambda_s)
+            if (sample_id + 1) % 25 == 0 or sample_id == self.n_samples - 1:
+                print(
+                    f"[BCD:init] processed_samples={sample_id + 1}/{self.n_samples}",
+                    flush=True,
+                )
 
         pg_sol = np.array(pg_sol)
         x_sol = np.array(x_sol)
         x_opt_sol = np.array(x_opt_sol)
         coc_sol = np.array(coc_sol)
         cpower_sol = np.array(cpower_sol)
+        print("[BCD:init] Initialization complete", flush=True)
 
         return pg_sol, x_sol, x_opt_sol, coc_sol, cpower_sol, lambda_sol
     
@@ -1679,11 +1764,289 @@ class Agent_NN_BCD:
 
     def _apply_fast_gurobi_tolerances(self, model, mip=True):
         model.Params.OutputFlag = 0
+        if self.gurobi_threads is not None:
+            model.Params.Threads = self.gurobi_threads
         model.Params.FeasibilityTol = self.gurobi_feasibility_tol
         model.Params.OptimalityTol = self.gurobi_optimality_tol
         if mip:
             model.Params.MIPGap = self.gurobi_mip_gap
             model.Params.IntFeasTol = self.gurobi_int_feas_tol
+
+    def _require_cvxpy_highs_main_backend(self) -> None:
+        if self._lp_backend != LP_BACKEND_CVXPY_HIGHS:
+            raise RuntimeError(f"Main BCD lp_backend={self._lp_backend!r} is not cvxpy_highs")
+        assert_lp_backend_available(self._lp_backend)
+        if not CVXPY_AVAILABLE:
+            raise RuntimeError("cvxpy is unavailable for main BCD cvxpy_highs backend")
+
+    def _build_generator_incidence_matrix(self) -> np.ndarray:
+        nb = self.bus.shape[0]
+        G = np.zeros((nb, self.ng))
+        for g in range(self.ng):
+            bus_idx = int(self.gen[g, GEN_BUS])
+            if 0 <= bus_idx < nb:
+                G[bus_idx, g] = 1.0
+        return G
+
+    def _solve_lp_with_fixed_x_cvxpy_highs(self, Pd: np.ndarray, x_vals: np.ndarray):
+        self._require_cvxpy_highs_main_backend()
+
+        Pd = np.asarray(Pd, dtype=float)
+        x_vals = np.asarray(x_vals, dtype=float)
+        a = (self.gencost[:, -2] / self.T_delta).reshape(self.ng, 1)
+        b = (self.gencost[:, -1] / self.T_delta).reshape(self.ng, 1)
+        pg = cp.Variable((self.ng, self.T))
+        coc = cp.Variable((self.ng, max(self.T - 1, 0)))
+        cpower = cp.Variable((self.ng, self.T))
+        constraints = [pg >= 0, cpower >= 0]
+        if self.T > 1:
+            constraints.append(coc >= 0)
+
+        power_balance_cons = []
+        pg_lower_cons = [[None for _ in range(self.T)] for _ in range(self.ng)]
+        pg_upper_cons = [[None for _ in range(self.T)] for _ in range(self.ng)]
+        ramp_up_cons = [[None for _ in range(max(self.T - 1, 0))] for _ in range(self.ng)]
+        ramp_down_cons = [[None for _ in range(max(self.T - 1, 0))] for _ in range(self.ng)]
+        start_cost_cons = [[None for _ in range(max(self.T - 1, 0))] for _ in range(self.ng)]
+        shut_cost_cons = [[None for _ in range(max(self.T - 1, 0))] for _ in range(self.ng)]
+        coc_nonneg_cons = [[None for _ in range(max(self.T - 1, 0))] for _ in range(self.ng)]
+        cpower_cons = [[None for _ in range(self.T)] for _ in range(self.ng)]
+
+        for t in range(self.T):
+            cons = cp.sum(pg[:, t]) == float(np.sum(Pd[:, t]))
+            constraints.append(cons)
+            power_balance_cons.append(cons)
+
+        for g in range(self.ng):
+            for t in range(self.T):
+                cons = pg[g, t] >= self.gen[g, PMIN] * x_vals[g, t]
+                constraints.append(cons)
+                pg_lower_cons[g][t] = cons
+                cons = pg[g, t] <= self.gen[g, PMAX] * x_vals[g, t]
+                constraints.append(cons)
+                pg_upper_cons[g][t] = cons
+
+        for g in range(self.ng):
+            for t in range(1, self.T):
+                rhs_up = self.Ru[g] * x_vals[g, t - 1] + self.Ru_co[g] * (1.0 - x_vals[g, t - 1])
+                cons = pg[g, t] - pg[g, t - 1] <= rhs_up
+                constraints.append(cons)
+                ramp_up_cons[g][t - 1] = cons
+                rhs_dn = self.Rd[g] * x_vals[g, t] + self.Rd_co[g] * (1.0 - x_vals[g, t])
+                cons = pg[g, t - 1] - pg[g, t] <= rhs_dn
+                constraints.append(cons)
+                ramp_down_cons[g][t - 1] = cons
+
+        start_cost = self.gencost[:, 1]
+        shut_cost = self.gencost[:, 2]
+        for g in range(self.ng):
+            for t in range(1, self.T):
+                cons = coc[g, t - 1] >= start_cost[g] * (x_vals[g, t] - x_vals[g, t - 1])
+                constraints.append(cons)
+                start_cost_cons[g][t - 1] = cons
+                cons = coc[g, t - 1] >= shut_cost[g] * (x_vals[g, t - 1] - x_vals[g, t])
+                constraints.append(cons)
+                shut_cost_cons[g][t - 1] = cons
+                cons = coc[g, t - 1] >= 0.0
+                constraints.append(cons)
+                coc_nonneg_cons[g][t - 1] = cons
+
+        for g in range(self.ng):
+            for t in range(self.T):
+                cons = cpower[g, t] >= a[g, 0] * pg[g, t] + b[g, 0] * x_vals[g, t]
+                constraints.append(cons)
+                cpower_cons[g][t] = cons
+
+        objective = cp.sum(cpower) + (cp.sum(coc) if self.T > 1 else 0.0)
+        problem = cp.Problem(cp.Minimize(objective), constraints)
+        _solve_with_cvxpy_highs(problem, verbose=False)
+        if not _problem_is_optimal(problem):
+            return None, None, None, None
+
+        lambda_dict = self._create_empty_lambda_dict()
+        lambda_dict['lambda_power_balance'] = np.array(
+            [_cvxpy_pi_to_gurobi_pi(cons, 'eq') for cons in power_balance_cons],
+            dtype=float,
+        )
+        lambda_dict['lambda_pg_lower'] = np.array(
+            [[abs(_cvxpy_pi_to_gurobi_pi(pg_lower_cons[g][t], 'ge')) for t in range(self.T)] for g in range(self.ng)],
+            dtype=float,
+        )
+        lambda_dict['lambda_pg_upper'] = np.array(
+            [[abs(_cvxpy_pi_to_gurobi_pi(pg_upper_cons[g][t], 'le')) for t in range(self.T)] for g in range(self.ng)],
+            dtype=float,
+        )
+        if self.T > 1:
+            lambda_dict['lambda_ramp_up'] = np.array(
+                [[abs(_cvxpy_pi_to_gurobi_pi(ramp_up_cons[g][t], 'le')) for t in range(self.T - 1)] for g in range(self.ng)],
+                dtype=float,
+            )
+            lambda_dict['lambda_ramp_down'] = np.array(
+                [[abs(_cvxpy_pi_to_gurobi_pi(ramp_down_cons[g][t], 'le')) for t in range(self.T - 1)] for g in range(self.ng)],
+                dtype=float,
+            )
+            lambda_dict['lambda_start_cost'] = np.array(
+                [[abs(_cvxpy_pi_to_gurobi_pi(start_cost_cons[g][t], 'ge')) for t in range(self.T - 1)] for g in range(self.ng)],
+                dtype=float,
+            )
+            lambda_dict['lambda_shut_cost'] = np.array(
+                [[abs(_cvxpy_pi_to_gurobi_pi(shut_cost_cons[g][t], 'ge')) for t in range(self.T - 1)] for g in range(self.ng)],
+                dtype=float,
+            )
+            lambda_dict['lambda_coc_nonneg'] = np.array(
+                [[abs(_cvxpy_pi_to_gurobi_pi(coc_nonneg_cons[g][t], 'ge')) for t in range(self.T - 1)] for g in range(self.ng)],
+                dtype=float,
+            )
+        lambda_dict['lambda_cpower'] = np.array(
+            [[abs(_cvxpy_pi_to_gurobi_pi(cpower_cons[g][t], 'ge')) for t in range(self.T)] for g in range(self.ng)],
+            dtype=float,
+        )
+
+        pg_sol = np.asarray(pg.value, dtype=float)
+        coc_sol = np.asarray(coc.value, dtype=float) if self.T > 1 else np.zeros((self.ng, 0), dtype=float)
+        cpower_sol = np.asarray(cpower.value, dtype=float)
+        return pg_sol, coc_sol, cpower_sol, lambda_dict
+
+    def _solve_lp_relaxation_cvxpy_highs(self, Pd: np.ndarray):
+        self._require_cvxpy_highs_main_backend()
+
+        Pd = np.asarray(Pd, dtype=float)
+        a = (self.gencost[:, -2] / self.T_delta).reshape(self.ng, 1)
+        b = (self.gencost[:, -1] / self.T_delta).reshape(self.ng, 1)
+        pg = cp.Variable((self.ng, self.T))
+        x = cp.Variable((self.ng, self.T))
+        coc = cp.Variable((self.ng, max(self.T - 1, 0)))
+        cpower = cp.Variable((self.ng, self.T))
+        constraints = [pg >= 0, x >= 0, x <= 1, cpower >= 0]
+        if self.T > 1:
+            constraints.append(coc >= 0)
+
+        power_balance_cons = []
+        pg_lower_cons = [[None for _ in range(self.T)] for _ in range(self.ng)]
+        pg_upper_cons = [[None for _ in range(self.T)] for _ in range(self.ng)]
+        ramp_up_cons = [[None for _ in range(max(self.T - 1, 0))] for _ in range(self.ng)]
+        ramp_down_cons = [[None for _ in range(max(self.T - 1, 0))] for _ in range(self.ng)]
+        min_on_cons = {}
+        min_off_cons = {}
+        start_cost_cons = [[None for _ in range(max(self.T - 1, 0))] for _ in range(self.ng)]
+        shut_cost_cons = [[None for _ in range(max(self.T - 1, 0))] for _ in range(self.ng)]
+        coc_nonneg_cons = [[None for _ in range(max(self.T - 1, 0))] for _ in range(self.ng)]
+        cpower_cons = [[None for _ in range(self.T)] for _ in range(self.ng)]
+
+        for t in range(self.T):
+            cons = cp.sum(pg[:, t]) == float(np.sum(Pd[:, t]))
+            constraints.append(cons)
+            power_balance_cons.append(cons)
+
+        for g in range(self.ng):
+            for t in range(self.T):
+                cons = pg[g, t] >= self.gen[g, PMIN] * x[g, t]
+                constraints.append(cons)
+                pg_lower_cons[g][t] = cons
+                cons = pg[g, t] <= self.gen[g, PMAX] * x[g, t]
+                constraints.append(cons)
+                pg_upper_cons[g][t] = cons
+
+        for g in range(self.ng):
+            for t in range(1, self.T):
+                cons = pg[g, t] - pg[g, t - 1] <= self.Ru[g] * x[g, t - 1] + self.Ru_co[g] * (1 - x[g, t - 1])
+                constraints.append(cons)
+                ramp_up_cons[g][t - 1] = cons
+                cons = pg[g, t - 1] - pg[g, t] <= self.Rd[g] * x[g, t] + self.Rd_co[g] * (1 - x[g, t])
+                constraints.append(cons)
+                ramp_down_cons[g][t - 1] = cons
+
+        Ton = min(4, self.T)
+        Toff = min(4, self.T)
+        for g in range(self.ng):
+            for tau in range(1, Ton + 1):
+                for t1 in range(self.T - tau):
+                    cons = x[g, t1 + 1] - x[g, t1] <= x[g, t1 + tau]
+                    constraints.append(cons)
+                    min_on_cons[g, tau - 1, t1] = cons
+            for tau in range(1, Toff + 1):
+                for t1 in range(self.T - tau):
+                    cons = -x[g, t1 + 1] + x[g, t1] <= 1 - x[g, t1 + tau]
+                    constraints.append(cons)
+                    min_off_cons[g, tau - 1, t1] = cons
+
+        start_cost = self.gencost[:, 1]
+        shut_cost = self.gencost[:, 2]
+        for g in range(self.ng):
+            for t in range(1, self.T):
+                cons = coc[g, t - 1] >= start_cost[g] * (x[g, t] - x[g, t - 1])
+                constraints.append(cons)
+                start_cost_cons[g][t - 1] = cons
+                cons = coc[g, t - 1] >= shut_cost[g] * (x[g, t - 1] - x[g, t])
+                constraints.append(cons)
+                shut_cost_cons[g][t - 1] = cons
+                cons = coc[g, t - 1] >= 0.0
+                constraints.append(cons)
+                coc_nonneg_cons[g][t - 1] = cons
+
+        for g in range(self.ng):
+            for t in range(self.T):
+                cons = cpower[g, t] >= a[g, 0] * pg[g, t] + b[g, 0] * x[g, t]
+                constraints.append(cons)
+                cpower_cons[g][t] = cons
+
+        objective = cp.sum(cpower) + (cp.sum(coc) if self.T > 1 else 0.0)
+        problem = cp.Problem(cp.Minimize(objective), constraints)
+        _solve_with_cvxpy_highs(problem, verbose=False)
+        if not _problem_is_optimal(problem):
+            return None, None, None, None, None
+
+        lambda_dict = self._create_empty_lambda_dict()
+        lambda_dict['lambda_power_balance'] = np.array(
+            [_cvxpy_pi_to_gurobi_pi(cons, 'eq') for cons in power_balance_cons],
+            dtype=float,
+        )
+        lambda_dict['lambda_pg_lower'] = np.array(
+            [[abs(_cvxpy_pi_to_gurobi_pi(pg_lower_cons[g][t], 'ge')) for t in range(self.T)] for g in range(self.ng)],
+            dtype=float,
+        )
+        lambda_dict['lambda_pg_upper'] = np.array(
+            [[abs(_cvxpy_pi_to_gurobi_pi(pg_upper_cons[g][t], 'le')) for t in range(self.T)] for g in range(self.ng)],
+            dtype=float,
+        )
+        if self.T > 1:
+            lambda_dict['lambda_ramp_up'] = np.array(
+                [[abs(_cvxpy_pi_to_gurobi_pi(ramp_up_cons[g][t], 'le')) for t in range(self.T - 1)] for g in range(self.ng)],
+                dtype=float,
+            )
+            lambda_dict['lambda_ramp_down'] = np.array(
+                [[abs(_cvxpy_pi_to_gurobi_pi(ramp_down_cons[g][t], 'le')) for t in range(self.T - 1)] for g in range(self.ng)],
+                dtype=float,
+            )
+            lambda_dict['lambda_start_cost'] = np.array(
+                [[abs(_cvxpy_pi_to_gurobi_pi(start_cost_cons[g][t], 'ge')) for t in range(self.T - 1)] for g in range(self.ng)],
+                dtype=float,
+            )
+            lambda_dict['lambda_shut_cost'] = np.array(
+                [[abs(_cvxpy_pi_to_gurobi_pi(shut_cost_cons[g][t], 'ge')) for t in range(self.T - 1)] for g in range(self.ng)],
+                dtype=float,
+            )
+            lambda_dict['lambda_coc_nonneg'] = np.array(
+                [[abs(_cvxpy_pi_to_gurobi_pi(coc_nonneg_cons[g][t], 'ge')) for t in range(self.T - 1)] for g in range(self.ng)],
+                dtype=float,
+            )
+        for g in range(self.ng):
+            for tau in range(Ton):
+                for t1 in range(self.T - (tau + 1)):
+                    lambda_dict['lambda_min_on'][g, tau, t1] = abs(_cvxpy_pi_to_gurobi_pi(min_on_cons[g, tau, t1], 'le'))
+            for tau in range(Toff):
+                for t1 in range(self.T - (tau + 1)):
+                    lambda_dict['lambda_min_off'][g, tau, t1] = abs(_cvxpy_pi_to_gurobi_pi(min_off_cons[g, tau, t1], 'le'))
+        lambda_dict['lambda_cpower'] = np.array(
+            [[abs(_cvxpy_pi_to_gurobi_pi(cpower_cons[g][t], 'ge')) for t in range(self.T)] for g in range(self.ng)],
+            dtype=float,
+        )
+
+        x_lp = np.asarray(x.value, dtype=float)
+        pg_sol = np.asarray(pg.value, dtype=float)
+        coc_sol = np.asarray(coc.value, dtype=float) if self.T > 1 else np.zeros((self.ng, 0), dtype=float)
+        cpower_sol = np.asarray(cpower.value, dtype=float)
+        return x_lp, pg_sol, coc_sol, cpower_sol, lambda_dict
     
     def _create_union_analysis_from_x_init(self, x_init, lambda_init):
         """创建union_analysis（参考uc_NN.py）"""
@@ -2780,244 +3143,1035 @@ class Agent_NN_BCD:
         values = zeta_tensor.detach().cpu().numpy()
         return {name: float(val) for name, val in zip(self.zeta_var_names, values)}
     
+    def _iter_with_pg_block_cvxpy_highs(self, sample_id=0, theta_values=None, zeta_values=None, union_analysis=None):
+        self._require_cvxpy_highs_main_backend()
+        if union_analysis is None:
+            union_analysis = self._current_union_analysis
+
+        Pd = np.asarray(self.active_set_data[sample_id]['pd_data'], dtype=float)
+        G = self._generator_incidence_matrix
+        PTDF = self._ptdf_matrix
+        branch_limit = self._branch_limit
+        a = (self.gencost[:, -2] / self.T_delta).reshape(self.ng, 1)
+        b = (self.gencost[:, -1] / self.T_delta).reshape(self.ng, 1)
+        start_cost = self.gencost[:, 1]
+        shut_cost = self.gencost[:, 2]
+
+        pg = cp.Variable((self.ng, self.T))
+        x = cp.Variable((self.ng, self.T))
+        coc = cp.Variable((self.ng, max(self.T - 1, 0)))
+        constraints = [pg >= 0, x >= 0, x <= 1]
+        if self.T > 1:
+            constraints.append(coc >= 0)
+
+        lambda_sample = self.lambda_[sample_id]
+        obj_primal_terms = []
+        obj_opt_terms = []
+
+        for t in range(self.T):
+            power_balance_expr = cp.sum(pg[:, t]) - float(np.sum(Pd[:, t]))
+            obj_primal_terms.append(cp.abs(power_balance_expr))
+            obj_opt_terms.append(abs(float(lambda_sample['lambda_power_balance'][t])) * cp.abs(power_balance_expr))
+
+        pg_lower_expr = cp.multiply(self.gen[:, PMIN].reshape(self.ng, 1), x) - pg
+        pg_upper_expr = pg - cp.multiply(self.gen[:, PMAX].reshape(self.ng, 1), x)
+        obj_primal_terms.append(cp.sum(cp.pos(pg_lower_expr)))
+        obj_primal_terms.append(cp.sum(cp.pos(pg_upper_expr)))
+        obj_opt_terms.append(cp.sum(cp.multiply(np.abs(lambda_sample['lambda_pg_lower']), cp.abs(pg_lower_expr))))
+        obj_opt_terms.append(cp.sum(cp.multiply(np.abs(lambda_sample['lambda_pg_upper']), cp.abs(pg_upper_expr))))
+        obj_opt_terms.append(cp.sum(cp.multiply(np.abs(lambda_sample['lambda_x_lower']), x)))
+        obj_opt_terms.append(cp.sum(cp.multiply(np.abs(lambda_sample['lambda_x_upper']), 1 - x)))
+
+        if self.T > 1:
+            ramp_up_expr = pg[:, 1:] - pg[:, :-1] - self.Ru.reshape(self.ng, 1) * x[:, :-1] - self.Ru_co.reshape(self.ng, 1) * (1 - x[:, :-1])
+            ramp_down_expr = pg[:, :-1] - pg[:, 1:] - self.Rd.reshape(self.ng, 1) * x[:, 1:] - self.Rd_co.reshape(self.ng, 1) * (1 - x[:, 1:])
+            obj_primal_terms.append(cp.sum(cp.pos(ramp_up_expr)))
+            obj_primal_terms.append(cp.sum(cp.pos(ramp_down_expr)))
+            obj_opt_terms.append(cp.sum(cp.multiply(np.abs(lambda_sample['lambda_ramp_up']), cp.abs(ramp_up_expr))))
+            obj_opt_terms.append(cp.sum(cp.multiply(np.abs(lambda_sample['lambda_ramp_down']), cp.abs(ramp_down_expr))))
+
+        Ton = min(4, self.T)
+        Toff = min(4, self.T)
+        for tau in range(1, Ton + 1):
+            expr = x[:, 1:self.T - tau + 1] - x[:, :self.T - tau] - x[:, tau:]
+            obj_primal_terms.append(cp.sum(cp.pos(expr)))
+            obj_opt_terms.append(cp.sum(cp.multiply(np.abs(lambda_sample['lambda_min_on'][:, tau - 1, :self.T - tau]), cp.abs(expr))))
+        for tau in range(1, Toff + 1):
+            expr = -x[:, 1:self.T - tau + 1] + x[:, :self.T - tau] - (1 - x[:, tau:])
+            obj_primal_terms.append(cp.sum(cp.pos(expr)))
+            obj_opt_terms.append(cp.sum(cp.multiply(np.abs(lambda_sample['lambda_min_off'][:, tau - 1, :self.T - tau]), cp.abs(expr))))
+
+        if self.T > 1:
+            start_expr = start_cost.reshape(self.ng, 1) * (x[:, 1:] - x[:, :-1]) - coc
+            shut_expr = shut_cost.reshape(self.ng, 1) * (x[:, :-1] - x[:, 1:]) - coc
+            obj_primal_terms.append(cp.sum(cp.pos(start_expr)))
+            obj_primal_terms.append(cp.sum(cp.pos(shut_expr)))
+            obj_opt_terms.append(cp.sum(cp.multiply(np.abs(lambda_sample['lambda_start_cost']), cp.abs(start_expr))))
+            obj_opt_terms.append(cp.sum(cp.multiply(np.abs(lambda_sample['lambda_shut_cost']), cp.abs(shut_expr))))
+            obj_opt_terms.append(cp.sum(cp.multiply(np.abs(lambda_sample['lambda_coc_nonneg']), coc)))
+
+        cpower_expr = cp.multiply(a, pg) + cp.multiply(b, x)
+        for t in range(self.T):
+            flow = PTDF @ (G @ pg[:, t] - Pd[:, t])
+            dcpf_upper_expr = flow - branch_limit
+            dcpf_lower_expr = -flow - branch_limit
+            obj_primal_terms.append(cp.sum(cp.pos(dcpf_upper_expr)))
+            obj_primal_terms.append(cp.sum(cp.pos(dcpf_lower_expr)))
+            obj_opt_terms.append(cp.sum(cp.multiply(np.abs(lambda_sample['lambda_dcpf_upper'][:, t]), cp.abs(dcpf_upper_expr))))
+            obj_opt_terms.append(cp.sum(cp.multiply(np.abs(lambda_sample['lambda_dcpf_lower'][:, t]), cp.abs(dcpf_lower_expr))))
+
+        unit_commitment_matrix = _get_uc_matrix_from_sample(self.active_set_data[sample_id], self.ng, self.T)
+        if unit_commitment_matrix is None:
+            unit_commitment_matrix = np.asarray(self.x[sample_id], dtype=float)
+        obj_binary = cp.sum(cp.abs(x - unit_commitment_matrix))
+
+        objective = (
+            self.rho_binary * obj_binary
+            + self.rho_primal * _sum_scalar_terms(obj_primal_terms)
+            + self.rho_opt * _sum_scalar_terms(obj_opt_terms)
+        )
+        problem = cp.Problem(cp.Minimize(objective), constraints)
+        _solve_with_cvxpy_highs(problem, verbose=False)
+        if not _problem_is_optimal(problem):
+            print(f"❌ PG block cvxpy_highs failed, status={problem.status}", flush=True)
+            return None, None, None, None
+
+        pg_sol = np.asarray(pg.value, dtype=float)
+        x_sol = np.asarray(x.value, dtype=float)
+        cpower_sol = np.asarray(cpower_expr.value, dtype=float)
+        coc_sol = np.asarray(coc.value, dtype=float) if self.T > 1 else np.zeros((self.ng, 0), dtype=float)
+        return pg_sol, x_sol, cpower_sol, coc_sol
+
+    def _iter_with_dual_block_cvxpy_highs(self, sample_id=0, theta_values=None, zeta_values=None, union_analysis=None):
+        if sample_id <= 2:
+            print("[BCD][cvxpy_highs] dual block fallback: reuse current lambda/mu/ita", flush=True)
+        return (
+            {
+                key: np.array(val, copy=True) if isinstance(val, np.ndarray) else val
+                for key, val in self.lambda_[sample_id].items()
+            },
+            np.array(self.mu[sample_id], copy=True),
+            np.array(self.ita[sample_id], copy=True),
+        )
+
+    # ------------------------------------------------------------------
+    # Persistent pg-block model helpers
+    # ------------------------------------------------------------------
+
+    def _build_pg_model(self, sample_id: int, union_analysis=None):
+        """一次性建立 pg 块 Gurobi 模型（变量 + 约束结构）。
+        返回 (model, vars_dict)；vars_dict 保存所有变量引用及 theta/zeta 更新信息。
+        """
+        Pd = self.active_set_data[sample_id]['pd_data']
+        model = gp.Model('pg_block')
+        model.Params.OutputFlag = 0
+
+        pg      = model.addVars(self.ng, self.T,   lb=0,                         name='pg')
+        x       = model.addVars(self.ng, self.T,   vtype=GRB.CONTINUOUS, lb=0, ub=1, name='x')
+        coc     = model.addVars(self.ng, self.T-1, lb=0,                         name='coc')
+        cpower  = model.addVars(self.ng, self.T,   lb=0,                         name='cpower')
+
+        power_balance_viol = model.addVars(self.T,              lb=0, name='power_balance_viol')
+        pg_lower_viol      = model.addVars(self.ng, self.T,     lb=0, name='pg_lower_viol')
+        pg_upper_viol      = model.addVars(self.ng, self.T,     lb=0, name='pg_upper_viol')
+        pg_lower_abs       = model.addVars(self.ng, self.T,     lb=0, name='pg_lower_abs')
+        pg_upper_abs       = model.addVars(self.ng, self.T,     lb=0, name='pg_upper_abs')
+        ramp_up_viol       = model.addVars(self.ng, self.T-1,   lb=0, name='ramp_up_viol')
+        ramp_down_viol     = model.addVars(self.ng, self.T-1,   lb=0, name='ramp_down_viol')
+        ramp_up_abs        = model.addVars(self.ng, self.T-1,   lb=0, name='ramp_up_abs')
+        ramp_down_abs      = model.addVars(self.ng, self.T-1,   lb=0, name='ramp_down_abs')
+
+        Ton  = min(4, self.T)
+        Toff = min(4, self.T)
+        min_on_viol   = model.addVars(self.ng, Ton,  self.T,   lb=0, name='min_on_viol')
+        min_off_viol  = model.addVars(self.ng, Toff, self.T,   lb=0, name='min_off_viol')
+        min_on_abs    = model.addVars(self.ng, Ton,  self.T,   lb=0, name='min_on_abs')
+        min_off_abs   = model.addVars(self.ng, Toff, self.T,   lb=0, name='min_off_abs')
+        start_cost_viol = model.addVars(self.ng, self.T-1, lb=0, name='start_cost_viol')
+        shut_cost_viol  = model.addVars(self.ng, self.T-1, lb=0, name='shut_cost_viol')
+        start_cost_abs  = model.addVars(self.ng, self.T-1, lb=0, name='start_cost_abs')
+        shut_cost_abs   = model.addVars(self.ng, self.T-1, lb=0, name='shut_cost_abs')
+        dcpf_upper_viol = model.addVars(self.nl, self.T,   lb=0, name='dcpf_upper_viol')
+        dcpf_upper_abs  = model.addVars(self.nl, self.T,   lb=0, name='dcpf_upper_abs')
+        dcpf_lower_viol = model.addVars(self.nl, self.T,   lb=0, name='dcpf_lower_viol')
+        dcpf_lower_abs  = model.addVars(self.nl, self.T,   lb=0, name='dcpf_lower_abs')
+        x_binary_dev    = model.addVars(self.ng, self.T,   lb=0, name='x_binary_dev')
+
+        # 静态目标项（结构不变，仅需在 setObjective 时乘以当前 rho）
+        obj_primal = gp.LinExpr()
+        obj_binary = gp.LinExpr()
+
+        Ru    = self.Ru;  Rd    = self.Rd
+        Ru_co = self.Ru_co;  Rd_co = self.Rd_co
+
+        # 功率平衡约束
+        for t in range(self.T):
+            pb_expr = gp.quicksum(pg[g, t] for g in range(self.ng)) - np.sum(Pd[:, t])
+            model.addConstr(power_balance_viol[t] >= pb_expr,  name=f'pb_pos_{t}')
+            model.addConstr(power_balance_viol[t] >= -pb_expr, name=f'pb_neg_{t}')
+            obj_primal += power_balance_viol[t]
+
+            for g in range(self.ng):
+                lower_e = self.gen[g, PMIN] * x[g, t] - pg[g, t]
+                upper_e = pg[g, t] - self.gen[g, PMAX] * x[g, t]
+                model.addConstr(pg_lower_viol[g, t] >= lower_e,  name=f'pg_lo_viol_{g}_{t}')
+                model.addConstr(pg_upper_viol[g, t] >= upper_e,  name=f'pg_up_viol_{g}_{t}')
+                model.addConstr(pg_lower_abs[g, t]  >= lower_e,  name=f'pg_lo_abs1_{g}_{t}')
+                model.addConstr(pg_lower_abs[g, t]  >= -lower_e, name=f'pg_lo_abs2_{g}_{t}')
+                model.addConstr(pg_upper_abs[g, t]  >= upper_e,  name=f'pg_up_abs1_{g}_{t}')
+                model.addConstr(pg_upper_abs[g, t]  >= -upper_e, name=f'pg_up_abs2_{g}_{t}')
+                obj_primal += pg_lower_viol[g, t] + pg_upper_viol[g, t]
+
+        # 爬坡约束
+        for t in range(1, self.T):
+            for g in range(self.ng):
+                ru_e = pg[g,t] - pg[g,t-1] - Ru[g]*x[g,t-1] - Ru_co[g]*(1-x[g,t-1])
+                rd_e = pg[g,t-1] - pg[g,t] - Rd[g]*x[g,t] - Rd_co[g]*(1-x[g,t])
+                model.addConstr(ramp_up_viol[g,t-1]   >= ru_e,  name=f'ru_viol_{g}_{t}')
+                model.addConstr(ramp_up_abs[g,t-1]    >= ru_e,  name=f'ru_abs1_{g}_{t}')
+                model.addConstr(ramp_up_abs[g,t-1]    >= -ru_e, name=f'ru_abs2_{g}_{t}')
+                model.addConstr(ramp_down_viol[g,t-1] >= rd_e,  name=f'rd_viol_{g}_{t}')
+                model.addConstr(ramp_down_abs[g,t-1]  >= rd_e,  name=f'rd_abs1_{g}_{t}')
+                model.addConstr(ramp_down_abs[g,t-1]  >= -rd_e, name=f'rd_abs2_{g}_{t}')
+                obj_primal += ramp_up_viol[g,t-1] + ramp_down_viol[g,t-1]
+
+        # 最小开/关机时间约束
+        for g in range(self.ng):
+            for t in range(1, Ton+1):
+                for t1 in range(self.T - t):
+                    e = x[g,t1+1] - x[g,t1] - x[g,t1+t]
+                    model.addConstr(min_on_viol[g,t-1,t1] >= e,  name=f'mon_viol_{g}_{t}_{t1}')
+                    model.addConstr(min_on_abs[g,t-1,t1]  >= e,  name=f'mon_abs1_{g}_{t}_{t1}')
+                    model.addConstr(min_on_abs[g,t-1,t1]  >= -e, name=f'mon_abs2_{g}_{t}_{t1}')
+                    obj_primal += min_on_viol[g,t-1,t1]
+            for t in range(1, Toff+1):
+                for t1 in range(self.T - t):
+                    e = -x[g,t1+1] + x[g,t1] - (1 - x[g,t1+t])
+                    model.addConstr(min_off_viol[g,t-1,t1] >= e,  name=f'moff_viol_{g}_{t}_{t1}')
+                    model.addConstr(min_off_abs[g,t-1,t1]  >= e,  name=f'moff_abs1_{g}_{t}_{t1}')
+                    model.addConstr(min_off_abs[g,t-1,t1]  >= -e, name=f'moff_abs2_{g}_{t}_{t1}')
+                    obj_primal += min_off_viol[g,t-1,t1]
+
+        # 启停成本约束
+        start_cost = self.gencost[:, 1]
+        shut_cost  = self.gencost[:, 2]
+        for t in range(1, self.T):
+            for g in range(self.ng):
+                sc_e  = start_cost[g] * (x[g,t] - x[g,t-1]) - coc[g,t-1]
+                shc_e = shut_cost[g]  * (x[g,t-1] - x[g,t]) - coc[g,t-1]
+                model.addConstr(start_cost_viol[g,t-1] >= sc_e,   name=f'sc_viol_{g}_{t}')
+                model.addConstr(start_cost_abs[g,t-1]  >= sc_e,   name=f'sc_abs1_{g}_{t}')
+                model.addConstr(start_cost_abs[g,t-1]  >= -sc_e,  name=f'sc_abs2_{g}_{t}')
+                model.addConstr(shut_cost_viol[g,t-1]  >= shc_e,  name=f'shc_viol_{g}_{t}')
+                model.addConstr(shut_cost_abs[g,t-1]   >= shc_e,  name=f'shc_abs1_{g}_{t}')
+                model.addConstr(shut_cost_abs[g,t-1]   >= -shc_e, name=f'shc_abs2_{g}_{t}')
+                obj_primal += start_cost_viol[g,t-1] + shut_cost_viol[g,t-1]
+
+        # 发电成本定义
+        for t in range(self.T):
+            for g in range(self.ng):
+                model.addConstr(
+                    cpower[g,t] == self.gencost[g,-2]/self.T_delta * pg[g,t]
+                                 + self.gencost[g,-1]/self.T_delta * x[g,t],
+                    name=f'cpower_{g}_{t}')
+
+        # 潮流约束
+        G           = self._generator_incidence_matrix
+        PTDF        = self._ptdf_matrix
+        branch_limit = self._branch_limit
+        for t in range(self.T):
+            flow = PTDF @ (G @ np.array([pg[g, t] for g in range(self.ng)]) - Pd[:, t])
+            for l in range(self.branch.shape[0]):
+                model.addConstr(dcpf_upper_viol[l,t] >= flow[l] - branch_limit[l],  name=f'dcpf_up_viol_{l}_{t}')
+                model.addConstr(dcpf_lower_viol[l,t] >= -flow[l] - branch_limit[l], name=f'dcpf_lo_viol_{l}_{t}')
+                model.addConstr(dcpf_upper_abs[l,t]  >= flow[l] - branch_limit[l],  name=f'dcpf_up_abs1_{l}_{t}')
+                model.addConstr(dcpf_upper_abs[l,t]  >= -flow[l]+branch_limit[l],   name=f'dcpf_up_abs2_{l}_{t}')
+                model.addConstr(dcpf_lower_abs[l,t]  >= -flow[l]-branch_limit[l],   name=f'dcpf_lo_abs1_{l}_{t}')
+                model.addConstr(dcpf_lower_abs[l,t]  >= flow[l]+branch_limit[l],    name=f'dcpf_lo_abs2_{l}_{t}')
+                obj_primal += dcpf_upper_viol[l,t] + dcpf_lower_viol[l,t]
+
+        # 二进制偏差约束（使用数据中的静态 unit_commitment_matrix）
+        ucm = _get_uc_matrix_from_sample(self.active_set_data[sample_id], self.ng, self.T)
+        if ucm is None:
+            ucm = self.x[sample_id]
+        for g in range(self.ng):
+            for t in range(self.T):
+                dev = x[g,t] - float(ucm[g,t])
+                model.addConstr(x_binary_dev[g,t] >= dev,  name=f'xdev_pos_{g}_{t}')
+                model.addConstr(x_binary_dev[g,t] >= -dev, name=f'xdev_neg_{g}_{t}')
+                obj_binary += x_binary_dev[g,t]
+
+        # 参数化 theta/zeta 约束（结构固定，系数通过 chgCoeff 更新）
+        theta_update_infos = []
+        zeta_update_infos  = []
+        if self.enable_theta_constraints and union_analysis and 'union_constraints' in union_analysis:
+            theta_update_infos = self._build_pg_model_parametric_theta(
+                model, x, sample_id, union_analysis, PTDF, branch_limit)
+            for info in theta_update_infos:
+                obj_primal += info['viol_var']
+        if self.enable_zeta_constraints and union_analysis and 'union_zeta_constraints' in union_analysis:
+            zeta_update_infos = self._build_pg_model_parametric_zeta(
+                model, x, sample_id, union_analysis)
+            for info in zeta_update_infos:
+                obj_primal += info['viol_var']
+
+        self._apply_fast_gurobi_tolerances(model, mip=False)
+        model.update()
+
+        vars_dict = {
+            'pg': pg, 'x': x, 'coc': coc, 'cpower': cpower,
+            'power_balance_viol': power_balance_viol,
+            'pg_lower_abs': pg_lower_abs, 'pg_upper_abs': pg_upper_abs,
+            'ramp_up_abs': ramp_up_abs, 'ramp_down_abs': ramp_down_abs,
+            'min_on_abs': min_on_abs, 'min_off_abs': min_off_abs,
+            'start_cost_abs': start_cost_abs, 'shut_cost_abs': shut_cost_abs,
+            'dcpf_upper_abs': dcpf_upper_abs, 'dcpf_lower_abs': dcpf_lower_abs,
+            'x_binary_dev': x_binary_dev,
+            'obj_primal': obj_primal,
+            'obj_binary': obj_binary,
+            'Ton': Ton, 'Toff': Toff,
+            'theta_update_infos': theta_update_infos,
+            'zeta_update_infos': zeta_update_infos,
+        }
+        return model, vars_dict
+
+    def _build_pg_model_parametric_theta(self, model, x, sample_id, union_analysis, PTDF, branch_limit):
+        """为 theta 参数化约束添加变量和约束，返回 update_infos 列表（供 chgCoeff 使用）。"""
+        if not union_analysis or 'union_constraints' not in union_analysis:
+            return []
+        update_infos = []
+        for ci in union_analysis['union_constraints']:
+            branch_id  = ci['branch_id']
+            time_slot  = ci['time_slot']
+            direction  = self._get_theta_constraint_direction(branch_id, time_slot)
+            rhs_name   = self._theta_rhs_name(branch_id, time_slot)
+            terms = []
+            for coeff_info in ci['nonzero_pg_coefficients']:
+                unit_id     = coeff_info['unit_id']
+                member_time = self._theta_member_time_index(ci, coeff_info)
+                theta_name  = self._theta_var_name(branch_id, unit_id, member_time)
+                terms.append((x[unit_id, member_time], theta_name))
+
+            viol_var = model.addVar(lb=0, name=f'para_viol_{branch_id}_{time_slot}')
+            abs_var  = model.addVar(lb=0, name=f'para_abs_{branch_id}_{time_slot}')
+
+            # 以零系数建立约束，后续 chgCoeff 填入真实值
+            # 约束形式：viol_var - direction*Σ(theta*x) >= -direction*rhs
+            c_viol    = model.addConstr(viol_var    >= 0.0, name=f'para_viol_c_{branch_id}_{time_slot}')
+            c_abs_pos = model.addConstr(abs_var     >= 0.0, name=f'para_abs_pos_{branch_id}_{time_slot}')
+            c_abs_neg = model.addConstr(abs_var     >= 0.0, name=f'para_abs_neg_{branch_id}_{time_slot}')
+
+            update_infos.append({
+                'branch_id': branch_id, 'time_slot': time_slot,
+                'direction': direction, 'rhs_name': rhs_name,
+                'terms': terms,
+                'c_viol': c_viol, 'c_abs_pos': c_abs_pos, 'c_abs_neg': c_abs_neg,
+                'viol_var': viol_var, 'abs_var': abs_var,
+            })
+        return update_infos
+
+    def _build_pg_model_parametric_zeta(self, model, x, sample_id, union_analysis):
+        """为 zeta 参数化约束添加变量和约束，返回 update_infos 列表。"""
+        if not union_analysis or 'union_zeta_constraints' not in union_analysis:
+            return []
+        update_infos = []
+        for ci in union_analysis['union_zeta_constraints']:
+            unit_id   = ci['unit_id']
+            time_slot = ci['time_slot']
+            direction = self._get_zeta_constraint_direction(unit_id, time_slot)
+            rhs_name  = f'zeta_rhs_unit_{unit_id}_time_{time_slot}'
+            zeta_name = f'zeta_unit_{unit_id}_time_{time_slot}'
+            terms = [(x[unit_id, time_slot], zeta_name)]
+
+            viol_var = model.addVar(lb=0, name=f'zeta_viol_{unit_id}_{time_slot}')
+            abs_var  = model.addVar(lb=0, name=f'zeta_abs_{unit_id}_{time_slot}')
+
+            c_viol    = model.addConstr(viol_var >= 0.0, name=f'zeta_viol_c_{unit_id}_{time_slot}')
+            c_abs_pos = model.addConstr(abs_var  >= 0.0, name=f'zeta_abs_pos_{unit_id}_{time_slot}')
+            c_abs_neg = model.addConstr(abs_var  >= 0.0, name=f'zeta_abs_neg_{unit_id}_{time_slot}')
+
+            update_infos.append({
+                'unit_id': unit_id, 'time_slot': time_slot,
+                'direction': direction, 'rhs_name': rhs_name,
+                'terms': terms,
+                'c_viol': c_viol, 'c_abs_pos': c_abs_pos, 'c_abs_neg': c_abs_neg,
+                'viol_var': viol_var, 'abs_var': abs_var,
+            })
+        return update_infos
+
+    def _apply_pg_model_parametric_update(self, model, theta_values, zeta_values,
+                                          theta_update_infos, zeta_update_infos):
+        """通过 chgCoeff 更新 theta/zeta 参数化约束的系数和 RHS。"""
+        tv = theta_values or {}
+        for info in theta_update_infos:
+            d   = info['direction']
+            rhs = float(tv.get(info['rhs_name'], 1.0))
+            # 清除旧的变量系数再设新值（通过 chgCoeff 直接覆盖）
+            lhs_expr = gp.LinExpr()
+            for x_var, theta_name in info['terms']:
+                theta = float(tv.get(theta_name, 0.0))
+                lhs_expr += theta * x_var
+            # viol: viol_var - direction*lhs >= -direction*rhs
+            # → coeff of x_var in LHS: -direction*theta
+            for x_var, theta_name in info['terms']:
+                theta = float(tv.get(theta_name, 0.0))
+                model.chgCoeff(info['c_viol'],    x_var,  -d * theta)
+                model.chgCoeff(info['c_abs_pos'], x_var,  -theta)
+                model.chgCoeff(info['c_abs_neg'], x_var,   theta)
+            info['c_viol'].RHS    = -d * rhs
+            info['c_abs_pos'].RHS = -rhs
+            info['c_abs_neg'].RHS =  rhs
+
+        zv = zeta_values or {}
+        for info in zeta_update_infos:
+            d   = info['direction']
+            rhs = float(zv.get(info['rhs_name'], 1.0))
+            for x_var, zeta_name in info['terms']:
+                zeta = float(zv.get(zeta_name, 0.0))
+                model.chgCoeff(info['c_viol'],    x_var,  -d * zeta)
+                model.chgCoeff(info['c_abs_pos'], x_var,  -zeta)
+                model.chgCoeff(info['c_abs_neg'], x_var,   zeta)
+            info['c_viol'].RHS    = -d * rhs
+            info['c_abs_pos'].RHS = -rhs
+            info['c_abs_neg'].RHS =  rhs
+
+    def _update_pg_model_objective(self, sample_id: int, model, vars_dict,
+                                   theta_values=None, zeta_values=None, union_analysis=None):
+        """每次迭代：更新 theta/zeta 约束系数，然后重建目标函数并调用 setObjective。"""
+        # 1. 更新参数化约束系数（chgCoeff + RHS）
+        if vars_dict['theta_update_infos'] or vars_dict['zeta_update_infos']:
+            self._apply_pg_model_parametric_update(
+                model, theta_values, zeta_values,
+                vars_dict['theta_update_infos'],
+                vars_dict['zeta_update_infos'],
+            )
+
+        pg  = vars_dict['pg']
+        x   = vars_dict['x']
+        coc = vars_dict['coc']
+        power_balance_viol = vars_dict['power_balance_viol']
+        pg_lower_abs       = vars_dict['pg_lower_abs']
+        pg_upper_abs       = vars_dict['pg_upper_abs']
+        ramp_up_abs        = vars_dict['ramp_up_abs']
+        ramp_down_abs      = vars_dict['ramp_down_abs']
+        min_on_abs         = vars_dict['min_on_abs']
+        min_off_abs        = vars_dict['min_off_abs']
+        start_cost_abs     = vars_dict['start_cost_abs']
+        shut_cost_abs      = vars_dict['shut_cost_abs']
+        dcpf_upper_abs     = vars_dict['dcpf_upper_abs']
+        dcpf_lower_abs     = vars_dict['dcpf_lower_abs']
+        Ton  = vars_dict['Ton']
+        Toff = vars_dict['Toff']
+        lam  = self.lambda_[sample_id]
+
+        # 2. 重建 obj_opt（动态对偶系数）
+        obj_opt = gp.LinExpr()
+        for t in range(self.T):
+            obj_opt += power_balance_viol[t] * abs(lam['lambda_power_balance'][t])
+            for g in range(self.ng):
+                obj_opt += pg_lower_abs[g,t] * abs(lam['lambda_pg_lower'][g,t])
+                obj_opt += pg_upper_abs[g,t] * abs(lam['lambda_pg_upper'][g,t])
+                obj_opt += x[g,t]        * abs(lam['lambda_x_lower'][g,t])
+                obj_opt += (1 - x[g,t]) * abs(lam['lambda_x_upper'][g,t])
+        for t in range(1, self.T):
+            for g in range(self.ng):
+                obj_opt += ramp_up_abs[g,t-1]   * abs(lam['lambda_ramp_up'][g,t-1])
+                obj_opt += ramp_down_abs[g,t-1] * abs(lam['lambda_ramp_down'][g,t-1])
+        for g in range(self.ng):
+            for tau in range(1, Ton+1):
+                for t1 in range(self.T - tau):
+                    obj_opt += min_on_abs[g,tau-1,t1] * abs(lam['lambda_min_on'][g,tau-1,t1])
+            for tau in range(1, Toff+1):
+                for t1 in range(self.T - tau):
+                    obj_opt += min_off_abs[g,tau-1,t1] * abs(lam['lambda_min_off'][g,tau-1,t1])
+        for t in range(1, self.T):
+            for g in range(self.ng):
+                obj_opt += start_cost_abs[g,t-1] * abs(lam['lambda_start_cost'][g,t-1])
+                obj_opt += shut_cost_abs[g,t-1]  * abs(lam['lambda_shut_cost'][g,t-1])
+                obj_opt += coc[g,t-1]            * abs(lam['lambda_coc_nonneg'][g,t-1])
+        for t in range(self.T):
+            for l in range(self.branch.shape[0]):
+                obj_opt += dcpf_upper_abs[l,t] * abs(lam['lambda_dcpf_upper'][l,t])
+                obj_opt += dcpf_lower_abs[l,t] * abs(lam['lambda_dcpf_lower'][l,t])
+
+        # theta/zeta abs_var × |mu/ita|
+        for info in vars_dict['theta_update_infos']:
+            bid, ts = info['branch_id'], info['time_slot']
+            if bid < self.nl:
+                mu_v = abs(float(self.mu[sample_id, bid, ts]))
+            else:
+                mu_v = getattr(self, 'dual_para_bound', 0.1)
+            obj_opt += info['abs_var'] * mu_v
+        for info in vars_dict['zeta_update_infos']:
+            uid, ts = info['unit_id'], info['time_slot']
+            obj_opt += info['abs_var'] * abs(float(self.ita[sample_id, uid, ts]))
+
+        # 3. Prox 项（QP）
+        obj_prox = self._build_pg_block_prox_obj(model, sample_id, pg, x, coc)
+
+        # 4. 设置完整目标函数
+        model.setObjective(
+            self.rho_binary  * vars_dict['obj_binary']
+            + self.rho_primal * vars_dict['obj_primal']
+            + self.rho_opt    * obj_opt
+            + self.pg_block_prox_weight * obj_prox,
+            GRB.MINIMIZE,
+        )
+
+    # ------------------------------------------------------------------
+
     def iter_with_pg_block(self, sample_id=0, theta_values=None, zeta_values=None, union_analysis=None):
         """
         迭代PG块（完整实现，参考uc_dfsm_bcd.py）
         更新x, pg等原始变量
         """
-        Pd = self.active_set_data[sample_id]['pd_data']
-        model = gp.Model('iter_with_pg_block')
-        model.Params.OutputFlag = 0
-        
-        # 主要变量
-        pg = model.addVars(self.ng, self.T, lb=0, name='pg')
-        x = model.addVars(self.ng, self.T, vtype=GRB.CONTINUOUS, lb=0, ub=1, name='x')
-        coc = model.addVars(self.ng, self.T-1, lb=0, name='coc')
-        cpower = model.addVars(self.ng, self.T, lb=0, name='cpower')
+        if self._lp_backend == LP_BACKEND_CVXPY_HIGHS:
+            return self._iter_with_pg_block_cvxpy_highs(sample_id, theta_values, zeta_values, union_analysis)
 
-        # 辅助变量用于处理绝对值和最大值
-        power_balance_viol = model.addVars(self.T, lb=0, name='power_balance_viol')
-        pg_lower_viol = model.addVars(self.ng, self.T, lb=0, name='pg_lower_viol')
-        pg_upper_viol = model.addVars(self.ng, self.T, lb=0, name='pg_upper_viol')
-        pg_lower_abs = model.addVars(self.ng, self.T, lb=0, name='pg_lower_abs')
-        pg_upper_abs = model.addVars(self.ng, self.T, lb=0, name='pg_upper_abs')
-        ramp_up_viol = model.addVars(self.ng, self.T-1, lb=0, name='ramp_up_viol')
-        ramp_down_viol = model.addVars(self.ng, self.T-1, lb=0, name='ramp_down_viol')
-        ramp_up_abs = model.addVars(self.ng, self.T-1, lb=0, name='ramp_up_abs')
-        ramp_down_abs = model.addVars(self.ng, self.T-1, lb=0, name='ramp_down_abs')
-        
-        Ton = min(4, self.T)
-        Toff = min(4, self.T)
-        min_on_viol = model.addVars(self.ng, Ton, self.T, lb=0, name='min_on_viol')
-        min_off_viol = model.addVars(self.ng, Toff, self.T, lb=0, name='min_off_viol')
-        min_on_abs = model.addVars(self.ng, Ton, self.T, lb=0, name='min_on_abs')
-        min_off_abs = model.addVars(self.ng, Toff, self.T, lb=0, name='min_off_abs')
-        start_cost_viol = model.addVars(self.ng, self.T, lb=0, name='start_cost_viol')
-        shut_cost_viol = model.addVars(self.ng, self.T, lb=0, name='shut_cost_viol')
-        start_cost_abs = model.addVars(self.ng, self.T, lb=0, name='start_cost_abs')
-        shut_cost_abs = model.addVars(self.ng, self.T, lb=0, name='shut_cost_abs')
-        dcpf_upper_viol = model.addVars(self.nl, self.T, lb=0, name='dcpf_upper_viol')
-        dcpf_upper_abs = model.addVars(self.nl, self.T, lb=0, name='dcpf_upper_abs')
-        dcpf_lower_viol = model.addVars(self.nl, self.T, lb=0, name='dcpf_lower_viol')
-        dcpf_lower_abs = model.addVars(self.nl, self.T, lb=0, name='dcpf_lower_abs')
-        x_binary_dev = model.addVars(self.ng, self.T, lb=0, name='x_binary_dev')
+        # --- 复用或新建 persistent 模型 ---
+        union_id = id(union_analysis)
+        if (sample_id not in self._pg_models
+                or self._pg_model_union_id.get(sample_id) != union_id):
+            if sample_id in self._pg_models:
+                try:
+                    self._pg_models[sample_id].dispose()
+                except Exception:
+                    pass
+            model, vars_dict = self._build_pg_model(sample_id, union_analysis)
+            self._pg_models[sample_id]         = model
+            self._pg_vars[sample_id]           = vars_dict
+            self._pg_model_union_id[sample_id] = union_id
+        else:
+            model     = self._pg_models[sample_id]
+            vars_dict = self._pg_vars[sample_id]
 
-        obj_primal = 0
-        obj_opt = 0
-        obj_binary = 0
-        
-        # 功率平衡约束
-        for t in range(self.T):
-            power_balance_expr = gp.quicksum(pg[g, t] for g in range(self.ng)) - np.sum(Pd[:, t])
-            model.addConstr(power_balance_viol[t] >= power_balance_expr, name=f'power_balance_pos_{t}')
-            model.addConstr(power_balance_viol[t] >= -power_balance_expr, name=f'power_balance_neg_{t}')
-            
-            obj_primal += power_balance_viol[t]
-            obj_opt += power_balance_viol[t] * abs(self.lambda_[sample_id]['lambda_power_balance'][t])
-            
-            # 发电上下限约束
-            for g in range(self.ng):
-                pg_lower_expr = self.gen[g, PMIN] * x[g, t] - pg[g, t]
-                model.addConstr(pg_lower_viol[g, t] >= pg_lower_expr, name=f'pg_lower_viol_{g}_{t}')
-                obj_primal += pg_lower_viol[g, t]
-                
-                pg_upper_expr = pg[g, t] - self.gen[g, PMAX] * x[g, t]
-                model.addConstr(pg_upper_viol[g, t] >= pg_upper_expr, name=f'pg_upper_viol_{g}_{t}')
-                obj_primal += pg_upper_viol[g, t]
-                
-                model.addConstr(pg_lower_abs[g, t] >= pg_lower_expr, name=f'pg_lower_abs1_{g}_{t}')
-                model.addConstr(pg_lower_abs[g, t] >= -pg_lower_expr, name=f'pg_lower_abs2_{g}_{t}')
-                model.addConstr(pg_upper_abs[g, t] >= pg_upper_expr, name=f'pg_upper_abs1_{g}_{t}')
-                model.addConstr(pg_upper_abs[g, t] >= -pg_upper_expr, name=f'pg_upper_abs2_{g}_{t}')
+        # --- 每次迭代只更新目标函数 ---
+        self._update_pg_model_objective(
+            sample_id, model, vars_dict, theta_values, zeta_values, union_analysis)
 
-                obj_opt += pg_lower_abs[g, t] * abs(self.lambda_[sample_id]['lambda_pg_lower'][g, t])
-                obj_opt += pg_upper_abs[g, t] * abs(self.lambda_[sample_id]['lambda_pg_upper'][g, t])
-
-                obj_opt += x[g, t] * abs(self.lambda_[sample_id]['lambda_x_lower'][g, t])
-                obj_opt += (1 - x[g, t]) * abs(self.lambda_[sample_id]['lambda_x_upper'][g, t])
-
-        # 爬坡约束
-        Ru = self.Ru
-        Rd = self.Rd
-        Ru_co = self.Ru_co
-        Rd_co = self.Rd_co
-
-        for t in range(1, self.T):
-            for g in range(self.ng):
-                ramp_up_expr = pg[g, t] - pg[g, t-1] - Ru[g] * x[g, t-1] - Ru_co[g] * (1 - x[g, t-1])
-                model.addConstr(ramp_up_viol[g, t-1] >= ramp_up_expr, name=f'ramp_up_viol_{g}_{t}')
-                obj_primal += ramp_up_viol[g, t-1]
-                
-                model.addConstr(ramp_up_abs[g, t-1] >= ramp_up_expr, name=f'ramp_up_abs1_{g}_{t}')
-                model.addConstr(ramp_up_abs[g, t-1] >= -ramp_up_expr, name=f'ramp_up_abs2_{g}_{t}')
-
-                ramp_down_expr = pg[g, t-1] - pg[g, t] - Rd[g] * x[g, t] - Rd_co[g] * (1 - x[g, t])
-                model.addConstr(ramp_down_viol[g, t-1] >= ramp_down_expr, name=f'ramp_down_viol_{g}_{t}')
-                obj_primal += ramp_down_viol[g, t-1]
-                
-                model.addConstr(ramp_down_abs[g, t-1] >= ramp_down_expr, name=f'ramp_down_abs1_{g}_{t}')
-                model.addConstr(ramp_down_abs[g, t-1] >= -ramp_down_expr, name=f'ramp_down_abs2_{g}_{t}')
-
-                obj_opt += ramp_up_abs[g, t-1] * abs(self.lambda_[sample_id]['lambda_ramp_up'][g, t-1])
-                obj_opt += ramp_down_abs[g, t-1] * abs(self.lambda_[sample_id]['lambda_ramp_down'][g, t-1])
-
-        # 最小开机时间和最小关机时间约束
-        for g in range(self.ng):
-            for t in range(1, Ton+1):
-                for t1 in range(self.T - t):
-                    min_on_expr = x[g, t1+1] - x[g, t1] - x[g, t1+t]
-                    model.addConstr(min_on_viol[g, t-1, t1] >= min_on_expr, name=f'min_on_viol_{g}_{t}_{t1}')
-                    model.addConstr(min_on_abs[g, t-1, t1] >= min_on_expr, name=f'min_on_abs1_{g}_{t}_{t1}')
-                    model.addConstr(min_on_abs[g, t-1, t1] >= -min_on_expr, name=f'min_on_abs2_{g}_{t}_{t1}')
-                    obj_primal += min_on_viol[g, t-1, t1]
-                    obj_opt += min_on_abs[g, t-1, t1] * abs(self.lambda_[sample_id]['lambda_min_on'][g, t-1, t1])
-
-        for g in range(self.ng):
-            for t in range(1, Toff+1):
-                for t1 in range(self.T - t):
-                    min_off_expr = -x[g, t1+1] + x[g, t1] - (1 - x[g, t1+t])
-                    model.addConstr(min_off_viol[g, t-1, t1] >= min_off_expr, name=f'min_off_viol_{g}_{t}_{t1}')
-                    model.addConstr(min_off_abs[g, t-1, t1] >= min_off_expr, name=f'min_off_abs1_{g}_{t}_{t1}')
-                    model.addConstr(min_off_abs[g, t-1, t1] >= -min_off_expr, name=f'min_off_abs2_{g}_{t}_{t1}')
-                    obj_primal += min_off_viol[g, t-1, t1]
-                    obj_opt += min_off_abs[g, t-1, t1] * abs(self.lambda_[sample_id]['lambda_min_off'][g, t-1, t1])
-
-        # 启停成本
-        start_cost = self.gencost[:, 1]
-        shut_cost = self.gencost[:, 2]
-        for t in range(1, self.T):
-            for g in range(self.ng):
-                model.addConstr(start_cost_viol[g, t-1] >= start_cost[g] * (x[g, t] - x[g, t-1]) - coc[g, t-1], name=f'start_cost_viol_{g}_{t}')
-                model.addConstr(start_cost_abs[g, t-1] >= start_cost[g] * (x[g, t] - x[g, t-1]) - coc[g, t-1], name=f'start_cost_abs1_{g}_{t}')
-                model.addConstr(start_cost_abs[g, t-1] >= -start_cost[g] * (x[g, t] - x[g, t-1]) + coc[g, t-1], name=f'start_cost_abs2_{g}_{t}')
-                obj_primal += start_cost_viol[g, t-1]
-                obj_opt += start_cost_abs[g, t-1] * abs(self.lambda_[sample_id]['lambda_start_cost'][g, t-1])
-
-                model.addConstr(shut_cost_viol[g, t-1] >= shut_cost[g] * (x[g, t-1] - x[g, t]) - coc[g, t-1], name=f'shut_cost_viol_{g}_{t}')
-                model.addConstr(shut_cost_abs[g, t-1] >= shut_cost[g] * (x[g, t-1] - x[g, t]) - coc[g, t-1], name=f'shut_cost_abs1_{g}_{t}')
-                model.addConstr(shut_cost_abs[g, t-1] >= -shut_cost[g] * (x[g, t-1] - x[g, t]) + coc[g, t-1], name=f'shut_cost_abs2_{g}_{t}')
-                obj_primal += shut_cost_viol[g, t-1]
-                obj_opt += shut_cost_abs[g, t-1] * abs(self.lambda_[sample_id]['lambda_shut_cost'][g, t-1])
-
-                obj_opt += coc[g, t-1] * abs(self.lambda_[sample_id]['lambda_coc_nonneg'][g, t-1])
-
-        # 发电成本
-        for t in range(self.T):
-            for g in range(self.ng):
-                model.addConstr(cpower[g, t] == self.gencost[g, -2]/self.T_delta * pg[g, t] + self.gencost[g, -1]/self.T_delta * x[g, t], name=f'cpower_{g}_{t}')
-
-        # 潮流约束
-        nb = self.bus.shape[0]
-        G = np.zeros((nb, self.ng))
-        for g in range(self.ng):
-            bus_idx = int(self.gen[g, GEN_BUS])
-            if 0 <= bus_idx < nb:
-                G[bus_idx, g] = 1
-        PTDF = makePTDF(self.baseMVA, self.bus, self.branch)
-        branch_limit = self.branch[:, RATE_A]
-        for t in range(self.T):
-            flow = PTDF @ (G @ np.array([pg[g, t] for g in range(self.ng)]) - Pd[:, t])
-            for l in range(self.branch.shape[0]):
-                model.addConstr(dcpf_upper_viol[l, t] >= flow[l] - branch_limit[l], name=f'dcpf_upper_viol_{l}_{t}')
-                model.addConstr(dcpf_lower_viol[l, t] >= -flow[l] - branch_limit[l], name=f'dcpf_lower_viol_{l}_{t}')
-                model.addConstr(dcpf_upper_abs[l, t] >= flow[l] - branch_limit[l], name=f'dcpf_upper_abs1_{l}_{t}')
-                model.addConstr(dcpf_upper_abs[l, t] >= -flow[l] + branch_limit[l], name=f'dcpf_upper_abs2_{l}_{t}')
-                model.addConstr(dcpf_lower_abs[l, t] >= -flow[l] - branch_limit[l], name=f'dcpf_lower_abs1_{l}_{t}')
-                model.addConstr(dcpf_lower_abs[l, t] >= flow[l] + branch_limit[l], name=f'dcpf_lower_abs2_{l}_{t}')
-                obj_primal += dcpf_upper_viol[l, t] + dcpf_lower_viol[l, t]
-                obj_opt += dcpf_upper_abs[l, t] * abs(self.lambda_[sample_id]['lambda_dcpf_upper'][l, t])
-                obj_opt += dcpf_lower_abs[l, t] * abs(self.lambda_[sample_id]['lambda_dcpf_lower'][l, t])
-
-        # 二进制变量偏差
-        # 确保unit_commitment_matrix是正确的形状 (ng, T)
-        unit_commitment_matrix = _get_uc_matrix_from_sample(
-            self.active_set_data[sample_id], self.ng, self.T)
-        if unit_commitment_matrix is None:
-            unit_commitment_matrix = self.x[sample_id]  # fallback 到当前 x
-
-        for g in range(self.ng):
-            for t in range(self.T):
-                target_value = unit_commitment_matrix[g, t]
-                x_dev_expr = x[g, t] - target_value
-                model.addConstr(x_binary_dev[g, t] >= x_dev_expr, name=f'x_dev_pos_{g}_{t}')
-                model.addConstr(x_binary_dev[g, t] >= -x_dev_expr, name=f'x_dev_neg_{g}_{t}')
-                obj_binary += x_binary_dev[g, t]
-
-        # 添加参数化约束的罚项（参考uc_dfsm_bcd.py的形式）
-        if self.enable_theta_constraints and union_analysis and 'union_constraints' in union_analysis and theta_values is not None:
-            model, parametric_obj_primal, parametric_obj_opt = self._add_parametric_penalties_pg_block(
-                model, x, sample_id, theta_values, union_analysis, PTDF=PTDF, branch_limit=branch_limit
-            )
-            obj_primal += parametric_obj_primal
-            obj_opt += parametric_obj_opt
-        
-        if self.enable_zeta_constraints and union_analysis and 'union_zeta_constraints' in union_analysis and zeta_values is not None:
-            model, parametric_obj_primal, parametric_obj_opt = self._add_parametric_balance_power_penalties_pg_block(
-                model, x, sample_id, zeta_values, union_analysis
-            )
-            obj_primal += parametric_obj_primal
-            obj_opt += parametric_obj_opt
-        
-        # 设置目标函数
-        obj_prox = self._build_pg_block_prox_obj(model, sample_id, pg, x, coc)
-        total_objective = (
-            self.rho_binary * obj_binary
-            + self.rho_primal * obj_primal
-            + self.rho_opt * obj_opt
-            + self.pg_block_prox_weight * obj_prox
-        )
-        model.setObjective(total_objective, GRB.MINIMIZE)
-
-        self._apply_fast_gurobi_tolerances(model, mip=True)
         model.optimize()
-        
+
         if model.status == GRB.OPTIMAL:
-            pg_sol = np.array([[pg[g, t].X for t in range(self.T)] for g in range(self.ng)])
-            x_sol = np.array([[x[g, t].X for t in range(self.T)] for g in range(self.ng)])
-            cpower_sol = np.array([[cpower[g, t].X for t in range(self.T)] for g in range(self.ng)])
-            coc_sol = np.array([[coc[g, t].X for t in range(self.T-1)] for g in range(self.ng)])
-        
+            pg      = vars_dict['pg']
+            x       = vars_dict['x']
+            cpower  = vars_dict['cpower']
+            coc     = vars_dict['coc']
+            pg_sol     = np.array([[pg[g,t].X      for t in range(self.T)]   for g in range(self.ng)])
+            x_sol      = np.array([[x[g,t].X       for t in range(self.T)]   for g in range(self.ng)])
+            cpower_sol = np.array([[cpower[g,t].X  for t in range(self.T)]   for g in range(self.ng)])
+            coc_sol    = np.array([[coc[g,t].X     for t in range(self.T-1)] for g in range(self.ng)])
+
             if sample_id <= 2:
+                obj_primal_v = vars_dict['obj_primal'].getValue()
+                obj_binary_v = vars_dict['obj_binary'].getValue()
                 print(
-                    f"pg_block, sample_id: {sample_id}, obj_primal: {obj_primal.getValue()}, "
-                    f"obj_opt: {obj_opt.getValue()}, obj_binary: {obj_binary.getValue()}, "
-                    f"obj_prox: {obj_prox.getValue() if hasattr(obj_prox, 'getValue') else 0.0}"
+                    f"pg_block, sample_id: {sample_id}, "
+                    f"obj_primal: {obj_primal_v:.4f}, "
+                    f"obj_binary: {obj_binary_v:.4f}",
+                    flush=True,
                 )
-            
             return pg_sol, x_sol, cpower_sol, coc_sol
         else:
-
             print(f"❌ PG块模型求解失败，状态: {model.status}", flush=True)
-            
             return None, None, None, None
     
+    # ------------------------------------------------------------------
+    # Persistent dual-block model helpers
+    # ------------------------------------------------------------------
+
+    def _build_dual_model(self, sample_id: int, union_analysis=None,
+                          floor_active: bool = False, sign_relax_round: bool = False):
+        """一次性建立 dual 块 Gurobi 模型（变量 + 约束结构）。
+        返回 (model, vars_dict)。theta/zeta 的 mu 贡献系数以零初始化，
+        后续通过 chgCoeff 更新。
+        """
+        Pd = self.active_set_data[sample_id]['pd_data']
+        model = gp.Model('dual_block')
+        model.Params.OutputFlag = 0
+
+        lambda_power_balance = model.addVars(self.T,           lb=-GRB.INFINITY, name='lambda_pb')
+        lambda_pg_lower      = model.addVars(self.ng, self.T,  lb=0, name='lambda_pg_lower')
+        lambda_pg_upper      = model.addVars(self.ng, self.T,  lb=0, name='lambda_pg_upper')
+        lambda_ramp_up       = model.addVars(self.ng, self.T-1,lb=0, name='lambda_ramp_up')
+        lambda_ramp_down     = model.addVars(self.ng, self.T-1,lb=0, name='lambda_ramp_down')
+
+        Ton  = min(4, self.T)
+        Toff = min(4, self.T)
+        lambda_min_on    = model.addVars(self.ng, Ton,  self.T,   lb=0, name='lambda_min_on')
+        lambda_min_off   = model.addVars(self.ng, Toff, self.T,   lb=0, name='lambda_min_off')
+        lambda_start_cost= model.addVars(self.ng, self.T-1,        lb=0, name='lambda_sc')
+        lambda_shut_cost = model.addVars(self.ng, self.T-1,        lb=0, name='lambda_shc')
+        lambda_coc_nonneg= model.addVars(self.ng, self.T-1,        lb=0, name='lambda_coc')
+        lambda_cpower    = model.addVars(self.ng, self.T,           lb=0, name='lambda_cpower')
+        lambda_dcpf_upper= model.addVars(self.nl, self.T,           lb=0, name='lambda_dcpf_up')
+        lambda_dcpf_lower= model.addVars(self.nl, self.T,           lb=0, name='lambda_dcpf_lo')
+        lambda_x_upper   = model.addVars(self.ng, self.T,           lb=0, name='lambda_x_up')
+        lambda_x_lower   = model.addVars(self.ng, self.T,           lb=0, name='lambda_x_lo')
+
+        mu_lb  = -GRB.INFINITY if (floor_active and sign_relax_round) else 0.0
+        ita_lb = -GRB.INFINITY if (floor_active and sign_relax_round) else 0.0
+        mu     = model.addVars(self.nl, self.T, lb=mu_lb,  name='mu')
+        ita    = model.addVars(self.ng, self.T, lb=ita_lb, name='ita')
+        mu_abs = model.addVars(self.nl, self.T, lb=0,      name='mu_abs')
+        ita_abs= model.addVars(self.ng, self.T, lb=0,      name='ita_abs')
+        mu_max = model.addVar(lb=0, name='mu_max')
+        ita_max= model.addVar(lb=0, name='ita_max')
+        deadband = 100
+
+        for l in range(self.nl):
+            for t in range(self.T):
+                model.addConstr(mu_abs[l,t] >= mu[l,t],  name=f'mu_abs_pos_{l}_{t}')
+                model.addConstr(mu_abs[l,t] >= -mu[l,t], name=f'mu_abs_neg_{l}_{t}')
+                if floor_active:
+                    if sign_relax_round:
+                        model.addConstr(mu_abs[l,t] >= self.mu_dual_floor_init, name=f'mu_abs_lb_{l}_{t}')
+                    else:
+                        model.addConstr(mu[l,t] >= self.mu_dual_floor_init, name=f'mu_lb_{l}_{t}')
+                model.addConstr(mu_max >= mu_abs[l,t] - deadband, name=f'mu_max_{l}_{t}')
+        for g in range(self.ng):
+            for t in range(self.T):
+                model.addConstr(ita_abs[g,t] >= ita[g,t],  name=f'ita_abs_pos_{g}_{t}')
+                model.addConstr(ita_abs[g,t] >= -ita[g,t], name=f'ita_abs_neg_{g}_{t}')
+                if floor_active:
+                    if sign_relax_round:
+                        model.addConstr(ita_abs[g,t] >= self.ita_dual_floor_init, name=f'ita_abs_lb_{g}_{t}')
+                    else:
+                        model.addConstr(ita[g,t] >= self.ita_dual_floor_init, name=f'ita_lb_{g}_{t}')
+                model.addConstr(ita_max >= ita_abs[g,t] - deadband, name=f'ita_max_{g}_{t}')
+
+        PTDF_G = self._ptdf_g
+        PTDF   = self._ptdf_matrix
+        branch_limit = self._branch_limit
+        Ru  = self.Ru;  Rd  = self.Rd
+        Ru_co = self.Ru_co; Rd_co = self.Rd_co
+        start_cost = self.gencost[:, 1]
+        shut_cost  = self.gencost[:, 2]
+
+        obj_dual_pg  = gp.LinExpr()
+        obj_dual_x   = gp.LinExpr()
+        obj_dual_coc = gp.LinExpr()
+
+        # pg 驻点约束（全静态系数）
+        for g in range(self.ng):
+            for t in range(self.T):
+                de = self.gencost[g,-2] / self.T_delta
+                de -= lambda_power_balance[t]
+                de -= lambda_pg_lower[g,t]
+                de += lambda_pg_upper[g,t]
+                if t > 0:
+                    de += lambda_ramp_up[g,t-1]
+                    de -= lambda_ramp_down[g,t-1]
+                if t < self.T - 1:
+                    de -= lambda_ramp_up[g,t]
+                    de += lambda_ramp_down[g,t]
+                ptdfg_col = PTDF_G[:, g]
+                for l in range(self.branch.shape[0]):
+                    de += ptdfg_col[l] * (lambda_dcpf_upper[l,t] - lambda_dcpf_lower[l,t])
+                abs_v = model.addVar(lb=0, name=f'dabs_pg_{g}_{t}')
+                model.addConstr(abs_v >= de,  name=f'dabs_pg_pos_{g}_{t}')
+                model.addConstr(abs_v >= -de, name=f'dabs_pg_neg_{g}_{t}')
+                obj_dual_pg += abs_v
+
+        # x 驻点约束（theta/zeta 贡献以零系数初始化，后续 chgCoeff 更新）
+        dual_x_theta_terms = []  # for chgCoeff updates
+        for g in range(self.ng):
+            for t in range(self.T):
+                de = self._build_x_dual_stationarity_expr(
+                    g=g, t=t,
+                    lambda_cpower=lambda_cpower,
+                    lambda_x_upper=lambda_x_upper,
+                    lambda_x_lower=lambda_x_lower,
+                    lambda_pg_lower=lambda_pg_lower,
+                    lambda_pg_upper=lambda_pg_upper,
+                    lambda_ramp_down=lambda_ramp_down,
+                    lambda_ramp_up=lambda_ramp_up,
+                    lambda_min_on=lambda_min_on,
+                    lambda_min_off=lambda_min_off,
+                    lambda_start_cost=lambda_start_cost,
+                    lambda_shut_cost=lambda_shut_cost,
+                    fixed_cost=self.gencost[g,-1]/self.T_delta,
+                    pmin=self.gen[g,PMIN], pmax=self.gen[g,PMAX],
+                    rd_delta=Rd_co[g]-Rd[g], ru_delta=Ru_co[g]-Ru[g],
+                    start_cost=start_cost[g], shut_cost=shut_cost[g],
+                    Ton=Ton, Toff=Toff,
+                )
+                # 收集 theta 贡献信息（但不加入 de，初始系数为 0）
+                theta_terms = []
+                if self.enable_theta_constraints and union_analysis and 'union_constraints' in union_analysis:
+                    for ci in union_analysis['union_constraints']:
+                        bid  = ci['branch_id']
+                        ts   = ci['time_slot']
+                        direc = self._get_theta_constraint_direction(bid, ts)
+                        for coeff_info in ci['nonzero_pg_coefficients']:
+                            uid  = coeff_info['unit_id']
+                            mt   = self._theta_member_time_index(ci, coeff_info)
+                            if uid != g or mt != t:
+                                continue
+                            tname = self._theta_var_name(bid, uid, mt)
+                            if bid < self.nl:
+                                theta_terms.append((mu[bid, ts], direc, tname))
+                            else:
+                                default_mu = getattr(self, 'dual_para_bound', 0.1)
+                                de += 0.0  # handled as constant; skip chgCoeff for virtual branch
+
+                zeta_terms = []
+                if self.enable_zeta_constraints and union_analysis and 'union_zeta_constraints' in union_analysis:
+                    for ci in union_analysis['union_zeta_constraints']:
+                        uid  = ci['unit_id']
+                        ts   = ci['time_slot']
+                        if uid != g or ts != t:
+                            continue
+                        zname = f'zeta_unit_{uid}_time_{ts}'
+                        direc  = self._get_zeta_constraint_direction(uid, ts)
+                        zeta_terms.append((ita[uid, ts], direc, zname))
+
+                abs_v = model.addVar(lb=0, name=f'dabs_x_{g}_{t}')
+                c_pos = model.addConstr(abs_v >= de,  name=f'dabs_x_pos_{g}_{t}')
+                c_neg = model.addConstr(abs_v >= -de, name=f'dabs_x_neg_{g}_{t}')
+                obj_dual_x += abs_v
+
+                if theta_terms or zeta_terms:
+                    dual_x_theta_terms.append({
+                        'g': g, 't': t,
+                        'c_pos': c_pos, 'c_neg': c_neg,
+                        'theta_terms': theta_terms,
+                        'zeta_terms':  zeta_terms,
+                    })
+
+        # cpower 驻点（等式约束）
+        for g in range(self.ng):
+            for t in range(self.T):
+                model.addConstr(lambda_cpower[g,t] == 1, name=f'dcpower_{g}_{t}')
+
+        # coc 驻点
+        for g in range(self.ng):
+            for t in range(self.T-1):
+                de = 1 - lambda_start_cost[g,t] - lambda_shut_cost[g,t] - lambda_coc_nonneg[g,t]
+                abs_v = model.addVar(lb=0, name=f'dabs_coc_{g}_{t}')
+                model.addConstr(abs_v >= de,  name=f'dabs_coc_pos_{g}_{t}')
+                model.addConstr(abs_v >= -de, name=f'dabs_coc_neg_{g}_{t}')
+                obj_dual_coc += abs_v
+
+        # 为 obj_opt 预声明 lambda_power_balance_abs 变量（结构静态）
+        lambda_pb_abs = model.addVars(self.T, lb=0, name='lambda_pb_abs')
+        for t in range(self.T):
+            model.addConstr(lambda_pb_abs[t] >= lambda_power_balance[t],  name=f'lpb_abs_pos_{t}')
+            model.addConstr(lambda_pb_abs[t] >= -lambda_power_balance[t], name=f'lpb_abs_neg_{t}')
+
+        self._apply_fast_gurobi_tolerances(model, mip=False)
+        model.update()
+
+        vars_dict = {
+            'lambda_power_balance': lambda_power_balance,
+            'lambda_pg_lower': lambda_pg_lower, 'lambda_pg_upper': lambda_pg_upper,
+            'lambda_ramp_up': lambda_ramp_up,   'lambda_ramp_down': lambda_ramp_down,
+            'lambda_min_on': lambda_min_on,     'lambda_min_off': lambda_min_off,
+            'lambda_start_cost': lambda_start_cost, 'lambda_shut_cost': lambda_shut_cost,
+            'lambda_coc_nonneg': lambda_coc_nonneg,
+            'lambda_cpower': lambda_cpower,
+            'lambda_dcpf_upper': lambda_dcpf_upper, 'lambda_dcpf_lower': lambda_dcpf_lower,
+            'lambda_x_upper': lambda_x_upper,   'lambda_x_lower': lambda_x_lower,
+            'mu': mu, 'ita': ita, 'mu_abs': mu_abs, 'ita_abs': ita_abs,
+            'mu_max': mu_max, 'ita_max': ita_max,
+            'lambda_pb_abs': lambda_pb_abs,
+            'obj_dual_pg': obj_dual_pg, 'obj_dual_x': obj_dual_x, 'obj_dual_coc': obj_dual_coc,
+            'Ton': Ton, 'Toff': Toff,
+            'dual_x_theta_terms': dual_x_theta_terms,
+            'Pd': Pd,
+        }
+        return model, vars_dict
+
+    def _apply_dual_model_theta_chgcoeff(self, model, theta_values, zeta_values, dual_x_theta_terms):
+        """通过 chgCoeff 更新 x 驻点约束中 theta/zeta 的 mu/ita 系数。"""
+        tv = theta_values or {}
+        zv = zeta_values or {}
+        for info in dual_x_theta_terms:
+            c_pos = info['c_pos']
+            c_neg = info['c_neg']
+            for mu_var, direction, tname in info['theta_terms']:
+                theta = float(tv.get(tname, 0.0))
+                # de includes direction*theta*mu[b,t]
+                # abs_v >= de  →  coeff of mu in LHS: -direction*theta
+                model.chgCoeff(c_pos, mu_var, -direction * theta)
+                model.chgCoeff(c_neg, mu_var,  direction * theta)
+            for ita_var, direction, zname in info['zeta_terms']:
+                zeta = float(zv.get(zname, 0.0))
+                model.chgCoeff(c_pos, ita_var, -direction * zeta)
+                model.chgCoeff(c_neg, ita_var,  direction * zeta)
+
+    def _update_dual_model_objective(self, sample_id: int, model, vars_dict,
+                                     theta_values=None, zeta_values=None, union_analysis=None):
+        """每次迭代：更新 theta/zeta 驻点系数，重建 obj_opt 和 obj_prox，调用 setObjective。"""
+        # 1. 更新 x 驻点约束的 theta/zeta 系数
+        if vars_dict['dual_x_theta_terms']:
+            self._apply_dual_model_theta_chgcoeff(
+                model, theta_values, zeta_values, vars_dict['dual_x_theta_terms'])
+
+        Pd = vars_dict['Pd']
+        lam_pb   = vars_dict['lambda_power_balance']
+        lam_pgl  = vars_dict['lambda_pg_lower']
+        lam_pgu  = vars_dict['lambda_pg_upper']
+        lam_ru   = vars_dict['lambda_ramp_up']
+        lam_rd   = vars_dict['lambda_ramp_down']
+        lam_mon  = vars_dict['lambda_min_on']
+        lam_moff = vars_dict['lambda_min_off']
+        lam_sc   = vars_dict['lambda_start_cost']
+        lam_shc  = vars_dict['lambda_shut_cost']
+        lam_coc  = vars_dict['lambda_coc_nonneg']
+        lam_dcu  = vars_dict['lambda_dcpf_upper']
+        lam_dcl  = vars_dict['lambda_dcpf_lower']
+        lam_xu   = vars_dict['lambda_x_upper']
+        lam_xl   = vars_dict['lambda_x_lower']
+        lam_pb_abs = vars_dict['lambda_pb_abs']
+        mu       = vars_dict['mu']
+        ita      = vars_dict['ita']
+        mu_abs   = vars_dict['mu_abs']
+        ita_abs  = vars_dict['ita_abs']
+        mu_max   = vars_dict['mu_max']
+        ita_max  = vars_dict['ita_max']
+        Ton  = vars_dict['Ton']
+        Toff = vars_dict['Toff']
+        PTDF         = self._ptdf_matrix
+        G            = self._generator_incidence_matrix
+        branch_limit = self._branch_limit
+        start_cost   = self.gencost[:, 1]
+        shut_cost    = self.gencost[:, 2]
+        Ru   = self.Ru;  Rd   = self.Rd
+        Ru_co= self.Ru_co; Rd_co= self.Rd_co
+
+        # 2. 重建 obj_opt（动态：使用当前 self.pg/x/coc 的违反量作为标量系数）
+        obj_opt = gp.LinExpr()
+
+        for t in range(self.T):
+            pb_viol = abs(sum(float(self.pg[sample_id, g, t]) for g in range(self.ng)) - np.sum(Pd[:, t]))
+            if pb_viol > 1e-10:
+                obj_opt += pb_viol * lam_pb_abs[t]
+            for g in range(self.ng):
+                pgl_v = abs(float(self.pg[sample_id,g,t]) - self.gen[g,PMIN]*float(self.x[sample_id,g,t]))
+                if pgl_v > 1e-10:
+                    obj_opt += pgl_v * lam_pgl[g,t]
+                pgu_v = abs(self.gen[g,PMAX]*float(self.x[sample_id,g,t]) - float(self.pg[sample_id,g,t]))
+                if pgu_v > 1e-10:
+                    obj_opt += pgu_v * lam_pgu[g,t]
+
+        for t in range(1, self.T):
+            for g in range(self.ng):
+                ru_v = abs(float(self.pg[sample_id,g,t]) - float(self.pg[sample_id,g,t-1])
+                           - (Ru[g]*float(self.x[sample_id,g,t-1]) + Ru_co[g]*(1-float(self.x[sample_id,g,t-1]))))
+                if ru_v > 1e-10:
+                    obj_opt += ru_v * lam_ru[g,t-1]
+                rd_v = abs(float(self.pg[sample_id,g,t-1]) - float(self.pg[sample_id,g,t])
+                           - (Rd[g]*float(self.x[sample_id,g,t]) + Rd_co[g]*(1-float(self.x[sample_id,g,t]))))
+                if rd_v > 1e-10:
+                    obj_opt += rd_v * lam_rd[g,t-1]
+
+        for g in range(self.ng):
+            for tau in range(1, Ton+1):
+                for t1 in range(self.T - tau):
+                    v = abs(float(self.x[sample_id,g,t1+1]) - float(self.x[sample_id,g,t1]) - float(self.x[sample_id,g,t1+tau]))
+                    if v > 1e-10:
+                        obj_opt += v * lam_mon[g,tau-1,t1]
+            for tau in range(1, Toff+1):
+                for t1 in range(self.T - tau):
+                    v = abs(-float(self.x[sample_id,g,t1+1]) + float(self.x[sample_id,g,t1]) - 1 + float(self.x[sample_id,g,t1+tau]))
+                    if v > 1e-10:
+                        obj_opt += v * lam_moff[g,tau-1,t1]
+
+        for t in range(1, self.T):
+            for g in range(self.ng):
+                coc_v = abs(float(self.coc[sample_id,g,t-1]))
+                if coc_v > 1e-10:
+                    obj_opt += coc_v * lam_coc[g,t-1]
+                sc_v = abs(float(self.coc[sample_id,g,t-1]) - start_cost[g]*(float(self.x[sample_id,g,t]) - float(self.x[sample_id,g,t-1])))
+                if sc_v > 1e-10:
+                    obj_opt += sc_v * lam_sc[g,t-1]
+                shc_v = abs(float(self.coc[sample_id,g,t-1]) - shut_cost[g]*(float(self.x[sample_id,g,t-1]) - float(self.x[sample_id,g,t])))
+                if shc_v > 1e-10:
+                    obj_opt += shc_v * lam_shc[g,t-1]
+
+        for t in range(self.T):
+            flow = PTDF @ (G @ np.array([float(self.pg[sample_id,g,t]) for g in range(self.ng)]) - Pd[:, t])
+            for l in range(self.branch.shape[0]):
+                dcu_v = abs(flow[l] - branch_limit[l])
+                dcl_v = abs(flow[l] + branch_limit[l])
+                if dcu_v > 1e-10:
+                    obj_opt += dcu_v * lam_dcu[l,t]
+                if dcl_v > 1e-10:
+                    obj_opt += dcl_v * lam_dcl[l,t]
+
+        for t in range(self.T):
+            for g in range(self.ng):
+                xl_v = abs(float(self.x[sample_id,g,t]))
+                if xl_v > 1e-10:
+                    obj_opt += xl_v * lam_xl[g,t]
+                xu_v = abs(float(self.x[sample_id,g,t]) - 1)
+                if xu_v > 1e-10:
+                    obj_opt += xu_v * lam_xu[g,t]
+
+        # theta/zeta obj_opt 项（用 self.x[s] 标量计算 lhs - rhs）
+        tv = theta_values or {}
+        zv = zeta_values or {}
+        if self.enable_theta_constraints and union_analysis and 'union_constraints' in union_analysis:
+            for ci in union_analysis['union_constraints']:
+                bid = ci['branch_id']
+                ts  = ci['time_slot']
+                rhs_name = self._theta_rhs_name(bid, ts)
+                rhs = float(tv.get(rhs_name, 1.0))
+                lhs = 0.0
+                for coeff_info in ci['nonzero_pg_coefficients']:
+                    uid  = coeff_info['unit_id']
+                    mt   = self._theta_member_time_index(ci, coeff_info)
+                    tname = self._theta_var_name(bid, uid, mt)
+                    theta = float(tv.get(tname, 0.0))
+                    lhs  += theta * float(self.x[sample_id, uid, mt])
+                para_abs = abs(lhs - rhs)
+                if para_abs > 1e-10:
+                    if bid < self.nl:
+                        obj_opt += para_abs * mu_abs[bid, ts]
+                    else:
+                        obj_opt += para_abs * getattr(self, 'dual_para_bound', 0.1)
+        if self.enable_zeta_constraints and union_analysis and 'union_zeta_constraints' in union_analysis:
+            for ci in union_analysis['union_zeta_constraints']:
+                uid  = ci['unit_id']
+                ts   = ci['time_slot']
+                rhs_name = f'zeta_rhs_unit_{uid}_time_{ts}'
+                rhs = float(zv.get(rhs_name, 1.0))
+                zname = f'zeta_unit_{uid}_time_{ts}'
+                zeta = float(zv.get(zname, 0.0))
+                lhs  = zeta * float(self.x[sample_id, uid, ts])
+                para_abs = abs(lhs - rhs)
+                if para_abs > 1e-10:
+                    obj_opt += para_abs * ita_abs[uid, ts]
+
+        # 3. Prox 项（QP）
+        obj_dual_prox = self._build_dual_block_prox_obj(
+            model, sample_id,
+            lam_pb, lam_pgl, lam_pgu, lam_ru, lam_rd,
+            lam_mon, lam_moff, lam_sc, lam_shc, lam_coc,
+            lam_dcu, lam_dcl, lam_xu, lam_xl,
+            mu, ita, Ton, Toff,
+        )
+
+        penal_mu  = 0 * mu_max
+        penal_ita = 0 * ita_max
+
+        model.setObjective(
+            self.rho_dual_pg  * vars_dict['obj_dual_pg']
+            + self.rho_dual_x  * vars_dict['obj_dual_x']
+            + self.rho_dual_coc* vars_dict['obj_dual_coc']
+            + self.rho_opt     * obj_opt
+            + self.dual_block_prox_weight * obj_dual_prox
+            + penal_mu + penal_ita,
+            GRB.MINIMIZE,
+        )
+
+    # ------------------------------------------------------------------
+
     def iter_with_dual_block(self, sample_id=0, theta_values=None, zeta_values=None, union_analysis=None):
         """
         迭代对偶块（完整实现，参考uc_dfsm_bcd.py）
         更新对偶变量lambda, mu, ita
         """
+        if self._lp_backend == LP_BACKEND_CVXPY_HIGHS:
+            return self._iter_with_dual_block_cvxpy_highs(sample_id, theta_values, zeta_values, union_analysis)
+
+        # 确定当前 floor / sign_relax 状态
+        dual_decay_round_ = self._current_dual_decay_round()
+        floor_active      = self.iter_number < dual_decay_round_
+        sign_relax_round  = self._is_dual_sign_relaxation_round()
+        current_state     = (floor_active, sign_relax_round)
+
+        # --- 复用或新建 persistent 模型 ---
+        union_id = id(union_analysis)
+        need_rebuild = (
+            sample_id not in self._dual_models
+            or self._dual_model_state.get(sample_id) != current_state
+            or self._dual_model_union_id.get(sample_id) != union_id
+        )
+        if need_rebuild:
+            if sample_id in self._dual_models:
+                try:
+                    self._dual_models[sample_id].dispose()
+                except Exception:
+                    pass
+            model, vars_dict = self._build_dual_model(
+                sample_id, union_analysis, floor_active, sign_relax_round)
+            self._dual_models[sample_id]      = model
+            self._dual_vars[sample_id]        = vars_dict
+            self._dual_model_state[sample_id] = current_state
+            self._dual_model_union_id[sample_id] = union_id
+        else:
+            model     = self._dual_models[sample_id]
+            vars_dict = self._dual_vars[sample_id]
+
+        # --- 每次迭代只更新目标函数（含 theta/zeta chgCoeff）---
+        self._update_dual_model_objective(
+            sample_id, model, vars_dict, theta_values, zeta_values, union_analysis)
+
+        model.optimize()
+
+        Ton  = vars_dict['Ton']
+        Toff = vars_dict['Toff']
+        lam_pb  = vars_dict['lambda_power_balance']
+        lam_pgl = vars_dict['lambda_pg_lower']
+        lam_pgu = vars_dict['lambda_pg_upper']
+        lam_ru  = vars_dict['lambda_ramp_up']
+        lam_rd  = vars_dict['lambda_ramp_down']
+        lam_mon = vars_dict['lambda_min_on']
+        lam_moff= vars_dict['lambda_min_off']
+        lam_sc  = vars_dict['lambda_start_cost']
+        lam_shc = vars_dict['lambda_shut_cost']
+        lam_coc = vars_dict['lambda_coc_nonneg']
+        lam_cp  = vars_dict['lambda_cpower']
+        lam_dcu = vars_dict['lambda_dcpf_upper']
+        lam_dcl = vars_dict['lambda_dcpf_lower']
+        lam_xu  = vars_dict['lambda_x_upper']
+        lam_xl  = vars_dict['lambda_x_lower']
+        mu      = vars_dict['mu']
+        ita     = vars_dict['ita']
+
+        Pd = self.active_set_data[sample_id]['pd_data']
+
+        if model.status == GRB.OPTIMAL:
+            lambda_sol = {
+                'lambda_power_balance': np.array([lam_pb[t].X  for t in range(self.T)]),
+                'lambda_pg_lower':      np.array([[lam_pgl[g,t].X  for t in range(self.T)]   for g in range(self.ng)]),
+                'lambda_pg_upper':      np.array([[lam_pgu[g,t].X  for t in range(self.T)]   for g in range(self.ng)]),
+                'lambda_ramp_up':       np.array([[lam_ru[g,t].X   for t in range(self.T-1)] for g in range(self.ng)]),
+                'lambda_ramp_down':     np.array([[lam_rd[g,t].X   for t in range(self.T-1)] for g in range(self.ng)]),
+                'lambda_min_on':        np.array([[[lam_mon[g,tau,t1].X for t1 in range(self.T)] for tau in range(Ton)]  for g in range(self.ng)]),
+                'lambda_min_off':       np.array([[[lam_moff[g,tau,t1].X for t1 in range(self.T)] for tau in range(Toff)] for g in range(self.ng)]),
+                'lambda_start_cost':    np.array([[lam_sc[g,t].X   for t in range(self.T-1)] for g in range(self.ng)]),
+                'lambda_shut_cost':     np.array([[lam_shc[g,t].X  for t in range(self.T-1)] for g in range(self.ng)]),
+                'lambda_coc_nonneg':    np.array([[lam_coc[g,t].X  for t in range(self.T-1)] for g in range(self.ng)]),
+                'lambda_cpower':        np.array([[lam_cp[g,t].X   for t in range(self.T)]   for g in range(self.ng)]),
+                'lambda_dcpf_upper':    np.array([[lam_dcu[l,t].X  for t in range(self.T)]   for l in range(self.nl)]),
+                'lambda_dcpf_lower':    np.array([[lam_dcl[l,t].X  for t in range(self.T)]   for l in range(self.nl)]),
+                'lambda_x_upper':       np.array([[lam_xu[g,t].X   for t in range(self.T)]   for g in range(self.ng)]),
+                'lambda_x_lower':       np.array([[lam_xl[g,t].X   for t in range(self.T)]   for g in range(self.ng)]),
+            }
+            mu_sol  = np.array([[mu[l,t].X   for t in range(self.T)] for l in range(self.nl)])
+            ita_sol = np.array([[ita[g,t].X  for t in range(self.T)] for g in range(self.ng)])
+
+            if sample_id <= 2:
+                obj_dual_v = (vars_dict['obj_dual_pg'].getValue()
+                              + vars_dict['obj_dual_x'].getValue()
+                              + vars_dict['obj_dual_coc'].getValue())
+                print(
+                    f"dual_block, sample_id: {sample_id}, obj_dual: {obj_dual_v:.4f}",
+                    flush=True,
+                )
+            return lambda_sol, mu_sol, ita_sol
+        else:
+            print(f"❌ 对偶块模型求解失败，状态: {model.status}", flush=True)
+            return None, None, None
+
+    def _iter_with_dual_block_original(self, sample_id=0, theta_values=None, zeta_values=None, union_analysis=None):
+        """保留原始实现以备参考（不再被主流程调用）。"""
+        if self._lp_backend == LP_BACKEND_CVXPY_HIGHS:
+            return self._iter_with_dual_block_cvxpy_highs(sample_id, theta_values, zeta_values, union_analysis)
         model = gp.Model('iter_with_dual_block')
-        model.Params.OutputFlag = 0 
+        model.Params.OutputFlag = 0
         Pd = self.active_set_data[sample_id]['pd_data']
         
         # 功率平衡约束的对偶变量（无符号限制）
@@ -3082,14 +4236,10 @@ class Agent_NN_BCD:
         penal_mu = penalty_factor * mu_max
         penal_ita = penalty_factor * ita_max
 
-        nb = Pd.shape[0]
-        G = np.zeros((nb, self.ng))
-        for g in range(self.ng):
-            bus_idx = int(self.gen[g, GEN_BUS])
-            if 0 <= bus_idx < nb:
-                G[bus_idx, g] = 1
-        PTDF = makePTDF(self.baseMVA, self.bus, self.branch)
-        branch_limit = self.branch[:, RATE_A]
+        G = self._generator_incidence_matrix
+        PTDF = self._ptdf_matrix
+        branch_limit = self._branch_limit
+        PTDF_G = self._ptdf_g
 
         Ru = self.Ru
         Rd = self.Rd
@@ -3118,7 +4268,7 @@ class Agent_NN_BCD:
                     dual_expr -= lambda_ramp_up[g, t]
                     dual_expr += lambda_ramp_down[g, t]
                 
-                ptdfg_col = (PTDF @ G[:, g]).T
+                ptdfg_col = PTDF_G[:, g]
                 for l in range(self.branch.shape[0]):
                     pg_coeff = ptdfg_col[l]
                     dual_expr += pg_coeff * (lambda_dcpf_upper[l, t] - lambda_dcpf_lower[l, t])
@@ -3313,10 +4463,7 @@ class Agent_NN_BCD:
         )
         model.setObjective(total_objective, GRB.MINIMIZE)
 
-        self._apply_fast_gurobi_tolerances(model, mip=True)
-        model.Params.Presolve = 0
-        model.Params.NumericFocus = 2
-        model.Params.ScaleFlag = 2
+        self._apply_fast_gurobi_tolerances(model, mip=False)
         model.optimize()
         
         if model.status == GRB.OPTIMAL:
@@ -3543,9 +4690,9 @@ class Agent_NN_BCD:
         gamma = self.gamma_base / (self.n_samples * max_iter)
 
         for i in range(max_iter):
-            print(f"🔄 迭代 {i+1}/{max_iter} 开始", flush=True)
             self.iter_number = i
             self._sync_parametric_direction_strategy_state()
+            print(f"[BCD] Iteration {i+1}/{max_iter}", flush=True)
             active_union_analysis, active_theta_stage = self._resolve_active_union_analysis(
                 i,
                 max_iter,
@@ -3582,7 +4729,8 @@ class Agent_NN_BCD:
                     union_analysis=active_union_analysis
                 )
                 if pg_sol is None:
-                    print("❌ PG块迭代失败，终止迭代", flush=True)
+                    print(f"[BCD] PG block failed for sample {sample_id}", flush=True)
+                    print("[BCD] Stopping after PG block failure", flush=True)
                     break
                 
                 # 数值过滤
@@ -3610,7 +4758,8 @@ class Agent_NN_BCD:
                     union_analysis=active_union_analysis
                 )
                 if lambda_sol is None or mu_sol is None:
-                    print("❌ 对偶块迭代失败，终止迭代", flush=True)
+                    print(f"[BCD] Dual block failed for sample {sample_id}", flush=True)
+                    print("[BCD] Stopping after dual block failure", flush=True)
                     break
                 
                 self.lambda_[sample_id] = lambda_sol
@@ -3683,14 +4832,16 @@ class Agent_NN_BCD:
                 learning_rate=nn_learning_rate,
             )
             if theta_values_new is None or zeta_values_new is None:
-                print("❌ Theta/Zeta神经网络更新失败，终止迭代", flush=True)
+                print("[BCD] Theta/Zeta neural update failed", flush=True)
+                print("[BCD] Stopping after Theta/Zeta neural update failure", flush=True)
                 break
             self.theta_values_list = theta_values_new
             self.zeta_values_list = zeta_values_new
             self.theta_values = self.theta_values_list[0]
             self.zeta_values = self.zeta_values_list[0]
+            print(f"[BCD] Iteration {i+1}/{max_iter} complete", flush=True)
             
-            print(f"✅ 迭代 {i+1}/{max_iter} 成功", flush=True)
+            print(f"[BCD] Iteration {i+1}/{max_iter} succeeded", flush=True)
             
             # 计算违反量（参考uc_dfsm_bcd.py）
             (
@@ -3727,6 +4878,12 @@ class Agent_NN_BCD:
             self.rho_dual_coc = min(self.rho_dual_coc + gamma_dual * obj_dual_coc, self.rho_max)
             self._sync_rho_dual_summary()
             self.rho_opt = min(self.rho_opt + gamma * obj_opt, self.rho_max)
+            print(
+                f"[BCD][rho] primal={self.rho_primal}, dual_pg={self.rho_dual_pg}, "
+                f"dual_x={self.rho_dual_x}, dual_coc={self.rho_dual_coc}, "
+                f"dual={self.rho_dual}, opt={self.rho_opt}",
+                flush=True,
+            )
             print(
                 f"当前惩罚参数: ρ_primal={self.rho_primal}, "
                 f"ρ_dual_pg={self.rho_dual_pg}, ρ_dual_x={self.rho_dual_x}, "
@@ -5007,6 +6164,7 @@ class Agent_NN_BCD:
         """
         Pd = self.active_set_data[sample_id]['pd_data']
         model = gp.Model('LP_without_theta')
+        self._apply_fast_gurobi_tolerances(model, mip=False)
         model.Params.OutputFlag = 0
         
         # 主要变量
@@ -5096,6 +6254,7 @@ class Agent_NN_BCD:
         
         Pd = self.active_set_data[sample_id]['pd_data']
         model = gp.Model('LP_with_theta')
+        self._apply_fast_gurobi_tolerances(model, mip=False)
         model.Params.OutputFlag = 0
         
         # 主要变量
@@ -5668,6 +6827,97 @@ class Agent_NN_BCD:
         else: plt.close()
     
     # ========================== 测试代码段 ==========================
+def _active_set_reader_load_all_samples_clean(self) -> List[Dict]:
+    all_samples_data = []
+    total_samples = self.get_total_samples_count()
+    raw_samples = self.data.get('all_samples', [])
+    has_dataset_renewable = any(
+        'renewable_data' in sample and np.any(np.abs(np.asarray(sample['renewable_data'], dtype=float)) > 1e-9)
+        for sample in raw_samples
+    )
+
+    print(f"[ActiveSet] Loading {total_samples} samples...", flush=True)
+
+    for sample_id in range(total_samples):
+        try:
+            sample = self.get_sample_data(sample_id)
+            if sample is None:
+                raise ValueError(f"Sample {sample_id} does not exist")
+            if not has_dataset_renewable:
+                sample = dict(sample)
+                sample.pop('renewable_data', None)
+            sample = normalize_sample_arrays(dict(sample))
+
+            active_constraints, active_variables, pd_data = self.extract_active_constraints_and_variables(sample_id)
+            unit_commitment = self.get_unit_commitment_matrix(sample_id)
+
+            sample_data = {
+                'sample_id': sample_id,
+                'active_constraints': active_constraints,
+                'active_variables': active_variables,
+                'pd_data': pd_data,
+                'load_data': np.array(sample.get('load_data', pd_data), dtype=float),
+                'unit_commitment_matrix': unit_commitment,
+            }
+            if has_dataset_renewable and 'renewable_data' in sample:
+                sample_data['renewable_data'] = np.array(sample['renewable_data'], dtype=float)
+            if sample and 'lambda' in sample:
+                sample_data['lambda'] = sample['lambda']
+
+            all_samples_data.append(sample_data)
+            if (sample_id + 1) % 10 == 0 or sample_id == total_samples - 1:
+                print(f"[ActiveSet] loaded_samples={sample_id + 1}/{total_samples}", flush=True)
+        except Exception as e:
+            print(f"[ActiveSet] sample {sample_id} failed to load: {e}", flush=True)
+            all_samples_data.append({
+                'sample_id': sample_id,
+                'active_constraints': [],
+                'active_variables': [],
+                'pd_data': np.array([]),
+                'load_data': np.array([]),
+                'renewable_data': np.array([]),
+                'unit_commitment_matrix': np.array([]),
+                'error': str(e),
+            })
+
+    print("[ActiveSet] Finished loading all samples", flush=True)
+    return all_samples_data
+
+
+ActiveSetReader.load_all_samples = _active_set_reader_load_all_samples_clean
+
+
+def load_active_set_from_json(json_filepath: str, sample_id: Optional[int] = None):
+    reader = ActiveSetReader(json_filepath)
+
+    if sample_id is not None:
+        active_constraints, active_variables, pd_data = reader.extract_active_constraints_and_variables(sample_id)
+        unit_commitment = reader.get_unit_commitment_matrix(sample_id)
+
+        print(f"[ActiveSet] Loaded sample {sample_id}", flush=True)
+        print(f"[ActiveSet] active_constraints={len(active_constraints)}", flush=True)
+        print(f"[ActiveSet] active_variables={len(active_variables)}", flush=True)
+        print(f"[ActiveSet] pd_shape={pd_data.shape}", flush=True)
+
+        sample_data = {
+            'sample_id': sample_id,
+            'active_constraints': active_constraints,
+            'active_variables': active_variables,
+            'pd_data': pd_data,
+            'unit_commitment_matrix': unit_commitment,
+            'single_sample': True,
+        }
+        sample = reader.get_sample_data(sample_id)
+        if sample and 'lambda' in sample:
+            sample_data['lambda'] = sample['lambda']
+        return sample_data
+
+    all_samples_data = reader.load_all_samples()
+    print("=== Loaded all active-set samples ===", flush=True)
+    print(f"[ActiveSet] total_samples={len(all_samples_data)}", flush=True)
+    return all_samples_data
+
+
 if __name__ == "__main__":
     if not PYPOWER_AVAILABLE:
         print("错误: pypower未安装，无法运行测试代码", flush=True)

@@ -1716,6 +1716,16 @@ class SubproblemSurrogateTrainer:
         # 初始化求解
         self._initialize_solve()
 
+        # ----- Persistent Gurobi model cache -----
+        # 每个样本只建一次模型，后续迭代通过 setObjective / chgCoeff 更新
+        self._primal_models: dict = {}           # sample_id -> gp.Model
+        self._primal_vars: dict = {}             # sample_id -> vars_dict
+        self._primal_model_n_coupling: dict = {} # sample_id -> num_coupling at build time
+
+        self._dual_sub_models: dict = {}         # sample_id -> gp.Model
+        self._dual_sub_vars: dict = {}           # sample_id -> vars_dict
+        self._dual_sub_model_state: dict = {}    # sample_id -> (lb, x_bound_dual_ub)
+
         # 迭代间输出差异正则：用于抑制 NN 输出在相邻 BCD 迭代间剧烈跳变
         self._prev_alpha_values = None
         self._prev_beta_values = None
@@ -1723,7 +1733,7 @@ class SubproblemSurrogateTrainer:
         self._prev_delta_values = None
         self._prev_cost_values = None
         self._prev_pg_cost_values = None
-        
+
         print(f"✓ 机组{unit_id}子问题代理约束训练器初始化完成", flush=True)
     
     def _get_lambda_values(self) -> np.ndarray:
@@ -2651,84 +2661,38 @@ class SubproblemSurrogateTrainer:
                     'lambda_x_lower':    np.zeros(self.T),
                 }
     
-    def iter_with_primal_block(
-        self,
-        sample_id: int,
-        alphas: np.ndarray,
-        betas: np.ndarray,
-        gammas: np.ndarray,
-        deltas: np.ndarray,
-        costs: np.ndarray = None,
-        pg_costs: np.ndarray = None,
-    ):
+    # ------------------------------------------------------------------
+    # Persistent primal-block model helpers
+    # ------------------------------------------------------------------
+
+    def _build_primal_model(self, sample_id: int, alphas, betas, gammas, deltas):
+        """一次性建立 primal 块 Gurobi 模型（变量 + 约束结构）。
+        耦合约束以初始 alpha/beta/gamma/delta 值建立，后续通过 chgCoeff 更新。
+        返回 (model, vars_dict, coupling_constr_refs)。
         """
-        BCD迭代：原始块 - V3三时段耦合约束版本
-        固定代理约束参数(alphas, betas, gammas, deltas)和对偶变量(mu)，更新原始变量(pg, x)
+        g    = self.unit_id
+        Pmin = self.gen[g, PMIN]
+        Pmax = self.gen[g, PMAX]
+        a    = self.gencost[g, -2] / self.T_delta
+        b    = self.gencost[g, -1] / self.T_delta
+        Ru   = float(self.Ru_all[g]); Rd   = float(self.Rd_all[g])
+        Ru_co= float(self.Ru_co_all[g]); Rd_co= float(self.Rd_co_all[g])
+        sc   = 0.0 if self.ignore_startup_shutdown_costs else self.gencost[g, 1]
+        shc  = 0.0 if self.ignore_startup_shutdown_costs else self.gencost[g, 2]
+        Ton  = min(4, self.T); Toff = min(4, self.T)
 
-        时序耦合约束形式（T-2个）:
-            alpha_t * x_t + beta_t * x_{t+1} + gamma_t * x_{t+2} <= delta_t  (t = 0..T-3)
-
-        目标函数（参考BCD软约束形式）:
-            min  rho_primal * Σ_{all} max(0, violation)   [原问题约束 + 耦合约束]
-                 + rho_opt    * Σ_{all} |violation| * dual  [互补松弛]
-                 + obj_binary
-
-        原问题约束均以软约束形式处理（violation变量），与BCD一致。
-        lambda_inherent 由 _initialize_solve 在初始化阶段从单机组LP提取，保证非None。
-        c_x / c_pg 均不入原始块目标；相关调整仅通过 dual block / 驻点损失传递。
-        """
-        g = self.unit_id
-        mu_vals = np.abs(self.mu[sample_id])   # (num_coupling_constraints,)
-        lam_inh = self.lambda_inherent[sample_id]  # dict，由 _initialize_solve 保证非None
-
-        alphas, betas, gammas, deltas = self._apply_surrogate_direction_to_params(
-            alphas,
-            betas,
-            gammas,
-            deltas,
-        )
-
-        Pmin    = self.gen[g, PMIN]
-        Pmax    = self.gen[g, PMAX]
-        a       = self.gencost[g, -2] / self.T_delta   # 线性发电成本系数
-        b       = self.gencost[g, -1] / self.T_delta   # 无负荷成本系数
-        Ru      = float(self.Ru_all[g])
-        Rd      = float(self.Rd_all[g])
-        Ru_co   = float(self.Ru_co_all[g])
-        Rd_co   = float(self.Rd_co_all[g])
-        sc      = 0.0 if self.ignore_startup_shutdown_costs else self.gencost[g, 1]
-        shc     = 0.0 if self.ignore_startup_shutdown_costs else self.gencost[g, 2]
-        Ton     = min(4, self.T)
-        Toff    = min(4, self.T)
-
-        if self._lp_backend == LP_BACKEND_CVXPY_HIGHS:
-            assert_lp_backend_available(self._lp_backend)
-            return solve_primal_block_backend(
-                self,
-                sample_id,
-                alphas,
-                betas,
-                gammas,
-                deltas,
-                costs=costs,
-                pg_costs=pg_costs,
-            )
-
-        model = gp.Model('primal_block_temporal')
+        model = gp.Model('primal_block')
         model.Params.OutputFlag = 0
 
-        # --- 决策变量 ---
-        pg     = model.addVars(self.T,   lb=0, name='pg')
+        pg     = model.addVars(self.T,   lb=0,      name='pg')
         x      = model.addVars(self.T,   lb=0, ub=1, name='x')
-        coc    = model.addVars(self.T-1, lb=0, name='coc')
-        cpower = model.addVars(self.T,   lb=0, name='cpower')
+        coc    = model.addVars(self.T-1, lb=0,      name='coc')
+        cpower = model.addVars(self.T,   lb=0,      name='cpower')
 
         x_true = self.active_set_data[sample_id].get('x_true', None)
         if x_true is None:
             x_true = self.x[sample_id]
-        x_binary_dev = model.addVars(self.T, lb=0, name='x_binary_dev')
-
-        # 原问题约束违反量/绝对值辅助变量（软约束形式）
+        x_binary_dev    = model.addVars(self.T,   lb=0, name='x_binary_dev')
         pg_lower_viol   = model.addVars(self.T,   lb=0, name='pg_lower_viol')
         pg_upper_viol   = model.addVars(self.T,   lb=0, name='pg_upper_viol')
         pg_lower_abs    = model.addVars(self.T,   lb=0, name='pg_lower_abs')
@@ -2745,144 +2709,542 @@ class SubproblemSurrogateTrainer:
         shut_cost_viol  = model.addVars(self.T-1, lb=0, name='shut_cost_viol')
         start_cost_abs  = model.addVars(self.T-1, lb=0, name='start_cost_abs')
         shut_cost_abs   = model.addVars(self.T-1, lb=0, name='shut_cost_abs')
-
-        # 代理耦合约束违反量/绝对值
-        surrogate_viols    = model.addVars(self.num_coupling_constraints, lb=0, name='surrogate_viol')
-        surrogate_abs_vals = model.addVars(self.num_coupling_constraints, lb=0, name='surrogate_abs')
+        surrogate_viols    = model.addVars(self.num_coupling_constraints, lb=0, name='surr_viol')
+        surrogate_abs_vals = model.addVars(self.num_coupling_constraints, lb=0, name='surr_abs')
 
         obj_primal = gp.LinExpr()
-        obj_opt    = gp.LinExpr()
         obj_binary = gp.LinExpr()
 
-        # --- x 偏差（硬约束，定义性）---
+        # x 偏差
         for t in range(self.T):
-            model.addConstr(x_binary_dev[t] >= x[t] - x_true[t], name=f'x_binary_dev_pos_{t}')
-            model.addConstr(x_binary_dev[t] >= x_true[t] - x[t], name=f'x_binary_dev_neg_{t}')
+            model.addConstr(x_binary_dev[t] >= x[t] - float(x_true[t]),  name=f'xdev_pos_{t}')
+            model.addConstr(x_binary_dev[t] >= float(x_true[t]) - x[t],  name=f'xdev_neg_{t}')
             obj_binary += x_binary_dev[t]
 
-        # --- 发电上下限（软约束）---
+        # 发电上下限
         for t in range(self.T):
-            pg_lower_expr = Pmin * x[t] - pg[t]
-            model.addConstr(pg_lower_viol[t] >= pg_lower_expr, name=f'pg_lower_viol_{t}')
-            model.addConstr(pg_lower_abs[t]  >= pg_lower_expr, name=f'pg_lower_abs1_{t}')
-            model.addConstr(pg_lower_abs[t]  >= -pg_lower_expr, name=f'pg_lower_abs2_{t}')
-            obj_primal += pg_lower_viol[t]
+            lo_e = Pmin * x[t] - pg[t]
+            up_e = pg[t] - Pmax * x[t]
+            model.addConstr(pg_lower_viol[t] >= lo_e,  name=f'pg_lo_v_{t}')
+            model.addConstr(pg_lower_abs[t]  >= lo_e,  name=f'pg_lo_a1_{t}')
+            model.addConstr(pg_lower_abs[t]  >= -lo_e, name=f'pg_lo_a2_{t}')
+            model.addConstr(pg_upper_viol[t] >= up_e,  name=f'pg_up_v_{t}')
+            model.addConstr(pg_upper_abs[t]  >= up_e,  name=f'pg_up_a1_{t}')
+            model.addConstr(pg_upper_abs[t]  >= -up_e, name=f'pg_up_a2_{t}')
+            obj_primal += pg_lower_viol[t] + pg_upper_viol[t]
 
-            pg_upper_expr = pg[t] - Pmax * x[t]
-            model.addConstr(pg_upper_viol[t] >= pg_upper_expr, name=f'pg_upper_viol_{t}')
-            model.addConstr(pg_upper_abs[t]  >= pg_upper_expr, name=f'pg_upper_abs1_{t}')
-            model.addConstr(pg_upper_abs[t]  >= -pg_upper_expr, name=f'pg_upper_abs2_{t}')
-            obj_primal += pg_upper_viol[t]
-
-            obj_opt += pg_lower_abs[t] * abs(float(lam_inh['lambda_pg_lower'][t]))
-            obj_opt += pg_upper_abs[t] * abs(float(lam_inh['lambda_pg_upper'][t]))
-            obj_opt += x[t]       * abs(float(lam_inh['lambda_x_lower'][t]))
-            obj_opt += (1 - x[t]) * abs(float(lam_inh['lambda_x_upper'][t]))
-
-        # --- 爬坡约束（软约束，Ru_co=0.3*Pmax 与 dual block 一致）---
+        # 爬坡约束
         for t in range(1, self.T):
-            ramp_up_expr = pg[t] - pg[t-1] - Ru * x[t-1] - Ru_co * (1 - x[t-1])
-            model.addConstr(ramp_up_viol[t-1] >= ramp_up_expr, name=f'ramp_up_viol_{t}')
-            model.addConstr(ramp_up_abs[t-1]  >= ramp_up_expr, name=f'ramp_up_abs1_{t}')
-            model.addConstr(ramp_up_abs[t-1]  >= -ramp_up_expr, name=f'ramp_up_abs2_{t}')
-            obj_primal += ramp_up_viol[t-1]
-            obj_opt += ramp_up_abs[t-1]   * abs(float(lam_inh['lambda_ramp_up'][t-1]))
+            ru_e = pg[t] - pg[t-1] - Ru*x[t-1] - Ru_co*(1-x[t-1])
+            rd_e = pg[t-1] - pg[t] - Rd*x[t] - Rd_co*(1-x[t])
+            model.addConstr(ramp_up_viol[t-1]  >= ru_e,  name=f'ru_v_{t}')
+            model.addConstr(ramp_up_abs[t-1]   >= ru_e,  name=f'ru_a1_{t}')
+            model.addConstr(ramp_up_abs[t-1]   >= -ru_e, name=f'ru_a2_{t}')
+            model.addConstr(ramp_down_viol[t-1] >= rd_e,  name=f'rd_v_{t}')
+            model.addConstr(ramp_down_abs[t-1]  >= rd_e,  name=f'rd_a1_{t}')
+            model.addConstr(ramp_down_abs[t-1]  >= -rd_e, name=f'rd_a2_{t}')
+            obj_primal += ramp_up_viol[t-1] + ramp_down_viol[t-1]
 
-            ramp_down_expr = pg[t-1] - pg[t] - Rd * x[t] - Rd_co * (1 - x[t])
-            model.addConstr(ramp_down_viol[t-1] >= ramp_down_expr, name=f'ramp_down_viol_{t}')
-            model.addConstr(ramp_down_abs[t-1]  >= ramp_down_expr, name=f'ramp_down_abs1_{t}')
-            model.addConstr(ramp_down_abs[t-1]  >= -ramp_down_expr, name=f'ramp_down_abs2_{t}')
-            obj_primal += ramp_down_viol[t-1]
-            obj_opt += ramp_down_abs[t-1] * abs(float(lam_inh['lambda_ramp_down'][t-1]))
-
-        # --- 最小开关机时间（软约束）---
+        # 最小开关机时间
         for tau in range(1, Ton+1):
             for t1 in range(self.T - tau):
-                min_on_expr = x[t1+1] - x[t1] - x[t1+tau]
-                model.addConstr(min_on_viol[tau-1, t1] >= min_on_expr, name=f'min_on_viol_{tau}_{t1}')
-                model.addConstr(min_on_abs[tau-1, t1]  >= min_on_expr, name=f'min_on_abs1_{tau}_{t1}')
-                model.addConstr(min_on_abs[tau-1, t1]  >= -min_on_expr, name=f'min_on_abs2_{tau}_{t1}')
+                e = x[t1+1] - x[t1] - x[t1+tau]
+                model.addConstr(min_on_viol[tau-1,t1] >= e,  name=f'mon_v_{tau}_{t1}')
+                model.addConstr(min_on_abs[tau-1,t1]  >= e,  name=f'mon_a1_{tau}_{t1}')
+                model.addConstr(min_on_abs[tau-1,t1]  >= -e, name=f'mon_a2_{tau}_{t1}')
                 obj_primal += min_on_viol[tau-1, t1]
-                obj_opt += min_on_abs[tau-1, t1] * abs(float(lam_inh['lambda_min_on'][tau-1][t1]))
-
         for tau in range(1, Toff+1):
             for t1 in range(self.T - tau):
-                min_off_expr = -x[t1+1] + x[t1] - (1 - x[t1+tau])
-                model.addConstr(min_off_viol[tau-1, t1] >= min_off_expr, name=f'min_off_viol_{tau}_{t1}')
-                model.addConstr(min_off_abs[tau-1, t1]  >= min_off_expr, name=f'min_off_abs1_{tau}_{t1}')
-                model.addConstr(min_off_abs[tau-1, t1]  >= -min_off_expr, name=f'min_off_abs2_{tau}_{t1}')
+                e = -x[t1+1] + x[t1] - (1 - x[t1+tau])
+                model.addConstr(min_off_viol[tau-1,t1] >= e,  name=f'moff_v_{tau}_{t1}')
+                model.addConstr(min_off_abs[tau-1,t1]  >= e,  name=f'moff_a1_{tau}_{t1}')
+                model.addConstr(min_off_abs[tau-1,t1]  >= -e, name=f'moff_a2_{tau}_{t1}')
                 obj_primal += min_off_viol[tau-1, t1]
-                obj_opt += min_off_abs[tau-1, t1] * abs(float(lam_inh['lambda_min_off'][tau-1][t1]))
 
-        # --- 启停成本（软约束）---
+        # 启停成本
         for t in range(1, self.T):
-            start_expr = sc * (x[t] - x[t-1]) - coc[t-1]
-            model.addConstr(start_cost_viol[t-1] >= start_expr, name=f'start_cost_viol_{t}')
-            model.addConstr(start_cost_abs[t-1]  >= start_expr, name=f'start_cost_abs1_{t}')
-            model.addConstr(start_cost_abs[t-1]  >= -start_expr, name=f'start_cost_abs2_{t}')
-            obj_primal += start_cost_viol[t-1]
-            obj_opt += start_cost_abs[t-1] * abs(float(lam_inh['lambda_start_cost'][t-1]))
+            sc_e  = sc  * (x[t] - x[t-1]) - coc[t-1]
+            shc_e = shc * (x[t-1] - x[t]) - coc[t-1]
+            model.addConstr(start_cost_viol[t-1] >= sc_e,   name=f'sc_v_{t}')
+            model.addConstr(start_cost_abs[t-1]  >= sc_e,   name=f'sc_a1_{t}')
+            model.addConstr(start_cost_abs[t-1]  >= -sc_e,  name=f'sc_a2_{t}')
+            model.addConstr(shut_cost_viol[t-1]  >= shc_e,  name=f'shc_v_{t}')
+            model.addConstr(shut_cost_abs[t-1]   >= shc_e,  name=f'shc_a1_{t}')
+            model.addConstr(shut_cost_abs[t-1]   >= -shc_e, name=f'shc_a2_{t}')
+            obj_primal += start_cost_viol[t-1] + shut_cost_viol[t-1]
 
-            shut_expr = shc * (x[t-1] - x[t]) - coc[t-1]
-            model.addConstr(shut_cost_viol[t-1] >= shut_expr, name=f'shut_cost_viol_{t}')
-            model.addConstr(shut_cost_abs[t-1]  >= shut_expr, name=f'shut_cost_abs1_{t}')
-            model.addConstr(shut_cost_abs[t-1]  >= -shut_expr, name=f'shut_cost_abs2_{t}')
-            obj_primal += shut_cost_viol[t-1]
+        # 发电成本定义
+        for t in range(self.T):
+            model.addConstr(cpower[t] == a*pg[t] + b*x[t], name=f'cpower_{t}')
+
+        # 代理耦合约束（以初始 alpha/beta/gamma/delta 建立，后续 chgCoeff 更新）
+        sensitive_t         = self.sensitive_timesteps[sample_id]
+        constraint_offsets  = self._constraint_offsets_for_sample(sample_id)
+        coupling_constr_refs = []  # list of {'c_viol', 'c_abs_pos', 'c_abs_neg', 'x_vars', 'offsets'}
+        for k, t_k in enumerate(sensitive_t):
+            off = constraint_offsets[k]
+            # 用初始参数值建立约束
+            lhs_init = build_surrogate_constraint_expression(
+                x, t_k, off, float(alphas[k]), float(betas[k]), float(gammas[k]), self.T)
+            rhs_init = float(deltas[k])
+            c_viol    = model.addConstr(surrogate_viols[k]    >= lhs_init - rhs_init, name=f'surr_viol_{k}')
+            c_abs_pos = model.addConstr(surrogate_abs_vals[k] >= lhs_init - rhs_init, name=f'surr_abs_pos_{k}')
+            c_abs_neg = model.addConstr(surrogate_abs_vals[k] >= rhs_init - lhs_init, name=f'surr_abs_neg_{k}')
+            # 记录约束中涉及的 x 变量及偏移，供 chgCoeff 使用
+            x_vars_with_offset = []
+            for dx, xv_var in [(0, x[t_k]), (1, x[t_k+1] if t_k+1 < self.T else None),
+                                (2, x[t_k+2] if t_k+2 < self.T else None)]:
+                coeff_name = ['alphas', 'betas', 'gammas'][dx]
+                if xv_var is not None:
+                    x_vars_with_offset.append((xv_var, dx))  # dx: 0=alpha, 1=beta, 2=gamma
+            coupling_constr_refs.append({
+                'c_viol': c_viol, 'c_abs_pos': c_abs_pos, 'c_abs_neg': c_abs_neg,
+                'x_vars': x_vars_with_offset,
+                't_k': t_k,
+            })
+            obj_primal += surrogate_viols[k]
+
+        model.update()
+
+        vars_dict = {
+            'pg': pg, 'x': x, 'coc': coc, 'cpower': cpower,
+            'x_binary_dev': x_binary_dev,
+            'pg_lower_abs': pg_lower_abs, 'pg_upper_abs': pg_upper_abs,
+            'ramp_up_abs': ramp_up_abs,   'ramp_down_abs': ramp_down_abs,
+            'min_on_abs': min_on_abs,     'min_off_abs': min_off_abs,
+            'start_cost_abs': start_cost_abs, 'shut_cost_abs': shut_cost_abs,
+            'surrogate_abs_vals': surrogate_abs_vals,
+            'obj_primal': obj_primal,
+            'obj_binary': obj_binary,
+            'Ton': Ton, 'Toff': Toff,
+            'coupling_constr_refs': coupling_constr_refs,
+            'sensitive_t': sensitive_t,
+        }
+        return model, vars_dict
+
+    def _update_primal_coupling_coefficients(self, model, vars_dict,
+                                              alphas, betas, gammas, deltas):
+        """通过 chgCoeff + RHS 更新耦合约束系数（每次 NN 更新后调用）。"""
+        refs = vars_dict['coupling_constr_refs']
+        for k, info in enumerate(refs):
+            coeffs = [float(alphas[k]), float(betas[k]), float(gammas[k])]
+            rhs    = float(deltas[k])
+            for x_var, dx in info['x_vars']:
+                c = coeffs[dx]
+                # lhs >= alpha*x_tk + beta*x_tk+1 + gamma*x_tk+2 - delta
+                # Ax >= b form: viol - alpha*x - beta*x1 - gamma*x2 >= -delta
+                model.chgCoeff(info['c_viol'],    x_var, -c)
+                model.chgCoeff(info['c_abs_pos'], x_var, -c)
+                model.chgCoeff(info['c_abs_neg'], x_var,  c)
+            info['c_viol'].RHS    = -rhs
+            info['c_abs_pos'].RHS = -rhs
+            info['c_abs_neg'].RHS =  rhs
+
+    def _update_primal_model_objective(self, sample_id: int, model, vars_dict,
+                                        alphas, betas, gammas, deltas):
+        """每次迭代：更新耦合约束系数，重建目标函数，调用 setObjective。"""
+        # 1. 更新耦合约束系数（chgCoeff）
+        self._update_primal_coupling_coefficients(model, vars_dict, alphas, betas, gammas, deltas)
+
+        pg  = vars_dict['pg']
+        x   = vars_dict['x']
+        coc = vars_dict['coc']
+        pg_lower_abs    = vars_dict['pg_lower_abs']
+        pg_upper_abs    = vars_dict['pg_upper_abs']
+        ramp_up_abs     = vars_dict['ramp_up_abs']
+        ramp_down_abs   = vars_dict['ramp_down_abs']
+        min_on_abs      = vars_dict['min_on_abs']
+        min_off_abs     = vars_dict['min_off_abs']
+        start_cost_abs  = vars_dict['start_cost_abs']
+        shut_cost_abs   = vars_dict['shut_cost_abs']
+        surr_abs        = vars_dict['surrogate_abs_vals']
+        Ton  = vars_dict['Ton']
+        Toff = vars_dict['Toff']
+        sensitive_t = vars_dict['sensitive_t']
+        lam_inh = self.lambda_inherent[sample_id]
+        mu_vals = np.abs(self.mu[sample_id])
+
+        # 2. 重建 obj_opt（动态对偶系数）
+        obj_opt = gp.LinExpr()
+        for t in range(self.T):
+            obj_opt += pg_lower_abs[t] * abs(float(lam_inh['lambda_pg_lower'][t]))
+            obj_opt += pg_upper_abs[t] * abs(float(lam_inh['lambda_pg_upper'][t]))
+            obj_opt += x[t]        * abs(float(lam_inh['lambda_x_lower'][t]))
+            obj_opt += (1 - x[t]) * abs(float(lam_inh['lambda_x_upper'][t]))
+        for t in range(1, self.T):
+            obj_opt += ramp_up_abs[t-1]   * abs(float(lam_inh['lambda_ramp_up'][t-1]))
+            obj_opt += ramp_down_abs[t-1] * abs(float(lam_inh['lambda_ramp_down'][t-1]))
+        for tau in range(1, Ton+1):
+            for t1 in range(self.T - tau):
+                obj_opt += min_on_abs[tau-1,t1] * abs(float(lam_inh['lambda_min_on'][tau-1][t1]))
+        for tau in range(1, Toff+1):
+            for t1 in range(self.T - tau):
+                obj_opt += min_off_abs[tau-1,t1] * abs(float(lam_inh['lambda_min_off'][tau-1][t1]))
+        for t in range(1, self.T):
+            obj_opt += start_cost_abs[t-1] * abs(float(lam_inh['lambda_start_cost'][t-1]))
             obj_opt += shut_cost_abs[t-1]  * abs(float(lam_inh['lambda_shut_cost'][t-1]))
             obj_opt += coc[t-1]            * abs(float(lam_inh['lambda_coc_nonneg'][t-1]))
+        # surrogate coupling obj_opt
+        for k in range(len(sensitive_t)):
+            obj_opt += surr_abs[k] * float(mu_vals[k])
 
-        # --- 发电成本定义（等式约束，lambda_cpower=1；成本不显式入目标，与BCD一致）---
-        for t in range(self.T):
-            model.addConstr(cpower[t] == a * pg[t] + b * x[t], name=f'cpower_{t}')
-
-        # --- 代理耦合约束（软约束，按 sensitive_timesteps 索引）---
-        sensitive_t = self.sensitive_timesteps[sample_id]
-        constraint_offsets = self._constraint_offsets_for_sample(sample_id)
-        for k, t in enumerate(sensitive_t):
-            coupling_lhs = build_surrogate_constraint_expression(
-                x,
-                t,
-                constraint_offsets[k],
-                alphas[k],
-                betas[k],
-                gammas[k],
-                self.T,
-            )
-            model.addConstr(surrogate_viols[k]    >= coupling_lhs - deltas[k], name=f'coupling_viol_{k}')
-            model.addConstr(surrogate_abs_vals[k] >= coupling_lhs - deltas[k], name=f'coupling_abs_pos_{k}')
-            model.addConstr(surrogate_abs_vals[k] >= deltas[k] - coupling_lhs, name=f'coupling_abs_neg_{k}')
-        obj_primal += gp.quicksum(surrogate_viols[k]    for k in range(len(sensitive_t)))
-        obj_opt    += gp.quicksum(surrogate_abs_vals[k] * mu_vals[k]
-                                  for k in range(len(sensitive_t)))
-
-        # --- 目标函数 ---
+        # 3. Prox
         obj_prox = self._build_primal_block_prox_obj(model, sample_id, pg, x, coc)
+
         model.setObjective(
-            self.rho_primal * obj_primal
-            + self.rho_opt  * obj_opt
-            + self.rho_binary * obj_binary
+            self.rho_primal  * vars_dict['obj_primal']
+            + self.rho_opt   * obj_opt
+            + self.rho_binary* vars_dict['obj_binary']
             + self.pg_block_prox_weight * obj_prox,
             GRB.MINIMIZE,
         )
+
+    # ------------------------------------------------------------------
+
+    def iter_with_primal_block(
+        self,
+        sample_id: int,
+        alphas: np.ndarray,
+        betas: np.ndarray,
+        gammas: np.ndarray,
+        deltas: np.ndarray,
+        costs: np.ndarray = None,
+        pg_costs: np.ndarray = None,
+    ):
+        """
+        BCD迭代：原始块 - V3三时段耦合约束版本（persistent model）
+        固定代理约束参数(alphas, betas, gammas, deltas)和对偶变量(mu)，更新原始变量(pg, x)
+        """
+        g = self.unit_id
+        alphas, betas, gammas, deltas = self._apply_surrogate_direction_to_params(
+            alphas, betas, gammas, deltas)
+
+        if self._lp_backend == LP_BACKEND_CVXPY_HIGHS:
+            assert_lp_backend_available(self._lp_backend)
+            return solve_primal_block_backend(
+                self, sample_id, alphas, betas, gammas, deltas,
+                costs=costs, pg_costs=pg_costs)
+
+        # 决定是否需要重建（仅首次，或敏感时段集合变化时）
+        n_coupling = len(self.sensitive_timesteps[sample_id])
+        need_rebuild = (
+            sample_id not in self._primal_models
+            or self._primal_model_n_coupling.get(sample_id) != n_coupling
+        )
+        if need_rebuild:
+            if sample_id in self._primal_models:
+                try:
+                    self._primal_models[sample_id].dispose()
+                except Exception:
+                    pass
+            model, vars_dict = self._build_primal_model(sample_id, alphas, betas, gammas, deltas)
+            self._primal_models[sample_id]         = model
+            self._primal_vars[sample_id]           = vars_dict
+            self._primal_model_n_coupling[sample_id] = n_coupling
+        else:
+            model     = self._primal_models[sample_id]
+            vars_dict = self._primal_vars[sample_id]
+
+        self._update_primal_model_objective(sample_id, model, vars_dict,
+                                            alphas, betas, gammas, deltas)
         model.optimize()
 
         if model.status == GRB.OPTIMAL:
+            pg  = vars_dict['pg']
+            x   = vars_dict['x']
+            coc = vars_dict['coc']
+            cp  = vars_dict['cpower']
             if sample_id <= 2:
                 print(f"primal_block, sample_id: {sample_id}, "
-                      f"obj_primal: {obj_primal.getValue():.4f}, "
-                      f"obj_opt: {obj_opt.getValue():.4f}, "
-                      f"obj_binary: {obj_binary.getValue():.4f}, "
-                      f"obj_prox: {obj_prox.getValue() if hasattr(obj_prox, 'getValue') else 0.0:.4f}", flush=True)
-
-            pg_sol     = np.array([pg[t].X     for t in range(self.T)])
-            x_sol      = np.array([x[t].X      for t in range(self.T)])
-            coc_sol    = np.array([coc[t].X    for t in range(self.T-1)])
-            cpower_sol = np.array([cpower[t].X for t in range(self.T)])
+                      f"obj_primal: {vars_dict['obj_primal'].getValue():.4f}, "
+                      f"obj_binary: {vars_dict['obj_binary'].getValue():.4f}", flush=True)
+            pg_sol     = np.array([pg[t].X  for t in range(self.T)])
+            x_sol      = np.array([x[t].X   for t in range(self.T)])
+            coc_sol    = np.array([coc[t].X for t in range(self.T-1)])
+            cpower_sol = np.array([cp[t].X  for t in range(self.T)])
             return pg_sol, x_sol, coc_sol, cpower_sol
         else:
             print(f"警告: 原始块求解失败，状态: {model.status}", flush=True)
             return None, None, None, None
     
+    # ------------------------------------------------------------------
+    # Persistent dual-subproblem model helpers
+    # ------------------------------------------------------------------
+
+    def _build_dual_sub_model(self, sample_id: int,
+                               alphas, betas, gammas, deltas,
+                               costs, pg_costs,
+                               lb, sign_relax_round, x_bound_dual_ub, phase):
+        """一次性建立 dual-sub 块 Gurobi 模型。
+        x 驻点约束中 mu 的 alpha/beta/gamma 系数以初始值建立，后续通过 chgCoeff 更新。
+        """
+        g = self.unit_id
+        a    = self.gencost[g, -2] / self.T_delta
+        b    = self.gencost[g, -1] / self.T_delta
+        Pmin = self.gen[g, PMIN]; Pmax = self.gen[g, PMAX]
+        Ru   = float(self.Ru_all[g]); Rd   = float(self.Rd_all[g])
+        Ru_co= float(self.Ru_co_all[g]); Rd_co= float(self.Rd_co_all[g])
+        start_cost = 0.0 if self.ignore_startup_shutdown_costs else self.gencost[g, 1]
+        shut_cost  = 0.0 if self.ignore_startup_shutdown_costs else self.gencost[g, 2]
+        Ton  = min(4, self.T); Toff = min(4, self.T)
+        lambda_val = self.lambda_vals[sample_id]
+
+        model = gp.Model('dual_sub_block')
+        model.Params.OutputFlag = 0
+        model.Params.NumericFocus = 2
+        model.Params.MIPGap = 1e-6
+
+        lam_pg_lower   = model.addVars(self.T,    lb=0, name='lam_pgl')
+        lam_pg_upper   = model.addVars(self.T,    lb=0, name='lam_pgu')
+        lam_ramp_up    = model.addVars(self.T-1,  lb=0, name='lam_ru')
+        lam_ramp_down  = model.addVars(self.T-1,  lb=0, name='lam_rd')
+        lam_start_cost = model.addVars(self.T-1,  lb=0, name='lam_sc')
+        lam_shut_cost  = model.addVars(self.T-1,  lb=0, name='lam_shc')
+        lam_coc_nonneg = model.addVars(self.T-1,  lb=0, name='lam_coc')
+        lam_x_upper    = model.addVars(self.T,    lb=0, ub=x_bound_dual_ub, name='lam_xu')
+        lam_x_lower    = model.addVars(self.T,    lb=0, ub=x_bound_dual_ub, name='lam_xl')
+        lam_min_on     = {}
+        lam_min_off    = {}
+        for tau in range(1, Ton+1):
+            for t1 in range(self.T - tau):
+                lam_min_on[tau-1, t1]  = model.addVar(lb=0, name=f'lam_mon_{tau-1}_{t1}')
+        for tau in range(1, Toff+1):
+            for t1 in range(self.T - tau):
+                lam_min_off[tau-1, t1] = model.addVar(lb=0, name=f'lam_moff_{tau-1}_{t1}')
+
+        mu_lb_val = -GRB.INFINITY if (phase != "none" and sign_relax_round) else 0.0
+        mu     = model.addVars(self.num_coupling_constraints, lb=mu_lb_val, name='mu')
+        mu_abs = model.addVars(self.num_coupling_constraints, lb=0,         name='mu_abs')
+        for k in range(self.num_coupling_constraints):
+            model.addConstr(mu_abs[k] >= mu[k],  name=f'mu_abs_pos_{k}')
+            model.addConstr(mu_abs[k] >= -mu[k], name=f'mu_abs_neg_{k}')
+            if phase == "individual" and lb > 0:
+                if sign_relax_round:
+                    model.addConstr(mu_abs[k] >= lb, name=f'mu_abs_lb_{k}')
+                else:
+                    model.addConstr(mu[k] >= lb, name=f'mu_lb_{k}')
+        if phase == "group" and lb > 0 and self._uses_group_mu_lower_bound():
+            for gi in range(self.num_coupling_constraints // self.all_mode_group_size):
+                gstart = gi * self.all_mode_group_size
+                gstop  = gstart + self.all_mode_group_size
+                model.addConstr(
+                    gp.quicksum((mu_abs[k] if sign_relax_round else mu[k])
+                                for k in range(gstart, gstop)) >= lb,
+                    name=f'mu_group_lb_{gi}',
+                )
+
+        obj_dual_pg  = gp.LinExpr()
+        obj_dual_x   = gp.LinExpr()
+        obj_dual_coc = gp.LinExpr()
+
+        # pg 驻点（完全静态系数）
+        for t in range(self.T):
+            expr = a + (float(pg_costs[t]) if pg_costs is not None else 0.0) - float(lambda_val[t])
+            expr -= lam_pg_lower[t]
+            expr += lam_pg_upper[t]
+            if t > 0:
+                expr += lam_ramp_up[t-1]
+                expr -= lam_ramp_down[t-1]
+            if t < self.T - 1:
+                expr -= lam_ramp_up[t]
+                expr += lam_ramp_down[t]
+            abs_v = model.addVar(lb=0, name=f'abs_pg_{t}')
+            model.addConstr(abs_v >= expr,  name=f'abs_pg_pos_{t}')
+            model.addConstr(abs_v >= -expr, name=f'abs_pg_neg_{t}')
+            obj_dual_pg += abs_v
+
+        # x 驻点（mu 的 alpha/beta/gamma 系数以初始值建立）
+        sensitive_t        = self.sensitive_timesteps[sample_id]
+        constraint_offsets = self._constraint_offsets_for_sample(sample_id)
+        dual_x_mu_terms    = {}  # t -> [(c_pos, c_neg, mu[k], k, coeff_key)]
+        for t in range(self.T):
+            expr = b + (float(costs[t]) if costs is not None else 0.0)
+            expr += Pmin * lam_pg_lower[t]
+            expr -= Pmax * lam_pg_upper[t]
+            if t < self.T - 1:
+                expr += (Ru_co - Ru) * lam_ramp_up[t]
+            if t > 0:
+                expr += (Rd_co - Rd) * lam_ramp_down[t-1]
+            for tau in range(1, Ton+1):
+                for t1 in range(self.T - tau):
+                    k = lam_min_on[tau-1, t1]
+                    if t == t1+1:   expr += k
+                    if t == t1:     expr -= k
+                    if t == t1+tau: expr -= k
+            for tau in range(1, Toff+1):
+                for t1 in range(self.T - tau):
+                    k = lam_min_off[tau-1, t1]
+                    if t == t1+1:   expr -= k
+                    if t == t1:     expr += k
+                    if t == t1+tau: expr += k
+            if t > 0:
+                expr += start_cost * lam_start_cost[t-1]
+                expr -= shut_cost  * lam_shut_cost[t-1]
+            if t < self.T - 1:
+                expr -= start_cost * lam_start_cost[t]
+                expr += shut_cost  * lam_shut_cost[t]
+
+            # 代理约束 mu 贡献（以初始值建立，后续 chgCoeff 更新）
+            mu_terms_t = []
+            for k_idx, ts in enumerate(sensitive_t):
+                for time_idx, coeff in iterate_surrogate_constraint_terms(
+                        ts, constraint_offsets[k_idx],
+                        float(alphas[k_idx]), float(betas[k_idx]), float(gammas[k_idx]), self.T):
+                    if time_idx == t:
+                        expr += coeff * mu[k_idx]
+
+            expr += lam_x_upper[t] - lam_x_lower[t]
+
+            abs_v = model.addVar(lb=0, name=f'abs_x_{t}')
+            c_pos = model.addConstr(abs_v >= expr,  name=f'abs_x_pos_{t}')
+            c_neg = model.addConstr(abs_v >= -expr, name=f'abs_x_neg_{t}')
+            obj_dual_x += abs_v
+
+            # 记录各 mu 项（用于后续 chgCoeff）
+            for k_idx, ts in enumerate(sensitive_t):
+                for time_idx, coeff in iterate_surrogate_constraint_terms(
+                        ts, constraint_offsets[k_idx],
+                        float(alphas[k_idx]), float(betas[k_idx]), float(gammas[k_idx]), self.T):
+                    if time_idx == t:
+                        mu_terms_t.append((c_pos, c_neg, mu[k_idx], k_idx,
+                                           ts, constraint_offsets[k_idx]))
+            if mu_terms_t:
+                dual_x_mu_terms[t] = mu_terms_t
+
+        # coc 驻点（完全静态）
+        for t in range(self.T-1):
+            expr = 1 - lam_start_cost[t] - lam_shut_cost[t] - lam_coc_nonneg[t]
+            abs_v = model.addVar(lb=0, name=f'abs_coc_{t}')
+            model.addConstr(abs_v >= expr,  name=f'abs_coc_pos_{t}')
+            model.addConstr(abs_v >= -expr, name=f'abs_coc_neg_{t}')
+            obj_dual_coc += abs_v
+
+        model.update()
+
+        vars_dict = {
+            'lam_pg_lower': lam_pg_lower, 'lam_pg_upper': lam_pg_upper,
+            'lam_ramp_up': lam_ramp_up,   'lam_ramp_down': lam_ramp_down,
+            'lam_start_cost': lam_start_cost, 'lam_shut_cost': lam_shut_cost,
+            'lam_coc_nonneg': lam_coc_nonneg,
+            'lam_x_upper': lam_x_upper, 'lam_x_lower': lam_x_lower,
+            'lam_min_on': lam_min_on, 'lam_min_off': lam_min_off,
+            'mu': mu, 'mu_abs': mu_abs,
+            'obj_dual_pg': obj_dual_pg, 'obj_dual_x': obj_dual_x, 'obj_dual_coc': obj_dual_coc,
+            'Ton': Ton, 'Toff': Toff,
+            'dual_x_mu_terms': dual_x_mu_terms,
+            'sensitive_t': sensitive_t,
+            'constraint_offsets': constraint_offsets,
+        }
+        return model, vars_dict
+
+    def _apply_dual_sub_mu_chgcoeff(self, model, vars_dict, alphas, betas, gammas):
+        """通过 chgCoeff 更新 x 驻点约束中 mu 的 alpha/beta/gamma 系数。"""
+        sensitive_t        = vars_dict['sensitive_t']
+        constraint_offsets = vars_dict['constraint_offsets']
+        mu                 = vars_dict['mu']
+        dual_x_mu_terms    = vars_dict['dual_x_mu_terms']
+
+        for t, mu_terms_t in dual_x_mu_terms.items():
+            for c_pos, c_neg, mu_var, k_idx, ts, off in mu_terms_t:
+                # Recompute the coefficient for this (t, k) using new alphas/betas/gammas
+                new_coeff = 0.0
+                for time_idx, coeff in iterate_surrogate_constraint_terms(
+                        ts, off,
+                        float(alphas[k_idx]), float(betas[k_idx]), float(gammas[k_idx]), self.T):
+                    if time_idx == t:
+                        new_coeff = coeff
+                        break
+                # abs_v >= expr + new_coeff*mu  →  abs_v - expr - new_coeff*mu >= 0
+                model.chgCoeff(c_pos, mu_var, -new_coeff)
+                model.chgCoeff(c_neg, mu_var,  new_coeff)
+
+    def _update_dual_sub_model_objective(self, sample_id: int, model, vars_dict,
+                                          alphas, betas, gammas, deltas,
+                                          costs=None, pg_costs=None):
+        """每次迭代：更新 mu 驻点系数，重建 obj_opt + prox，调用 setObjective。"""
+        # 1. 更新 x 驻点约束中 mu 的系数
+        self._apply_dual_sub_mu_chgcoeff(model, vars_dict, alphas, betas, gammas)
+
+        g = self.unit_id
+        pg_val  = self.pg[sample_id]
+        x_val   = self.x[sample_id]
+        coc_val = self.coc[sample_id]
+        Pmin = self.gen[g, PMIN]; Pmax = self.gen[g, PMAX]
+        Ru   = float(self.Ru_all[g]); Rd   = float(self.Rd_all[g])
+        Ru_co= float(self.Ru_co_all[g]); Rd_co= float(self.Rd_co_all[g])
+        start_cost = 0.0 if self.ignore_startup_shutdown_costs else self.gencost[g, 1]
+        shut_cost  = 0.0 if self.ignore_startup_shutdown_costs else self.gencost[g, 2]
+        Ton  = vars_dict['Ton']; Toff = vars_dict['Toff']
+        sensitive_t        = vars_dict['sensitive_t']
+        constraint_offsets = vars_dict['constraint_offsets']
+        lam_pgl   = vars_dict['lam_pg_lower']; lam_pgu = vars_dict['lam_pg_upper']
+        lam_ru    = vars_dict['lam_ramp_up'];  lam_rd  = vars_dict['lam_ramp_down']
+        lam_sc    = vars_dict['lam_start_cost']; lam_shc = vars_dict['lam_shut_cost']
+        lam_coc   = vars_dict['lam_coc_nonneg']
+        lam_xu    = vars_dict['lam_x_upper'];  lam_xl  = vars_dict['lam_x_lower']
+        lam_mon   = vars_dict['lam_min_on'];   lam_moff= vars_dict['lam_min_off']
+        mu        = vars_dict['mu']; mu_abs = vars_dict['mu_abs']
+
+        # 2. 重建 obj_opt（动态标量系数）
+        obj_opt = gp.LinExpr()
+        for t in range(self.T):
+            pgl_v = abs(pg_val[t] - Pmin * x_val[t])
+            if pgl_v > 1e-10: obj_opt += pgl_v * lam_pgl[t]
+            pgu_v = abs(Pmax * x_val[t] - pg_val[t])
+            if pgu_v > 1e-10: obj_opt += pgu_v * lam_pgu[t]
+        for t in range(1, self.T):
+            limit_u = Ru*x_val[t-1] + Ru_co*(1-x_val[t-1])
+            rv_u = abs(pg_val[t] - pg_val[t-1] - limit_u)
+            if rv_u > 1e-10: obj_opt += rv_u * lam_ru[t-1]
+            limit_d = Rd*x_val[t] + Rd_co*(1-x_val[t])
+            rv_d = abs(pg_val[t-1] - pg_val[t] - limit_d)
+            if rv_d > 1e-10: obj_opt += rv_d * lam_rd[t-1]
+        for tau in range(1, Ton+1):
+            for t1 in range(self.T - tau):
+                v = abs(x_val[t1+1] - x_val[t1] - x_val[t1+tau])
+                if v > 1e-10: obj_opt += v * lam_mon[tau-1, t1]
+        for tau in range(1, Toff+1):
+            for t1 in range(self.T - tau):
+                v = abs(-x_val[t1+1] + x_val[t1] - 1 + x_val[t1+tau])
+                if v > 1e-10: obj_opt += v * lam_moff[tau-1, t1]
+        for t in range(self.T-1):
+            sc_v  = abs(coc_val[t] - start_cost*(x_val[t+1] - x_val[t]))
+            shc_v = abs(coc_val[t] - shut_cost*(x_val[t] - x_val[t+1]))
+            coc_v = abs(coc_val[t])
+            if sc_v  > 1e-10: obj_opt += sc_v  * lam_sc[t]
+            if shc_v > 1e-10: obj_opt += shc_v * lam_shc[t]
+            if coc_v > 1e-10: obj_opt += coc_v * lam_coc[t]
+        for t in range(self.T):
+            xl_v = abs(x_val[t])
+            xu_v = abs(x_val[t] - 1)
+            if xl_v > 1e-10: obj_opt += xl_v * lam_xl[t]
+            if xu_v > 1e-10: obj_opt += xu_v * lam_xu[t]
+        for k_idx, ts in enumerate(sensitive_t):
+            lhs = build_surrogate_constraint_expression(
+                x_val, ts, constraint_offsets[k_idx],
+                float(alphas[k_idx]), float(betas[k_idx]), float(gammas[k_idx]), self.T)
+            viol = abs(lhs - float(deltas[k_idx]))
+            if viol > 1e-10:
+                obj_opt += viol * mu_abs[k_idx]
+
+        # 3. Prox
+        obj_dual_prox = self._build_dual_block_prox_obj(
+            model, sample_id,
+            lam_pgl, lam_pgu, lam_ru, lam_rd, lam_sc, lam_shc, lam_coc,
+            lam_xu, lam_xl, lam_mon, lam_moff, mu, Ton, Toff,
+        )
+
+        model.setObjective(
+            self.rho_dual_pg  * vars_dict['obj_dual_pg']
+            + self.rho_dual_x  * vars_dict['obj_dual_x']
+            + self.rho_dual_coc* vars_dict['obj_dual_coc']
+            + self.rho_opt     * obj_opt
+            + self.dual_block_prox_weight * obj_dual_prox,
+            GRB.MINIMIZE,
+        )
+
+    # ------------------------------------------------------------------
+
     def iter_with_dual_block(
         self,
         sample_id: int,
@@ -2894,67 +3256,117 @@ class SubproblemSurrogateTrainer:
         pg_costs: np.ndarray = None,
     ):
         """
-        BCD迭代：对偶块 - V3三时段耦合约束完整版本
-        固定原始变量(pg, x, coc)和代理约束参数，联合更新所有对偶变量：
-          - 固有约束对偶变量 (lambda_pg_lower/upper, lambda_ramp_up/down,
-            lambda_min_on/off, lambda_start/shut_cost, lambda_coc_nonneg,
-            lambda_x_upper/lower)
-          - 代理耦合约束对偶变量 (mu)
-
-        目标：
-            min  rho_dual * obj_dual + rho_opt * obj_opt
-
-        obj_dual = Σ KKT驻点条件违反量（对 pg, x, coc 变量）
-        obj_opt  = Σ 约束违反量 * 对应对偶变量（互补松弛条件）
-
-        Returns:
-            lambda_inherent_sol: dict，固有约束对偶变量
-            mu_sol: (num_coupling_constraints,) 代理耦合对偶变量
+        BCD迭代：对偶块 - V3三时段耦合约束完整版本（persistent model）
+        固定原始变量(pg, x, coc)和代理约束参数，联合更新所有对偶变量。
         """
         g = self.unit_id
-        pg_val  = self.pg[sample_id]    # (T,)
-        x_val   = self.x[sample_id]     # (T,)
-        coc_val = self.coc[sample_id]   # (T-1,)
-        lambda_val = self.lambda_vals[sample_id]  # (T,)  电价对偶变量（外部给定）
 
-        # 机组参数
-        a    = self.gencost[g, -2] / self.T_delta   # 线性发电成本系数
-        b    = self.gencost[g, -1] / self.T_delta   # 无负荷成本系数
-        Pmin = self.gen[g, PMIN]
-        Pmax = self.gen[g, PMAX]
-        Ru    = float(self.Ru_all[g])
-        Rd    = float(self.Rd_all[g])
-        Ru_co = float(self.Ru_co_all[g])
-        Rd_co = float(self.Rd_co_all[g])
-        start_cost = 0.0 if self.ignore_startup_shutdown_costs else self.gencost[g, 1]
-        shut_cost  = 0.0 if self.ignore_startup_shutdown_costs else self.gencost[g, 2]
-        Ton  = min(4, self.T)
-        Toff = min(4, self.T)
-
-        phase = self._get_mu_lower_bound_phase()
-        lb = self._current_mu_lower_bound_value()
+        phase            = self._get_mu_lower_bound_phase()
+        lb               = self._current_mu_lower_bound_value()
         sign_relax_round = self._is_mu_sign_relaxation_round()
-        direction_signs = self._get_surrogate_direction_signs()
+        x_bound_dual_ub  = 0.0 if self._force_zero_x_bound_duals() else GRB.INFINITY
         alphas, betas, gammas, deltas = self._apply_surrogate_direction_to_params(
-            alphas,
-            betas,
-            gammas,
-            deltas,
-        )
+            alphas, betas, gammas, deltas)
 
         if self._lp_backend == LP_BACKEND_CVXPY_HIGHS:
             assert_lp_backend_available(self._lp_backend)
             return solve_dual_block_backend(
-                self,
-                sample_id,
-                alphas,
-                betas,
-                gammas,
-                deltas,
-                costs=costs,
-                pg_costs=pg_costs,
-            )
+                self, sample_id, alphas, betas, gammas, deltas,
+                costs=costs, pg_costs=pg_costs)
 
+        current_state = (lb, sign_relax_round, x_bound_dual_ub,
+                         len(self.sensitive_timesteps[sample_id]))
+        need_rebuild = (
+            sample_id not in self._dual_sub_models
+            or self._dual_sub_model_state.get(sample_id) != current_state
+        )
+        if need_rebuild:
+            if sample_id in self._dual_sub_models:
+                try:
+                    self._dual_sub_models[sample_id].dispose()
+                except Exception:
+                    pass
+            model, vars_dict = self._build_dual_sub_model(
+                sample_id, alphas, betas, gammas, deltas,
+                costs, pg_costs, lb, sign_relax_round, x_bound_dual_ub, phase)
+            self._dual_sub_models[sample_id]      = model
+            self._dual_sub_vars[sample_id]        = vars_dict
+            self._dual_sub_model_state[sample_id] = current_state
+        else:
+            model     = self._dual_sub_models[sample_id]
+            vars_dict = self._dual_sub_vars[sample_id]
+
+        self._update_dual_sub_model_objective(
+            sample_id, model, vars_dict, alphas, betas, gammas, deltas,
+            costs=costs, pg_costs=pg_costs)
+        model.optimize()
+
+        Ton  = vars_dict['Ton']
+        Toff = vars_dict['Toff']
+        lam_pgl  = vars_dict['lam_pg_lower']; lam_pgu = vars_dict['lam_pg_upper']
+        lam_ru   = vars_dict['lam_ramp_up'];  lam_rd  = vars_dict['lam_ramp_down']
+        lam_sc   = vars_dict['lam_start_cost']; lam_shc = vars_dict['lam_shut_cost']
+        lam_coc  = vars_dict['lam_coc_nonneg']
+        lam_xu   = vars_dict['lam_x_upper'];  lam_xl  = vars_dict['lam_x_lower']
+        lam_mon  = vars_dict['lam_min_on'];   lam_moff= vars_dict['lam_min_off']
+        mu       = vars_dict['mu']
+
+        if model.status == GRB.OPTIMAL:
+            lambda_inherent_sol = {
+                'lambda_pg_lower':   np.array([lam_pgl[t].X  for t in range(self.T)]),
+                'lambda_pg_upper':   np.array([lam_pgu[t].X  for t in range(self.T)]),
+                'lambda_ramp_up':    np.array([lam_ru[t].X   for t in range(self.T-1)]),
+                'lambda_ramp_down':  np.array([lam_rd[t].X   for t in range(self.T-1)]),
+                'lambda_min_on':     np.array([[lam_mon[tau-1, t1].X
+                                                for t1 in range(self.T - tau)]
+                                               for tau in range(1, Ton+1)], dtype=object),
+                'lambda_min_off':    np.array([[lam_moff[tau-1, t1].X
+                                                for t1 in range(self.T - tau)]
+                                               for tau in range(1, Toff+1)], dtype=object),
+                'lambda_start_cost': np.array([lam_sc[t].X   for t in range(self.T-1)]),
+                'lambda_shut_cost':  np.array([lam_shc[t].X  for t in range(self.T-1)]),
+                'lambda_coc_nonneg': np.array([lam_coc[t].X  for t in range(self.T-1)]),
+                'lambda_x_upper':    np.array([lam_xu[t].X   for t in range(self.T)]),
+                'lambda_x_lower':    np.array([lam_xl[t].X   for t in range(self.T)]),
+            }
+            mu_sol = np.array([mu[k].X for k in range(self.num_coupling_constraints)])
+
+            if self.unit_id < 3 and sample_id <= 2:
+                obj_dual_v = (vars_dict['obj_dual_pg'].getValue()
+                              + vars_dict['obj_dual_x'].getValue()
+                              + vars_dict['obj_dual_coc'].getValue())
+                print(
+                    f"[Unit-{self.unit_id}] dual_block, sample_id: {sample_id}, "
+                    f"obj_dual: {obj_dual_v:.6f}",
+                    flush=True,
+                )
+            return lambda_inherent_sol, mu_sol
+        else:
+            print(f"警告: 对偶块求解失败 sample={sample_id}，状态: {model.status}", flush=True)
+            return None, None
+
+    def _iter_with_dual_block_original(self, sample_id: int,
+                                        alphas, betas, gammas, deltas,
+                                        costs=None, pg_costs=None):
+        """保留原始实现以备参考（不再被主流程调用）。"""
+        g = self.unit_id
+        pg_val  = self.pg[sample_id]
+        x_val   = self.x[sample_id]
+        coc_val = self.coc[sample_id]
+        lambda_val = self.lambda_vals[sample_id]
+        a    = self.gencost[g, -2] / self.T_delta
+        b    = self.gencost[g, -1] / self.T_delta
+        Pmin = self.gen[g, PMIN]; Pmax = self.gen[g, PMAX]
+        Ru   = float(self.Ru_all[g]); Rd   = float(self.Rd_all[g])
+        Ru_co= float(self.Ru_co_all[g]); Rd_co= float(self.Rd_co_all[g])
+        start_cost = 0.0 if self.ignore_startup_shutdown_costs else self.gencost[g, 1]
+        shut_cost  = 0.0 if self.ignore_startup_shutdown_costs else self.gencost[g, 2]
+        Ton  = min(4, self.T); Toff = min(4, self.T)
+        phase            = self._get_mu_lower_bound_phase()
+        lb               = self._current_mu_lower_bound_value()
+        sign_relax_round = self._is_mu_sign_relaxation_round()
+        alphas, betas, gammas, deltas = self._apply_surrogate_direction_to_params(
+            alphas, betas, gammas, deltas)
         model = gp.Model('dual_block_v3')
         model.Params.OutputFlag = 0
         model.Params.NumericFocus = 2

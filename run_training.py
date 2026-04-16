@@ -129,6 +129,8 @@ N_WORKERS_UNIT = 1
 N_WORKERS_SAMPLE = min(6, LOCAL_CPU_COUNT, max(2, LOCAL_CPU_COUNT // 2))
 # 兼容旧变量名（历史配置仍可用）
 N_WORKERS_SUBPROBLEM = N_WORKERS_SAMPLE
+BCD_LP_BACKEND = 'gurobi'   # 'gurobi' / 'cvxpy_highs'
+BCD_GUROBI_THREADS = None   # None = let agent decide / backend default
 SUBPROBLEM_LP_BACKEND = 'cvxpy_highs'   # 'gurobi' / 'cvxpy_highs'
 SUBPROBLEM_SOLVER_BIN_PREPEND = None
 JOINT_MAX_ITER = 10
@@ -293,7 +295,18 @@ if RUN_FP:
 
 # ──────────────────────── 工具函数 / 辅助函数 ────────────────────────
 
+def _looks_mojibake(msg: object) -> bool:
+    text = str(msg)
+    mojibake_markers = ("æ", "ç", "é", "è", "å", "œ", "Ž", "ˆ", "™", "€", "‚")
+    return any(marker in text for marker in mojibake_markers)
+
+
 def log(msg):
+    msg = str(msg)
+    if not msg.isascii():
+        return
+    if _looks_mojibake(msg):
+        return
     ts = datetime.now().strftime("%H:%M:%S")
     print(f"[{ts}] {msg}", flush=True)
 
@@ -415,6 +428,8 @@ def resolve_existing_path(path_value: str | None, label: str) -> Path | None:
 
 def create_bcd_agent(ppc, all_samples, T_DELTA, *,
                      n_workers: int = 4,
+                     lp_backend: str = 'gurobi',
+                     gurobi_threads: int | None = None,
                      external_sparse_templates=None,
                      lambda_init_strategy: str = 'lp_relaxation',
                      max_theta_constraints_per_time_slot: int = 10,
@@ -453,6 +468,8 @@ def create_bcd_agent(ppc, all_samples, T_DELTA, *,
         n_workers = 1
 
     agent_kwargs = dict(
+        lp_backend=lp_backend,
+        gurobi_threads=gurobi_threads,
         lambda_init_strategy=lambda_init_strategy,
         max_theta_constraints_per_time_slot=max_theta_constraints_per_time_slot,
         theta_hot_start_strategy=theta_hot_start_strategy,
@@ -1018,6 +1035,8 @@ def print_surrogate_results(trainers, all_samples):
 def run_bcd(ppc, all_samples: list, T_DELTA, MAX_ITER, bcd_model_dir,
             case_name: str = 'case', timestamp: str = '', n_workers: int = 4, NN_EPOCHS: int = 10, DUAL_DECAY_ROUND: int = 10,
             DUAL_SIGN_RELAX_INTERVAL: int | None = None,
+            lp_backend: str = 'gurobi',
+            gurobi_threads: int | None = None,
             logger: 'TrainingLogger | None' = None,
             load_model_path: str | None = None,
             restore_rho_from_checkpoint: bool = False,
@@ -1056,6 +1075,8 @@ def run_bcd(ppc, all_samples: list, T_DELTA, MAX_ITER, bcd_model_dir,
             pg_block_prox_weight: float = BCD_PG_BLOCK_PROX_WEIGHT,
             dual_block_prox_weight: float = BCD_DUAL_BLOCK_PROX_WEIGHT):
     ensure_bcd_modules_imported()
+    log("Mode: main-problem BCD training (Agent_NN_BCD)")
+    log(f"Using {len(all_samples)} samples")
     """BCD 主代理训练（样本级并行），返回 ParallelAgent_NN_BCD 实例。"""
     log("模式: BCD 主代理训练（Agent_NN_BCD）")
     log(f"使用 {len(all_samples)} 个样本")
@@ -1087,26 +1108,43 @@ def run_bcd(ppc, all_samples: list, T_DELTA, MAX_ITER, bcd_model_dir,
         f"bcd_prox: pg_block={pg_block_prox_weight}, "
         f"dual_block={dual_block_prox_weight}"
     )
+    log(
+        f"bcd_schedule: max_iter={MAX_ITER}, nn_epochs_per_iter={NN_EPOCHS}, "
+        f"total_nn_epochs={MAX_ITER * NN_EPOCHS}"
+    )
+    log(
+        f"bcd_solver: lp_backend={lp_backend}, n_workers={n_workers}, "
+        f"gurobi_threads={gurobi_threads}"
+    )
     if theta_training_stages:
         log(f"theta staged training: {theta_training_stages}")
+    if n_workers <= 1:
+        log(f"Initializing serial Agent_NN_BCD, max_iter={MAX_ITER}")
+    else:
+        log(f"Initializing ParallelAgent_NN_BCD, max_iter={MAX_ITER}, n_workers={n_workers}")
 
     print("\n" + "=" * 70)
-    if n_workers <= 1:
-        log(f"初始化 Agent_NN_BCD（串行），max_iter={MAX_ITER}")
-    else:
-        log(f"初始化 ParallelAgent_NN_BCD，max_iter={MAX_ITER}，n_workers={n_workers}")
     print("=" * 70)
 
     if external_sparse_templates is not None and n_workers > 1:
-        log("警告: external_sparse_templates 当前仅支持串行 Agent_NN_BCD，将忽略 n_workers > 1")
+        log("Warning: external_sparse_templates currently forces serial Agent_NN_BCD; overriding n_workers to 1")
+
+    if n_workers <= 1:
+        log("Using serial Agent_NN_BCD")
+    else:
+        log(f"Using ParallelAgent_NN_BCD (n_workers={n_workers})")
+
+    if external_sparse_templates is not None and n_workers > 1:
+        log("Warning: external_sparse_templates only supports serial Agent_NN_BCD; forcing n_workers=1")
         n_workers = 1
 
     if n_workers <= 1:
-        log("使用串行 Agent_NN_BCD")
         agent = Agent_NN_BCD(
             ppc,
             all_samples,
             T_DELTA,
+            lp_backend=lp_backend,
+            gurobi_threads=gurobi_threads,
             external_sparse_templates=external_sparse_templates,
             lambda_init_strategy=lambda_init_strategy,
             max_theta_constraints_per_time_slot=max_theta_constraints_per_time_slot,
@@ -1142,11 +1180,12 @@ def run_bcd(ppc, all_samples: list, T_DELTA, MAX_ITER, bcd_model_dir,
             iter_delta_reg_deadband=iter_delta_reg_deadband,
         )
     else:
-        log(f"使用并行 ParallelAgent_NN_BCD (n_workers={n_workers})")
         agent = ParallelAgent_NN_BCD(
             ppc,
             all_samples,
             T_DELTA,
+            lp_backend=lp_backend,
+            gurobi_threads=gurobi_threads,
             lambda_init_strategy=lambda_init_strategy,
             max_theta_constraints_per_time_slot=max_theta_constraints_per_time_slot,
             theta_hot_start_strategy=theta_hot_start_strategy,
@@ -1183,11 +1222,11 @@ def run_bcd(ppc, all_samples: list, T_DELTA, MAX_ITER, bcd_model_dir,
         )
 
     print("\n" + "=" * 70)
-    log("开始 BCD 迭代训练")
+    log("Starting BCD iterative training")
     print("=" * 70)
 
     if load_model_path is not None:
-        log(f"从已有 BCD checkpoint 继续训练: {load_model_path}")
+        log(f"Continuing training from existing BCD checkpoint: {load_model_path}")
         agent.load_model_parameters(
             str(load_model_path),
             restore_rho_state=restore_rho_from_checkpoint,
@@ -1371,6 +1410,8 @@ def run_sparse_bcd(ppc, all_samples: list, T_DELTA, MAX_ITER, bcd_model_dir,
         NN_EPOCHS=NN_EPOCHS,
         DUAL_DECAY_ROUND=DUAL_DECAY_ROUND,
         DUAL_SIGN_RELAX_INTERVAL=BCD_DUAL_SIGN_RELAX_INTERVAL,
+        lp_backend=BCD_LP_BACKEND,
+        gurobi_threads=BCD_GUROBI_THREADS,
         logger=logger,
         external_sparse_templates=template_library,
         lambda_init_strategy=lambda_init_strategy,
@@ -1453,7 +1494,7 @@ def main():
     start_time = time.time()
 
     print("=" * 70)
-    print(f"训练脚本  模式: {MODE}")
+    print(f"Training script mode: {MODE}")
     print("=" * 70)
 
     # ── 配置 ──────────────────────────────────────────────
@@ -1493,6 +1534,8 @@ def main():
     BCD_NN_SMOOTH_ABS_EPS_VALUE = BCD_NN_SMOOTH_ABS_EPS
     BCD_MAX_THETA_CONSTRAINTS_PER_TIME_SLOT_VALUE = BCD_MAX_THETA_CONSTRAINTS_PER_TIME_SLOT
     BCD_THETA_TRAINING_STAGES_VALUE = BCD_THETA_TRAINING_STAGES
+    BCD_LP_BACKEND_VALUE = BCD_LP_BACKEND
+    BCD_GUROBI_THREADS_VALUE = BCD_GUROBI_THREADS
     BCD_GAMMA_BASE_VALUE = BCD_GAMMA_BASE
     BCD_MU_DUAL_FLOOR_INIT_VALUE = BCD_MU_DUAL_FLOOR_INIT
     BCD_ITA_DUAL_FLOOR_INIT_VALUE = BCD_ITA_DUAL_FLOOR_INIT
@@ -1560,15 +1603,15 @@ def main():
     save_dir = str(surrogate_model_dir / f'subproblem_models_{CASE_NAME}_{timestamp}')
 
     # ── 加载 PyPower 案例 ────────────────────────────────
-    log(f"加载 PyPower 案例: {CASE_NAME}")
+    log(f"Loading PyPower case: {CASE_NAME}")
     supported_cases = ['case3', 'case3lite', 'case14', 'case30', 'case39', 'case118']
     if CASE_NAME not in supported_cases:
-        print(f"未知案例: {CASE_NAME}，可选: {supported_cases}")
+        print(f"Unknown case: {CASE_NAME}. Supported cases: {supported_cases}")
         sys.exit(1)
     ppc = get_case_ppc(CASE_NAME)
     n_units = ppc['gen'].shape[0]
     n_buses = ppc['bus'].shape[0]
-    log(f"  {n_units} 机组，{n_buses} 节点")
+    log(f"Case summary: units={n_units}, buses={n_buses}")
     log(
         f"NN size config: BCD={BCD_NN_SIZE_VALUE} {BCD_NN_HIDDEN_DIMS_VALUE}, "
         f"subproblem={SUBPROBLEM_NN_SIZE_VALUE} {SUBPROBLEM_NN_HIDDEN_DIMS_VALUE}, "
@@ -1593,22 +1636,22 @@ def main():
         if not data_file.is_absolute():
             data_file = Path(__file__).parent / data_file
         if not data_file.exists():
-            log(f"错误: 指定的文件不存在: {data_file}")
+            log(f"Error: specified active-set file does not exist: {data_file}")
             sys.exit(1)
-        log(f"使用指定文件: {data_file}")
+        log(f"Using explicit active-set file: {data_file}")
     else:
         data_file = pick_data_file(data_dir, CASE_NAME)
     if data_file is None:
-        log(f"错误: 在 {data_dir} 中未找到 {CASE_NAME} 的 JSON 数据文件。")
-        log("请先运行 ActiveSetLearner 生成数据，或在 result/ 目录下放置")
-        log(f"命名为 active_sets_{CASE_NAME}_*.json 的数据文件后重试。")
+        log(f"Error: no JSON active-set file found for {CASE_NAME} under {data_dir}")
+        log("Run ActiveSetLearner first or place the active-set JSON file under result/active_set")
+        log(f"Expected filename pattern: active_sets_{CASE_NAME}_*.json")
         sys.exit(1)
 
     # ── 执行模式分支 ─────────────────────────────────────
     try:
         if MODE == 'bcd':
             # BCD 通过 ActiveSetReader 加载（含 unit_commitment_matrix）
-            log(f"通过 ActiveSetReader 加载数据: {data_file.name}")
+            log(f"Loading data through ActiveSetReader: {data_file.name}")
             ensure_bcd_modules_imported()
             all_samples_bcd = load_active_set_from_json(str(data_file))
             if MAX_SAMPLES and len(all_samples_bcd) > MAX_SAMPLES:
@@ -1616,6 +1659,8 @@ def main():
                 all_samples_bcd = all_samples_bcd[:MAX_SAMPLES]
             run_bcd(ppc, all_samples_bcd, T_DELTA, BCD_MAX_ITER_VALUE, bcd_model_dir,
                     case_name=CASE_NAME, timestamp=timestamp, n_workers=N_WORKERS_BCD, NN_EPOCHS=NN_EPOCHS, DUAL_DECAY_ROUND=DUAL_DECAY_ROUND, DUAL_SIGN_RELAX_INTERVAL=BCD_DUAL_SIGN_RELAX_INTERVAL_VALUE,
+                    lp_backend=BCD_LP_BACKEND_VALUE,
+                    gurobi_threads=BCD_GUROBI_THREADS_VALUE,
                     logger=logger,
                     load_model_path=str(resolve_existing_path(BCD_MODEL_FILE, 'BCD model file')) if BCD_CONTINUE_TRAINING and BCD_MODEL_FILE is not None else None,
                     restore_rho_from_checkpoint=BCD_RESTORE_RHO_FROM_CHECKPOINT,
@@ -1971,6 +2016,8 @@ def main():
                     NN_EPOCHS=NN_EPOCHS,
                     DUAL_DECAY_ROUND=DUAL_DECAY_ROUND,
                     DUAL_SIGN_RELAX_INTERVAL=BCD_DUAL_SIGN_RELAX_INTERVAL_VALUE,
+                    lp_backend=BCD_LP_BACKEND_VALUE,
+                    gurobi_threads=BCD_GUROBI_THREADS_VALUE,
                     logger=logger,
                     load_model_path=str(resolve_existing_path(BCD_MODEL_FILE, 'BCD model file')) if BCD_CONTINUE_TRAINING and BCD_MODEL_FILE is not None else None,
                     restore_rho_from_checkpoint=BCD_RESTORE_RHO_FROM_CHECKPOINT,

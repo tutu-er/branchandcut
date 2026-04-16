@@ -19,6 +19,7 @@ import run_training as rt
 
 
 TRAIN_TARGET = "main_bcd"  # "main_bcd" | "subproblem_bcd"
+MAIN_BCD_SOLVE_PRESET = "gurobi"  # "gurobi" | "cvxpy_highs"
 # 子问题求解预设：
 # - "desktop": 偏保守（适合本地 Windows/笔记本）
 # - "server":  更激进（适合服务器并行 + HiGHS）
@@ -35,6 +36,59 @@ def _cpu_count() -> int:
     return max(1, os.cpu_count() or 1)
 
 
+def _validate_main_bcd_theta_schedule(
+    *,
+    max_iter: int,
+    max_constraints_per_time_slot: int,
+    theta_training_stages: list[dict] | None,
+) -> None:
+    if not theta_training_stages:
+        return
+
+    total_iterations = 0
+    previous_limit = 0
+    for stage_idx, stage in enumerate(theta_training_stages):
+        if not isinstance(stage, dict):
+            raise ValueError(
+                f"theta_training_stages[{stage_idx}] must be a dict, got {type(stage).__name__}"
+            )
+
+        limit = int(stage["max_constraints_per_time_slot"])
+        iterations = int(stage["iterations"])
+        if limit <= 0:
+            raise ValueError(
+                f"theta_training_stages[{stage_idx}] has non-positive limit={limit}"
+            )
+        if iterations <= 0:
+            raise ValueError(
+                f"theta_training_stages[{stage_idx}] has non-positive iterations={iterations}"
+            )
+        if limit > max_constraints_per_time_slot:
+            raise ValueError(
+                f"theta_training_stages[{stage_idx}] limit={limit} exceeds "
+                f"BCD_MAX_THETA_CONSTRAINTS_PER_TIME_SLOT={max_constraints_per_time_slot}"
+            )
+        if limit < previous_limit:
+            raise ValueError(
+                f"theta_training_stages must be non-decreasing by limit; "
+                f"stage {stage_idx} has {limit} after {previous_limit}"
+            )
+        previous_limit = limit
+        total_iterations += iterations
+
+    if total_iterations != max_iter:
+        raise ValueError(
+            f"theta_training_stages iterations sum to {total_iterations}, "
+            f"but max_iter={max_iter}"
+        )
+    if previous_limit != max_constraints_per_time_slot:
+        raise ValueError(
+            "The final theta stage must reach "
+            f"BCD_MAX_THETA_CONSTRAINTS_PER_TIME_SLOT={max_constraints_per_time_slot}, "
+            f"got {previous_limit}"
+        )
+
+
 def _configure_common() -> None:
     rt.CASE_NAME = "case118"
     rt.RUN_FP = False
@@ -48,6 +102,7 @@ def _configure_common() -> None:
     rt.SURROGATE_MODEL_DIR = None
     rt.SURROGATE_CONTINUE_TRAINING = False
     rt.BCD_THETA_TRAINING_STAGES = None
+    rt.BCD_GUROBI_THREADS = None
 
     rt.THETA_HOT_START_STRATEGY = "dcpf_relative"
     rt.ZETA_HOT_START_STRATEGY = "zero"
@@ -55,33 +110,54 @@ def _configure_common() -> None:
 
 
 def _configure_main_bcd() -> None:
-    workers = min(2, _cpu_count())
-
     rt.MODE = "bcd"
-    rt.N_WORKERS_BCD = workers
+    cpu = _cpu_count()
 
-    # Use the full refined case118 set; keep iterations moderate because each
-    # sample is a 39-unit, 24-period UC trajectory.
-    rt.MAX_ITER = 120
-    rt.BCD_MAX_ITER = 120
-    rt.SUBPROBLEM_MAX_ITER = 120
+    if MAIN_BCD_SOLVE_PRESET == "gurobi":
+        rt.BCD_LP_BACKEND = "gurobi"
+        # Gurobi already uses substantial internal parallelism; keep sample-level
+        # BCD parallelism small to avoid oversubscription.
+        rt.N_WORKERS_BCD = min(2, cpu)
+        rt.BCD_GUROBI_THREADS = max(1, cpu // rt.N_WORKERS_BCD)
+    elif MAIN_BCD_SOLVE_PRESET == "cvxpy_highs":
+        rt.BCD_LP_BACKEND = "cvxpy_highs"
+        # Keep the fallback preset serial for stability in non-Gurobi setups.
+        rt.N_WORKERS_BCD = 1
+        rt.BCD_GUROBI_THREADS = None
+    else:
+        raise ValueError(
+            f"Unsupported MAIN_BCD_SOLVE_PRESET={MAIN_BCD_SOLVE_PRESET!r}; "
+            "expected 'gurobi' or 'cvxpy_highs'."
+        )
+
+    # Keep a longer outer BCD horizon for case118. The baseline BCD NN learning
+    # rate needs more than 120 outer rounds to fully exploit staged theta
+    # training on the 366-sample refined dataset.
+    rt.MAX_ITER = 180
+    rt.BCD_MAX_ITER = 180
+    rt.SUBPROBLEM_MAX_ITER = 180
     rt.NN_EPOCHS = 6
-    rt.DUAL_DECAY_ROUND = 24
+    rt.DUAL_DECAY_ROUND = 36
     rt.BCD_DUAL_SIGN_RELAX_INTERVAL = 6
 
     rt.BCD_NN_SIZE = "medium"
     rt.BCD_NN_BATCH_STRATEGY = "full-batch"
     rt.BCD_NN_BATCH_SIZE = 8
     rt.BCD_NN_SHUFFLE = True
-    rt.BCD_NN_LR = 2e-5
+    rt.BCD_NN_LR = 5e-5
     rt.BCD_ENABLE_DROPOUT_DURING_NN_TRAINING = True
 
     rt.BCD_MAX_THETA_CONSTRAINTS_PER_TIME_SLOT = 24
     rt.BCD_THETA_TRAINING_STAGES = [
-        {"max_constraints_per_time_slot": 8, "iterations": 40},
-        {"max_constraints_per_time_slot": 16, "iterations": 40},
-        {"max_constraints_per_time_slot": 24, "iterations": 40},
+        {"max_constraints_per_time_slot": 8, "iterations": 36},
+        {"max_constraints_per_time_slot": 16, "iterations": 54},
+        {"max_constraints_per_time_slot": 24, "iterations": 90},
     ]
+    _validate_main_bcd_theta_schedule(
+        max_iter=rt.BCD_MAX_ITER,
+        max_constraints_per_time_slot=rt.BCD_MAX_THETA_CONSTRAINTS_PER_TIME_SLOT,
+        theta_training_stages=rt.BCD_THETA_TRAINING_STAGES,
+    )
     rt.BCD_GAMMA_BASE = 1e-3
     rt.BCD_RHO_PRIMAL_INIT = 1e-3
     rt.BCD_RHO_DUAL_INIT = 1e-3
@@ -178,6 +254,27 @@ def main() -> None:
     print("=" * 72, flush=True)
     print(f"run_training_case118.py -> target={TRAIN_TARGET}", flush=True)
     print(f"active_set_json={CASE118_ACTIVE_SET_JSON}", flush=True)
+    if TRAIN_TARGET == "main_bcd":
+        print(
+            "main_bcd_preset="
+            f"{MAIN_BCD_SOLVE_PRESET}, "
+            f"backend={rt.BCD_LP_BACKEND}, "
+            f"n_workers_bcd={rt.N_WORKERS_BCD}, "
+            f"cpu_count={_cpu_count()}, "
+            f"gurobi_threads={rt.BCD_GUROBI_THREADS}, "
+            f"bcd_max_iter={rt.BCD_MAX_ITER}, "
+            f"nn_epochs={rt.NN_EPOCHS}",
+            flush=True,
+        )
+    elif TRAIN_TARGET == "subproblem_bcd":
+        print(
+            "subproblem_preset="
+            f"{SUBPROBLEM_SOLVE_PRESET}, "
+            f"backend={rt.SUBPROBLEM_LP_BACKEND}, "
+            f"n_workers_sample={rt.N_WORKERS_SAMPLE}, "
+            f"n_workers_unit={rt.N_WORKERS_UNIT}",
+            flush=True,
+        )
     print("=" * 72, flush=True)
 
     rt.main()

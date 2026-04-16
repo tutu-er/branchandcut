@@ -54,6 +54,8 @@ class ParallelAgent_NN_BCD(Agent_NN_BCD):
         mu_dual_floor_init: float = 0.1,
         ita_dual_floor_init: float = 0.1,
         dual_sign_relax_interval: int | None = None,
+        lp_backend: str = "gurobi",
+        gurobi_threads: int | None = None,
         nn_hidden_dims: list[int] | None = None,
         nn_learning_rate: float = 5e-5,
         nn_batch_strategy: str = "full-batch",
@@ -93,6 +95,8 @@ class ParallelAgent_NN_BCD(Agent_NN_BCD):
             mu_dual_floor_init=mu_dual_floor_init,
             ita_dual_floor_init=ita_dual_floor_init,
             dual_sign_relax_interval=dual_sign_relax_interval,
+            lp_backend=lp_backend,
+            gurobi_threads=gurobi_threads,
             nn_hidden_dims=nn_hidden_dims,
             nn_learning_rate=nn_learning_rate,
             nn_batch_strategy=nn_batch_strategy,
@@ -117,6 +121,7 @@ class ParallelAgent_NN_BCD(Agent_NN_BCD):
         dual_sign_relax_interval: int | None = None,
         nn_epochs: int = 10,
         union_analysis=None,
+        theta_training_stages=None,
         nn_batch_strategy: str | None = None,
         nn_batch_size: int | None = None,
         nn_shuffle: bool | None = None,
@@ -132,7 +137,9 @@ class ParallelAgent_NN_BCD(Agent_NN_BCD):
             self.dual_sign_relax_interval = max(int(dual_sign_relax_interval), 0)
 
         print(
-            f"[ParallelBCD] Start parallel BCD (n_workers={self.n_workers}, max_iter={max_iter})",
+            f"[ParallelBCD] Start parallel BCD (n_workers={self.n_workers}, "
+            f"max_iter={max_iter}, backend={self._lp_backend}, "
+            f"gurobi_threads={self.gurobi_threads})",
             flush=True,
         )
 
@@ -140,6 +147,31 @@ class ParallelAgent_NN_BCD(Agent_NN_BCD):
             print(f"[ParallelBCD] Iteration {i+1}/{max_iter}", flush=True)
             self.iter_number = i
             self._sync_parametric_direction_strategy_state()
+            active_union_analysis, active_theta_stage = self._resolve_active_union_analysis(
+                i,
+                max_iter,
+                union_analysis,
+                theta_training_stages,
+            )
+            if active_theta_stage is None:
+                self._last_reported_theta_stage_signature = None
+            else:
+                active_theta_count = len(active_union_analysis.get('union_constraints', []))
+                stage_signature = (
+                    int(active_theta_stage['stage_index']),
+                    int(active_theta_stage['max_constraints_per_time_slot']),
+                    int(active_theta_count),
+                )
+                if stage_signature != self._last_reported_theta_stage_signature:
+                    normalized_stages = self._normalize_theta_training_stages(theta_training_stages, max_iter) or []
+                    print(
+                        f"[ParallelBCD][theta-stage] stage={active_theta_stage['stage_index'] + 1}/{len(normalized_stages)}, "
+                        f"iter_range={active_theta_stage['iter_start'] + 1}-{active_theta_stage['iter_end']}, "
+                        f"active_limit_per_time={active_theta_stage['max_constraints_per_time_slot']}, "
+                        f"active_theta_constraints={active_theta_count}",
+                        flush=True,
+                    )
+                    self._last_reported_theta_stage_signature = stage_signature
 
             theta_snap_list = self.theta_values_list
             zeta_snap_list = self.zeta_values_list
@@ -152,7 +184,7 @@ class ParallelAgent_NN_BCD(Agent_NN_BCD):
                         sample_id,
                         theta_snap_list[sample_id],
                         zeta_snap_list[sample_id],
-                        union_analysis,
+                        active_union_analysis,
                     ): sample_id
                     for sample_id in range(self.n_samples)
                 }
@@ -188,7 +220,7 @@ class ParallelAgent_NN_BCD(Agent_NN_BCD):
                         sample_id,
                         theta_snap_list[sample_id],
                         zeta_snap_list[sample_id],
-                        union_analysis,
+                        active_union_analysis,
                     ): sample_id
                     for sample_id in range(self.n_samples)
                 }
@@ -221,7 +253,7 @@ class ParallelAgent_NN_BCD(Agent_NN_BCD):
                 obj_dual_coc,
                 obj_dual,
                 obj_opt,
-            ) = self.cal_viol_components(union_analysis=union_analysis)
+            ) = self.cal_viol_components(union_analysis=active_union_analysis)
             eps12 = 1e-12
             obj_primal = obj_primal if abs(obj_primal) >= eps12 else 0.0
             obj_dual_pg = obj_dual_pg if abs(obj_dual_pg) >= eps12 else 0.0
@@ -230,7 +262,7 @@ class ParallelAgent_NN_BCD(Agent_NN_BCD):
             obj_dual = obj_dual if abs(obj_dual) >= eps12 else 0.0
             obj_opt = obj_opt if abs(obj_opt) >= eps12 else 0.0
 
-            nn_metrics_pre = self.cal_nn_logging_components(union_analysis=union_analysis)
+            nn_metrics_pre = self.cal_nn_logging_components(union_analysis=active_union_analysis)
             print(
                 f"[ParallelBCD][NN-metric][before] obj_primal={nn_metrics_pre['obj_primal']:.6f}, "
                 f"obj_dual_x={nn_metrics_pre['obj_dual_x']:.6f}, "
@@ -242,7 +274,7 @@ class ParallelAgent_NN_BCD(Agent_NN_BCD):
                 self._refresh_iter_tensor_cache()
 
             theta_new, zeta_new = self.iter_with_theta_zeta_neural_network(
-                union_analysis=union_analysis,
+                union_analysis=active_union_analysis,
                 num_epochs=nn_epochs,
                 batch_strategy=nn_batch_strategy,
                 batch_size=nn_batch_size,
@@ -258,7 +290,7 @@ class ParallelAgent_NN_BCD(Agent_NN_BCD):
             self.theta_values = self.theta_values_list[0]
             self.zeta_values = self.zeta_values_list[0]
 
-            nn_metrics_after = self.cal_nn_logging_components(union_analysis=union_analysis)
+            nn_metrics_after = self.cal_nn_logging_components(union_analysis=active_union_analysis)
             print(
                 f"[ParallelBCD][NN-metric][after] obj_primal={nn_metrics_after['obj_primal']:.6f}, "
                 f"obj_dual_x={nn_metrics_after['obj_dual_x']:.6f}, "
@@ -276,7 +308,7 @@ class ParallelAgent_NN_BCD(Agent_NN_BCD):
                 obj_dual_coc,
                 obj_dual,
                 obj_opt,
-            ) = self.cal_viol_components(union_analysis=union_analysis)
+            ) = self.cal_viol_components(union_analysis=active_union_analysis)
             obj_primal = obj_primal if abs(obj_primal) >= eps12 else 0.0
             obj_dual_pg = obj_dual_pg if abs(obj_dual_pg) >= eps12 else 0.0
             obj_dual_x = obj_dual_x if abs(obj_dual_x) >= eps12 else 0.0

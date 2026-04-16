@@ -98,6 +98,10 @@ MODEL_DIR = None
 # 环境变量 RUN_TEST_BCD_MODEL_PATH 可覆盖本常量
 BCD_MODEL_PATH = None
 
+# 绘图开关：在自动化评估（如 agentic_fp_optimizer）中建议禁用绘图以避免空数据导致的 matplotlib 崩溃
+# - 设环境变量 RUN_TEST_DISABLE_PLOTS=1 可跳过所有 plot_* 调用
+RUN_TEST_DISABLE_PLOTS = (os.environ.get("RUN_TEST_DISABLE_PLOTS", "").strip() not in ("", "0", "false", "False"))
+
 
 def _auto_discover_model_path(directory, glob_pattern, label):
     """在 directory 下按 glob_pattern 查找最新文件/目录。"""
@@ -649,6 +653,9 @@ def plot_surrogate_analysis(trainers: dict, all_samples: list,
         fig_dir:     图像输出目录�?
         case_name:   算例名，用于图标题和文件名�?
     """
+    if RUN_TEST_DISABLE_PLOTS:
+        log("RUN_TEST_DISABLE_PLOTS=1，跳过绘图")
+        return
     if not MPL_AVAILABLE:
         log("matplotlib 不可用，跳过绘图")
         return
@@ -656,6 +663,9 @@ def plot_surrogate_analysis(trainers: dict, all_samples: list,
     _apply_style()
     unit_ids = sorted(trainers.keys())
     n_units = len(unit_ids)
+    if n_units == 0:
+        log("未加载任何 surrogate trainers，跳过绘图")
+        return
 
     # ── �?1：代理约束系数分布（2×2 violin�?─────────────────
     log("绘制图1：代理约束系数分布...")
@@ -679,12 +689,21 @@ def plot_surrogate_analysis(trainers: dict, all_samples: list,
         labels = []
         for uid in unit_ids:
             arr = getattr(trainers[uid], attr)   # (n_samples, nc)
-            data_per_unit.append(arr.ravel())
+            flat = np.asarray(arr).ravel()
+            if flat.size == 0:
+                continue
+            data_per_unit.append(flat)
             labels.append(f'G{uid}')
+
+        if not data_per_unit:
+            ax.set_title(f"{attr}: no data", fontsize=9)
+            ax.set_xticks([])
+            ax.set_yticks([])
+            continue
 
         parts = ax.violinplot(
             data_per_unit,
-            positions=range(n_units),
+            positions=range(len(data_per_unit)),
             showmedians=True,
             showextrema=True,
         )
@@ -696,7 +715,7 @@ def plot_surrogate_analysis(trainers: dict, all_samples: list,
                 parts[key].set_color('#333333')
                 parts[key].set_linewidth(1.2)
 
-        ax.set_xticks(range(n_units))
+        ax.set_xticks(range(len(labels)))
         ax.set_xticklabels(labels, fontsize=8)
         ax.set_ylabel(ylabel)
         ax.set_xlabel('Generator Unit')
