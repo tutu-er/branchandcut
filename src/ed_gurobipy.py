@@ -123,17 +123,35 @@ class EconomicDispatchGurobi:
             for r, bus_idx in enumerate(self.renewable_bus_ids):
                 R[bus_idx, r] = 1
             PTDF = makePTDF(self.baseMVA, self.bus, self.branch)
+            # Dense (nl, ng) / (nl, nr) — avoids ``PTDF @ (vector of LinExpr)`` which
+            # forces NumPy object-dtype matmul and makes addConstr appear to "hang"
+            # for minutes on case118-sized networks.
+            PG_coeff = np.asarray(PTDF @ G, dtype=float)
+            REN_coeff = (
+                np.asarray(PTDF @ R, dtype=float) if self.nr > 0 else None
+            )
             branch_limit = self.branch[:, RATE_A]
+            nl = int(self.branch.shape[0])
+            coeff_eps = 1e-12
             for t in range(self.T):
-                thermal_injection = G @ np.array([self.pg[g, t] for g in range(self.ng)])
-                renewable_injection = (
-                    R @ np.array([self.p_ren[r, t] for r in range(self.nr)])
-                    if self.nr > 0 else 0
-                )
-                flow = PTDF @ (thermal_injection + renewable_injection - self.load_data[:, t])
-                for l in range(self.branch.shape[0]):
-                    self.model.addConstr(flow[l] <= branch_limit[l], name=f'flow_upper_{l}_{t}')
-                    self.model.addConstr(flow[l] >= -branch_limit[l], name=f'flow_lower_{l}_{t}')
+                slack = -(PTDF @ np.asarray(self.load_data[:, t], dtype=float))
+                for l in range(nl):
+                    expr = gp.LinExpr()
+                    expr.addConstant(float(slack[l]))
+                    row_g = PG_coeff[l]
+                    for g in range(self.ng):
+                        c = float(row_g[g])
+                        if abs(c) > coeff_eps:
+                            expr += c * self.pg[g, t]
+                    if REN_coeff is not None:
+                        row_r = REN_coeff[l]
+                        for r in range(self.nr):
+                            c = float(row_r[r])
+                            if abs(c) > coeff_eps:
+                                expr += c * self.p_ren[r, t]
+                    limit = float(branch_limit[l])
+                    self.model.addConstr(expr <= limit, name=f'flow_upper_{l}_{t}')
+                    self.model.addConstr(expr >= -limit, name=f'flow_lower_{l}_{t}')
         except ImportError:
             print('未安装pypower，DCPF潮流约束未添加。')
         obj = gp.quicksum(self.cpower[g, t] for g in range(self.ng) for t in range(self.T))
