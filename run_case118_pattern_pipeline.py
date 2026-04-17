@@ -125,7 +125,7 @@ def _parse_args() -> argparse.Namespace:
                    help="Initial patterns per generator (Phase 2).")
     p.add_argument("--max-patterns-per-unit", type=int, default=None,
                    help="Hard cap on pattern count per generator (Phase 2).")
-    p.add_argument("--pattern-time-limit", type=float, default=600.0,
+    p.add_argument("--pattern-time-limit", type=float, default=6000.0,
                    help="Gurobi time limit per scenario in Phase 2 (seconds).")
 
     # ---- Shared solver options ----
@@ -144,15 +144,15 @@ def _parse_args() -> argparse.Namespace:
         help="Comma-separated sample_ids to refine (Phase 4). "
              "If omitted, samples with cost gap >= --refine-gap-threshold are selected.",
     )
-    p.add_argument("--refine-gap-threshold", type=float, default=0.7,
+    p.add_argument("--refine-gap-threshold", type=float, default=1.5,
                    help="Cost-gap threshold (%%) for auto-selecting refine targets.")
     p.add_argument("--refine-top-k", type=int, default=20,
                    help="Consider top-k gap samples when selecting refine targets.")
-    p.add_argument("--refine-base-time-limit", type=float, default=600.0,
+    p.add_argument("--refine-base-time-limit", type=float, default=6000.0,
                    help="Gurobi time limit for baseline solve in Phase 4 (seconds).")
     p.add_argument("--refine-greedy-time-limit", type=float, default=180.0,
                    help="Gurobi time limit per greedy trial in Phase 4 (seconds).")
-    p.add_argument("--refine-final-time-limit", type=float, default=600.0,
+    p.add_argument("--refine-final-time-limit", type=float, default=6000.0,
                    help="Gurobi time limit for full_repair solve in Phase 4 (seconds).")
     p.add_argument("--refine-max-greedy-steps", type=int, default=8,
                    help="Max greedy augmentation steps per sample in Phase 4.")
