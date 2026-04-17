@@ -545,52 +545,61 @@ def _solve_global_dual_payload_from_ed(
         renewable_data=renewable_data,
         verbose=False,
     )
-    pg_sol, _ = ed.solve()
-    if pg_sol is None:
-        raise RuntimeError(f"ED solve failed with status={ed.model.status}")
+    try:
+        pg_sol, _ = ed.solve()
+        if pg_sol is None:
+            raise RuntimeError(f"ED solve failed with status={ed.model.status}")
 
-    T = Pd.shape[1]
-    nl = ed.branch.shape[0]
-    lambda_pb = np.zeros(T, dtype=float)
-    lambda_dcpf_upper = np.zeros((nl, T), dtype=float)
-    lambda_dcpf_lower = np.zeros((nl, T), dtype=float)
+        T = Pd.shape[1]
+        nl = ed.branch.shape[0]
+        lambda_pb = np.zeros(T, dtype=float)
+        lambda_dcpf_upper = np.zeros((nl, T), dtype=float)
+        lambda_dcpf_lower = np.zeros((nl, T), dtype=float)
 
-    for t in range(T):
-        constr = ed.model.getConstrByName(f'power_balance_{t}')
-        # For the equality balance constraint, Gurobi's Pi already matches the
-        # economic marginal price convention used by the subproblem:
-        #   min cost - lambda^T pg, with stationarity a - lambda + ... = 0.
-        lambda_pb[t] = float(constr.Pi) if constr is not None else 0.0
-        for l in range(nl):
-            cu = ed.model.getConstrByName(f'flow_upper_{l}_{t}')
-            cl = ed.model.getConstrByName(f'flow_lower_{l}_{t}')
-            # Recover canonical nonnegative multipliers for:
-            #   flow_upper:  flow - limit <= 0
-            #   flow_lower: -flow - limit <= 0
-            # In the ED model these are encoded as:
-            #   flow <= limit      -> Pi is nonpositive when binding
-            #   flow >= -limit     -> Pi is nonnegative when binding
-            # So the correct mapping is upper = -Pi, lower = +Pi.
-            lambda_dcpf_upper[l, t] = max(
-                0.0,
-                -(float(cu.Pi) if cu is not None else 0.0),
-            )
-            lambda_dcpf_lower[l, t] = max(
-                0.0,
-                float(cl.Pi) if cl is not None else 0.0,
-            )
+        for t in range(T):
+            constr = ed.model.getConstrByName(f'power_balance_{t}')
+            # For the equality balance constraint, Gurobi's Pi already matches the
+            # economic marginal price convention used by the subproblem:
+            #   min cost - lambda^T pg, with stationarity a - lambda + ... = 0.
+            lambda_pb[t] = float(constr.Pi) if constr is not None else 0.0
+            for l in range(nl):
+                cu = ed.model.getConstrByName(f'flow_upper_{l}_{t}')
+                cl = ed.model.getConstrByName(f'flow_lower_{l}_{t}')
+                # Recover canonical nonnegative multipliers for:
+                #   flow_upper:  flow - limit <= 0
+                #   flow_lower: -flow - limit <= 0
+                # In the ED model these are encoded as:
+                #   flow <= limit      -> Pi is nonpositive when binding
+                #   flow >= -limit     -> Pi is nonnegative when binding
+                # So the correct mapping is upper = -Pi, lower = +Pi.
+                lambda_dcpf_upper[l, t] = max(
+                    0.0,
+                    -(float(cu.Pi) if cu is not None else 0.0),
+                )
+                lambda_dcpf_lower[l, t] = max(
+                    0.0,
+                    float(cl.Pi) if cl is not None else 0.0,
+                )
 
-    return {
-        'lambda_power_balance': lambda_pb,
-        'lambda_dcpf_upper': lambda_dcpf_upper,
-        'lambda_dcpf_lower': lambda_dcpf_lower,
-        'lambda_pg_effective': _combine_pg_duals(
-            lambda_pb,
-            lambda_dcpf_upper,
-            lambda_dcpf_lower,
-            generator_injection_sensitivity,
-        ),
-    }
+        return {
+            'lambda_power_balance': lambda_pb,
+            'lambda_dcpf_upper': lambda_dcpf_upper,
+            'lambda_dcpf_lower': lambda_dcpf_lower,
+            'lambda_pg_effective': _combine_pg_duals(
+                lambda_pb,
+                lambda_dcpf_upper,
+                lambda_dcpf_lower,
+                generator_injection_sensitivity,
+            ),
+        }
+    finally:
+        # Release native Gurobi resources immediately; batch convert creates
+        # hundreds of ED models and relying on GC alone can thrash memory and
+        # look like a hang after the first WLS license banner.
+        try:
+            ed.model.dispose()
+        except Exception:
+            pass
 
 
 def _solve_effective_pg_dual_from_ed(

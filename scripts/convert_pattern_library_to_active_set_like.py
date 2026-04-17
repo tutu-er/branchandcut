@@ -201,8 +201,16 @@ def convert_pattern_library_to_active_set_like(
     unique_active_sets: List[List[List[object]]] = []
     seen_active_sets = set()
     dual_refreshed_sample_ids: List[int] = []
+    n_samples = len(original_samples)
+    print(
+        f"[convert_pattern_library] {n_samples} samples; "
+        "each successful conversion triggers one ED solve + dual extraction "
+        "(first Gurobi model may print WLS license lines; then long silence is "
+        "normal until progress lines appear).",
+        flush=True,
+    )
 
-    for sample in original_samples:
+    for idx, sample in enumerate(original_samples):
         sample_id = int(sample["sample_id"])
         scenario = scenario_by_sample_id.get(sample_id)
         converted = copy.deepcopy(sample)
@@ -238,6 +246,14 @@ def convert_pattern_library_to_active_set_like(
         converted["active_set"] = active_set
         converted["conversion_status"] = conversion_status
         if conversion_status == "converted_from_pattern_library":
+            # Progress: dual extraction does O(T * n_branch) getConstrByName calls;
+            # hundreds of samples can take many minutes — not a UTF-8 / encoding stall.
+            if idx % 10 == 0:
+                print(
+                    f"  [convert] ED dual refresh sample_id={sample_id} "
+                    f"({idx + 1}/{n_samples}) …",
+                    flush=True,
+                )
             _refresh_sample_dual_payload(converted, x_matrix, ppc, t_delta)
             dual_refreshed_sample_ids.append(sample_id)
 

@@ -1,3 +1,5 @@
+import os
+
 import numpy as np
 import gurobipy as gp
 from gurobipy import GRB
@@ -43,6 +45,14 @@ class EconomicDispatchGurobi:
         self.model = gp.Model('EconomicDispatch')
         self.model.Params.OutputFlag = 1 if self.verbose else 0
         self.model.Params.LogToConsole = 1 if self.verbose else 0
+        # Optional cap for pathological ED instances (seconds). Example:
+        #   export BRANCHANDCUT_ED_TIME_LIMIT=120
+        _tl = os.environ.get("BRANCHANDCUT_ED_TIME_LIMIT", "").strip()
+        if _tl:
+            try:
+                self.model.Params.TimeLimit = float(_tl)
+            except ValueError:
+                pass
         self.pg = self.model.addVars(self.ng, self.T, lb=0, name='pg')
         self.p_ren = self.model.addVars(self.nr, self.T, lb=0, name='p_ren') if self.nr > 0 else None
         self.cpower = self.model.addVars(self.ng, self.T, lb=0, name='cpower')

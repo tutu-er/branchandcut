@@ -38,6 +38,10 @@ Notes
 * Phase 1 uses the *serial* ActiveSetLearner so that individual UC failures
   propagate as RuntimeError.  If you need parallelism, fix
   ParallelActiveSetLearner to raise on failed workers first.
+* Phase 3 (convert) runs one Gurobi ED per successfully converted sample; the
+  first model may print WLS license lines, then there can be long gaps while
+  ``getConstrByName`` extracts branch duals (progress prints every 10 samples).
+  Set ``BRANCHANDCUT_ED_TIME_LIMIT`` (seconds) to cap each ED if needed.
 * --refine-sample-ids accepts a comma-separated list, e.g. ``143,132,257``.
   If omitted, samples whose cost gap exceeds --refine-gap-threshold are chosen
   automatically from the pattern-library summary (same logic as the standalone
