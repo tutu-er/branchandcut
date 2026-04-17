@@ -384,7 +384,18 @@ def build_refined_active_set(
     pattern_library_json: str,
     refinement_json: str,
     output_json: str,
+    require_full_repair_success_for_rows: bool = False,
 ) -> str:
+    """Build a refined active_set_like JSON.
+
+    Parameters
+    ----------
+    require_full_repair_success_for_rows:
+        When True, any refinement row that has a ``full_repair`` block with
+        ``success=False`` raises RuntimeError instead of being silently skipped.
+        Also requires that every sample_id appearing in batch_results has a
+        successful full_repair.  Default False preserves the original behaviour.
+    """
     active_set_like = _load_json(active_set_like_json)
     pattern_library_data = _load_json(pattern_library_json)
     refinement_data = _load_json(refinement_json)
@@ -409,6 +420,12 @@ def build_refined_active_set(
 
         full_repair = row.get("full_repair") or {}
         if not full_repair.get("success", False):
+            if require_full_repair_success_for_rows:
+                raise RuntimeError(
+                    f"[build_refined_active_set] full_repair failed for sample_id={sample_id} "
+                    f"(status={full_repair.get('status')!r}). "
+                    "Set require_full_repair_success_for_rows=False to skip instead."
+                )
             continue
 
         refined_x = _reconstruct_refined_matrix(
@@ -499,6 +516,11 @@ def main() -> None:
     parser.add_argument("--pattern-library-json", default=None, type=str)
     parser.add_argument("--refinement-json", default=None, type=str)
     parser.add_argument("--output", default=None, type=str)
+    parser.add_argument(
+        "--strict",
+        action="store_true",
+        help="Raise instead of skipping samples whose full_repair failed.",
+    )
     args = parser.parse_args()
 
     active_set_like_json = args.active_set_like_json or DEFAULT_ACTIVE_SET_LIKE_JSON
@@ -511,6 +533,7 @@ def main() -> None:
         pattern_library_json=pattern_library_json,
         refinement_json=refinement_json,
         output_json=output_json,
+        require_full_repair_success_for_rows=args.strict,
     )
     print(f"Refined active-set JSON written to: {output}")
 

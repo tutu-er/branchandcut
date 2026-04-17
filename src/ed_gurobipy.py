@@ -134,10 +134,12 @@ class EconomicDispatchGurobi:
         self.model.optimize()
         if self.model.status == GRB.OPTIMAL:
             pg_sol = np.array([[self.pg[g, t].X for t in range(self.T)] for g in range(self.ng)])
-            print(f"总运行成本: {self.model.objVal}")
+            if self.verbose:
+                print(f"总运行成本: {self.model.objVal}")
             return pg_sol, self.model.objVal
         else:
-            print("未找到最优解")
+            if self.verbose:
+                print("未找到最优解")
             return None, None
 
 # 示例调用：

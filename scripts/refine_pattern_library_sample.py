@@ -478,6 +478,334 @@ def _refine_one_sample(
     }
 
 
+def run_refinement_batch(
+    ppc: dict,
+    active_set_json: str,
+    pattern_library_json: str,
+    active_set_like_json: str,
+    sample_ids: Optional[List[int]] = None,
+    *,
+    high_gap_top_k: int = 20,
+    high_gap_threshold_pct: float = 0.7,
+    t_delta: float = 1.0,
+    base_time_limit: float = 600.0,
+    greedy_trial_time_limit: float = 180.0,
+    final_time_limit: float = 600.0,
+    mip_gap: float = 1e-4,
+    max_greedy_steps: int = 8,
+    verbose_solver: bool = False,
+    strict_dual: bool = False,
+    require_full_repair_success: bool = False,
+) -> Dict:
+    """Run batch refinement and return the result dict (caller writes to disk).
+
+    Parameters
+    ----------
+    strict_dual:
+        When True, dual recomputation failures raise immediately instead of
+        being recorded as ``lambda_dual_refresh_failed``.
+    require_full_repair_success:
+        When True, raise RuntimeError for any sample whose full_repair did not
+        succeed.
+    """
+    if IMPORT_ERROR is not None:
+        raise RuntimeError(
+            "[run_refinement_batch] Missing required dependency."
+        ) from IMPORT_ERROR
+
+    pattern_library_data = _load_json(pattern_library_json)
+    global_top_gap = _top_gap_samples(pattern_library_data, high_gap_top_k)
+    global_large_gap = [
+        row for row in global_top_gap if row["gap_pct"] >= high_gap_threshold_pct
+    ]
+
+    if sample_ids is None:
+        # Default: samples with cost gap above threshold, or top-k if none exceed threshold
+        sample_ids = [row["sample_id"] for row in global_large_gap]
+        if not sample_ids:
+            sample_ids = [row["sample_id"] for row in global_top_gap]
+
+    print("=" * 72, flush=True)
+    print("  Batch Pattern-Library Refinement", flush=True)
+    print("=" * 72, flush=True)
+    print(f"sample_ids={sample_ids}", flush=True)
+    print(f"pattern_library_json={pattern_library_json}", flush=True)
+    print(f"active_set_like_json={active_set_like_json}", flush=True)
+
+    samples = _load_commitment_samples_from_json(active_set_json)
+    active_set_like_data = _load_json(active_set_like_json)
+    base_allowed_patterns = _build_allowed_patterns_from_result(pattern_library_data)
+
+    batch_results: List[Dict] = []
+    for sid in sample_ids:
+        print("\n" + "-" * 72, flush=True)
+        print(f"Processing sample_id={sid}", flush=True)
+        sample = _find_sample(samples, sid)
+        sample_like = _find_active_set_like_sample(active_set_like_data, sid)
+
+        if strict_dual:
+            result = _refine_one_sample_strict_dual(
+                ppc=ppc,
+                sample=sample,
+                sample_like=sample_like,
+                base_allowed_patterns=base_allowed_patterns,
+                t_delta=t_delta,
+                base_time_limit=base_time_limit,
+                greedy_trial_time_limit=greedy_trial_time_limit,
+                final_time_limit=final_time_limit,
+                mip_gap=mip_gap,
+                verbose_solver=verbose_solver,
+                max_greedy_steps=max_greedy_steps,
+            )
+        else:
+            result = _refine_one_sample(
+                ppc=ppc,
+                sample=sample,
+                sample_like=sample_like,
+                base_allowed_patterns=base_allowed_patterns,
+                t_delta=t_delta,
+                base_time_limit=base_time_limit,
+                greedy_trial_time_limit=greedy_trial_time_limit,
+                final_time_limit=final_time_limit,
+                mip_gap=mip_gap,
+                verbose_solver=verbose_solver,
+                max_greedy_steps=max_greedy_steps,
+            )
+
+        if require_full_repair_success and not result.get("full_repair", {}).get("success"):
+            raise RuntimeError(
+                f"[run_refinement_batch] full_repair failed for sample_id={sid} "
+                f"(status={result.get('full_repair', {}).get('status')!r}). "
+                "Use require_full_repair_success=False to skip instead."
+            )
+
+        batch_results.append(result)
+
+    return {
+        "metadata": {
+            "case_name": "case118",
+            "timestamp": datetime.now().isoformat(),
+            "source_active_set_json": active_set_json,
+            "source_pattern_library_json": pattern_library_json,
+            "source_active_set_like_json": active_set_like_json,
+        },
+        "parameters": {
+            "sample_ids": sample_ids,
+            "high_gap_top_k": high_gap_top_k,
+            "high_gap_threshold_pct": high_gap_threshold_pct,
+            "t_delta": t_delta,
+            "base_time_limit": base_time_limit,
+            "greedy_trial_time_limit": greedy_trial_time_limit,
+            "final_time_limit": final_time_limit,
+            "mip_gap": mip_gap,
+            "max_greedy_steps": max_greedy_steps,
+            "strict_dual": strict_dual,
+            "require_full_repair_success": require_full_repair_success,
+        },
+        "high_gap_samples": {
+            "top_k": global_top_gap,
+            "above_threshold": global_large_gap,
+        },
+        "batch_results": batch_results,
+    }
+
+
+def _refine_one_sample_strict_dual(
+    ppc: dict,
+    sample: Dict,
+    sample_like: Optional[Dict],
+    base_allowed_patterns: List[List[np.ndarray]],
+    t_delta: float,
+    base_time_limit: float,
+    greedy_trial_time_limit: float,
+    final_time_limit: float,
+    mip_gap: float,
+    verbose_solver: bool,
+    max_greedy_steps: int,
+) -> Dict:
+    """Same as _refine_one_sample but dual failures raise immediately."""
+    sample_id = int(sample["sample_id"])
+    x_opt = np.asarray(sample["unit_commitment_matrix"], dtype=int)
+    optimal_cost = _compute_optimal_cost(ppc, sample, t_delta)
+
+    allowed_patterns = _clone_patterns(base_allowed_patterns)
+    baseline = _solve_once(
+        ppc=ppc, sample=sample, allowed_patterns=allowed_patterns,
+        t_delta=t_delta, time_limit=base_time_limit, mip_gap=mip_gap,
+        verbose=verbose_solver,
+    )
+    _summarize_solution(f"sample {sample_id} baseline", baseline, optimal_cost)
+
+    baseline_matches_active_set_like = None
+    if sample_like is not None and baseline["x_sol"] is not None:
+        x_like = np.asarray(sample_like["unit_commitment_matrix"], dtype=int)
+        baseline_matches_active_set_like = bool(np.array_equal(x_like, baseline["x_sol"]))
+        print(f"  baseline_matches_active_set_like={baseline_matches_active_set_like}")
+
+    mismatched_generators = [
+        g for g in range(x_opt.shape[0])
+        if baseline["x_sol"] is None
+        or not np.array_equal(np.asarray(baseline["x_sol"][g, :], dtype=int), x_opt[g, :])
+    ]
+    print(f"  mismatched_generators={mismatched_generators}")
+
+    greedy_patterns = _clone_patterns(allowed_patterns)
+    greedy_history: List[Dict] = []
+    remaining_generators = mismatched_generators[:]
+    current_best = copy.deepcopy(baseline)
+
+    for step in range(1, max_greedy_steps + 1):
+        best_step_info = None
+        best_generator = None
+        for generator_id in remaining_generators:
+            candidate_patterns = _clone_patterns(greedy_patterns)
+            added = _ensure_pattern(
+                candidate_patterns, generator_id=generator_id,
+                pattern_key=_pattern_to_key(x_opt[generator_id, :]),
+            )
+            if not added:
+                continue
+            candidate = _solve_once(
+                ppc=ppc, sample=sample, allowed_patterns=candidate_patterns,
+                t_delta=t_delta, time_limit=greedy_trial_time_limit,
+                mip_gap=mip_gap, verbose=verbose_solver,
+            )
+            if not candidate["success"]:
+                continue
+            if (
+                not current_best["success"]
+                or candidate["objective_value"] + 1e-6 < current_best["objective_value"]
+            ):
+                if best_step_info is None or (
+                    candidate["objective_value"] + 1e-6 < best_step_info["objective_value"]
+                ):
+                    best_step_info = candidate
+                    best_generator = generator_id
+
+        if best_step_info is None or best_generator is None:
+            print(f"  greedy step {step}: no improving single-generator augmentation found")
+            break
+
+        _ensure_pattern(
+            greedy_patterns, generator_id=best_generator,
+            pattern_key=_pattern_to_key(x_opt[best_generator, :]),
+        )
+        current_best = best_step_info
+        remaining_generators = [g for g in remaining_generators if g != best_generator]
+        greedy_entry = {
+            "step": step,
+            "chosen_generator": int(best_generator),
+            "objective_value": float(current_best["objective_value"]),
+            "gap_pct": _cost_gap_pct(current_best["objective_value"], optimal_cost),
+            "matched_unit_patterns": current_best.get("matched_unit_patterns"),
+            "changed_unit_patterns": current_best.get("changed_unit_patterns"),
+            "status": current_best.get("status"),
+        }
+        greedy_history.append(greedy_entry)
+        print(
+            f"  greedy step {step}: add generator {best_generator} optimal pattern -> "
+            f"objective={current_best['objective_value']}, gap_pct={greedy_entry['gap_pct']}"
+        )
+
+    greedy_best = current_best
+    _summarize_solution(f"sample {sample_id} greedy_best", greedy_best, optimal_cost)
+
+    full_repair_patterns = _clone_patterns(allowed_patterns)
+    full_repair_added_generators: List[int] = []
+    for generator_id in mismatched_generators:
+        added = _ensure_pattern(
+            full_repair_patterns, generator_id=generator_id,
+            pattern_key=_pattern_to_key(x_opt[generator_id, :]),
+        )
+        if added:
+            full_repair_added_generators.append(generator_id)
+
+    full_repair = _solve_once(
+        ppc=ppc, sample=sample, allowed_patterns=full_repair_patterns,
+        t_delta=t_delta, time_limit=final_time_limit, mip_gap=mip_gap,
+        verbose=verbose_solver,
+    )
+    _summarize_solution(f"sample {sample_id} full_repair", full_repair, optimal_cost)
+
+    # Strict dual: raise immediately on failure
+    optimal_dual = _dual_payload_for_x_matrix(
+        ppc, sample, t_delta, x_opt,
+        "recomputed_from_ed_optimal_commitment",
+    )
+    baseline_dual = (
+        _dual_payload_for_x_matrix(
+            ppc, sample, t_delta, baseline["x_sol"],
+            "recomputed_from_ed_after_pattern_restricted_baseline",
+        ) if baseline["x_sol"] is not None else None
+    )
+    greedy_best_dual = (
+        _dual_payload_for_x_matrix(
+            ppc, sample, t_delta, greedy_best["x_sol"],
+            "recomputed_from_ed_after_pattern_restricted_greedy_best",
+        ) if greedy_best["x_sol"] is not None else None
+    )
+    full_repair_dual = (
+        _dual_payload_for_x_matrix(
+            ppc, sample, t_delta, full_repair["x_sol"],
+            "recomputed_from_ed_after_pattern_restricted_full_repair",
+        ) if full_repair["x_sol"] is not None else None
+    )
+
+    def _merge_dual(block: Dict, dual: Optional[Dict]) -> Dict:
+        if dual:
+            return {**block, **dual}
+        return block
+
+    return {
+        "sample_id": sample_id,
+        "optimal_cost": optimal_cost,
+        "optimal_dual": optimal_dual,
+        "baseline_matches_active_set_like": baseline_matches_active_set_like,
+        "mismatched_generators": mismatched_generators,
+        "baseline": _merge_dual(
+            {
+                "success": baseline["success"],
+                "status": baseline["status"],
+                "objective_value": baseline["objective_value"],
+                "gap_pct": _cost_gap_pct(baseline["objective_value"], optimal_cost)
+                if baseline["success"] else None,
+                "matched_unit_patterns": baseline.get("matched_unit_patterns"),
+                "changed_unit_patterns": baseline.get("changed_unit_patterns"),
+                "selected_pattern_indices": _safe_json_value(baseline.get("selected_pattern_indices")),
+            },
+            baseline_dual,
+        ),
+        "greedy_history": greedy_history,
+        "greedy_best": _merge_dual(
+            {
+                "success": greedy_best["success"],
+                "status": greedy_best["status"],
+                "objective_value": greedy_best["objective_value"],
+                "gap_pct": _cost_gap_pct(greedy_best["objective_value"], optimal_cost)
+                if greedy_best["success"] else None,
+                "matched_unit_patterns": greedy_best.get("matched_unit_patterns"),
+                "changed_unit_patterns": greedy_best.get("changed_unit_patterns"),
+                "selected_pattern_indices": _safe_json_value(greedy_best.get("selected_pattern_indices")),
+            },
+            greedy_best_dual,
+        ),
+        "full_repair": _merge_dual(
+            {
+                "success": full_repair["success"],
+                "status": full_repair["status"],
+                "objective_value": full_repair["objective_value"],
+                "gap_pct": _cost_gap_pct(full_repair["objective_value"], optimal_cost)
+                if full_repair["success"] else None,
+                "matched_unit_patterns": full_repair.get("matched_unit_patterns"),
+                "changed_unit_patterns": full_repair.get("changed_unit_patterns"),
+                "selected_pattern_indices": _safe_json_value(full_repair.get("selected_pattern_indices")),
+                "added_generators": full_repair_added_generators,
+            },
+            full_repair_dual,
+        ),
+    }
+
+
 def main() -> None:
     ACTIVE_SET_JSON = (
         r"result/active_set/active_sets_case118_T0_n366_20260322_063917.json"
@@ -506,108 +834,34 @@ def main() -> None:
     VERBOSE_SOLVER = False
     MAX_GREEDY_STEPS = 8
 
-    print("=" * 72)
-    print("  Batch Pattern-Library Refinement")
-    print("=" * 72)
-    print(f"sample_ids={SAMPLE_IDS}")
-    print(f"pattern_library_json={PATTERN_LIBRARY_JSON}")
-    print(f"active_set_like_json={ACTIVE_SET_LIKE_JSON}")
-
-    pattern_library_data = _load_json(PATTERN_LIBRARY_JSON)
-    global_top_gap = _top_gap_samples(pattern_library_data, HIGH_GAP_TOP_K)
-    global_large_gap = [row for row in global_top_gap if row["gap_pct"] >= HIGH_GAP_THRESHOLD_PCT]
-
-    print("\n[Global high-gap samples]")
-    for row in global_top_gap[:10]:
-        print(
-            f"  sample_id={row['sample_id']}, gap_pct={row['gap_pct']:.6f}, "
-            f"changed={row['changed_unit_patterns']}, matched={row['matched_unit_patterns']}, "
-            f"status={row['solver_status']}"
-        )
-
     if IMPORT_ERROR is not None:
-        print(f"\nMissing dependency: {IMPORT_ERROR}")
-        print("This script requires a Python environment with gurobipy available.")
-        output = {
-            "metadata": {
-                "case_name": "case118",
-                "timestamp": datetime.now().isoformat(),
-                "source_active_set_json": ACTIVE_SET_JSON,
-                "source_pattern_library_json": PATTERN_LIBRARY_JSON,
-                "source_active_set_like_json": ACTIVE_SET_LIKE_JSON,
-            },
-            "parameters": {
-                "sample_ids": SAMPLE_IDS,
-                "high_gap_top_k": HIGH_GAP_TOP_K,
-                "high_gap_threshold_pct": HIGH_GAP_THRESHOLD_PCT,
-            },
-            "high_gap_samples": {
-                "top_k": global_top_gap,
-                "above_threshold": global_large_gap,
-            },
-            "batch_results": [],
-            "dependency_error": str(IMPORT_ERROR),
-        }
-        output_path = Path(OUTPUT_JSON)
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        output_path.write_text(json.dumps(output, ensure_ascii=False, indent=2), encoding="utf-8")
-        print(f"Saved summary-only report to: {output_path}")
-        return
+        raise RuntimeError(
+            f"Missing required dependency: {IMPORT_ERROR}. "
+            "This script requires a Python environment with gurobipy and commitment_clustering available."
+        ) from IMPORT_ERROR
 
     ppc = load_case118_ppc_with_mti_limits(
         aggregate_thermal_by_bus=AGGREGATE_THERMAL_BY_BUS,
     )
-    samples = _load_commitment_samples_from_json(ACTIVE_SET_JSON)
-    active_set_like_data = _load_json(ACTIVE_SET_LIKE_JSON)
-    base_allowed_patterns = _build_allowed_patterns_from_result(pattern_library_data)
 
-    batch_results: List[Dict] = []
-    for sample_id in SAMPLE_IDS:
-        print("\n" + "-" * 72)
-        print(f"Processing sample_id={sample_id}")
-        sample = _find_sample(samples, sample_id)
-        sample_like = _find_active_set_like_sample(active_set_like_data, sample_id)
-        result = _refine_one_sample(
-            ppc=ppc,
-            sample=sample,
-            sample_like=sample_like,
-            base_allowed_patterns=base_allowed_patterns,
-            t_delta=T_DELTA,
-            base_time_limit=BASE_TIME_LIMIT,
-            greedy_trial_time_limit=GREEDY_TRIAL_TIME_LIMIT,
-            final_time_limit=FINAL_TIME_LIMIT,
-            mip_gap=MIP_GAP,
-            verbose_solver=VERBOSE_SOLVER,
-            max_greedy_steps=MAX_GREEDY_STEPS,
-        )
-        batch_results.append(result)
-
-    output = {
-        "metadata": {
-            "case_name": "case118",
-            "timestamp": datetime.now().isoformat(),
-            "source_active_set_json": ACTIVE_SET_JSON,
-            "source_pattern_library_json": PATTERN_LIBRARY_JSON,
-            "source_active_set_like_json": ACTIVE_SET_LIKE_JSON,
-        },
-        "parameters": {
-            "sample_ids": SAMPLE_IDS,
-            "high_gap_top_k": HIGH_GAP_TOP_K,
-            "high_gap_threshold_pct": HIGH_GAP_THRESHOLD_PCT,
-            "aggregate_thermal_by_bus": AGGREGATE_THERMAL_BY_BUS,
-            "T_delta": T_DELTA,
-            "base_time_limit": BASE_TIME_LIMIT,
-            "greedy_trial_time_limit": GREEDY_TRIAL_TIME_LIMIT,
-            "final_time_limit": FINAL_TIME_LIMIT,
-            "mip_gap": MIP_GAP,
-            "max_greedy_steps": MAX_GREEDY_STEPS,
-        },
-        "high_gap_samples": {
-            "top_k": global_top_gap,
-            "above_threshold": global_large_gap,
-        },
-        "batch_results": batch_results,
-    }
+    output = run_refinement_batch(
+        ppc=ppc,
+        active_set_json=ACTIVE_SET_JSON,
+        pattern_library_json=PATTERN_LIBRARY_JSON,
+        active_set_like_json=ACTIVE_SET_LIKE_JSON,
+        sample_ids=SAMPLE_IDS,
+        high_gap_top_k=HIGH_GAP_TOP_K,
+        high_gap_threshold_pct=HIGH_GAP_THRESHOLD_PCT,
+        t_delta=T_DELTA,
+        base_time_limit=BASE_TIME_LIMIT,
+        greedy_trial_time_limit=GREEDY_TRIAL_TIME_LIMIT,
+        final_time_limit=FINAL_TIME_LIMIT,
+        mip_gap=MIP_GAP,
+        max_greedy_steps=MAX_GREEDY_STEPS,
+        verbose_solver=VERBOSE_SOLVER,
+        strict_dual=False,
+        require_full_repair_success=False,
+    )
 
     output_path = Path(OUTPUT_JSON)
     output_path.parent.mkdir(parents=True, exist_ok=True)
