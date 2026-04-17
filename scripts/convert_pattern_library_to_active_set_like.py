@@ -137,6 +137,63 @@ def _matrix_as_nested_list(x: np.ndarray) -> List[List[int]]:
     return [[int(v) for v in row] for row in x]
 
 
+def _original_commitment_matrix_from_sample(sample: Dict, ppc: dict) -> Optional[List[List[int]]]:
+    """Recover UC-optimal commitment for heal / metadata.
+
+    ``ActiveSetLearner.save_active_sets_json`` typically stores ``active_set`` and
+    ``lambda`` but **not** ``unit_commitment_matrix``. Pattern-library JSON still
+    needs the true optimal ``x`` for augmentation and ED fallback, so we rebuild
+    from ``active_set`` when the matrix field is absent.
+    """
+    raw = sample.get("unit_commitment_matrix")
+    if raw is not None:
+        xm = np.asarray(raw, dtype=int)
+        if xm.size > 0 and xm.ndim == 2:
+            return _matrix_as_nested_list(xm)
+
+    load = sample.get("pd_data", sample.get("load_data"))
+    if load is None:
+        return None
+    load_arr = np.asarray(load, dtype=float)
+    if load_arr.ndim != 2 or load_arr.shape[1] == 0:
+        return None
+    horizon = int(load_arr.shape[1])
+    gen = ppc.get("gen")
+    if gen is None:
+        return None
+    ng = int(np.asarray(gen).shape[0])
+    if ng <= 0:
+        return None
+
+    active_set = sample.get("active_set")
+    if not isinstance(active_set, list) or not active_set:
+        return None
+
+    x = np.zeros((ng, horizon), dtype=int)
+    for item in active_set:
+        if (
+            isinstance(item, list)
+            and len(item) == 2
+            and isinstance(item[0], list)
+            and len(item[0]) == 2
+        ):
+            g, t = int(item[0][0]), int(item[0][1])
+            value = int(item[1])
+        elif isinstance(item, dict):
+            g = item.get("unit_id", item.get("generator_id", item.get("g")))
+            t = item.get("time_slot", item.get("time", item.get("t")))
+            value = item.get("value", item.get("x"))
+            if g is None or t is None or value is None:
+                continue
+            g, t, value = int(g), int(t), int(value)
+        else:
+            continue
+        if 0 <= g < ng and 0 <= t < horizon:
+            x[g, t] = value
+
+    return _matrix_as_nested_list(x)
+
+
 def _refresh_sample_dual_with_pattern_heal(
     sample: Dict,
     x_matrix: List[List[int]],
@@ -381,6 +438,9 @@ def convert_pattern_library_to_active_set_like(
         scenario = scenario_by_sample_id.get(sample_id)
         converted = copy.deepcopy(sample)
         original_x = copy.deepcopy(sample.get("unit_commitment_matrix"))
+        if original_x is None:
+            # ActiveSetLearner JSON: matrix absent, only ``active_set`` + ``lambda``.
+            original_x = _original_commitment_matrix_from_sample(sample, ppc)
         conversion_status = "converted"
 
         if scenario is None:
