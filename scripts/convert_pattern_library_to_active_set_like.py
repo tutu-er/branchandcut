@@ -160,12 +160,16 @@ def _refresh_sample_dual_with_pattern_heal(
     2. If still failing, fall back to **original** ``unit_commitment_matrix`` and
        refresh dual (must be ED-feasible if ActiveSetLearner data is consistent).
     """
+    # Note: Python 3 deletes the name ``exc`` when leaving the ``except`` block, so
+    # we must copy the exception object before any code runs after ``except``.
+    saved_ed_exc: Optional[RuntimeError] = None
     try:
         _refresh_sample_dual_payload(sample, x_matrix, ppc, t_delta)
         return x_matrix, None
     except RuntimeError as exc:
         if not heal or "ED solve failed" not in str(exc):
             raise
+        saved_ed_exc = exc
 
     print(
         f"  [convert] sample_id={sample.get('sample_id')}: ED infeasible on pattern x "
@@ -178,8 +182,8 @@ def _refresh_sample_dual_with_pattern_heal(
     if x_opt is None:
         raise RuntimeError(
             f"sample_id={sample.get('sample_id')}: ED failed after pattern conversion "
-            f"and no original_unit_commitment_matrix is available for heal. ({exc})"
-        ) from exc
+            f"and no original_unit_commitment_matrix is available for heal. ({saved_ed_exc})"
+        ) from saved_ed_exc
 
     x_opt_arr = np.asarray(x_opt, dtype=int)
     load = np.asarray(sample.get("load_data", sample.get("pd_data")), dtype=float)
@@ -188,7 +192,7 @@ def _refresh_sample_dual_with_pattern_heal(
 
     heal_info: Dict = {
         "trigger": "ed_solve_failed_after_pattern_conversion",
-        "detail": str(exc),
+        "detail": str(saved_ed_exc) if saved_ed_exc is not None else "",
     }
 
     from src.commitment_clustering import (
@@ -239,7 +243,7 @@ def _refresh_sample_dual_with_pattern_heal(
             f"pattern-rescue UC did not yield ED-feasible x; "
             f"original optimal commitment is also ED-infeasible "
             f"({ec_orig.get('reason')})."
-        ) from exc
+        ) from saved_ed_exc
 
     x_list = _matrix_as_nested_list(x_opt_arr)
     _refresh_sample_dual_payload(
