@@ -151,7 +151,7 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument(
         "--heal-mip-time-limit",
         type=float,
-        default=180.0,
+        default=1800.0,
         help="Phase 3: Gurobi time limit (seconds) for rescue pattern-restricted UC.",
     )
 
@@ -167,7 +167,7 @@ def _parse_args() -> argparse.Namespace:
                    help="Consider top-k gap samples when selecting refine targets.")
     p.add_argument("--refine-base-time-limit", type=float, default=6000.0,
                    help="Gurobi time limit for baseline solve in Phase 4 (seconds).")
-    p.add_argument("--refine-greedy-time-limit", type=float, default=180.0,
+    p.add_argument("--refine-greedy-time-limit", type=float, default=1800.0,
                    help="Gurobi time limit per greedy trial in Phase 4 (seconds).")
     p.add_argument("--refine-final-time-limit", type=float, default=6000.0,
                    help="Gurobi time limit for full_repair solve in Phase 4 (seconds).")
