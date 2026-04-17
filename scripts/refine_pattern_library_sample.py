@@ -140,6 +140,72 @@ def _safe_json_value(value):
     return value
 
 
+def _serialize_dual_payload(payload: Dict) -> Dict:
+    return {
+        key: np.asarray(value, dtype=float).tolist()
+        for key, value in payload.items()
+    }
+
+
+def _dual_payload_for_x_matrix(
+    ppc: dict,
+    sample: Dict,
+    t_delta: float,
+    x_sol: np.ndarray,
+    refresh_source: str,
+) -> Dict[str, object]:
+    """与 convert_pattern_library_to_active_set_like / build_refined_case118_active_set 一致：固定 x 后解 ED 提取全局对偶。"""
+    from src.uc_NN_subproblem import (
+        _build_generator_injection_sensitivity,
+        _solve_global_dual_payload_from_ed,
+    )
+
+    pd_data = np.asarray(sample.get("pd_data", sample.get("load_data")), dtype=float)
+    renewable_data = sample.get("renewable_data")
+    renewable_arr = None if renewable_data is None else np.asarray(renewable_data, dtype=float)
+    x_arr = np.asarray(x_sol, dtype=float)
+    generator_injection_sensitivity = _build_generator_injection_sensitivity(ppc)
+    payload = _solve_global_dual_payload_from_ed(
+        ppc,
+        pd_data,
+        float(t_delta),
+        x_arr,
+        generator_injection_sensitivity,
+        renewable_data=renewable_arr,
+    )
+    serialized = _serialize_dual_payload(payload)
+    return {
+        "lambda": serialized,
+        "lambda_pg_electricity_price": serialized["lambda_pg_effective"],
+        "lambda_refresh_source": refresh_source,
+    }
+
+
+def _try_attach_dual(
+    ppc: dict,
+    sample: Dict,
+    t_delta: float,
+    x_sol: np.ndarray | None,
+    refresh_source: str,
+    sample_id: int,
+    label: str,
+) -> Dict[str, object] | None:
+    if x_sol is None:
+        return None
+    try:
+        return _dual_payload_for_x_matrix(ppc, sample, t_delta, x_sol, refresh_source)
+    except Exception as exc:
+        print(
+            f"  WARNING sample_id={sample_id} {label}: dual refresh failed ({refresh_source}): {exc}",
+            flush=True,
+        )
+        return {
+            "lambda_dual_refresh_failed": True,
+            "lambda_dual_refresh_error": str(exc),
+            "lambda_refresh_source": refresh_source,
+        }
+
+
 def _summarize_solution(tag: str, solve_info: Dict, optimal_cost: float) -> None:
     gap_pct = None
     if solve_info["success"]:
@@ -320,43 +386,95 @@ def _refine_one_sample(
     )
     _summarize_solution(f"sample {sample_id} full_repair", full_repair, optimal_cost)
 
+    optimal_dual = _try_attach_dual(
+        ppc,
+        sample,
+        t_delta,
+        x_opt,
+        "recomputed_from_ed_optimal_commitment",
+        sample_id,
+        "optimal_x",
+    )
+    baseline_dual = _try_attach_dual(
+        ppc,
+        sample,
+        t_delta,
+        baseline.get("x_sol"),
+        "recomputed_from_ed_after_pattern_restricted_baseline",
+        sample_id,
+        "baseline_x",
+    )
+    greedy_best_dual = _try_attach_dual(
+        ppc,
+        sample,
+        t_delta,
+        greedy_best.get("x_sol"),
+        "recomputed_from_ed_after_pattern_restricted_greedy_best",
+        sample_id,
+        "greedy_best_x",
+    )
+    full_repair_dual = _try_attach_dual(
+        ppc,
+        sample,
+        t_delta,
+        full_repair.get("x_sol"),
+        "recomputed_from_ed_after_pattern_restricted_full_repair",
+        sample_id,
+        "full_repair_x",
+    )
+
+    def _merge_dual(block: Dict[str, object], dual: Dict[str, object] | None) -> Dict[str, object]:
+        if dual:
+            return {**block, **dual}
+        return block
+
     return {
         "sample_id": sample_id,
         "optimal_cost": optimal_cost,
+        "optimal_dual": optimal_dual,
         "baseline_matches_active_set_like": baseline_matches_active_set_like,
         "mismatched_generators": mismatched_generators,
-        "baseline": {
-            "success": baseline["success"],
-            "status": baseline["status"],
-            "objective_value": baseline["objective_value"],
-            "gap_pct": _cost_gap_pct(baseline["objective_value"], optimal_cost)
-            if baseline["success"] else None,
-            "matched_unit_patterns": baseline.get("matched_unit_patterns"),
-            "changed_unit_patterns": baseline.get("changed_unit_patterns"),
-            "selected_pattern_indices": _safe_json_value(baseline.get("selected_pattern_indices")),
-        },
+        "baseline": _merge_dual(
+            {
+                "success": baseline["success"],
+                "status": baseline["status"],
+                "objective_value": baseline["objective_value"],
+                "gap_pct": _cost_gap_pct(baseline["objective_value"], optimal_cost)
+                if baseline["success"] else None,
+                "matched_unit_patterns": baseline.get("matched_unit_patterns"),
+                "changed_unit_patterns": baseline.get("changed_unit_patterns"),
+                "selected_pattern_indices": _safe_json_value(baseline.get("selected_pattern_indices")),
+            },
+            baseline_dual,
+        ),
         "greedy_history": greedy_history,
-        "greedy_best": {
-            "success": greedy_best["success"],
-            "status": greedy_best["status"],
-            "objective_value": greedy_best["objective_value"],
-            "gap_pct": _cost_gap_pct(greedy_best["objective_value"], optimal_cost)
-            if greedy_best["success"] else None,
-            "matched_unit_patterns": greedy_best.get("matched_unit_patterns"),
-            "changed_unit_patterns": greedy_best.get("changed_unit_patterns"),
-            "selected_pattern_indices": _safe_json_value(greedy_best.get("selected_pattern_indices")),
-        },
-        "full_repair": {
-            "success": full_repair["success"],
-            "status": full_repair["status"],
-            "objective_value": full_repair["objective_value"],
-            "gap_pct": _cost_gap_pct(full_repair["objective_value"], optimal_cost)
-            if full_repair["success"] else None,
-            "matched_unit_patterns": full_repair.get("matched_unit_patterns"),
-            "changed_unit_patterns": full_repair.get("changed_unit_patterns"),
-            "selected_pattern_indices": _safe_json_value(full_repair.get("selected_pattern_indices")),
-            "added_generators": full_repair_added_generators,
-        },
+        "greedy_best": _merge_dual(
+            {
+                "success": greedy_best["success"],
+                "status": greedy_best["status"],
+                "objective_value": greedy_best["objective_value"],
+                "gap_pct": _cost_gap_pct(greedy_best["objective_value"], optimal_cost)
+                if greedy_best["success"] else None,
+                "matched_unit_patterns": greedy_best.get("matched_unit_patterns"),
+                "changed_unit_patterns": greedy_best.get("changed_unit_patterns"),
+                "selected_pattern_indices": _safe_json_value(greedy_best.get("selected_pattern_indices")),
+            },
+            greedy_best_dual,
+        ),
+        "full_repair": _merge_dual(
+            {
+                "success": full_repair["success"],
+                "status": full_repair["status"],
+                "objective_value": full_repair["objective_value"],
+                "gap_pct": _cost_gap_pct(full_repair["objective_value"], optimal_cost)
+                if full_repair["success"] else None,
+                "matched_unit_patterns": full_repair.get("matched_unit_patterns"),
+                "changed_unit_patterns": full_repair.get("changed_unit_patterns"),
+                "selected_pattern_indices": _safe_json_value(full_repair.get("selected_pattern_indices")),
+                "added_generators": full_repair_added_generators,
+            },
+            full_repair_dual,
+        ),
     }
 
 
