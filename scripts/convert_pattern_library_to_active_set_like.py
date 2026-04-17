@@ -17,7 +17,7 @@ import json
 import sys
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -70,7 +70,14 @@ def _serialize_dual_payload(payload: Dict) -> Dict:
     }
 
 
-def _refresh_sample_dual_payload(sample: Dict, x_matrix: List[List[int]], ppc, t_delta: float) -> None:
+def _refresh_sample_dual_payload(
+    sample: Dict,
+    x_matrix: List[List[int]],
+    ppc,
+    t_delta: float,
+    *,
+    lambda_refresh_source: str = "recomputed_from_ed_after_pattern_conversion",
+) -> None:
     from src.uc_NN_subproblem import (
         _build_generator_injection_sensitivity,
         _solve_global_dual_payload_from_ed,
@@ -92,7 +99,158 @@ def _refresh_sample_dual_payload(sample: Dict, x_matrix: List[List[int]], ppc, t
     serialized = _serialize_dual_payload(payload)
     sample["lambda"] = serialized
     sample["lambda_pg_electricity_price"] = serialized["lambda_pg_effective"]
-    sample["lambda_refresh_source"] = "recomputed_from_ed_after_pattern_conversion"
+    sample["lambda_refresh_source"] = lambda_refresh_source
+
+
+def _allowed_patterns_from_pattern_library(pattern_library: List[Dict]) -> List[List[np.ndarray]]:
+    """Same pattern list shape as ``solve_pattern_restricted_uc`` expects."""
+    allowed: List[List[np.ndarray]] = []
+    for generator_entry in pattern_library:
+        patterns_g: List[np.ndarray] = []
+        for pattern_entry in generator_entry.get("patterns", []):
+            bits = [int(ch) for ch in str(pattern_entry["pattern"]).strip()]
+            patterns_g.append(np.asarray(bits, dtype=int))
+        allowed.append(patterns_g)
+    return allowed
+
+
+def _augment_allowed_with_commitment_rows(
+    allowed: List[List[np.ndarray]],
+    x_opt: np.ndarray,
+) -> List[List[np.ndarray]]:
+    """Append each generator's optimal row as an extra pattern if not already present."""
+    from src.commitment_clustering import _pattern_to_key
+
+    aug: List[List[np.ndarray]] = [
+        [np.asarray(p, dtype=int).copy() for p in row] for row in allowed
+    ]
+    x_opt = np.asarray(x_opt, dtype=int)
+    for g in range(x_opt.shape[0]):
+        key = _pattern_to_key(x_opt[g, :])
+        if not any(_pattern_to_key(np.asarray(p, dtype=int)) == key for p in aug[g]):
+            aug[g].append(np.asarray(x_opt[g, :], dtype=int).copy())
+    return aug
+
+
+def _matrix_as_nested_list(x: np.ndarray) -> List[List[int]]:
+    x = np.asarray(x, dtype=int)
+    return [[int(v) for v in row] for row in x]
+
+
+def _refresh_sample_dual_with_pattern_heal(
+    sample: Dict,
+    x_matrix: List[List[int]],
+    ppc: dict,
+    t_delta: float,
+    pattern_library: List[Dict],
+    *,
+    heal: bool,
+    heal_mip_time_limit: float = 180.0,
+) -> Tuple[List[List[int]], Optional[Dict]]:
+    """Try ED dual refresh; on ED infeasibility optionally re-solve augmented pattern UC then retry.
+
+    Root cause (typical): pattern-restricted UC uses a subset of DC lines
+    (``active_lines``) while ``EconomicDispatchGurobi`` enforces **all** branches,
+    so the pattern MILP solution can be ED-infeasible under the full-line ED.
+
+    Heal ladder:
+    1. Augment each generator's allowed patterns with the **original optimal** row,
+       run ``solve_pattern_restricted_uc`` again, verify with ``evaluate_commitment_cost``,
+       then refresh dual.
+    2. If still failing, fall back to **original** ``unit_commitment_matrix`` and
+       refresh dual (must be ED-feasible if ActiveSetLearner data is consistent).
+    """
+    try:
+        _refresh_sample_dual_payload(sample, x_matrix, ppc, t_delta)
+        return x_matrix, None
+    except RuntimeError as exc:
+        if not heal or "ED solve failed" not in str(exc):
+            raise
+
+    print(
+        f"  [convert] sample_id={sample.get('sample_id')}: ED infeasible on pattern x "
+        f"(often UC uses a subset of DC lines vs full-branch ED). "
+        f"Running pattern rescue (MIP limit {heal_mip_time_limit:g}s) …",
+        flush=True,
+    )
+
+    x_opt = sample.get("original_unit_commitment_matrix")
+    if x_opt is None:
+        raise RuntimeError(
+            f"sample_id={sample.get('sample_id')}: ED failed after pattern conversion "
+            f"and no original_unit_commitment_matrix is available for heal. ({exc})"
+        ) from exc
+
+    x_opt_arr = np.asarray(x_opt, dtype=int)
+    load = np.asarray(sample.get("load_data", sample.get("pd_data")), dtype=float)
+    ren = sample.get("renewable_data")
+    ren_arr = None if ren is None else np.asarray(ren, dtype=float)
+
+    heal_info: Dict = {
+        "trigger": "ed_solve_failed_after_pattern_conversion",
+        "detail": str(exc),
+    }
+
+    from src.commitment_clustering import (
+        evaluate_commitment_cost,
+        solve_pattern_restricted_uc,
+    )
+
+    allowed = _allowed_patterns_from_pattern_library(pattern_library)
+    augmented = _augment_allowed_with_commitment_rows(allowed, x_opt_arr)
+    scenario = {
+        "load_data": load,
+        "renewable_data": ren_arr,
+        "unit_commitment_matrix": x_opt_arr,
+    }
+    x_sol, obj_val, status, _sel = solve_pattern_restricted_uc(
+        ppc,
+        scenario,
+        augmented,
+        T_delta=float(t_delta),
+        time_limit=float(heal_mip_time_limit),
+        mip_gap=1e-4,
+        verbose=False,
+    )
+    heal_info["pattern_rescue_mip_status"] = status
+    if x_sol is not None:
+        ec = evaluate_commitment_cost(
+            ppc, load, x_sol, float(t_delta), renewable_data=ren_arr,
+        )
+        if ec.get("success"):
+            x_list = _matrix_as_nested_list(x_sol)
+            _refresh_sample_dual_payload(
+                sample,
+                x_list,
+                ppc,
+                t_delta,
+                lambda_refresh_source="recomputed_from_ed_after_pattern_uc_heal",
+            )
+            heal_info["rescue"] = "pattern_restricted_uc_with_optimal_rows_augmented"
+            heal_info["objective_value"] = float(obj_val)
+            return x_list, heal_info
+
+    ec_orig = evaluate_commitment_cost(
+        ppc, load, x_opt_arr, float(t_delta), renewable_data=ren_arr,
+    )
+    if not ec_orig.get("success"):
+        raise RuntimeError(
+            f"sample_id={sample.get('sample_id')}: pattern ED infeasible; "
+            f"pattern-rescue UC did not yield ED-feasible x; "
+            f"original optimal commitment is also ED-infeasible "
+            f"({ec_orig.get('reason')})."
+        ) from exc
+
+    x_list = _matrix_as_nested_list(x_opt_arr)
+    _refresh_sample_dual_payload(
+        sample,
+        x_list,
+        ppc,
+        t_delta,
+        lambda_refresh_source="recomputed_from_ed_after_heal_fallback_original_uc",
+    )
+    heal_info["rescue"] = "fallback_original_uc_commitment"
+    return x_list, heal_info
 
 
 def _load_json(path: str) -> Dict:
@@ -167,6 +325,8 @@ def convert_pattern_library_to_active_set_like(
     pattern_library_json_path: str,
     output_path: str,
     fallback_to_original: bool = True,
+    ed_infeasibility_heal: bool = True,
+    heal_mip_time_limit: float = 180.0,
 ) -> str:
     active_set_data = _load_json(active_set_json_path)
     pattern_data = _load_json(pattern_library_json_path)
@@ -201,6 +361,8 @@ def convert_pattern_library_to_active_set_like(
     unique_active_sets: List[List[List[object]]] = []
     seen_active_sets = set()
     dual_refreshed_sample_ids: List[int] = []
+    ed_heal_rescue_ids: List[int] = []
+    ed_heal_fallback_ids: List[int] = []
     n_samples = len(original_samples)
     print(
         f"[convert_pattern_library] {n_samples} samples; "
@@ -254,7 +416,25 @@ def convert_pattern_library_to_active_set_like(
                     f"({idx + 1}/{n_samples}) …",
                     flush=True,
                 )
-            _refresh_sample_dual_payload(converted, x_matrix, ppc, t_delta)
+            x_matrix, heal_info = _refresh_sample_dual_with_pattern_heal(
+                converted,
+                x_matrix,
+                ppc,
+                t_delta,
+                pattern_library,
+                heal=ed_infeasibility_heal,
+                heal_mip_time_limit=heal_mip_time_limit,
+            )
+            converted["unit_commitment_matrix"] = x_matrix
+            converted["active_set"] = _matrix_to_active_set(x_matrix)
+            if heal_info:
+                converted["ed_infeasibility_heal"] = heal_info
+                if heal_info.get("rescue") == "pattern_restricted_uc_with_optimal_rows_augmented":
+                    converted["conversion_status"] = "converted_pattern_then_rescue_uc"
+                    ed_heal_rescue_ids.append(sample_id)
+                elif heal_info.get("rescue") == "fallback_original_uc_commitment":
+                    converted["conversion_status"] = "converted_pattern_then_fallback_original_ed"
+                    ed_heal_fallback_ids.append(sample_id)
             dual_refreshed_sample_ids.append(sample_id)
 
         if scenario is not None:
@@ -295,10 +475,16 @@ def convert_pattern_library_to_active_set_like(
             "conversion_type": "pattern_library_to_active_set_like",
             "dual_payload_refreshed_count": len(dual_refreshed_sample_ids),
             "dual_payload_refreshed_sample_ids": dual_refreshed_sample_ids,
+            "ed_heal_rescue_sample_ids": ed_heal_rescue_ids,
+            "ed_heal_fallback_sample_ids": ed_heal_fallback_ids,
+            "ed_heal_rescue_count": len(ed_heal_rescue_ids),
+            "ed_heal_fallback_count": len(ed_heal_fallback_ids),
         },
         "parameters": {
             **active_set_data.get("parameters", {}),
             "fallback_to_original": bool(fallback_to_original),
+            "ed_infeasibility_heal": bool(ed_infeasibility_heal),
+            "heal_mip_time_limit": float(heal_mip_time_limit),
         },
         "unique_active_sets": unique_active_sets,
         "all_samples": converted_samples,
@@ -323,6 +509,17 @@ def main() -> None:
         action="store_true",
         help="Fail if a sample is missing or unsuccessful in the pattern-library result",
     )
+    parser.add_argument(
+        "--no-ed-heal",
+        action="store_true",
+        help="Do not run pattern-UC / original-x heal when ED is infeasible after conversion.",
+    )
+    parser.add_argument(
+        "--heal-mip-time-limit",
+        type=float,
+        default=180.0,
+        help="Gurobi time limit (seconds) for the rescue pattern-restricted UC solve.",
+    )
     args = parser.parse_args()
 
     active_set_json = args.active_set_json or DEFAULT_ACTIVE_SET_JSON
@@ -337,6 +534,8 @@ def main() -> None:
         pattern_library_json_path=pattern_library_json,
         output_path=output_json,
         fallback_to_original=fallback_to_original,
+        ed_infeasibility_heal=not args.no_ed_heal,
+        heal_mip_time_limit=float(args.heal_mip_time_limit),
     )
     print(f"Converted JSON written to: {output_path}")
 

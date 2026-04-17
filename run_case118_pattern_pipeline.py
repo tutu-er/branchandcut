@@ -142,6 +142,19 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--verbose-solver", action="store_true", default=False,
                    help="Show Gurobi output in all phases.")
 
+    # ---- Phase 3 options ----
+    p.add_argument(
+        "--no-ed-heal",
+        action="store_true",
+        help="Phase 3: disable heal when pattern x is ED-infeasible (raise instead).",
+    )
+    p.add_argument(
+        "--heal-mip-time-limit",
+        type=float,
+        default=180.0,
+        help="Phase 3: Gurobi time limit (seconds) for rescue pattern-restricted UC.",
+    )
+
     # ---- Phase 4 options ----
     p.add_argument(
         "--refine-sample-ids", default=None,
@@ -259,6 +272,8 @@ def main() -> None:
             active_set_path=active_set_path,
             pattern_library_path=pattern_lib_path,
             output_path=active_set_like_path,
+            ed_infeasibility_heal=not args.no_ed_heal,
+            heal_mip_time_limit=float(args.heal_mip_time_limit),
         )
     else:
         print(f"\n[Phase 3] Skipped – using: {active_set_like_path}", flush=True)

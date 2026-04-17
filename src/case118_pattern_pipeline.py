@@ -135,11 +135,15 @@ def validate_final_commitments_ed_feasible(
 
 
 def _assert_converted_samples_have_lambda(converted_samples: List[Dict]) -> None:
+    _need_lambda_statuses = frozenset({
+        "converted_from_pattern_library",
+        "converted_pattern_then_rescue_uc",
+        "converted_pattern_then_fallback_original_ed",
+    })
     bad = [
         s.get("sample_id")
         for s in converted_samples
-        if s.get("conversion_status") == "converted_from_pattern_library"
-        and not s.get("lambda")
+        if s.get("conversion_status") in _need_lambda_statuses and not s.get("lambda")
     ]
     if bad:
         raise RuntimeError(
@@ -250,10 +254,16 @@ def run_phase_convert(
     active_set_path: str,
     pattern_library_path: str,
     output_path: str,
+    *,
+    ed_infeasibility_heal: bool = True,
+    heal_mip_time_limit: float = 180.0,
 ) -> str:
     """Convert pattern-library result to active_set_like JSON.
 
     Uses fallback_to_original=False so any missing/failed pattern result raises.
+    When ``ed_infeasibility_heal`` is True, ED infeasibility on the pattern x
+    triggers an augmented pattern-restricted UC re-solve, then optional
+    fallback to the original optimal commitment (see convert script).
     Verifies that all converted samples have a non-empty lambda.
     Returns output_path.
     """
@@ -264,6 +274,8 @@ def run_phase_convert(
         pattern_library_json_path=pattern_library_path,
         output_path=output_path,
         fallback_to_original=False,
+        ed_infeasibility_heal=ed_infeasibility_heal,
+        heal_mip_time_limit=heal_mip_time_limit,
     )
 
     # Verify lambda presence on converted samples
