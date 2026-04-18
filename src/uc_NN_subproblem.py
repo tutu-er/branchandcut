@@ -1541,6 +1541,7 @@ class SubproblemSurrogateTrainer:
         self.bus = ppc_int['bus']
         self.gen = ppc_int['gen']
         self.branch = ppc_int['branch']
+        self.nl = int(self.branch.shape[0])
         self.gencost = ppc_int['gencost']
         self.n_samples = len(active_set_data)
         self.T_delta = T_delta
@@ -6708,6 +6709,14 @@ def _dual_predictor_trainer_init(
 
     self.lambda_targets = self._solve_for_true_dual_variables()
     self.lambda_true = self.lambda_targets
+    if self.lambda_targets.size:
+        y_flat = self.lambda_targets.reshape(-1)
+        print(
+            f"[DualPredictor] lambda_targets: shape={self.lambda_targets.shape}, "
+            f"min={float(np.min(y_flat)):.4g}, max={float(np.max(y_flat)):.4g}, "
+            f"mean_abs={float(np.mean(np.abs(y_flat))):.4g}, std={float(np.std(y_flat)):.4g}",
+            flush=True,
+        )
 
 
 def _dual_predictor_trainer_solve_true(self) -> np.ndarray:

@@ -154,15 +154,34 @@ def _summarize_lambda_inherent(lam_inh: dict | None) -> dict:
     return summary
 
 
-def _solve_with_cvxpy_highs(problem, verbose: bool = False) -> float:
+def _solve_with_cvxpy_highs(problem, verbose: bool = False, threads: int = 1,
+                             warm_start: bool = False) -> float:
+    """Solve a CVXPY problem with HiGHS.
+
+    Args:
+        problem: CVXPY problem to solve.
+        verbose: Pass verbose=True to HiGHS for debugging.
+        threads: Number of threads for HiGHS to use.  Set >1 only when the
+            caller guarantees no nested parallelism (e.g. the main-BCD
+            single-process thread-pool path).  The default of 1 is safe for
+            the subproblem process-pool path where HiGHS and Python multiprocessing
+            would otherwise compete for cores.
+        warm_start: When True CVXPY reuses cached solver data and passes the
+            previous primal/dual solution as a hot-start.  Effective only when
+            the SAME problem object is solved repeatedly (persistent problems
+            built with cp.Parameter).
+    """
     assert_lp_backend_available(LP_BACKEND_CVXPY_HIGHS)
     solver_name = getattr(cp, "HIGHS", "HIGHS")
+    highs_threads = max(1, int(threads))
+    highs_parallel = "on" if highs_threads > 1 else "off"
     try:
         return problem.solve(
             solver=solver_name,
             verbose=verbose,
-            threads=1,
-            parallel="off",
+            threads=highs_threads,
+            parallel=highs_parallel,
+            warm_start=warm_start,
         )
     except Exception as exc:
         if _strict_cvxpy_highs_diagnostics_enabled() and CVXPY_AVAILABLE:
@@ -180,8 +199,9 @@ def _solve_with_cvxpy_highs(problem, verbose: bool = False) -> float:
                 _ = problem.solve(
                     solver=solver_name,
                     verbose=True,
-                    threads=1,
-                    parallel="off",
+                    threads=highs_threads,
+                    parallel=highs_parallel,
+                    warm_start=warm_start,
                 )
             except Exception:
                 pass

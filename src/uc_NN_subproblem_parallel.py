@@ -656,11 +656,32 @@ def _train_unit_worker(args: dict) -> dict:
     rho_binary_init     = args.get('rho_binary_init', 1.0)
     rho_opt_init        = args.get('rho_opt_init', 1e-3)
     gamma_base          = args.get('gamma_base', 1e-3)
+    mu_lower_bound_init = args.get('mu_lower_bound_init', 0.1)
     mu_individual_lower_bound_round = args.get('mu_individual_lower_bound_round', 3)
     mu_group_lower_bound_round = args.get('mu_group_lower_bound_round', 50)
     mu_signed_round_interval = args.get('mu_signed_round_interval')
     mu_sign_hysteresis_rounds = args.get('mu_sign_hysteresis_rounds', 2)
     mu_sign_flip_min_share = args.get('mu_sign_flip_min_share', 0.67)
+    x_bound_dual_zero_rounds = args.get('x_bound_dual_zero_rounds', 0)
+    ignore_startup_shutdown_costs = args.get('ignore_startup_shutdown_costs', False)
+    nn_learning_rate    = args.get('nn_learning_rate', 1e-4)
+    cost_learning_rate  = args.get('cost_learning_rate', 1e-5)
+    nn_batch_strategy   = args.get('nn_batch_strategy', 'full-batch')
+    nn_batch_size       = args.get('nn_batch_size', 4)
+    nn_shuffle          = args.get('nn_shuffle', True)
+    nn_smooth_abs_eps   = args.get('nn_smooth_abs_eps', 1e-6)
+    loss_ratio_primal   = args.get('loss_ratio_primal', 1.0)
+    loss_ratio_dual_pg  = args.get('loss_ratio_dual_pg', 1.0)
+    loss_ratio_dual_x   = args.get('loss_ratio_dual_x', 1.0)
+    nn_dual_term_interval = args.get('nn_dual_term_interval', 1)
+    loss_ratio_opt      = args.get('loss_ratio_opt', 1.0)
+    loss_ratio_reg      = args.get('loss_ratio_reg', 1.0)
+    pg_cost_nn_epochs   = args.get('pg_cost_nn_epochs')
+    pg_cost_start_round = args.get('pg_cost_start_round', 3)
+    pg_cost_lr          = args.get('pg_cost_lr', 2e-5)
+    pg_cost_surr_lr     = args.get('pg_cost_surr_lr', 5e-5)
+    pg_block_prox_weight = args.get('pg_block_prox_weight', 2e-2)
+    dual_block_prox_weight = args.get('dual_block_prox_weight', 1e-2)
     sample_n_workers    = args.get('sample_n_workers', 4)
     use_sample_parallel = args.get('use_sample_parallel', True)
     lp_backend          = args.get('lp_backend', LP_BACKEND_GUROBI)
@@ -690,11 +711,32 @@ def _train_unit_worker(args: dict) -> dict:
             rho_binary_init=rho_binary_init,
             rho_opt_init=rho_opt_init,
             gamma_base=gamma_base,
+            mu_lower_bound_init=mu_lower_bound_init,
             mu_individual_lower_bound_round=mu_individual_lower_bound_round,
             mu_group_lower_bound_round=mu_group_lower_bound_round,
             mu_signed_round_interval=mu_signed_round_interval,
             mu_sign_hysteresis_rounds=mu_sign_hysteresis_rounds,
             mu_sign_flip_min_share=mu_sign_flip_min_share,
+            x_bound_dual_zero_rounds=x_bound_dual_zero_rounds,
+            ignore_startup_shutdown_costs=ignore_startup_shutdown_costs,
+            nn_learning_rate=nn_learning_rate,
+            cost_learning_rate=cost_learning_rate,
+            nn_batch_strategy=nn_batch_strategy,
+            nn_batch_size=nn_batch_size,
+            nn_shuffle=nn_shuffle,
+            nn_smooth_abs_eps=nn_smooth_abs_eps,
+            loss_ratio_primal=loss_ratio_primal,
+            loss_ratio_dual_pg=loss_ratio_dual_pg,
+            loss_ratio_dual_x=loss_ratio_dual_x,
+            nn_dual_term_interval=nn_dual_term_interval,
+            loss_ratio_opt=loss_ratio_opt,
+            loss_ratio_reg=loss_ratio_reg,
+            pg_cost_nn_epochs=pg_cost_nn_epochs,
+            pg_cost_start_round=pg_cost_start_round,
+            pg_cost_lr=pg_cost_lr,
+            pg_cost_surr_lr=pg_cost_surr_lr,
+            pg_block_prox_weight=pg_block_prox_weight,
+            dual_block_prox_weight=dual_block_prox_weight,
             n_workers=sample_n_workers,
         )
     else:
@@ -710,11 +752,32 @@ def _train_unit_worker(args: dict) -> dict:
             rho_binary_init=rho_binary_init,
             rho_opt_init=rho_opt_init,
             gamma_base=gamma_base,
+            mu_lower_bound_init=mu_lower_bound_init,
             mu_individual_lower_bound_round=mu_individual_lower_bound_round,
             mu_group_lower_bound_round=mu_group_lower_bound_round,
             mu_signed_round_interval=mu_signed_round_interval,
             mu_sign_hysteresis_rounds=mu_sign_hysteresis_rounds,
             mu_sign_flip_min_share=mu_sign_flip_min_share,
+            x_bound_dual_zero_rounds=x_bound_dual_zero_rounds,
+            ignore_startup_shutdown_costs=ignore_startup_shutdown_costs,
+            nn_learning_rate=nn_learning_rate,
+            cost_learning_rate=cost_learning_rate,
+            nn_batch_strategy=nn_batch_strategy,
+            nn_batch_size=nn_batch_size,
+            nn_shuffle=nn_shuffle,
+            nn_smooth_abs_eps=nn_smooth_abs_eps,
+            loss_ratio_primal=loss_ratio_primal,
+            loss_ratio_dual_pg=loss_ratio_dual_pg,
+            loss_ratio_dual_x=loss_ratio_dual_x,
+            nn_dual_term_interval=nn_dual_term_interval,
+            loss_ratio_opt=loss_ratio_opt,
+            loss_ratio_reg=loss_ratio_reg,
+            pg_cost_nn_epochs=pg_cost_nn_epochs,
+            pg_cost_start_round=pg_cost_start_round,
+            pg_cost_lr=pg_cost_lr,
+            pg_cost_surr_lr=pg_cost_surr_lr,
+            pg_block_prox_weight=pg_block_prox_weight,
+            dual_block_prox_weight=dual_block_prox_weight,
         )
 
     trainer.iter(max_iter=max_iter, nn_epochs=nn_epochs)
@@ -883,11 +946,32 @@ def train_all_surrogates_parallel(
     rho_binary_init: float = 1.0,
     rho_opt_init: float = 1e-3,
     gamma_base: float = 1e-3,
+    mu_lower_bound_init: float = 0.1,
     mu_individual_lower_bound_round: int = 3,
     mu_group_lower_bound_round: int = 50,
     mu_signed_round_interval: int | None = None,
     mu_sign_hysteresis_rounds: int = 2,
     mu_sign_flip_min_share: float = 0.67,
+    x_bound_dual_zero_rounds: int = 0,
+    ignore_startup_shutdown_costs: bool = False,
+    nn_learning_rate: float = 1e-4,
+    cost_learning_rate: float = 1e-5,
+    nn_batch_strategy: str = "full-batch",
+    nn_batch_size: int = 4,
+    nn_shuffle: bool = True,
+    nn_smooth_abs_eps: float = 1e-6,
+    loss_ratio_primal: float = 1.0,
+    loss_ratio_dual_pg: float = 1.0,
+    loss_ratio_dual_x: float = 1.0,
+    nn_dual_term_interval: int | None = 1,
+    loss_ratio_opt: float = 1.0,
+    loss_ratio_reg: float = 1.0,
+    pg_cost_nn_epochs: int | None = None,
+    pg_cost_start_round: int = 3,
+    pg_cost_lr: float = 2e-5,
+    pg_cost_surr_lr: float = 5e-5,
+    pg_block_prox_weight: float = 2e-2,
+    dual_block_prox_weight: float = 1e-2,
     save_dir: Optional[str] = None,
     device=None,
     n_workers: Optional[int] = None,
@@ -983,11 +1067,32 @@ def train_all_surrogates_parallel(
             'rho_binary_init':    rho_binary_init,
             'rho_opt_init':       rho_opt_init,
             'gamma_base':         gamma_base,
+            'mu_lower_bound_init': mu_lower_bound_init,
             'mu_individual_lower_bound_round': mu_individual_lower_bound_round,
             'mu_group_lower_bound_round': mu_group_lower_bound_round,
             'mu_signed_round_interval': mu_signed_round_interval,
             'mu_sign_hysteresis_rounds': mu_sign_hysteresis_rounds,
             'mu_sign_flip_min_share': mu_sign_flip_min_share,
+            'x_bound_dual_zero_rounds': x_bound_dual_zero_rounds,
+            'ignore_startup_shutdown_costs': ignore_startup_shutdown_costs,
+            'nn_learning_rate':   nn_learning_rate,
+            'cost_learning_rate': cost_learning_rate,
+            'nn_batch_strategy':  nn_batch_strategy,
+            'nn_batch_size':      nn_batch_size,
+            'nn_shuffle':         nn_shuffle,
+            'nn_smooth_abs_eps':  nn_smooth_abs_eps,
+            'loss_ratio_primal':  loss_ratio_primal,
+            'loss_ratio_dual_pg': loss_ratio_dual_pg,
+            'loss_ratio_dual_x':  loss_ratio_dual_x,
+            'nn_dual_term_interval': nn_dual_term_interval,
+            'loss_ratio_opt':     loss_ratio_opt,
+            'loss_ratio_reg':     loss_ratio_reg,
+            'pg_cost_nn_epochs':  pg_cost_nn_epochs,
+            'pg_cost_start_round': pg_cost_start_round,
+            'pg_cost_lr':         pg_cost_lr,
+            'pg_cost_surr_lr':    pg_cost_surr_lr,
+            'pg_block_prox_weight': pg_block_prox_weight,
+            'dual_block_prox_weight': dual_block_prox_weight,
             'sample_n_workers':   sample_n_workers,
             'use_sample_parallel': use_sample_parallel,
             'lp_backend':         lp_backend,

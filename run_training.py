@@ -131,6 +131,8 @@ N_WORKERS_SAMPLE = min(6, LOCAL_CPU_COUNT, max(2, LOCAL_CPU_COUNT // 2))
 N_WORKERS_SUBPROBLEM = N_WORKERS_SAMPLE
 BCD_LP_BACKEND = 'gurobi'   # 'gurobi' / 'cvxpy_highs'
 BCD_GUROBI_THREADS = None   # None = let agent decide / backend default
+BCD_GUROBI_LP_METHOD = -1   # -1=auto, 0=primal simplex, 1=dual simplex, 2=barrier(IPM)
+BCD_HIGHS_THREADS = 1       # HiGHS threads per BCD LP solve (>1 safe only for thread-pool path)
 SUBPROBLEM_LP_BACKEND = 'cvxpy_highs'   # 'gurobi' / 'cvxpy_highs'
 SUBPROBLEM_SOLVER_BIN_PREPEND = None
 JOINT_MAX_ITER = 10
@@ -223,7 +225,7 @@ BCD_ITER_DELTA_REG_DEADBAND = 0.05
 SUBPROBLEM_ITER_DELTA_REG_WEIGHT = 5e-5
 SUBPROBLEM_ITER_DELTA_REG_DEADBAND = 0.10
 BCD_PG_BLOCK_PROX_WEIGHT = 0
-BCD_DUAL_BLOCK_PROX_WEIGHT = 1e-2
+BCD_DUAL_BLOCK_PROX_WEIGHT = 0
 SUBPROBLEM_PG_BLOCK_PROX_WEIGHT = 0
 SUBPROBLEM_DUAL_BLOCK_PROX_WEIGHT = 0
 
@@ -792,11 +794,32 @@ def run_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS,
             rho_binary_init=rho_binary_init,
             rho_opt_init=rho_opt_init,
             gamma_base=subproblem_gamma_base,
+            mu_lower_bound_init=mu_lower_bound_init,
             mu_individual_lower_bound_round=mu_individual_lower_bound_round,
             mu_group_lower_bound_round=mu_group_lower_bound_round,
             mu_signed_round_interval=mu_signed_round_interval,
             mu_sign_hysteresis_rounds=mu_sign_hysteresis_rounds,
             mu_sign_flip_min_share=mu_sign_flip_min_share,
+            x_bound_dual_zero_rounds=x_bound_dual_zero_rounds,
+            ignore_startup_shutdown_costs=ignore_startup_shutdown_costs,
+            nn_learning_rate=subproblem_nn_learning_rate,
+            cost_learning_rate=subproblem_cost_learning_rate,
+            nn_batch_strategy=subproblem_nn_batch_strategy,
+            nn_batch_size=subproblem_nn_batch_size,
+            nn_shuffle=subproblem_nn_shuffle,
+            nn_smooth_abs_eps=subproblem_nn_smooth_abs_eps,
+            loss_ratio_primal=loss_ratio_primal,
+            loss_ratio_dual_pg=loss_ratio_dual_pg,
+            loss_ratio_dual_x=loss_ratio_dual_x,
+            nn_dual_term_interval=nn_dual_term_interval,
+            loss_ratio_opt=loss_ratio_opt,
+            loss_ratio_reg=loss_ratio_reg,
+            pg_cost_nn_epochs=pg_cost_nn_epochs,
+            pg_cost_start_round=pg_cost_start_round,
+            pg_cost_lr=pg_cost_lr,
+            pg_cost_surr_lr=pg_cost_surr_lr,
+            pg_block_prox_weight=pg_block_prox_weight,
+            dual_block_prox_weight=dual_block_prox_weight,
             save_dir=save_dir,
             n_workers=N_WORKERS_UNIT,
             sample_n_workers=N_WORKERS_SAMPLE,
@@ -1037,6 +1060,8 @@ def run_bcd(ppc, all_samples: list, T_DELTA, MAX_ITER, bcd_model_dir,
             DUAL_SIGN_RELAX_INTERVAL: int | None = None,
             lp_backend: str = 'gurobi',
             gurobi_threads: int | None = None,
+            gurobi_lp_method: int = -1,
+            bcd_highs_threads: int = 1,
             logger: 'TrainingLogger | None' = None,
             load_model_path: str | None = None,
             restore_rho_from_checkpoint: bool = False,
@@ -1145,6 +1170,8 @@ def run_bcd(ppc, all_samples: list, T_DELTA, MAX_ITER, bcd_model_dir,
             T_DELTA,
             lp_backend=lp_backend,
             gurobi_threads=gurobi_threads,
+            gurobi_lp_method=gurobi_lp_method,
+            bcd_highs_threads=bcd_highs_threads,
             external_sparse_templates=external_sparse_templates,
             lambda_init_strategy=lambda_init_strategy,
             max_theta_constraints_per_time_slot=max_theta_constraints_per_time_slot,
@@ -1186,6 +1213,8 @@ def run_bcd(ppc, all_samples: list, T_DELTA, MAX_ITER, bcd_model_dir,
             T_DELTA,
             lp_backend=lp_backend,
             gurobi_threads=gurobi_threads,
+            gurobi_lp_method=gurobi_lp_method,
+            bcd_highs_threads=bcd_highs_threads,
             lambda_init_strategy=lambda_init_strategy,
             max_theta_constraints_per_time_slot=max_theta_constraints_per_time_slot,
             theta_hot_start_strategy=theta_hot_start_strategy,
@@ -1536,6 +1565,8 @@ def main():
     BCD_THETA_TRAINING_STAGES_VALUE = BCD_THETA_TRAINING_STAGES
     BCD_LP_BACKEND_VALUE = BCD_LP_BACKEND
     BCD_GUROBI_THREADS_VALUE = BCD_GUROBI_THREADS
+    BCD_GUROBI_LP_METHOD_VALUE = BCD_GUROBI_LP_METHOD
+    BCD_HIGHS_THREADS_VALUE = BCD_HIGHS_THREADS
     BCD_GAMMA_BASE_VALUE = BCD_GAMMA_BASE
     BCD_MU_DUAL_FLOOR_INIT_VALUE = BCD_MU_DUAL_FLOOR_INIT
     BCD_ITA_DUAL_FLOOR_INIT_VALUE = BCD_ITA_DUAL_FLOOR_INIT
@@ -1661,6 +1692,8 @@ def main():
                     case_name=CASE_NAME, timestamp=timestamp, n_workers=N_WORKERS_BCD, NN_EPOCHS=NN_EPOCHS, DUAL_DECAY_ROUND=DUAL_DECAY_ROUND, DUAL_SIGN_RELAX_INTERVAL=BCD_DUAL_SIGN_RELAX_INTERVAL_VALUE,
                     lp_backend=BCD_LP_BACKEND_VALUE,
                     gurobi_threads=BCD_GUROBI_THREADS_VALUE,
+                    gurobi_lp_method=BCD_GUROBI_LP_METHOD_VALUE,
+                    bcd_highs_threads=BCD_HIGHS_THREADS_VALUE,
                     logger=logger,
                     load_model_path=str(resolve_existing_path(BCD_MODEL_FILE, 'BCD model file')) if BCD_CONTINUE_TRAINING and BCD_MODEL_FILE is not None else None,
                     restore_rho_from_checkpoint=BCD_RESTORE_RHO_FROM_CHECKPOINT,

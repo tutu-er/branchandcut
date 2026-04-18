@@ -28,7 +28,7 @@ SUBPROBLEM_SOLVE_PRESET = "desktop"  # "desktop" | "server"
 ROOT = Path(__file__).resolve().parent
 CASE118_ACTIVE_SET_JSON = (
     "result/commitment_clustering/"
-    "pattern_library_case118_K10_20260408_132932_active_set_like_refined.json"
+    "pattern_library_case118_K10_20260418_032025_active_set_like_refined_20260418_032025.json"
 )
 
 
@@ -115,15 +115,24 @@ def _configure_main_bcd() -> None:
 
     if MAIN_BCD_SOLVE_PRESET == "gurobi":
         rt.BCD_LP_BACKEND = "gurobi"
-        # Gurobi already uses substantial internal parallelism; keep sample-level
-        # BCD parallelism small to avoid oversubscription.
+        # Gurobi academic license: 2 concurrent sessions maximum.
+        # With Method=2 (barrier/IPM) each LP model is multi-threaded, so
+        # allocate cpu//2 threads per model to saturate all cores with 2 workers.
         rt.N_WORKERS_BCD = min(2, cpu)
         rt.BCD_GUROBI_THREADS = max(1, cpu // rt.N_WORKERS_BCD)
+        rt.BCD_GUROBI_LP_METHOD = 2   # barrier (IPM) – multi-threaded LP
     elif MAIN_BCD_SOLVE_PRESET == "cvxpy_highs":
         rt.BCD_LP_BACKEND = "cvxpy_highs"
-        # Keep the fallback preset serial for stability in non-Gurobi setups.
-        rt.N_WORKERS_BCD = 1
+        # HiGHS has no concurrent-model license limit.
+        # Run one worker per 2 CPU cores (each worker keeps one persistent CVXPY
+        # problem alive; warm_start=True avoids re-canonicalization every iter).
+        # Give each HiGHS solve 2 threads so total ≈ cpu cores used.
+        rt.N_WORKERS_BCD = max(1, cpu // 2)
         rt.BCD_GUROBI_THREADS = None
+        rt.BCD_GUROBI_LP_METHOD = -1
+        # 2 threads per HiGHS solve: barrier can use them; simplex falls back to 1.
+        # Total cores used = N_WORKERS_BCD × bcd_highs_threads ≈ cpu.
+        rt.BCD_HIGHS_THREADS = 2
     else:
         raise ValueError(
             f"Unsupported MAIN_BCD_SOLVE_PRESET={MAIN_BCD_SOLVE_PRESET!r}; "

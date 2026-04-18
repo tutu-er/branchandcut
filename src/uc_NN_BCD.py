@@ -540,6 +540,8 @@ class Agent_NN_BCD:
         dual_sign_relax_interval: int | None = None,
         lp_backend: str = LP_BACKEND_GUROBI,
         gurobi_threads: int | None = None,
+        gurobi_lp_method: int = -1,
+        bcd_highs_threads: int = 1,
         nn_hidden_dims: List[int] | None = None,
         nn_learning_rate: float = 5e-5,
         nn_batch_strategy: str = "full-batch",
@@ -629,6 +631,8 @@ class Agent_NN_BCD:
         self._last_reported_theta_stage_signature = None
         self._lp_backend = normalize_lp_backend(lp_backend)
         self.gurobi_threads = None if gurobi_threads is None else max(1, int(gurobi_threads))
+        self.gurobi_lp_method = int(gurobi_lp_method)
+        self.bcd_highs_threads = max(1, int(bcd_highs_threads))
         if self._lp_backend == LP_BACKEND_CVXPY_HIGHS:
             assert_lp_backend_available(self._lp_backend)
 
@@ -1766,6 +1770,8 @@ class Agent_NN_BCD:
         model.Params.OutputFlag = 0
         if self.gurobi_threads is not None:
             model.Params.Threads = self.gurobi_threads
+        if not mip and self.gurobi_lp_method != -1:
+            model.Params.Method = self.gurobi_lp_method
         model.Params.FeasibilityTol = self.gurobi_feasibility_tol
         model.Params.OptimalityTol = self.gurobi_optimality_tol
         if mip:
@@ -1859,7 +1865,7 @@ class Agent_NN_BCD:
 
         objective = cp.sum(cpower) + (cp.sum(coc) if self.T > 1 else 0.0)
         problem = cp.Problem(cp.Minimize(objective), constraints)
-        _solve_with_cvxpy_highs(problem, verbose=False)
+        _solve_with_cvxpy_highs(problem, verbose=False, threads=self.bcd_highs_threads)
         if not _problem_is_optimal(problem):
             return None, None, None, None
 
@@ -1992,7 +1998,7 @@ class Agent_NN_BCD:
 
         objective = cp.sum(cpower) + (cp.sum(coc) if self.T > 1 else 0.0)
         problem = cp.Problem(cp.Minimize(objective), constraints)
-        _solve_with_cvxpy_highs(problem, verbose=False)
+        _solve_with_cvxpy_highs(problem, verbose=False, threads=self.bcd_highs_threads)
         if not _problem_is_optimal(problem):
             return None, None, None, None, None
 
@@ -3143,116 +3149,632 @@ class Agent_NN_BCD:
         values = zeta_tensor.detach().cpu().numpy()
         return {name: float(val) for name, val in zip(self.zeta_var_names, values)}
     
-    def _iter_with_pg_block_cvxpy_highs(self, sample_id=0, theta_values=None, zeta_values=None, union_analysis=None):
-        self._require_cvxpy_highs_main_backend()
-        if union_analysis is None:
-            union_analysis = self._current_union_analysis
+    def _build_pg_cvxpy_persistent(self, sample_id: int):
+        """Build a persistent CVXPY PG-block problem using cp.Parameter for every
+        coefficient that changes between BCD iterations (lambda values, rho weights).
 
-        Pd = np.asarray(self.active_set_data[sample_id]['pd_data'], dtype=float)
-        G = self._generator_incidence_matrix
-        PTDF = self._ptdf_matrix
+        The returned dict contains:
+          'problem' – cp.Problem (built once, re-solved with warm_start=True)
+          'params'  – dict of cp.Parameter objects to update each iteration
+          'vars'    – dict of cp.Variable objects for reading solutions
+        """
+        Pd          = np.asarray(self.active_set_data[sample_id]['pd_data'], dtype=float)
+        G           = self._generator_incidence_matrix
+        PTDF        = self._ptdf_matrix
         branch_limit = self._branch_limit
-        a = (self.gencost[:, -2] / self.T_delta).reshape(self.ng, 1)
-        b = (self.gencost[:, -1] / self.T_delta).reshape(self.ng, 1)
+        a  = (self.gencost[:, -2] / self.T_delta).reshape(self.ng, 1)
+        b  = (self.gencost[:, -1] / self.T_delta).reshape(self.ng, 1)
         start_cost = self.gencost[:, 1]
-        shut_cost = self.gencost[:, 2]
+        shut_cost  = self.gencost[:, 2]
+        Ton  = min(4, self.T)
+        Toff = min(4, self.T)
 
-        pg = cp.Variable((self.ng, self.T))
-        x = cp.Variable((self.ng, self.T))
+        # ── Decision variables ──────────────────────────────────────────────
+        pg  = cp.Variable((self.ng, self.T))
+        x   = cp.Variable((self.ng, self.T))
         coc = cp.Variable((self.ng, max(self.T - 1, 0)))
         constraints = [pg >= 0, x >= 0, x <= 1]
         if self.T > 1:
             constraints.append(coc >= 0)
 
-        lambda_sample = self.lambda_[sample_id]
+        # ── Scalar rho parameters ───────────────────────────────────────────
+        p_rho_primal = cp.Parameter(nonneg=True)
+        p_rho_opt    = cp.Parameter(nonneg=True)
+        p_rho_binary = cp.Parameter(nonneg=True)
+
+        # ── Lambda magnitude parameters (nonneg=True: we store |lambda|) ───
+        p_lambda_pb  = cp.Parameter(self.T,               nonneg=True)
+        p_lambda_pgl = cp.Parameter((self.ng, self.T),    nonneg=True)
+        p_lambda_pgu = cp.Parameter((self.ng, self.T),    nonneg=True)
+        p_lambda_xl  = cp.Parameter((self.ng, self.T),    nonneg=True)
+        p_lambda_xu  = cp.Parameter((self.ng, self.T),    nonneg=True)
+        p_lambda_dcu = cp.Parameter((self.nl, self.T),    nonneg=True)
+        p_lambda_dcl = cp.Parameter((self.nl, self.T),    nonneg=True)
+        p_lambda_mon  = cp.Parameter((self.ng, Ton,  self.T), nonneg=True)
+        p_lambda_moff = cp.Parameter((self.ng, Toff, self.T), nonneg=True)
+        if self.T > 1:
+            p_lambda_ru  = cp.Parameter((self.ng, self.T - 1), nonneg=True)
+            p_lambda_rd  = cp.Parameter((self.ng, self.T - 1), nonneg=True)
+            p_lambda_sc  = cp.Parameter((self.ng, self.T - 1), nonneg=True)
+            p_lambda_shc = cp.Parameter((self.ng, self.T - 1), nonneg=True)
+            p_lambda_coc = cp.Parameter((self.ng, self.T - 1), nonneg=True)
+        else:
+            p_lambda_ru = p_lambda_rd = p_lambda_sc = p_lambda_shc = p_lambda_coc = None
+
+        # uc_matrix: fixed from dataset, or parameter if only runtime self.x is available
+        uc_const = _get_uc_matrix_from_sample(self.active_set_data[sample_id], self.ng, self.T)
+        if uc_const is not None:
+            uc_const = np.asarray(uc_const, dtype=float)
+            p_uc_matrix = None
+            obj_binary = cp.sum(cp.abs(x - uc_const))
+        else:
+            p_uc_matrix = cp.Parameter((self.ng, self.T))
+            obj_binary = cp.sum(cp.abs(x - p_uc_matrix))
+
+        # ── Structural residual expressions (structure never changes) ───────
+        pg_lower_expr  = cp.multiply(self.gen[:, PMIN].reshape(self.ng, 1), x) - pg
+        pg_upper_expr  = pg - cp.multiply(self.gen[:, PMAX].reshape(self.ng, 1), x)
+
+        # ── Objective terms ─────────────────────────────────────────────────
         obj_primal_terms = []
-        obj_opt_terms = []
+        obj_opt_terms    = []
 
+        # Power balance (need per-slot |pb_expr| for element-wise lambda multiply)
+        pb_abs_list = []
         for t in range(self.T):
-            power_balance_expr = cp.sum(pg[:, t]) - float(np.sum(Pd[:, t]))
-            obj_primal_terms.append(cp.abs(power_balance_expr))
-            obj_opt_terms.append(abs(float(lambda_sample['lambda_power_balance'][t])) * cp.abs(power_balance_expr))
+            pb_expr = cp.sum(pg[:, t]) - float(np.sum(Pd[:, t]))
+            pb_abs_list.append(cp.abs(pb_expr))
+            obj_primal_terms.append(pb_abs_list[-1])
+        obj_opt_terms.append(cp.sum(cp.multiply(p_lambda_pb, cp.hstack(pb_abs_list))))
 
-        pg_lower_expr = cp.multiply(self.gen[:, PMIN].reshape(self.ng, 1), x) - pg
-        pg_upper_expr = pg - cp.multiply(self.gen[:, PMAX].reshape(self.ng, 1), x)
+        # PG bounds
         obj_primal_terms.append(cp.sum(cp.pos(pg_lower_expr)))
         obj_primal_terms.append(cp.sum(cp.pos(pg_upper_expr)))
-        obj_opt_terms.append(cp.sum(cp.multiply(np.abs(lambda_sample['lambda_pg_lower']), cp.abs(pg_lower_expr))))
-        obj_opt_terms.append(cp.sum(cp.multiply(np.abs(lambda_sample['lambda_pg_upper']), cp.abs(pg_upper_expr))))
-        obj_opt_terms.append(cp.sum(cp.multiply(np.abs(lambda_sample['lambda_x_lower']), x)))
-        obj_opt_terms.append(cp.sum(cp.multiply(np.abs(lambda_sample['lambda_x_upper']), 1 - x)))
+        obj_opt_terms.append(cp.sum(cp.multiply(p_lambda_pgl, cp.abs(pg_lower_expr))))
+        obj_opt_terms.append(cp.sum(cp.multiply(p_lambda_pgu, cp.abs(pg_upper_expr))))
+        obj_opt_terms.append(cp.sum(cp.multiply(p_lambda_xl,  x)))
+        obj_opt_terms.append(cp.sum(cp.multiply(p_lambda_xu,  1 - x)))
 
+        # Ramp
         if self.T > 1:
-            ramp_up_expr = pg[:, 1:] - pg[:, :-1] - self.Ru.reshape(self.ng, 1) * x[:, :-1] - self.Ru_co.reshape(self.ng, 1) * (1 - x[:, :-1])
-            ramp_down_expr = pg[:, :-1] - pg[:, 1:] - self.Rd.reshape(self.ng, 1) * x[:, 1:] - self.Rd_co.reshape(self.ng, 1) * (1 - x[:, 1:])
-            obj_primal_terms.append(cp.sum(cp.pos(ramp_up_expr)))
-            obj_primal_terms.append(cp.sum(cp.pos(ramp_down_expr)))
-            obj_opt_terms.append(cp.sum(cp.multiply(np.abs(lambda_sample['lambda_ramp_up']), cp.abs(ramp_up_expr))))
-            obj_opt_terms.append(cp.sum(cp.multiply(np.abs(lambda_sample['lambda_ramp_down']), cp.abs(ramp_down_expr))))
+            ru_expr = (pg[:, 1:] - pg[:, :-1]
+                       - self.Ru.reshape(self.ng, 1) * x[:, :-1]
+                       - self.Ru_co.reshape(self.ng, 1) * (1 - x[:, :-1]))
+            rd_expr = (pg[:, :-1] - pg[:, 1:]
+                       - self.Rd.reshape(self.ng, 1) * x[:, 1:]
+                       - self.Rd_co.reshape(self.ng, 1) * (1 - x[:, 1:]))
+            obj_primal_terms.append(cp.sum(cp.pos(ru_expr)))
+            obj_primal_terms.append(cp.sum(cp.pos(rd_expr)))
+            obj_opt_terms.append(cp.sum(cp.multiply(p_lambda_ru, cp.abs(ru_expr))))
+            obj_opt_terms.append(cp.sum(cp.multiply(p_lambda_rd, cp.abs(rd_expr))))
 
-        Ton = min(4, self.T)
-        Toff = min(4, self.T)
+        # Min-on / min-off
         for tau in range(1, Ton + 1):
             expr = x[:, 1:self.T - tau + 1] - x[:, :self.T - tau] - x[:, tau:]
             obj_primal_terms.append(cp.sum(cp.pos(expr)))
-            obj_opt_terms.append(cp.sum(cp.multiply(np.abs(lambda_sample['lambda_min_on'][:, tau - 1, :self.T - tau]), cp.abs(expr))))
+            obj_opt_terms.append(
+                cp.sum(cp.multiply(p_lambda_mon[:, tau - 1, :self.T - tau], cp.abs(expr))))
         for tau in range(1, Toff + 1):
             expr = -x[:, 1:self.T - tau + 1] + x[:, :self.T - tau] - (1 - x[:, tau:])
             obj_primal_terms.append(cp.sum(cp.pos(expr)))
-            obj_opt_terms.append(cp.sum(cp.multiply(np.abs(lambda_sample['lambda_min_off'][:, tau - 1, :self.T - tau]), cp.abs(expr))))
+            obj_opt_terms.append(
+                cp.sum(cp.multiply(p_lambda_moff[:, tau - 1, :self.T - tau], cp.abs(expr))))
 
+        # Start/shut costs + coc
         if self.T > 1:
-            start_expr = start_cost.reshape(self.ng, 1) * (x[:, 1:] - x[:, :-1]) - coc
-            shut_expr = shut_cost.reshape(self.ng, 1) * (x[:, :-1] - x[:, 1:]) - coc
-            obj_primal_terms.append(cp.sum(cp.pos(start_expr)))
-            obj_primal_terms.append(cp.sum(cp.pos(shut_expr)))
-            obj_opt_terms.append(cp.sum(cp.multiply(np.abs(lambda_sample['lambda_start_cost']), cp.abs(start_expr))))
-            obj_opt_terms.append(cp.sum(cp.multiply(np.abs(lambda_sample['lambda_shut_cost']), cp.abs(shut_expr))))
-            obj_opt_terms.append(cp.sum(cp.multiply(np.abs(lambda_sample['lambda_coc_nonneg']), coc)))
+            sc_expr  = start_cost.reshape(self.ng, 1) * (x[:, 1:] - x[:, :-1]) - coc
+            shc_expr = shut_cost.reshape(self.ng, 1)  * (x[:, :-1] - x[:, 1:]) - coc
+            obj_primal_terms.append(cp.sum(cp.pos(sc_expr)))
+            obj_primal_terms.append(cp.sum(cp.pos(shc_expr)))
+            obj_opt_terms.append(cp.sum(cp.multiply(p_lambda_sc,  cp.abs(sc_expr))))
+            obj_opt_terms.append(cp.sum(cp.multiply(p_lambda_shc, cp.abs(shc_expr))))
+            obj_opt_terms.append(cp.sum(cp.multiply(p_lambda_coc, coc)))
 
-        cpower_expr = cp.multiply(a, pg) + cp.multiply(b, x)
+        # DCPF
         for t in range(self.T):
             flow = PTDF @ (G @ pg[:, t] - Pd[:, t])
-            dcpf_upper_expr = flow - branch_limit
-            dcpf_lower_expr = -flow - branch_limit
-            obj_primal_terms.append(cp.sum(cp.pos(dcpf_upper_expr)))
-            obj_primal_terms.append(cp.sum(cp.pos(dcpf_lower_expr)))
-            obj_opt_terms.append(cp.sum(cp.multiply(np.abs(lambda_sample['lambda_dcpf_upper'][:, t]), cp.abs(dcpf_upper_expr))))
-            obj_opt_terms.append(cp.sum(cp.multiply(np.abs(lambda_sample['lambda_dcpf_lower'][:, t]), cp.abs(dcpf_lower_expr))))
+            dcpf_up  = flow - branch_limit
+            dcpf_lo  = -flow - branch_limit
+            obj_primal_terms.append(cp.sum(cp.pos(dcpf_up)))
+            obj_primal_terms.append(cp.sum(cp.pos(dcpf_lo)))
+            obj_opt_terms.append(cp.sum(cp.multiply(p_lambda_dcu[:, t], cp.abs(dcpf_up))))
+            obj_opt_terms.append(cp.sum(cp.multiply(p_lambda_dcl[:, t], cp.abs(dcpf_lo))))
 
-        unit_commitment_matrix = _get_uc_matrix_from_sample(self.active_set_data[sample_id], self.ng, self.T)
-        if unit_commitment_matrix is None:
-            unit_commitment_matrix = np.asarray(self.x[sample_id], dtype=float)
-        obj_binary = cp.sum(cp.abs(x - unit_commitment_matrix))
+        cpower_expr = cp.multiply(a, pg) + cp.multiply(b, x)
 
-        objective = (
-            self.rho_binary * obj_binary
-            + self.rho_primal * _sum_scalar_terms(obj_primal_terms)
-            + self.rho_opt * _sum_scalar_terms(obj_opt_terms)
+        objective = cp.Minimize(
+            p_rho_binary * obj_binary
+            + p_rho_primal * _sum_scalar_terms(obj_primal_terms)
+            + p_rho_opt    * _sum_scalar_terms(obj_opt_terms)
         )
-        problem = cp.Problem(cp.Minimize(objective), constraints)
-        _solve_with_cvxpy_highs(problem, verbose=False)
+        problem = cp.Problem(objective, constraints)
+
+        params = dict(
+            p_rho_primal=p_rho_primal, p_rho_opt=p_rho_opt, p_rho_binary=p_rho_binary,
+            p_lambda_pb=p_lambda_pb,
+            p_lambda_pgl=p_lambda_pgl, p_lambda_pgu=p_lambda_pgu,
+            p_lambda_xl=p_lambda_xl,   p_lambda_xu=p_lambda_xu,
+            p_lambda_dcu=p_lambda_dcu, p_lambda_dcl=p_lambda_dcl,
+            p_lambda_mon=p_lambda_mon, p_lambda_moff=p_lambda_moff,
+            p_lambda_ru=p_lambda_ru,   p_lambda_rd=p_lambda_rd,
+            p_lambda_sc=p_lambda_sc,   p_lambda_shc=p_lambda_shc,
+            p_lambda_coc=p_lambda_coc,
+            p_uc_matrix=p_uc_matrix,
+        )
+        vars_dict = {'pg': pg, 'x': x, 'coc': coc, 'cpower_expr': cpower_expr}
+        return {'problem': problem, 'params': params, 'vars': vars_dict}
+
+    def _iter_with_pg_block_cvxpy_highs(self, sample_id=0, theta_values=None, zeta_values=None, union_analysis=None):
+        self._require_cvxpy_highs_main_backend()
+        if union_analysis is None:
+            union_analysis = self._current_union_analysis
+
+        # ── Persistent-problem cache ────────────────────────────────────────
+        # Each sample gets one CVXPY problem built with cp.Parameter.
+        # Subsequent calls update the parameter values and solve with warm_start
+        # (skips re-canonicalization; HiGHS hot-starts from the previous basis).
+        if not hasattr(self, '_pg_cvxpy_cache'):
+            self._pg_cvxpy_cache: dict = {}
+        if sample_id not in self._pg_cvxpy_cache:
+            self._pg_cvxpy_cache[sample_id] = self._build_pg_cvxpy_persistent(sample_id)
+
+        cache   = self._pg_cvxpy_cache[sample_id]
+        params  = cache['params']
+        problem = cache['problem']
+        v       = cache['vars']
+
+        # ── Update parameter values ─────────────────────────────────────────
+        lam = self.lambda_[sample_id]
+        params['p_rho_primal'].value  = float(self.rho_primal)
+        params['p_rho_opt'].value     = float(self.rho_opt)
+        params['p_rho_binary'].value  = float(self.rho_binary)
+        params['p_lambda_pb'].value   = np.abs(lam['lambda_power_balance'])
+        params['p_lambda_pgl'].value  = np.abs(lam['lambda_pg_lower'])
+        params['p_lambda_pgu'].value  = np.abs(lam['lambda_pg_upper'])
+        params['p_lambda_xl'].value   = np.abs(lam['lambda_x_lower'])
+        params['p_lambda_xu'].value   = np.abs(lam['lambda_x_upper'])
+        params['p_lambda_dcu'].value  = np.abs(lam['lambda_dcpf_upper'])
+        params['p_lambda_dcl'].value  = np.abs(lam['lambda_dcpf_lower'])
+        params['p_lambda_mon'].value  = np.abs(lam['lambda_min_on'])
+        params['p_lambda_moff'].value = np.abs(lam['lambda_min_off'])
+        if self.T > 1:
+            params['p_lambda_ru'].value  = np.abs(lam['lambda_ramp_up'])
+            params['p_lambda_rd'].value  = np.abs(lam['lambda_ramp_down'])
+            params['p_lambda_sc'].value  = np.abs(lam['lambda_start_cost'])
+            params['p_lambda_shc'].value = np.abs(lam['lambda_shut_cost'])
+            params['p_lambda_coc'].value = np.abs(lam['lambda_coc_nonneg'])
+        if params['p_uc_matrix'] is not None:
+            params['p_uc_matrix'].value = np.asarray(self.x[sample_id], dtype=float)
+
+        # ── Solve (warm_start=True reuses canonicalized form + prior basis) ─
+        first_solve = (problem.value is None)
+        _solve_with_cvxpy_highs(
+            problem, verbose=False,
+            threads=self.bcd_highs_threads,
+            warm_start=(not first_solve),
+        )
         if not _problem_is_optimal(problem):
             print(f"❌ PG block cvxpy_highs failed, status={problem.status}", flush=True)
             return None, None, None, None
 
-        pg_sol = np.asarray(pg.value, dtype=float)
-        x_sol = np.asarray(x.value, dtype=float)
-        cpower_sol = np.asarray(cpower_expr.value, dtype=float)
-        coc_sol = np.asarray(coc.value, dtype=float) if self.T > 1 else np.zeros((self.ng, 0), dtype=float)
+        pg_sol     = np.asarray(v['pg'].value,           dtype=float)
+        x_sol      = np.asarray(v['x'].value,            dtype=float)
+        cpower_sol = np.asarray(v['cpower_expr'].value,  dtype=float)
+        coc_sol    = (np.asarray(v['coc'].value, dtype=float)
+                      if self.T > 1 else np.zeros((self.ng, 0), dtype=float))
         return pg_sol, x_sol, cpower_sol, coc_sol
 
     def _iter_with_dual_block_cvxpy_highs(self, sample_id=0, theta_values=None, zeta_values=None, union_analysis=None):
-        if sample_id <= 2:
-            print("[BCD][cvxpy_highs] dual block fallback: reuse current lambda/mu/ita", flush=True)
-        return (
-            {
-                key: np.array(val, copy=True) if isinstance(val, np.ndarray) else val
-                for key, val in self.lambda_[sample_id].items()
-            },
-            np.array(self.mu[sample_id], copy=True),
-            np.array(self.ita[sample_id], copy=True),
+        """HiGHS/CVXPY implementation of the dual block.
+
+        Minimises over (lambda, mu, ita) the same objective as the persistent
+        Gurobi model in iter_with_dual_block:
+
+            rho_dual_pg  * ||KKT_pg||_1
+          + rho_dual_x   * ||KKT_x||_1      (includes theta/zeta contributions)
+          + rho_dual_coc * ||KKT_coc||_1
+          + rho_opt      * <violation_magnitudes, lambdas>
+          + dual_block_prox_weight * ||delta_lambda / scale||_2^2
+
+        All lambda variables are non-negative (except lambda_power_balance which
+        is free). mu/ita bounds depend on the current floor/sign_relax state.
+        """
+        self._require_cvxpy_highs_main_backend()
+        if union_analysis is None:
+            union_analysis = self._current_union_analysis
+
+        Pd           = np.asarray(self.active_set_data[sample_id]['pd_data'], dtype=float)
+        PTDF_G       = self._ptdf_g          # (nl, ng)
+        G            = self._generator_incidence_matrix  # (nb, ng)
+        branch_limit = self._branch_limit    # (nl,)
+        Ru   = self.Ru;   Rd   = self.Rd
+        Ru_co= self.Ru_co; Rd_co= self.Rd_co
+        start_cost   = self.gencost[:, 1]
+        shut_cost    = self.gencost[:, 2]
+        Ton  = min(4, self.T)
+        Toff = min(4, self.T)
+
+        # ---- floor / sign-relax flags ----
+        floor_active     = self._is_dual_floor_active()
+        sign_relax_round = self._is_dual_sign_relaxation_round()
+
+        # ================================================================
+        # Decision variables
+        # ================================================================
+        lambda_pb   = cp.Variable(self.T)                                    # free
+        lambda_pgl  = cp.Variable((self.ng, self.T),   nonneg=True)
+        lambda_pgu  = cp.Variable((self.ng, self.T),   nonneg=True)
+        lambda_ru   = cp.Variable((self.ng, self.T-1), nonneg=True) if self.T > 1 else None
+        lambda_rd   = cp.Variable((self.ng, self.T-1), nonneg=True) if self.T > 1 else None
+        lambda_mon  = cp.Variable((self.ng, Ton,  self.T), nonneg=True)
+        lambda_moff = cp.Variable((self.ng, Toff, self.T), nonneg=True)
+        lambda_sc   = cp.Variable((self.ng, self.T-1), nonneg=True) if self.T > 1 else None
+        lambda_shc  = cp.Variable((self.ng, self.T-1), nonneg=True) if self.T > 1 else None
+        lambda_coc_nonneg = cp.Variable((self.ng, self.T-1), nonneg=True) if self.T > 1 else None
+        lambda_cpower = cp.Variable((self.ng, self.T), nonneg=True)
+        lambda_dcu  = cp.Variable((self.nl, self.T), nonneg=True)
+        lambda_dcl  = cp.Variable((self.nl, self.T), nonneg=True)
+        lambda_xu   = cp.Variable((self.ng, self.T), nonneg=True)
+        lambda_xl   = cp.Variable((self.ng, self.T), nonneg=True)
+
+        # mu/ita: free when sign-relax, otherwise non-negative
+        if floor_active and sign_relax_round:
+            mu  = cp.Variable((self.nl, self.T))
+            ita = cp.Variable((self.ng, self.T))
+        else:
+            mu  = cp.Variable((self.nl, self.T), nonneg=True)
+            ita = cp.Variable((self.ng, self.T), nonneg=True)
+
+        mu_abs  = cp.Variable((self.nl, self.T), nonneg=True)
+        ita_abs = cp.Variable((self.ng, self.T), nonneg=True)
+
+        # ================================================================
+        # Constraints
+        # ================================================================
+        constraints = [
+            # cpower fixed to 1 (KKT stationarity for cpower variable)
+            lambda_cpower == 1.0,
+            # abs linearisation
+            mu_abs  >=  mu,
+            mu_abs  >= -mu,
+            ita_abs >=  ita,
+            ita_abs >= -ita,
+        ]
+
+        mu_floor  = float(getattr(self, 'mu_dual_floor_init',  0.0)) if floor_active else 0.0
+        ita_floor = float(getattr(self, 'ita_dual_floor_init', 0.0)) if floor_active else 0.0
+        if mu_floor > 0:
+            if sign_relax_round:
+                constraints.append(mu_abs >= mu_floor)
+            else:
+                constraints.append(mu >= mu_floor)
+        if ita_floor > 0:
+            if sign_relax_round:
+                constraints.append(ita_abs >= ita_floor)
+            else:
+                constraints.append(ita >= ita_floor)
+
+        # ================================================================
+        # KKT stationarity expressions
+        # ================================================================
+        tv = theta_values or {}
+        zv = zeta_values or {}
+
+        # -- pg stationarity: cost_g/T - lambda_pb[t] - lambda_pgl + lambda_pgu
+        #                     + ramp terms + PTDF_G^T (lambda_dcu - lambda_dcl) --
+        de_pg_list = []
+        for g in range(self.ng):
+            cost_g = float(self.gencost[g, -2]) / self.T_delta
+            for t in range(self.T):
+                de = cost_g - lambda_pb[t] - lambda_pgl[g, t] + lambda_pgu[g, t]
+                if self.T > 1:
+                    if t > 0:
+                        de = de + lambda_ru[g, t-1] - lambda_rd[g, t-1]
+                    if t < self.T - 1:
+                        de = de - lambda_ru[g, t]   + lambda_rd[g, t]
+                # DCPF dual contribution (only non-zero PTDF entries)
+                for l in range(self.nl):
+                    coeff = float(PTDF_G[l, g])
+                    if abs(coeff) > 1e-10:
+                        de = de + coeff * (lambda_dcu[l, t] - lambda_dcl[l, t])
+                de_pg_list.append(de)
+
+        # -- x stationarity: reuse the same source-of-truth helper --
+        de_x_list = []
+        for g in range(self.ng):
+            pmin = float(self.gen[g, PMIN]); pmax = float(self.gen[g, PMAX])
+            rd_delta = float(Rd_co[g] - Rd[g]); ru_delta = float(Ru_co[g] - Ru[g])
+            for t in range(self.T):
+                de = self._build_x_dual_stationarity_expr(
+                    g=g, t=t,
+                    lambda_cpower=lambda_cpower,
+                    lambda_x_upper=lambda_xu,
+                    lambda_x_lower=lambda_xl,
+                    lambda_pg_lower=lambda_pgl,
+                    lambda_pg_upper=lambda_pgu,
+                    lambda_ramp_down=lambda_rd,
+                    lambda_ramp_up=lambda_ru,
+                    lambda_min_on=lambda_mon,
+                    lambda_min_off=lambda_moff,
+                    lambda_start_cost=lambda_sc,
+                    lambda_shut_cost=lambda_shc,
+                    fixed_cost=float(self.gencost[g, -1]) / self.T_delta,
+                    pmin=pmin, pmax=pmax,
+                    rd_delta=rd_delta, ru_delta=ru_delta,
+                    start_cost=float(start_cost[g]),
+                    shut_cost=float(shut_cost[g]),
+                    Ton=Ton, Toff=Toff,
+                )
+                # theta contributions: direction * theta_val * mu[bid, ts]
+                if self.enable_theta_constraints and union_analysis and 'union_constraints' in union_analysis:
+                    for ci in union_analysis['union_constraints']:
+                        bid  = ci['branch_id']
+                        ts   = ci['time_slot']
+                        direc = self._get_theta_constraint_direction(bid, ts)
+                        for coeff_info in ci['nonzero_pg_coefficients']:
+                            uid = coeff_info['unit_id']
+                            mt  = self._theta_member_time_index(ci, coeff_info)
+                            if uid != g or mt != t:
+                                continue
+                            tname = self._theta_var_name(bid, uid, mt)
+                            theta_val = float(tv.get(tname, 0.0))
+                            if bid < self.nl and abs(theta_val) > 1e-12:
+                                de = de + direc * theta_val * mu[bid, ts]
+                # zeta contributions: direction * zeta_val * ita[uid, ts]
+                if self.enable_zeta_constraints and union_analysis and 'union_zeta_constraints' in union_analysis:
+                    for ci in union_analysis['union_zeta_constraints']:
+                        uid = ci['unit_id']
+                        ts  = ci['time_slot']
+                        if uid != g or ts != t:
+                            continue
+                        zname  = f'zeta_unit_{uid}_time_{ts}'
+                        direc  = self._get_zeta_constraint_direction(uid, ts)
+                        zeta_val = float(zv.get(zname, 0.0))
+                        if abs(zeta_val) > 1e-12:
+                            de = de + direc * zeta_val * ita[uid, ts]
+                de_x_list.append(de)
+
+        # -- coc stationarity: 1 - lambda_sc[g,t] - lambda_shc[g,t] - lambda_coc[g,t] --
+        de_coc_list = []
+        if self.T > 1:
+            for g in range(self.ng):
+                for t in range(self.T - 1):
+                    de = 1 - lambda_sc[g, t] - lambda_shc[g, t] - lambda_coc_nonneg[g, t]
+                    de_coc_list.append(de)
+
+        obj_dual_pg  = cp.sum([cp.abs(d) for d in de_pg_list])  if de_pg_list  else 0.0
+        obj_dual_x   = cp.sum([cp.abs(d) for d in de_x_list])   if de_x_list   else 0.0
+        obj_dual_coc = cp.sum([cp.abs(d) for d in de_coc_list]) if de_coc_list else 0.0
+
+        # ================================================================
+        # obj_opt: violation magnitudes (scalars) × lambda variables
+        # Mirrors _update_dual_model_objective exactly.
+        # ================================================================
+        opt_terms = []
+        pg_arr = self.pg[sample_id]   # (ng, T)
+        x_arr  = self.x[sample_id]    # (ng, T)
+        coc_arr= self.coc[sample_id]  # (ng, T-1)
+
+        # auxiliary: |lambda_pb[t]| is handled as lambda_pb_abs in Gurobi;
+        # in CVXPY we use cp.abs(lambda_pb) which CVXPY expands to auxiliary vars.
+        for t in range(self.T):
+            pb_viol = abs(float(np.sum(pg_arr[:, t])) - float(np.sum(Pd[:, t])))
+            if pb_viol > 1e-10:
+                opt_terms.append(pb_viol * cp.abs(lambda_pb[t]))
+            for g in range(self.ng):
+                pgl_v = abs(float(pg_arr[g, t]) - self.gen[g, PMIN] * float(x_arr[g, t]))
+                if pgl_v > 1e-10:
+                    opt_terms.append(pgl_v * lambda_pgl[g, t])
+                pgu_v = abs(self.gen[g, PMAX] * float(x_arr[g, t]) - float(pg_arr[g, t]))
+                if pgu_v > 1e-10:
+                    opt_terms.append(pgu_v * lambda_pgu[g, t])
+                xl_v = abs(float(x_arr[g, t]))
+                if xl_v > 1e-10:
+                    opt_terms.append(xl_v * lambda_xl[g, t])
+                xu_v = abs(float(x_arr[g, t]) - 1.0)
+                if xu_v > 1e-10:
+                    opt_terms.append(xu_v * lambda_xu[g, t])
+
+        if self.T > 1:
+            for t in range(1, self.T):
+                for g in range(self.ng):
+                    ru_v = abs(float(pg_arr[g, t]) - float(pg_arr[g, t-1])
+                               - (Ru[g]*float(x_arr[g, t-1]) + Ru_co[g]*(1-float(x_arr[g, t-1]))))
+                    if ru_v > 1e-10:
+                        opt_terms.append(ru_v * lambda_ru[g, t-1])
+                    rd_v = abs(float(pg_arr[g, t-1]) - float(pg_arr[g, t])
+                               - (Rd[g]*float(x_arr[g, t]) + Rd_co[g]*(1-float(x_arr[g, t]))))
+                    if rd_v > 1e-10:
+                        opt_terms.append(rd_v * lambda_rd[g, t-1])
+
+        for g in range(self.ng):
+            for tau in range(1, Ton+1):
+                for t1 in range(self.T - tau):
+                    v = abs(float(x_arr[g, t1+1]) - float(x_arr[g, t1]) - float(x_arr[g, t1+tau]))
+                    if v > 1e-10:
+                        opt_terms.append(v * lambda_mon[g, tau-1, t1])
+            for tau in range(1, Toff+1):
+                for t1 in range(self.T - tau):
+                    v = abs(-float(x_arr[g, t1+1]) + float(x_arr[g, t1]) - 1.0 + float(x_arr[g, t1+tau]))
+                    if v > 1e-10:
+                        opt_terms.append(v * lambda_moff[g, tau-1, t1])
+
+        if self.T > 1:
+            for t in range(1, self.T):
+                for g in range(self.ng):
+                    coc_v = abs(float(coc_arr[g, t-1]))
+                    if coc_v > 1e-10:
+                        opt_terms.append(coc_v * lambda_coc_nonneg[g, t-1])
+                    sc_v = abs(float(coc_arr[g, t-1])
+                               - start_cost[g]*(float(x_arr[g, t]) - float(x_arr[g, t-1])))
+                    if sc_v > 1e-10:
+                        opt_terms.append(sc_v * lambda_sc[g, t-1])
+                    shc_v = abs(float(coc_arr[g, t-1])
+                                - shut_cost[g]*(float(x_arr[g, t-1]) - float(x_arr[g, t])))
+                    if shc_v > 1e-10:
+                        opt_terms.append(shc_v * lambda_shc[g, t-1])
+
+        # DCPF flow violation × lambda_dcu / lambda_dcl
+        for t in range(self.T):
+            flow_t = self._ptdf_matrix @ (G @ pg_arr[:, t] - Pd[:, t])
+            for l in range(self.nl):
+                dcu_v = abs(float(flow_t[l]) - float(branch_limit[l]))
+                if dcu_v > 1e-10:
+                    opt_terms.append(dcu_v * lambda_dcu[l, t])
+                dcl_v = abs(float(flow_t[l]) + float(branch_limit[l]))
+                if dcl_v > 1e-10:
+                    opt_terms.append(dcl_v * lambda_dcl[l, t])
+
+        # theta/zeta parametric constraint violations × mu_abs / ita_abs
+        if self.enable_theta_constraints and union_analysis and 'union_constraints' in union_analysis:
+            for ci in union_analysis['union_constraints']:
+                bid = ci['branch_id']
+                ts  = ci['time_slot']
+                rhs_name = self._theta_rhs_name(bid, ts)
+                rhs  = float(tv.get(rhs_name, 1.0))
+                lhs  = 0.0
+                for coeff_info in ci['nonzero_pg_coefficients']:
+                    uid   = coeff_info['unit_id']
+                    mt    = self._theta_member_time_index(ci, coeff_info)
+                    tname = self._theta_var_name(bid, uid, mt)
+                    lhs  += float(tv.get(tname, 0.0)) * float(x_arr[uid, mt])
+                para_abs = abs(lhs - rhs)
+                if para_abs > 1e-10:
+                    if bid < self.nl:
+                        opt_terms.append(para_abs * mu_abs[bid, ts])
+                    else:
+                        opt_terms.append(para_abs * float(getattr(self, 'dual_para_bound', 0.1)))
+
+        if self.enable_zeta_constraints and union_analysis and 'union_zeta_constraints' in union_analysis:
+            for ci in union_analysis['union_zeta_constraints']:
+                uid      = ci['unit_id']
+                ts       = ci['time_slot']
+                rhs_name = f'zeta_rhs_unit_{uid}_time_{ts}'
+                rhs      = float(zv.get(rhs_name, 1.0))
+                zname    = f'zeta_unit_{uid}_time_{ts}'
+                zeta_val = float(zv.get(zname, 0.0))
+                para_abs = abs(zeta_val * float(x_arr[uid, ts]) - rhs)
+                if para_abs > 1e-10:
+                    opt_terms.append(para_abs * ita_abs[uid, ts])
+
+        obj_opt = _sum_scalar_terms(opt_terms) if opt_terms else 0.0
+
+        # ================================================================
+        # Prox term (QP): penalise deviation from previous iterate
+        # ================================================================
+        prox_terms = []
+        if self.dual_block_prox_weight > 0:
+            prev_lam = (self.lambda_[sample_id]
+                        if self.lambda_[sample_id] is not None
+                        else self._create_empty_lambda_dict())
+            prev_mu  = self.mu[sample_id]
+            prev_ita = self.ita[sample_id]
+
+            for t in range(self.T):
+                pv = float(prev_lam['lambda_power_balance'][t])
+                sc = max(1.0, abs(pv))
+                prox_terms.append(cp.square((lambda_pb[t] - pv) / sc))
+
+            for g in range(self.ng):
+                for t in range(self.T):
+                    for key, var in (('lambda_pg_lower', lambda_pgl),
+                                     ('lambda_pg_upper', lambda_pgu),
+                                     ('lambda_x_upper',  lambda_xu),
+                                     ('lambda_x_lower',  lambda_xl)):
+                        pv = float(prev_lam[key][g, t])
+                        sc = max(1.0, abs(pv))
+                        prox_terms.append(cp.square((var[g, t] - pv) / sc))
+                    pv = float(prev_ita[g, t])
+                    sc = max(1.0, abs(pv))
+                    prox_terms.append(cp.square((ita[g, t] - pv) / sc))
+                if self.T > 1:
+                    for t in range(self.T - 1):
+                        for key, var in (('lambda_ramp_up',    lambda_ru),
+                                         ('lambda_ramp_down',  lambda_rd),
+                                         ('lambda_start_cost', lambda_sc),
+                                         ('lambda_shut_cost',  lambda_shc),
+                                         ('lambda_coc_nonneg', lambda_coc_nonneg)):
+                            pv = float(prev_lam[key][g, t])
+                            sc = max(1.0, abs(pv))
+                            prox_terms.append(cp.square((var[g, t] - pv) / sc))
+                    for tau in range(Ton):
+                        for t in range(self.T):
+                            pv = float(prev_lam['lambda_min_on'][g, tau, t])
+                            sc = max(1.0, abs(pv))
+                            prox_terms.append(cp.square((lambda_mon[g, tau, t] - pv) / sc))
+                    for tau in range(Toff):
+                        for t in range(self.T):
+                            pv = float(prev_lam['lambda_min_off'][g, tau, t])
+                            sc = max(1.0, abs(pv))
+                            prox_terms.append(cp.square((lambda_moff[g, tau, t] - pv) / sc))
+
+            for l in range(self.nl):
+                for t in range(self.T):
+                    for key, var in (('lambda_dcpf_upper', lambda_dcu),
+                                     ('lambda_dcpf_lower', lambda_dcl)):
+                        pv = float(prev_lam[key][l, t])
+                        sc = max(1.0, abs(pv))
+                        prox_terms.append(cp.square((var[l, t] - pv) / sc))
+                    pv = float(prev_mu[l, t])
+                    sc = max(1.0, abs(pv))
+                    prox_terms.append(cp.square((mu[l, t] - pv) / sc))
+
+        obj_prox = cp.sum(prox_terms) if prox_terms else 0.0
+
+        # ================================================================
+        # Build and solve
+        # ================================================================
+        objective = cp.Minimize(
+            self.rho_dual_pg  * obj_dual_pg
+            + self.rho_dual_x  * obj_dual_x
+            + self.rho_dual_coc* obj_dual_coc
+            + self.rho_opt     * obj_opt
+            + self.dual_block_prox_weight * obj_prox
         )
+        problem = cp.Problem(objective, constraints)
+        _solve_with_cvxpy_highs(problem, verbose=False, threads=self.bcd_highs_threads)
+
+        if not _problem_is_optimal(problem):
+            print(f"❌ Dual block cvxpy_highs failed, status={problem.status}", flush=True)
+            return None, None, None
+
+        # ================================================================
+        # Extract solution
+        # ================================================================
+        def _v(arr):
+            """Return ndarray copy; fall back to zeros on None value."""
+            if arr is None:
+                return np.zeros(0)
+            v = arr.value
+            return np.array(v, dtype=float) if v is not None else np.zeros(np.shape(arr))
+
+        lambda_sol = {
+            'lambda_power_balance': _v(lambda_pb),
+            'lambda_pg_lower':      _v(lambda_pgl),
+            'lambda_pg_upper':      _v(lambda_pgu),
+            'lambda_ramp_up':       _v(lambda_ru)  if self.T > 1 else np.zeros((self.ng, 0)),
+            'lambda_ramp_down':     _v(lambda_rd)  if self.T > 1 else np.zeros((self.ng, 0)),
+            'lambda_min_on':        _v(lambda_mon),
+            'lambda_min_off':       _v(lambda_moff),
+            'lambda_start_cost':    _v(lambda_sc)  if self.T > 1 else np.zeros((self.ng, 0)),
+            'lambda_shut_cost':     _v(lambda_shc) if self.T > 1 else np.zeros((self.ng, 0)),
+            'lambda_coc_nonneg':    _v(lambda_coc_nonneg) if self.T > 1 else np.zeros((self.ng, 0)),
+            'lambda_cpower':        _v(lambda_cpower),
+            'lambda_dcpf_upper':    _v(lambda_dcu),
+            'lambda_dcpf_lower':    _v(lambda_dcl),
+            'lambda_x_upper':       _v(lambda_xu),
+            'lambda_x_lower':       _v(lambda_xl),
+        }
+        mu_sol  = _v(mu)
+        ita_sol = _v(ita)
+
+        if sample_id <= 2:
+            print(
+                f"[BCD][cvxpy_highs] dual_block sample_id={sample_id}, "
+                f"status={problem.status}",
+                flush=True,
+            )
+        return lambda_sol, mu_sol, ita_sol
 
     # ------------------------------------------------------------------
     # Persistent pg-block model helpers
