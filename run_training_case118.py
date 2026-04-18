@@ -31,6 +31,11 @@ CASE118_ACTIVE_SET_JSON = (
     "pattern_library_case118_K10_20260418_032025_active_set_like_refined_20260418_032025.json"
 )
 
+# 轻量并行入口（见 run_training_case118_subproblem_bcd_light.py）：在 subproblem 预设之后覆盖 rt
+SUBPROBLEM_LIGHT_MAX_SAMPLES: int | None = None
+SUBPROBLEM_LIGHT_N_WORKERS_UNIT: int | None = None
+SUBPROBLEM_LIGHT_N_WORKERS_SAMPLE: int | None = None
+
 
 def _cpu_count() -> int:
     return max(1, os.cpu_count() or 1)
@@ -246,14 +251,33 @@ def _validate_inputs() -> None:
         raise FileNotFoundError(f"case118 active set json not found: {path}")
 
 
+def _apply_subproblem_light_runtime_overrides() -> bool:
+    """在 ``_configure_subproblem_bcd`` 之后应用轻量覆盖（仅当对应 *_LIGHT_* 非 None）。"""
+    changed = False
+    if SUBPROBLEM_LIGHT_MAX_SAMPLES is not None:
+        rt.MAX_SAMPLES = max(1, int(SUBPROBLEM_LIGHT_MAX_SAMPLES))
+        changed = True
+    if SUBPROBLEM_LIGHT_N_WORKERS_UNIT is not None:
+        rt.N_WORKERS_UNIT = max(1, int(SUBPROBLEM_LIGHT_N_WORKERS_UNIT))
+        changed = True
+    if SUBPROBLEM_LIGHT_N_WORKERS_SAMPLE is not None:
+        w = max(1, int(SUBPROBLEM_LIGHT_N_WORKERS_SAMPLE))
+        rt.N_WORKERS_SAMPLE = w
+        rt.N_WORKERS_SUBPROBLEM = w
+        changed = True
+    return changed
+
+
 def main() -> None:
     _validate_inputs()
     _configure_common()
 
+    light_overrides = False
     if TRAIN_TARGET == "main_bcd":
         _configure_main_bcd()
     elif TRAIN_TARGET == "subproblem_bcd":
         _configure_subproblem_bcd()
+        light_overrides = _apply_subproblem_light_runtime_overrides()
     else:
         raise ValueError(
             f"Unsupported TRAIN_TARGET={TRAIN_TARGET!r}; "
@@ -284,6 +308,14 @@ def main() -> None:
             f"n_workers_unit={rt.N_WORKERS_UNIT}",
             flush=True,
         )
+        if light_overrides:
+            print(
+                "subproblem_light_overrides: "
+                f"max_samples={rt.MAX_SAMPLES}, "
+                f"n_workers_unit={rt.N_WORKERS_UNIT}, "
+                f"n_workers_sample={rt.N_WORKERS_SAMPLE}",
+                flush=True,
+            )
     print("=" * 72, flush=True)
 
     rt.main()

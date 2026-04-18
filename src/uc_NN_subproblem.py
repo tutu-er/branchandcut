@@ -2513,6 +2513,11 @@ class SubproblemSurrogateTrainer:
         Ton   = min(4, self.T)
         Toff  = min(4, self.T)
 
+        print(
+            f"  [Unit-{self.unit_id}] 开始初始化求解（{self.n_samples} 个样本，backend={self._lp_backend}）…",
+            flush=True,
+        )
+
         def _get_pi(m, name):
             """安全获取约束对偶变量（负值截断为0）"""
             try:
@@ -2522,7 +2527,19 @@ class SubproblemSurrogateTrainer:
 
         if self._lp_backend == LP_BACKEND_CVXPY_HIGHS:
             assert_lp_backend_available(self._lp_backend)
+            progress_every = max(1, min(50, self.n_samples // 6))
+            t_init = time.perf_counter()
             for sample_id in range(self.n_samples):
+                if (
+                    sample_id == 0
+                    or (sample_id + 1) % progress_every == 0
+                    or sample_id == self.n_samples - 1
+                ):
+                    print(
+                        f"  [Unit-{self.unit_id}] init_solve 样本 {sample_id + 1}/{self.n_samples} "
+                        f"（已用 {time.perf_counter() - t_init:.1f}s）",
+                        flush=True,
+                    )
                 result = solve_init_lp_backend(self, sample_id)
                 if result is None:
                     continue
@@ -2543,9 +2560,26 @@ class SubproblemSurrogateTrainer:
                 self.coc[sample_id] = result['coc_sol']
                 self.cpower[sample_id] = result['cpower_sol']
                 self.lambda_inherent[sample_id] = result['lambda_inherent']
+            print(
+                f"  [Unit-{self.unit_id}] 初始化求解完成（{self.n_samples} 个样本，"
+                f"共 {time.perf_counter() - t_init:.1f}s）",
+                flush=True,
+            )
             return
 
+        progress_every = max(1, min(50, self.n_samples // 6))
+        t_init = time.perf_counter()
         for sample_id in range(self.n_samples):
+            if (
+                sample_id == 0
+                or (sample_id + 1) % progress_every == 0
+                or sample_id == self.n_samples - 1
+            ):
+                print(
+                    f"  [Unit-{self.unit_id}] init_solve 样本 {sample_id + 1}/{self.n_samples} "
+                    f"（已用 {time.perf_counter() - t_init:.1f}s）",
+                    flush=True,
+                )
             lambda_val = self.lambda_vals[sample_id]
 
             # 恢复x：优先用 active_set，否则用 unit_commitment_matrix
@@ -2670,7 +2704,18 @@ class SubproblemSurrogateTrainer:
                     'lambda_x_upper':    np.zeros(self.T),
                     'lambda_x_lower':    np.zeros(self.T),
                 }
-    
+
+            try:
+                model.dispose()
+            except Exception:
+                pass
+
+        print(
+            f"  [Unit-{self.unit_id}] 初始化求解完成（Gurobi init_lp，{self.n_samples} 个样本，"
+            f"共 {time.perf_counter() - t_init:.1f}s）",
+            flush=True,
+        )
+
     # ------------------------------------------------------------------
     # Persistent primal-block model helpers
     # ------------------------------------------------------------------

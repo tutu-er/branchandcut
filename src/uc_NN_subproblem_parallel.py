@@ -641,9 +641,15 @@ def _train_unit_worker(args: dict) -> dict:
 
     from uc_NN_subproblem import SubproblemSurrogateTrainer
 
-    unit_id             = args['unit_id']
-    ppc                 = args['ppc']
-    active_set_data     = copy.deepcopy(args['active_set_data'])
+    unit_id = args['unit_id']
+    ppc = args['ppc']
+    # deepcopy 全量样本可能很慢且不易占满多核；先打日志避免误判为“卡死无输出”
+    print(
+        f"[Unit-{unit_id}] worker pid={os.getpid()}：开始 deepcopy(active_set_data)…",
+        flush=True,
+    )
+    active_set_data = copy.deepcopy(args['active_set_data'])
+    print(f"[Unit-{unit_id}] 数据复制完成，开始构建 trainer", flush=True)
     lambda_vals         = args.get('lambda_vals')
     T_delta             = args['T_delta']
     max_iter            = args['max_iter']
@@ -688,7 +694,6 @@ def _train_unit_worker(args: dict) -> dict:
     save_dir            = args.get('save_dir')
 
     prefix = f"[Unit-{unit_id}]"
-    print(f"{prefix} worker 启动 (pid={os.getpid()})", flush=True)
 
     # 将预计算的 lambda_vals 注入 active_set_data，避免子进程重复求解 LP
     if lambda_vals is not None:
@@ -1103,7 +1108,10 @@ def train_all_surrogates_parallel(
 
     results: Dict[int, dict] = {}
 
-    with ProcessPoolExecutor(max_workers=n_workers) as executor:
+    executor = ProcessPoolExecutor(max_workers=n_workers)
+    wait_on_close = True
+    cancel_pending = False
+    try:
         future_to_uid = {
             executor.submit(_train_unit_worker, args): args['unit_id']
             for args in worker_args
@@ -1118,6 +1126,18 @@ def train_all_surrogates_parallel(
                 print(f"✗ 机组 {uid} 训练失败: {exc}", flush=True)
                 import traceback
                 traceback.print_exc()
+    except KeyboardInterrupt:
+        print(
+            "\n收到 KeyboardInterrupt：正在以 wait=False 关闭进程池；"
+            "已在求解器内核中运行的子任务可能仍短暂存活，必要时请对进程组使用 kill -9。",
+            flush=True,
+        )
+        wait_on_close = False
+        cancel_pending = True
+        raise
+    finally:
+        # 避免仅用 with：中断时默认 shutdown(wait=True) 会长时间卡在 join 子进程上
+        executor.shutdown(wait=wait_on_close, cancel_futures=cancel_pending)
 
     print(f"\n✓ 所有机组并行训练完成 ({len(results)}/{len(unit_ids)})", flush=True)
     return results
