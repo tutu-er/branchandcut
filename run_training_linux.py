@@ -186,7 +186,6 @@ SUBPROBLEM_C_PG_NN_SIZE = 'medium'   # 'small' / 'medium' / 'large'
 SUBPROBLEM_NN_BATCH_SIZE = 4
 SUBPROBLEM_NN_SHUFFLE = True
 SUBPROBLEM_NN_LR = 5e-4
-SUBPROBLEM_ENABLE_NN_ROLLBACK = False  # 关闭可避免训练被回滚机制锁死（但可能更不稳定）
 SUBPROBLEM_IGNORE_STARTUP_SHUTDOWN_COSTS = True
 SUBPROBLEM_X_COST_NN_LR = 1e-5
 SUBPROBLEM_PG_COST_NN_EPOCHS = 12
@@ -517,7 +516,6 @@ def create_subproblem_trainer(ppc, all_samples, T_DELTA, unit_id: int, *,
                               pg_cost_smooth_abs_eps: float = 1e-6,
                               pg_block_prox_weight: float = SUBPROBLEM_PG_BLOCK_PROX_WEIGHT,
                               dual_block_prox_weight: float = SUBPROBLEM_DUAL_BLOCK_PROX_WEIGHT,
-                              enable_nn_rollback: bool = True,
                               iter_delta_reg_weight: float = SUBPROBLEM_ITER_DELTA_REG_WEIGHT,
                               iter_delta_reg_deadband: float = SUBPROBLEM_ITER_DELTA_REG_DEADBAND):
     trainer_kwargs = dict(
@@ -563,7 +561,6 @@ def create_subproblem_trainer(ppc, all_samples, T_DELTA, unit_id: int, *,
         pg_cost_smooth_abs_eps=pg_cost_smooth_abs_eps,
         pg_block_prox_weight=pg_block_prox_weight,
         dual_block_prox_weight=dual_block_prox_weight,
-        enable_nn_rollback=enable_nn_rollback,
         iter_delta_reg_weight=iter_delta_reg_weight,
         iter_delta_reg_deadband=iter_delta_reg_deadband,
     )
@@ -839,7 +836,6 @@ def run_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS,
                 pg_cost_smooth_abs_eps=pg_cost_smooth_abs_eps,
                 pg_block_prox_weight=pg_block_prox_weight,
                 dual_block_prox_weight=dual_block_prox_weight,
-                enable_nn_rollback=SUBPROBLEM_ENABLE_NN_ROLLBACK,
                 iter_delta_reg_weight=iter_delta_reg_weight,
                 iter_delta_reg_deadband=iter_delta_reg_deadband,
             )
@@ -889,7 +885,6 @@ def run_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS,
                 pg_cost_smooth_abs_eps=pg_cost_smooth_abs_eps,
                 pg_block_prox_weight=pg_block_prox_weight,
                 dual_block_prox_weight=dual_block_prox_weight,
-                enable_nn_rollback=SUBPROBLEM_ENABLE_NN_ROLLBACK,
                 iter_delta_reg_weight=iter_delta_reg_weight,
                 iter_delta_reg_deadband=iter_delta_reg_deadband,
                 n_workers=n_workers,

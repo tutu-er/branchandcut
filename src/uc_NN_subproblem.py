@@ -1579,7 +1579,6 @@ class SubproblemSurrogateTrainer:
                  loss_ratio_reg: float = 1.0,
                  pg_block_prox_weight: float = 2e-2,
                  dual_block_prox_weight: float = 1e-2,
-                 enable_nn_rollback: bool = True,
                  ignore_startup_shutdown_costs: bool = False,
                  device=None):
         """
@@ -1730,7 +1729,6 @@ class SubproblemSurrogateTrainer:
         self.loss_ratio_reg = float(loss_ratio_reg)
         self.pg_block_prox_weight = max(float(pg_block_prox_weight), 0.0)
         self.dual_block_prox_weight = max(float(dual_block_prox_weight), 0.0)
-        self.enable_nn_rollback = bool(enable_nn_rollback)
         self.ignore_startup_shutdown_costs = bool(ignore_startup_shutdown_costs)
         self.iter_number = 0
         self.x_cost_scale = 2.0
@@ -2296,58 +2294,12 @@ class SubproblemSurrogateTrainer:
             + self.loss_ratio_opt * self.rho_opt * obj_opt
         )
 
-    def _capture_nn_update_state(self) -> dict:
-        """Snapshot current NN/cached state so a bad update can be rolled back."""
-        state = {
-            'surrogate_net_state_dict': copy.deepcopy(self.surrogate_net.state_dict()),
-            'alpha_values': self.alpha_values.copy(),
-            'beta_values': self.beta_values.copy(),
-            'gamma_values': self.gamma_values.copy(),
-            'delta_values': self.delta_values.copy(),
-            'cost_values': self.cost_values.copy(),
-            'pg_cost_values': self.pg_cost_values.copy(),
-            'last_surr_nn_loss': getattr(self, '_last_surr_nn_loss', None),
-            'last_pg_cost_nn_loss': getattr(self, '_last_pg_cost_nn_loss', None),
-        }
-        for attr_name in (
-            '_surr_optimizer',
-            '_surr_cost_optimizer',
-            '_surr_scheduler',
-            '_surr_pg_cost_optimizer',
-            '_surr_pg_cost_scheduler',
-        ):
-            attr_value = getattr(self, attr_name, None)
-            state[attr_name] = None if attr_value is None else copy.deepcopy(attr_value.state_dict())
-        return state
-
-    def _restore_nn_update_state(self, state: dict) -> None:
-        """Restore the last accepted NN/cached state."""
-        self.surrogate_net.load_state_dict(state['surrogate_net_state_dict'])
-        self.alpha_values = state['alpha_values'].copy()
-        self.beta_values = state['beta_values'].copy()
-        self.gamma_values = state['gamma_values'].copy()
-        self.delta_values = state['delta_values'].copy()
-        self.cost_values = state['cost_values'].copy()
-        self.pg_cost_values = state['pg_cost_values'].copy()
-        self._last_surr_nn_loss = state.get('last_surr_nn_loss')
-        self._last_pg_cost_nn_loss = state.get('last_pg_cost_nn_loss')
-
-        for attr_name in (
-            '_surr_optimizer',
-            '_surr_cost_optimizer',
-            '_surr_scheduler',
-            '_surr_pg_cost_optimizer',
-            '_surr_pg_cost_scheduler',
-        ):
-            attr_state = state.get(attr_name)
-            attr_value = getattr(self, attr_name, None)
-            if attr_state is None:
-                setattr(self, attr_name, None)
-            elif attr_value is not None:
-                attr_value.load_state_dict(attr_state)
-
     def _generate_initial_values_from_nn(self):
         """用未训练的 SubproblemSurrogateNet forward pass 生成 alpha/beta/gamma/delta 初值。"""
+        print(
+            f"  - 正在 NN forward 生成代理约束初值（n_samples={self.n_samples}, device={self.device}）…",
+            flush=True,
+        )
         self._refresh_cached_surrogate_outputs(zero_auxiliary=True)
 
         print(f"  ✓ 用NN forward pass生成代理约束初值 "
@@ -3349,6 +3301,9 @@ class SubproblemSurrogateTrainer:
             lam_xu, lam_xl, lam_mon, lam_moff, mu, Ton, Toff,
         )
 
+        vars_dict['obj_opt'] = obj_opt
+        vars_dict['obj_dual_prox'] = obj_dual_prox
+
         model.setObjective(
             self.rho_dual_pg  * vars_dict['obj_dual_pg']
             + self.rho_dual_x  * vars_dict['obj_dual_x']
@@ -3446,13 +3401,23 @@ class SubproblemSurrogateTrainer:
             }
             mu_sol = np.array([mu[k].X for k in range(self.num_coupling_constraints)])
 
-            if self.unit_id < 3 and sample_id <= 2:
-                obj_dual_v = (vars_dict['obj_dual_pg'].getValue()
-                              + vars_dict['obj_dual_x'].getValue()
-                              + vars_dict['obj_dual_coc'].getValue())
+            # 与 primal_block / cvxpy solve_dual_block 一致：每个机组仅打印前 3 个样本
+            if sample_id <= 2:
+                obj_dp = float(vars_dict['obj_dual_pg'].getValue())
+                obj_dx = float(vars_dict['obj_dual_x'].getValue())
+                obj_dc = float(vars_dict['obj_dual_coc'].getValue())
+                obj_d = obj_dp + obj_dx + obj_dc
+                obj_o = float(vars_dict['obj_opt'].getValue())
+                obj_px = float(vars_dict['obj_dual_prox'].getValue())
                 print(
                     f"[Unit-{self.unit_id}] dual_block, sample_id: {sample_id}, "
-                    f"obj_dual: {obj_dual_v:.6f}",
+                    f"status: optimal, "
+                    f"obj_dual_pg: {obj_dp:.6f}, "
+                    f"obj_dual_x: {obj_dx:.6f}, "
+                    f"obj_dual_coc: {obj_dc:.6f}, "
+                    f"obj_dual: {obj_d:.6f}, "
+                    f"obj_opt: {obj_o:.6f}, "
+                    f"obj_dual_prox: {obj_px:.6f}",
                     flush=True,
                 )
             return lambda_inherent_sol, mu_sol
@@ -3771,9 +3736,8 @@ class SubproblemSurrogateTrainer:
             }
             mu_sol = np.array([mu[k].X for k in range(self.num_coupling_constraints)])
 
-            # Logging: keep parity with primal_block style and avoid flooding.
-            # Show only the first 3 units and the first 3 samples by default.
-            if self.unit_id < 3 and sample_id <= 2:
+            # 与 primal_block / cvxpy solve_dual_block 一致：每个机组仅打印前 3 个样本
+            if sample_id <= 2:
                 print(
                     f"[Unit-{self.unit_id}] dual_block, sample_id: {sample_id}, "
                     f"status: optimal, "
@@ -4715,7 +4679,19 @@ class SubproblemSurrogateTrainer:
     def cal_viol(self) -> Tuple[float, float, float]:
         obj_primal, _, _, _, obj_dual, obj_opt = self.cal_viol_components()
         return obj_primal, obj_dual, obj_opt
-    
+
+    def cal_obj_binary_gap(self) -> float:
+        """与 primal block 中 ``obj_binary`` 一致：各样本 ``x`` 相对参考解 ``x_true`` 的 L1 距离之和。"""
+        total = 0.0
+        for sample_id in range(self.n_samples):
+            x_true = self.active_set_data[sample_id].get("x_true")
+            if x_true is None:
+                continue
+            xv = np.asarray(self.x[sample_id], dtype=float)
+            xt = np.asarray(x_true, dtype=float)
+            total += float(np.sum(np.abs(xv - xt)))
+        return total
+
     def iter(
         self,
         max_iter: int = 20,
@@ -4741,9 +4717,6 @@ class SubproblemSurrogateTrainer:
             self.pg_cost_nn_epochs if pg_cost_nn_epochs is None else max(int(pg_cost_nn_epochs), 1)
         )
 
-        # 统计 NN 更新是否频繁回滚（用于排查训练停滞）
-        rollback_count = 0
-        
         for i in range(max_iter):
             print(f"🔄 迭代 {i+1}/{max_iter}", flush=True)
             self.iter_number = i
@@ -4804,12 +4777,7 @@ class SubproblemSurrogateTrainer:
                         direction_signs=direction_signs,
                     )
             
-            # 计算违反量（NN更新前）
             _z = lambda v: v if abs(v) >= 1e-12 else 0.0
-            obj_primal, obj_dual_pg, obj_dual_x, obj_dual_coc, obj_dual, obj_opt = self.cal_viol_components()
-            obj_primal, obj_dual_pg, obj_dual_x, obj_dual_coc, obj_dual, obj_opt = (
-                _z(obj_primal), _z(obj_dual_pg), _z(obj_dual_x), _z(obj_dual_coc), _z(obj_dual), _z(obj_opt)
-            )
             nn_metrics_pre = self.cal_nn_logging_components()
             print(
                 f"[Unit-{self.unit_id}][NN-metric][before] "
@@ -4821,10 +4789,6 @@ class SubproblemSurrogateTrainer:
                 f"reg_pg={nn_metrics_pre['reg_pg']:.6f}",
                 flush=True,
             )
-            merit_before_nn = self._weighted_violation_merit(
-                (obj_primal, obj_dual_pg, obj_dual_x, obj_dual_coc, obj_dual, obj_opt)
-            )
-
             # 3. 神经网络更新代理约束参数
             #    先缓存上一代输出，供“迭代间差异正则”使用（默认权重为0时不影响训练）
             self._prev_alpha_values = self.alpha_values.copy()
@@ -4833,7 +4797,6 @@ class SubproblemSurrogateTrainer:
             self._prev_delta_values = self.delta_values.copy()
             self._prev_cost_values = self.cost_values.copy()
             self._prev_pg_cost_values = self.pg_cost_values.copy()
-            nn_snapshot = self._capture_nn_update_state()
             self.iter_with_surrogate_nn(
                 num_epochs=nn_epochs,
                 batch_size=nn_batch_size,
@@ -4851,27 +4814,6 @@ class SubproblemSurrogateTrainer:
             )
             self._refresh_cached_surrogate_outputs()
 
-            # 计算违反量（NN更新后）
-            obj_primal, obj_dual_pg, obj_dual_x, obj_dual_coc, obj_dual, obj_opt = self.cal_viol_components()
-            obj_primal, obj_dual_pg, obj_dual_x, obj_dual_coc, obj_dual, obj_opt = (
-                _z(obj_primal), _z(obj_dual_pg), _z(obj_dual_x), _z(obj_dual_coc), _z(obj_dual), _z(obj_opt)
-            )
-            merit_after_nn = self._weighted_violation_merit(
-                (obj_primal, obj_dual_pg, obj_dual_x, obj_dual_coc, obj_dual, obj_opt)
-            )
-            merit_tol = max(1e-8, 1e-4 * max(1.0, abs(merit_before_nn)))
-            if self.enable_nn_rollback and (merit_after_nn > merit_before_nn + merit_tol):
-                self._restore_nn_update_state(nn_snapshot)
-                rollback_count += 1
-                obj_primal, obj_dual_pg, obj_dual_x, obj_dual_coc, obj_dual, obj_opt = self.cal_viol_components()
-                obj_primal, obj_dual_pg, obj_dual_x, obj_dual_coc, obj_dual, obj_opt = (
-                    _z(obj_primal), _z(obj_dual_pg), _z(obj_dual_x), _z(obj_dual_coc), _z(obj_dual), _z(obj_opt)
-                )
-                merit_after_nn = self._weighted_violation_merit(
-                    (obj_primal, obj_dual_pg, obj_dual_x, obj_dual_coc, obj_dual, obj_opt)
-                )
-            else:
-                pass
             nn_metrics_after = self.cal_nn_logging_components()
             print(
                 f"[Unit-{self.unit_id}][NN-metric][after] "
@@ -4884,6 +4826,11 @@ class SubproblemSurrogateTrainer:
                 flush=True,
             )
 
+            obj_primal, obj_dual_pg, obj_dual_x, obj_dual_coc, obj_dual, obj_opt = self.cal_viol_components()
+            obj_primal, obj_dual_pg, obj_dual_x, obj_dual_coc, obj_dual, obj_opt = (
+                _z(obj_primal), _z(obj_dual_pg), _z(obj_dual_x), _z(obj_dual_coc), _z(obj_dual), _z(obj_opt)
+            )
+            obj_binary = self.cal_obj_binary_gap()
             # 前3次迭代冻结rho，之后再按累加式更新
             if i >= 3:
                 self.rho_primal = min(self.rho_primal + gamma * obj_primal, self.rho_max)
@@ -4901,10 +4848,6 @@ class SubproblemSurrogateTrainer:
                 flush=True,
             )
             print("  " + "-" * 40, flush=True)
-
-            # 低频输出回滚计数（避免刷屏）
-            if i < 5 or ((i + 1) % 25 == 0):
-                print(f"[Unit-{self.unit_id}] rollback_count={rollback_count}/{i+1}", flush=True)
 
             # logger 钩子
             if i == max_iter - 1:

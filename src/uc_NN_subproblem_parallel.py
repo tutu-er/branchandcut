@@ -141,7 +141,6 @@ class ParallelSubproblemSurrogateTrainer(SubproblemSurrogateTrainer):
         loss_ratio_reg: float = 1.0,
         pg_block_prox_weight: float = 2e-2,
         dual_block_prox_weight: float = 1e-2,
-        enable_nn_rollback: bool = True,
         ignore_startup_shutdown_costs: bool = False,
         device=None,
         n_workers: int = 4,
@@ -192,7 +191,6 @@ class ParallelSubproblemSurrogateTrainer(SubproblemSurrogateTrainer):
             loss_ratio_reg=loss_ratio_reg,
             pg_block_prox_weight=pg_block_prox_weight,
             dual_block_prox_weight=dual_block_prox_weight,
-            enable_nn_rollback=enable_nn_rollback,
             ignore_startup_shutdown_costs=ignore_startup_shutdown_costs,
             device=device,
         )
@@ -304,15 +302,12 @@ class ParallelSubproblemSurrogateTrainer(SubproblemSurrogateTrainer):
         )
 
         EPS = 1e-10
-        gamma = self.gamma_base / (self.n_samples * max_iter)
+        gamma = self.gamma_base / (self.n_samples * max(max_iter, 1))
         gamma_dual = gamma * self.gamma_dual_component_scale
         self.gamma = gamma
         resolved_pg_cost_nn_epochs = (
             self.pg_cost_nn_epochs if pg_cost_nn_epochs is None else max(int(pg_cost_nn_epochs), 1)
         )
-
-        # 统计 NN 更新是否频繁回滚（用于排查训练停滞）
-        rollback_count = 0
 
         for i in range(max_iter):
             print(f"{prefix} 🔄 迭代 {i+1}/{max_iter}", flush=True)
@@ -411,12 +406,7 @@ class ParallelSubproblemSurrogateTrainer(SubproblemSurrogateTrainer):
                     self.lambda_inherent[s] = lambda_inherent_sol
                     self.mu[s] = self._apply_mu_lower_bound_policy(mu_sol, lb_mu)
 
-            # ── 计算违反量（NN更新前） ──────────────────────────────
             _z = lambda v: v if abs(v) >= 1e-12 else 0.0
-            obj_primal, obj_dual_pg, obj_dual_x, obj_dual_coc, obj_dual, obj_opt = self.cal_viol_components()
-            obj_primal, obj_dual_pg, obj_dual_x, obj_dual_coc, obj_dual, obj_opt = (
-                _z(obj_primal), _z(obj_dual_pg), _z(obj_dual_x), _z(obj_dual_coc), _z(obj_dual), _z(obj_opt)
-            )
             nn_metrics_pre = self.cal_nn_logging_components()
             print(
                 f"{prefix}[NN-metric][before] "
@@ -428,9 +418,6 @@ class ParallelSubproblemSurrogateTrainer(SubproblemSurrogateTrainer):
                 f"reg_pg={nn_metrics_pre['reg_pg']:.6f}",
                 flush=True,
             )
-            merit_before_nn = self._weighted_violation_merit(
-                (obj_primal, obj_dual_pg, obj_dual_x, obj_dual_coc, obj_dual, obj_opt)
-            )
 
             # ── 3. NN block（串行，批次化训练） ──────────────────────
             self._prev_alpha_values = self.alpha_values.copy()
@@ -439,7 +426,6 @@ class ParallelSubproblemSurrogateTrainer(SubproblemSurrogateTrainer):
             self._prev_delta_values = self.delta_values.copy()
             self._prev_cost_values = self.cost_values.copy()
             self._prev_pg_cost_values = self.pg_cost_values.copy()
-            nn_snapshot = self._capture_nn_update_state()
             self.iter_with_surrogate_nn(
                 num_epochs=nn_epochs,
                 batch_size=nn_batch_size,
@@ -457,27 +443,6 @@ class ParallelSubproblemSurrogateTrainer(SubproblemSurrogateTrainer):
             )
             self._refresh_cached_surrogate_outputs()
 
-            # ── 计算违反量（NN更新后） ──────────────────────────────
-            obj_primal, obj_dual_pg, obj_dual_x, obj_dual_coc, obj_dual, obj_opt = self.cal_viol_components()
-            obj_primal, obj_dual_pg, obj_dual_x, obj_dual_coc, obj_dual, obj_opt = (
-                _z(obj_primal), _z(obj_dual_pg), _z(obj_dual_x), _z(obj_dual_coc), _z(obj_dual), _z(obj_opt)
-            )
-            merit_after_nn = self._weighted_violation_merit(
-                (obj_primal, obj_dual_pg, obj_dual_x, obj_dual_coc, obj_dual, obj_opt)
-            )
-            merit_tol = max(1e-8, 1e-4 * max(1.0, abs(merit_before_nn)))
-            if self.enable_nn_rollback and (merit_after_nn > merit_before_nn + merit_tol):
-                self._restore_nn_update_state(nn_snapshot)
-                rollback_count += 1
-                obj_primal, obj_dual_pg, obj_dual_x, obj_dual_coc, obj_dual, obj_opt = self.cal_viol_components()
-                obj_primal, obj_dual_pg, obj_dual_x, obj_dual_coc, obj_dual, obj_opt = (
-                    _z(obj_primal), _z(obj_dual_pg), _z(obj_dual_x), _z(obj_dual_coc), _z(obj_dual), _z(obj_opt)
-                )
-                merit_after_nn = self._weighted_violation_merit(
-                    (obj_primal, obj_dual_pg, obj_dual_x, obj_dual_coc, obj_dual, obj_opt)
-                )
-            else:
-                pass
             nn_metrics_after = self.cal_nn_logging_components()
             print(
                 f"{prefix}[NN-metric][after] "
@@ -489,6 +454,12 @@ class ParallelSubproblemSurrogateTrainer(SubproblemSurrogateTrainer):
                 f"reg_pg={nn_metrics_after['reg_pg']:.6f}",
                 flush=True,
             )
+
+            obj_primal, obj_dual_pg, obj_dual_x, obj_dual_coc, obj_dual, obj_opt = self.cal_viol_components()
+            obj_primal, obj_dual_pg, obj_dual_x, obj_dual_coc, obj_dual, obj_opt = (
+                _z(obj_primal), _z(obj_dual_pg), _z(obj_dual_x), _z(obj_dual_coc), _z(obj_dual), _z(obj_opt)
+            )
+            obj_binary = self.cal_obj_binary_gap()
 
             if i == max_iter - 1:
                 obj_opt_breakdown = self.cal_obj_opt_breakdown()
@@ -516,8 +487,9 @@ class ParallelSubproblemSurrogateTrainer(SubproblemSurrogateTrainer):
                 self.rho_dual_x = min(self.rho_dual_x + gamma_dual * obj_dual_x, self.rho_max)
                 self.rho_dual_coc = min(self.rho_dual_coc + gamma_dual * obj_dual_coc, self.rho_max)
                 self._sync_rho_dual_summary()
+                self.rho_binary = min(self.rho_binary + gamma * obj_binary, self.rho_max)
                 self.rho_opt    = min(self.rho_opt    + gamma * obj_opt,    self.rho_max)
-            
+
             print(
                 f"{prefix}   ρ_primal={self.rho_primal:.4f}, ρ_dual_pg={self.rho_dual_pg:.4f}, "
                 f"ρ_dual_x={self.rho_dual_x:.4f}, ρ_dual_coc={self.rho_dual_coc:.4f}, "
@@ -526,10 +498,6 @@ class ParallelSubproblemSurrogateTrainer(SubproblemSurrogateTrainer):
             )
             # 与非并行版(`uc_NN_subproblem.py`)保持一致的分隔线输出格式
             print("  " + "-" * 40, flush=True)
-
-            # 低频输出回滚计数（避免刷屏）
-            if i < 5 or ((i + 1) % 25 == 0):
-                print(f"{prefix} rollback_count={rollback_count}/{i+1}", flush=True)
 
         print(f"{prefix} ✓ 样本级并行训练完成", flush=True)
 
@@ -692,6 +660,25 @@ def _train_unit_worker(args: dict) -> dict:
     use_sample_parallel = args.get('use_sample_parallel', True)
     lp_backend          = args.get('lp_backend', LP_BACKEND_GUROBI)
     save_dir            = args.get('save_dir')
+    # 机组级 ProcessPool 多进程时，各子进程若均默认选用 CUDA，常在 NN 首次 forward
+    # （_refresh_cached_surrogate_outputs）处互斥/死锁或长时间无输出；默认强制 NN 用 CPU。
+    force_nn_cpu_for_multiprocess = bool(args.get('force_nn_cpu_for_multiprocess', False))
+    if force_nn_cpu_for_multiprocess and str(
+        os.environ.get('SUBPROBLEM_UNIT_WORKER_ALLOW_CUDA', '0')
+    ).strip().lower() in ('1', 'true', 'yes', 'on'):
+        force_nn_cpu_for_multiprocess = False
+    nn_device = None
+    if force_nn_cpu_for_multiprocess:
+        import torch
+        torch.set_num_threads(
+            max(1, int(os.environ.get('SUBPROBLEM_UNIT_WORKER_TORCH_THREADS', '1')))
+        )
+        nn_device = torch.device('cpu')
+        print(
+            f"[Unit-{unit_id}] 机组级多进程：代理约束 NN 使用 {nn_device} "
+            f"（避免多进程 CUDA 初始化/forward 卡住；单机训练仍可用 GPU）",
+            flush=True,
+        )
 
     prefix = f"[Unit-{unit_id}]"
 
@@ -742,6 +729,7 @@ def _train_unit_worker(args: dict) -> dict:
             pg_cost_surr_lr=pg_cost_surr_lr,
             pg_block_prox_weight=pg_block_prox_weight,
             dual_block_prox_weight=dual_block_prox_weight,
+            device=nn_device,
             n_workers=sample_n_workers,
         )
     else:
@@ -783,6 +771,7 @@ def _train_unit_worker(args: dict) -> dict:
             pg_cost_surr_lr=pg_cost_surr_lr,
             pg_block_prox_weight=pg_block_prox_weight,
             dual_block_prox_weight=dual_block_prox_weight,
+            device=nn_device,
         )
 
     trainer.iter(max_iter=max_iter, nn_epochs=nn_epochs)
@@ -1102,6 +1091,8 @@ def train_all_surrogates_parallel(
             'use_sample_parallel': use_sample_parallel,
             'lp_backend':         lp_backend,
             'save_dir':           save_dir,
+            # n_workers>1 时子进程内强制 NN 用 CPU，见 _train_unit_worker
+            'force_nn_cpu_for_multiprocess': (n_workers > 1),
         }
         for g in unit_ids
     ]

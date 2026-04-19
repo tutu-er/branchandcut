@@ -1468,8 +1468,8 @@ def solve_dual_block(
         return None, None
 
     display_sample_id = int(getattr(trainer, "display_sample_id", sample_id))
-    # Logging parity with the Gurobi path: show only the first 3 units and first 3 samples.
-    if g < 3 and display_sample_id <= 2:
+    # 与 solve_primal_block 一致：每个机组仅打印前 3 个样本（sample_id 0..2）
+    if display_sample_id <= 2:
         try:
             obj_dual_pg_v = float(np.asarray(obj_dual_pg.value).reshape(-1)[0]) if obj_dual_pg is not None else 0.0
             obj_dual_x_v = float(np.asarray(obj_dual_x.value).reshape(-1)[0]) if obj_dual_x is not None else 0.0
