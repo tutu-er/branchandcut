@@ -91,6 +91,11 @@ DUAL_BATCH_SIZE = 8
 DUAL_BATCH_STRATEGY = 'full-batch'   # 'full-batch' / 'mini-batch'
 DUAL_SHUFFLE = True
 DUAL_LR = 5e-4
+# 与 run_training.py 一致：子问题 surrogate 内对偶预测器默认训练逻辑
+DUAL_PREDICTOR_NET_VARIANT = 'temporal_conv'
+DUAL_PREDICTOR_NORMALIZE_TARGETS = True
+DUAL_PREDICTOR_COSINE_LOSS_WEIGHT = 0.12
+DUAL_PREDICTOR_SMOOTH_L1_BETA = 2.0
 MAX_ITER = 300             # backward-compatible shared fallback
 BCD_MAX_ITER = MAX_ITER
 SUBPROBLEM_MAX_ITER = MAX_ITER
@@ -621,7 +626,11 @@ def run_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS,
                   pg_block_prox_weight: float = SUBPROBLEM_PG_BLOCK_PROX_WEIGHT,
                   dual_block_prox_weight: float = SUBPROBLEM_DUAL_BLOCK_PROX_WEIGHT,
                   iter_delta_reg_weight: float = SUBPROBLEM_ITER_DELTA_REG_WEIGHT,
-                  iter_delta_reg_deadband: float = SUBPROBLEM_ITER_DELTA_REG_DEADBAND):
+                  iter_delta_reg_deadband: float = SUBPROBLEM_ITER_DELTA_REG_DEADBAND,
+                  dual_net_variant: str = 'temporal_conv',
+                  dual_normalize_targets: bool = True,
+                  dual_cosine_loss_weight: float = 0.12,
+                  dual_smooth_l1_beta: float = 2.0):
     """V3 代理约束训练（样本级并行），返回 (dual_predictor, trainers)。"""
     import os
     from pypower.ext2int import ext2int
@@ -644,6 +653,10 @@ def run_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS,
     log(
         f"dual_nn: batch_strategy={dual_batch_strategy}, batch_size={DUAL_BATCH_SIZE}, "
         f"shuffle={dual_shuffle}, lr={dual_learning_rate}"
+    )
+    log(
+        f"dual_predictor: net_variant={dual_net_variant}, normalize_targets={dual_normalize_targets}, "
+        f"cosine_loss_w={dual_cosine_loss_weight}, smooth_l1_beta={dual_smooth_l1_beta}"
     )
     log(
         f"subproblem_nn: batch_strategy={subproblem_nn_batch_strategy}, "
@@ -716,6 +729,10 @@ def run_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS,
             shuffle=dual_shuffle,
             learning_rate=dual_learning_rate,
             save_path=dual_save_path,
+            dual_net_variant=dual_net_variant,
+            dual_normalize_targets=dual_normalize_targets,
+            dual_cosine_loss_weight=dual_cosine_loss_weight,
+            dual_smooth_l1_beta=dual_smooth_l1_beta,
         )
 
     # 步骤 2：训练代理约束（支持机组级并行或样本级并行）
@@ -784,12 +801,12 @@ def run_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS,
                 lp_backend=lp_backend,
                 constraint_generation_strategy=constraint_generation_strategy,
                 rho_primal_init=rho_primal_init,
-        rho_dual_init=rho_dual_init,
-        rho_dual_pg_init=rho_dual_pg_init,
-        rho_dual_x_init=rho_dual_x_init,
-        rho_dual_coc_init=rho_dual_coc_init,
-        rho_binary_init=rho_binary_init,
-        rho_opt_init=rho_opt_init,
+                rho_dual_init=rho_dual_init,
+                rho_dual_pg_init=rho_dual_pg_init,
+                rho_dual_x_init=rho_dual_x_init,
+                rho_dual_coc_init=rho_dual_coc_init,
+                rho_binary_init=rho_binary_init,
+                rho_opt_init=rho_opt_init,
                 loss_ratio_primal=loss_ratio_primal,
                 loss_ratio_dual_pg=loss_ratio_dual_pg,
                 loss_ratio_dual_x=loss_ratio_dual_x,
@@ -1442,6 +1459,10 @@ def main():
     DUAL_BATCH_STRATEGY_VALUE = DUAL_BATCH_STRATEGY
     DUAL_SHUFFLE_VALUE = DUAL_SHUFFLE
     DUAL_LR_VALUE = DUAL_LR
+    DUAL_PREDICTOR_NET_VARIANT_VALUE = DUAL_PREDICTOR_NET_VARIANT
+    DUAL_PREDICTOR_NORMALIZE_TARGETS_VALUE = DUAL_PREDICTOR_NORMALIZE_TARGETS
+    DUAL_PREDICTOR_COSINE_LOSS_WEIGHT_VALUE = DUAL_PREDICTOR_COSINE_LOSS_WEIGHT
+    DUAL_PREDICTOR_SMOOTH_L1_BETA_VALUE = DUAL_PREDICTOR_SMOOTH_L1_BETA
     BCD_MAX_ITER_VALUE = BCD_MAX_ITER
     SUBPROBLEM_MAX_ITER_VALUE = SUBPROBLEM_MAX_ITER
     BCD_LAMBDA_INIT_STRATEGY_VALUE = BCD_LAMBDA_INIT_STRATEGY
@@ -1747,6 +1768,10 @@ def main():
                     dual_block_prox_weight=SUBPROBLEM_DUAL_BLOCK_PROX_WEIGHT_VALUE,
                     iter_delta_reg_weight=SUBPROBLEM_ITER_DELTA_REG_WEIGHT,
                     iter_delta_reg_deadband=SUBPROBLEM_ITER_DELTA_REG_DEADBAND,
+                    dual_net_variant=DUAL_PREDICTOR_NET_VARIANT_VALUE,
+                    dual_normalize_targets=DUAL_PREDICTOR_NORMALIZE_TARGETS_VALUE,
+                    dual_cosine_loss_weight=DUAL_PREDICTOR_COSINE_LOSS_WEIGHT_VALUE,
+                    dual_smooth_l1_beta=DUAL_PREDICTOR_SMOOTH_L1_BETA_VALUE,
                 )
             print_surrogate_results(trainers, all_samples)
 
@@ -2042,6 +2067,10 @@ def main():
                     dual_block_prox_weight=SUBPROBLEM_DUAL_BLOCK_PROX_WEIGHT_VALUE,
                     iter_delta_reg_weight=SUBPROBLEM_ITER_DELTA_REG_WEIGHT,
                     iter_delta_reg_deadband=SUBPROBLEM_ITER_DELTA_REG_DEADBAND,
+                    dual_net_variant=DUAL_PREDICTOR_NET_VARIANT_VALUE,
+                    dual_normalize_targets=DUAL_PREDICTOR_NORMALIZE_TARGETS_VALUE,
+                    dual_cosine_loss_weight=DUAL_PREDICTOR_COSINE_LOSS_WEIGHT_VALUE,
+                    dual_smooth_l1_beta=DUAL_PREDICTOR_SMOOTH_L1_BETA_VALUE,
                 )
             print_surrogate_results(trainers, all_samples)
 

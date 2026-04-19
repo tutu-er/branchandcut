@@ -113,11 +113,11 @@ DUAL_BATCH_SIZE = 8
 DUAL_BATCH_STRATEGY = 'full-batch'   # 'full-batch' / 'mini-batch'
 DUAL_SHUFFLE = True
 DUAL_LR = 5e-4
-# 对偶预测器：不将启停作为输入；用网络结构 + 目标标准化 + 组合损失减轻「退化为列均值」
-DUAL_PREDICTOR_NET_VARIANT = 'mlp'  # 'mlp' | 'temporal_conv'（需 input_dim==2*nb*T，即 load+renew 展平）
-DUAL_PREDICTOR_NORMALIZE_TARGETS = False
-DUAL_PREDICTOR_COSINE_LOSS_WEIGHT = 0.0
-DUAL_PREDICTOR_SMOOTH_L1_BETA = 1.0
+# 对偶预测器（所有经 run_surrogate 的子问题/surrogate 训练默认启用；不满足 2*nb*T 时自动回退 MLP）
+DUAL_PREDICTOR_NET_VARIANT = 'temporal_conv'  # 'mlp' | 'temporal_conv'
+DUAL_PREDICTOR_NORMALIZE_TARGETS = True
+DUAL_PREDICTOR_COSINE_LOSS_WEIGHT = 0.12
+DUAL_PREDICTOR_SMOOTH_L1_BETA = 2.0
 MAX_ITER = 300             # backward-compatible shared fallback
 BCD_MAX_ITER = MAX_ITER
 SUBPROBLEM_MAX_ITER = MAX_ITER
@@ -661,10 +661,10 @@ def run_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS,
                   iter_delta_reg_weight: float = SUBPROBLEM_ITER_DELTA_REG_WEIGHT,
                   iter_delta_reg_deadband: float = SUBPROBLEM_ITER_DELTA_REG_DEADBAND,
                   dual_predictor_only: bool = False,
-                  dual_net_variant: str = 'mlp',
-                  dual_normalize_targets: bool = False,
-                  dual_cosine_loss_weight: float = 0.0,
-                  dual_smooth_l1_beta: float = 1.0):
+                  dual_net_variant: str = 'temporal_conv',
+                  dual_normalize_targets: bool = True,
+                  dual_cosine_loss_weight: float = 0.12,
+                  dual_smooth_l1_beta: float = 2.0):
     """V3 代理约束训练（样本级并行），返回 (dual_predictor, trainers)。"""
     import os
     from pypower.ext2int import ext2int

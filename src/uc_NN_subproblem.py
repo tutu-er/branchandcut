@@ -5463,10 +5463,10 @@ def train_dual_predictor_from_data(ppc, active_set_data: List[Dict], T_delta: fl
                                     shuffle: bool = True,
                                     learning_rate: float = 1e-3,
                                     save_path: str = None, device=None,
-                                    dual_net_variant: str = "mlp",
-                                    dual_normalize_targets: bool = False,
-                                    dual_cosine_loss_weight: float = 0.0,
-                                    dual_smooth_l1_beta: float = 1.0) -> DualVariablePredictorTrainer:
+                                    dual_net_variant: str = "temporal_conv",
+                                    dual_normalize_targets: bool = True,
+                                    dual_cosine_loss_weight: float = 0.12,
+                                    dual_smooth_l1_beta: float = 2.0) -> DualVariablePredictorTrainer:
     """
     训练对偶变量预测器
     

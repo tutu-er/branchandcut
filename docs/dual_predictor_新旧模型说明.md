@@ -83,8 +83,9 @@
 
 | 场景 | 做法 |
 |------|------|
-| **Case118 统一入口** | `run_training_case118.py` 顶部 **`CASE118_DUAL_PREDICTOR_*`** 常量 + `_configure_common()` 写入 `run_training.rt.DUAL_PREDICTOR_*`。 |
-| **直接跑 `run_training.py`** | 修改模块级 `DUAL_PREDICTOR_NET_VARIANT`、`DUAL_PREDICTOR_NORMALIZE_TARGETS`、`DUAL_PREDICTOR_COSINE_LOSS_WEIGHT`、`DUAL_PREDICTOR_SMOOTH_L1_BETA`。 |
+| **默认（全局）** | `run_training.py`、`run_training_local.py`、`run_training_linux.py` 顶部均已将上述四项设为 **新设定默认值**；`train_dual_predictor_from_data`（`uc_NN_subproblem.py`）的函数默认参数与之对齐，经 `train_complete_model` 等直接调用时亦默认走新逻辑。 |
+| **Case118 统一入口** | `run_training_case118.py` 顶部 **`CASE118_DUAL_PREDICTOR_*`** 覆盖 `rt.DUAL_PREDICTOR_*`（与全局默认一致时可不改）。 |
+| **单独改某一入口** | 修改对应脚本模块级 `DUAL_PREDICTOR_*` 即可。 |
 
 **`temporal_conv` 前提**：`input_dim == 2 × nb × T`，即样本需同时具备与 `(nb, T)` 一致的 `load_data` 与 `renewable_data` 拼接特征；否则实现会 **回退为 MLP** 并打印提示。
 

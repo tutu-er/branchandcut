@@ -74,6 +74,11 @@ DUAL_BATCH_SIZE = 4
 DUAL_BATCH_STRATEGY = 'full-batch'   # 'full-batch' / 'mini-batch'
 DUAL_SHUFFLE = True
 DUAL_LR = 5e-4
+# 与 run_training.py 一致：子问题 surrogate 内对偶预测器默认训练逻辑
+DUAL_PREDICTOR_NET_VARIANT = 'temporal_conv'
+DUAL_PREDICTOR_NORMALIZE_TARGETS = True
+DUAL_PREDICTOR_COSINE_LOSS_WEIGHT = 0.12
+DUAL_PREDICTOR_SMOOTH_L1_BETA = 2.0
 MAX_ITER = 50             # backward-compatible shared fallback
 BCD_MAX_ITER = MAX_ITER
 SUBPROBLEM_MAX_ITER = MAX_ITER
@@ -483,7 +488,11 @@ def run_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS,
                   pg_cost_scale_multiplier: float = 1.2,
                   pg_cost_lr: float = 2e-5,
                   pg_cost_surr_lr: float = 5e-5,
-                  pg_cost_reg_deadband: float = 0.25):
+                  pg_cost_reg_deadband: float = 0.25,
+                  dual_net_variant: str = 'temporal_conv',
+                  dual_normalize_targets: bool = True,
+                  dual_cosine_loss_weight: float = 0.12,
+                  dual_smooth_l1_beta: float = 2.0):
     """V3 代理约束训练（样本级并行），返回 (dual_predictor, trainers)。"""
     import os
     from pypower.ext2int import ext2int
@@ -501,6 +510,10 @@ def run_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS,
     log(
         f"dual_nn: batch_strategy={dual_batch_strategy}, batch_size={DUAL_BATCH_SIZE}, "
         f"shuffle={dual_shuffle}, lr={dual_learning_rate}"
+    )
+    log(
+        f"dual_predictor: net_variant={dual_net_variant}, normalize_targets={dual_normalize_targets}, "
+        f"cosine_loss_w={dual_cosine_loss_weight}, smooth_l1_beta={dual_smooth_l1_beta}"
     )
     log(
         f"subproblem_nn: batch_strategy={subproblem_nn_batch_strategy}, "
@@ -547,6 +560,10 @@ def run_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS,
             shuffle=dual_shuffle,
             learning_rate=dual_learning_rate,
             save_path=dual_save_path,
+            dual_net_variant=dual_net_variant,
+            dual_normalize_targets=dual_normalize_targets,
+            dual_cosine_loss_weight=dual_cosine_loss_weight,
+            dual_smooth_l1_beta=dual_smooth_l1_beta,
         )
 
     # 步骤 2：逐机组训练代理约束（n_workers<=1 串行，否则样本级并行）
@@ -1123,6 +1140,10 @@ def main():
     DUAL_BATCH_STRATEGY_VALUE = DUAL_BATCH_STRATEGY
     DUAL_SHUFFLE_VALUE = DUAL_SHUFFLE
     DUAL_LR_VALUE = DUAL_LR
+    DUAL_PREDICTOR_NET_VARIANT_VALUE = DUAL_PREDICTOR_NET_VARIANT
+    DUAL_PREDICTOR_NORMALIZE_TARGETS_VALUE = DUAL_PREDICTOR_NORMALIZE_TARGETS
+    DUAL_PREDICTOR_COSINE_LOSS_WEIGHT_VALUE = DUAL_PREDICTOR_COSINE_LOSS_WEIGHT
+    DUAL_PREDICTOR_SMOOTH_L1_BETA_VALUE = DUAL_PREDICTOR_SMOOTH_L1_BETA
     BCD_MAX_ITER_VALUE = BCD_MAX_ITER
     SUBPROBLEM_MAX_ITER_VALUE = SUBPROBLEM_MAX_ITER
     BCD_LAMBDA_INIT_STRATEGY_VALUE = BCD_LAMBDA_INIT_STRATEGY
@@ -1379,6 +1400,10 @@ def main():
                     pg_cost_lr=SUBPROBLEM_PG_COST_LR_VALUE,
                     pg_cost_surr_lr=SUBPROBLEM_PG_COST_SURR_LR_VALUE,
                     pg_cost_reg_deadband=SUBPROBLEM_PG_COST_REG_DEADBAND_VALUE,
+                    dual_net_variant=DUAL_PREDICTOR_NET_VARIANT_VALUE,
+                    dual_normalize_targets=DUAL_PREDICTOR_NORMALIZE_TARGETS_VALUE,
+                    dual_cosine_loss_weight=DUAL_PREDICTOR_COSINE_LOSS_WEIGHT_VALUE,
+                    dual_smooth_l1_beta=DUAL_PREDICTOR_SMOOTH_L1_BETA_VALUE,
                 )
             print_surrogate_results(trainers, all_samples)
 
@@ -1628,6 +1653,10 @@ def main():
                     pg_cost_lr=SUBPROBLEM_PG_COST_LR_VALUE,
                     pg_cost_surr_lr=SUBPROBLEM_PG_COST_SURR_LR_VALUE,
                     pg_cost_reg_deadband=SUBPROBLEM_PG_COST_REG_DEADBAND_VALUE,
+                    dual_net_variant=DUAL_PREDICTOR_NET_VARIANT_VALUE,
+                    dual_normalize_targets=DUAL_PREDICTOR_NORMALIZE_TARGETS_VALUE,
+                    dual_cosine_loss_weight=DUAL_PREDICTOR_COSINE_LOSS_WEIGHT_VALUE,
+                    dual_smooth_l1_beta=DUAL_PREDICTOR_SMOOTH_L1_BETA_VALUE,
                 )
             print_surrogate_results(trainers, all_samples)
 
