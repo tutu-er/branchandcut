@@ -175,7 +175,7 @@ try:
     from uc_NN_subproblem_parallel import ParallelSubproblemSurrogateTrainer
     from case_registry import get_case_ppc
     from mti118_data_loader import load_case118_ppc_with_mti_limits
-    from scenario_utils import has_meaningful_renewable_data, normalize_sample_arrays
+    from dataset_json_utils import load_v3_active_set_json
     from training_logger import TrainingLogger
     from training_visualizer import TrainingVisualizer
 except ImportError as e:
@@ -236,24 +236,7 @@ def resolve_nn_hidden_dims(size_option: str, dim_options: dict[str, list[int]], 
 
 def load_json_data(data_file: Path) -> list:
     """加载 JSON 数据文件并规范化为 v3 所需格式。"""
-    log(f"加载数据文件: {data_file.name}")
-    with open(data_file, 'r', encoding='utf-8') as f:
-        data = json.load(f)
-
-    all_samples = data.get('all_samples', [])
-    if not all_samples:
-        raise ValueError("JSON 文件中没有样本数据 (all_samples 为空)")
-
-    log(f"  原始样本数: {len(all_samples)}")
-
-    has_dataset_renewable = any(has_meaningful_renewable_data(sample) for sample in all_samples)
-
-    for sample in all_samples:
-        if not has_dataset_renewable:
-            sample.pop('renewable_data', None)
-        normalize_sample_arrays(sample)
-
-    return all_samples
+    return load_v3_active_set_json(data_file, announce=log)
 
 
 def inject_bcd_lambda(all_samples: list, bcd_lambdas: list, T: int) -> None:

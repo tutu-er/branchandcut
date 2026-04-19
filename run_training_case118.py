@@ -5,6 +5,11 @@
 Switch ``TRAIN_TARGET`` below to run either:
 - ``main_bcd``: main-problem BCD training
 - ``subproblem_bcd``: subproblem surrogate/BCD training
+- ``dual_predictor``: only train ``dual_predictor.pth`` (``run_training.SURROGATE_DUAL_PREDICTOR_ONLY``)
+
+Run from repo root::
+
+    python run_training_case118.py
 
 This wrapper reuses ``run_training.py`` and only overrides the configuration
 needed for the refined case118 dataset.
@@ -18,7 +23,7 @@ from pathlib import Path
 import run_training as rt
 
 
-TRAIN_TARGET = "main_bcd"  # "main_bcd" | "subproblem_bcd"
+TRAIN_TARGET = "dual_predictor"  # "main_bcd" | "subproblem_bcd" | "dual_predictor"
 MAIN_BCD_SOLVE_PRESET = "gurobi"  # "gurobi" | "cvxpy_highs"
 # 子问题求解预设：
 # - "desktop": 偏保守（适合本地 Windows/笔记本）
@@ -26,10 +31,29 @@ MAIN_BCD_SOLVE_PRESET = "gurobi"  # "gurobi" | "cvxpy_highs"
 SUBPROBLEM_SOLVE_PRESET = "desktop"  # "desktop" | "server"
 
 ROOT = Path(__file__).resolve().parent
-CASE118_ACTIVE_SET_JSON = (
+
+# ── 对偶预测器「新设定」（仅用负荷/可再生作输入；不将启停作为特征）────────────────
+# 在 `_configure_common` 中写入 `run_training`，凡经本入口的 case118 训练均生效。
+CASE118_DUAL_PREDICTOR_NET_VARIANT = "temporal_conv"  # "mlp" | "temporal_conv"
+CASE118_DUAL_PREDICTOR_NORMALIZE_TARGETS = True
+CASE118_DUAL_PREDICTOR_COSINE_LOSS_WEIGHT = 0.12
+CASE118_DUAL_PREDICTOR_SMOOTH_L1_BETA = 2.0
+
+# 原始 refined active set（含 lambda_power_balance / lambda_dcpf_upper/lower）
+CASE118_ACTIVE_SET_JSON_FULL = (
     "result/commitment_clustering/"
     "pattern_library_case118_K10_20260418_032025_active_set_like_refined_20260418_032025.json"
 )
+# 电价裁剪精简版：仅含 lambda_pg_electricity_price，范围 [0, 2×max_unit_linear_cost]
+# 由 clip_dual_prices_case118.py 生成
+CASE118_ACTIVE_SET_JSON_PRICE_CLIPPED = (
+    "result/commitment_clustering/"
+    "pattern_library_case118_K10_20260418_032025_active_set_like_refined_20260418_032025"
+    "_price_only_clipped.json"
+)
+
+# 当前激活的 active set（切换此变量即可）
+CASE118_ACTIVE_SET_JSON = CASE118_ACTIVE_SET_JSON_PRICE_CLIPPED
 
 # 轻量并行入口（见 run_training_case118_subproblem_bcd_light.py）：在 subproblem 预设之后覆盖 rt
 SUBPROBLEM_LIGHT_MAX_SAMPLES: int | None = None
@@ -106,12 +130,18 @@ def _configure_common() -> None:
     rt.BCD_CONTINUE_TRAINING = False
     rt.SURROGATE_MODEL_DIR = None
     rt.SURROGATE_CONTINUE_TRAINING = False
+    rt.SURROGATE_DUAL_PREDICTOR_ONLY = False
     rt.BCD_THETA_TRAINING_STAGES = None
     rt.BCD_GUROBI_THREADS = None
 
     rt.THETA_HOT_START_STRATEGY = "dcpf_relative"
     rt.ZETA_HOT_START_STRATEGY = "zero"
     rt.BCD_LAMBDA_INIT_STRATEGY = "ed_on_x_opt"
+
+    rt.DUAL_PREDICTOR_NET_VARIANT = CASE118_DUAL_PREDICTOR_NET_VARIANT
+    rt.DUAL_PREDICTOR_NORMALIZE_TARGETS = CASE118_DUAL_PREDICTOR_NORMALIZE_TARGETS
+    rt.DUAL_PREDICTOR_COSINE_LOSS_WEIGHT = CASE118_DUAL_PREDICTOR_COSINE_LOSS_WEIGHT
+    rt.DUAL_PREDICTOR_SMOOTH_L1_BETA = CASE118_DUAL_PREDICTOR_SMOOTH_L1_BETA
 
 
 def _configure_main_bcd() -> None:
@@ -182,10 +212,36 @@ def _configure_main_bcd() -> None:
     rt.BCD_RHO_OPT_INIT = 1e-3
 
 
+def _configure_dual_predictor() -> None:
+    """仅训练对偶变量预测器 NN（写出 ``dual_predictor.pth``），不跑各机组子问题代理。"""
+    rt.MODE = "surrogate"
+    rt.RUN_FP = False
+    rt.SURROGATE_DUAL_PREDICTOR_ONLY = True
+    rt.SURROGATE_MODEL_DIR = None
+    rt.SURROGATE_CONTINUE_TRAINING = False
+
+    # 续训：把目录指到已有 ``dual_predictor.pth``，并打开 ``SURROGATE_CONTINUE_TRAINING``。
+    # rt.SURROGATE_MODEL_DIR = "result/surrogate_models/your_run"
+    # rt.SURROGATE_CONTINUE_TRAINING = True
+
+    if SUBPROBLEM_SOLVE_PRESET == "server":
+        rt.SUBPROBLEM_LP_BACKEND = "cvxpy_highs"
+    else:
+        rt.SUBPROBLEM_LP_BACKEND = "gurobi"
+
+    rt.DUAL_EPOCHS = 160
+    rt.DUAL_BATCH_SIZE = 16
+    rt.DUAL_BATCH_STRATEGY = "mini-batch"
+    rt.DUAL_SHUFFLE = True
+    rt.DUAL_LR = 3e-4
+    # 对偶预测器新设定见文件顶部 CASE118_DUAL_* 与 _configure_common
+
+
 def _configure_subproblem_bcd() -> None:
     cpu = _cpu_count()
 
     rt.MODE = "surrogate"
+    rt.SURROGATE_DUAL_PREDICTOR_ONLY = False
     rt.UNIT_IDS = None
 
     if SUBPROBLEM_SOLVE_PRESET == "server":
@@ -209,6 +265,7 @@ def _configure_subproblem_bcd() -> None:
     rt.DUAL_BATCH_STRATEGY = "mini-batch"
     rt.DUAL_SHUFFLE = True
     rt.DUAL_LR = 3e-4
+    # 对偶预测器新设定见文件顶部 CASE118_DUAL_* 与 _configure_common
 
     rt.NN_EPOCHS = 5
     rt.MAX_ITER = 80
@@ -278,10 +335,13 @@ def main() -> None:
     elif TRAIN_TARGET == "subproblem_bcd":
         _configure_subproblem_bcd()
         light_overrides = _apply_subproblem_light_runtime_overrides()
+    elif TRAIN_TARGET == "dual_predictor":
+        _configure_dual_predictor()
+        light_overrides = _apply_subproblem_light_runtime_overrides()
     else:
         raise ValueError(
             f"Unsupported TRAIN_TARGET={TRAIN_TARGET!r}; "
-            "expected 'main_bcd' or 'subproblem_bcd'."
+            "expected 'main_bcd', 'subproblem_bcd', or 'dual_predictor'."
         )
 
     print("=" * 72, flush=True)
@@ -308,12 +368,44 @@ def main() -> None:
             f"n_workers_unit={rt.N_WORKERS_UNIT}",
             flush=True,
         )
+        print(
+            "dual_predictor_preset: "
+            f"net={rt.DUAL_PREDICTOR_NET_VARIANT}, "
+            f"normalize_targets={rt.DUAL_PREDICTOR_NORMALIZE_TARGETS}, "
+            f"cosine_w={rt.DUAL_PREDICTOR_COSINE_LOSS_WEIGHT}, "
+            f"smooth_l1_beta={rt.DUAL_PREDICTOR_SMOOTH_L1_BETA}",
+            flush=True,
+        )
         if light_overrides:
             print(
                 "subproblem_light_overrides: "
                 f"max_samples={rt.MAX_SAMPLES}, "
                 f"n_workers_unit={rt.N_WORKERS_UNIT}, "
                 f"n_workers_sample={rt.N_WORKERS_SAMPLE}",
+                flush=True,
+            )
+    elif TRAIN_TARGET == "dual_predictor":
+        print(
+            "dual_predictor_only: "
+            f"SURROGATE_DUAL_PREDICTOR_ONLY={rt.SURROGATE_DUAL_PREDICTOR_ONLY}, "
+            f"epochs={rt.DUAL_EPOCHS}, batch={rt.DUAL_BATCH_SIZE}, "
+            f"strategy={rt.DUAL_BATCH_STRATEGY}, lr={rt.DUAL_LR}, "
+            f"continue={rt.SURROGATE_CONTINUE_TRAINING}, "
+            f"model_dir={rt.SURROGATE_MODEL_DIR}",
+            flush=True,
+        )
+        print(
+            "dual_predictor_preset: "
+            f"net={rt.DUAL_PREDICTOR_NET_VARIANT}, "
+            f"normalize_targets={rt.DUAL_PREDICTOR_NORMALIZE_TARGETS}, "
+            f"cosine_w={rt.DUAL_PREDICTOR_COSINE_LOSS_WEIGHT}, "
+            f"smooth_l1_beta={rt.DUAL_PREDICTOR_SMOOTH_L1_BETA}",
+            flush=True,
+        )
+        if light_overrides:
+            print(
+                "subproblem_light_overrides (samples): "
+                f"max_samples={rt.MAX_SAMPLES}",
                 flush=True,
             )
     print("=" * 72, flush=True)

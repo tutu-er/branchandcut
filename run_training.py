@@ -10,7 +10,7 @@
 可选标志 RUN_FP=True：训练后运行 feasibility_pump 可行性泵测试
 （bcd / sparse 模式不支持 RUN_FP，请改用 both 模式）
 
-修改顶部的 MODE / RUN_FP 变量切换执行模式。
+修改顶部的 MODE / RUN_FP / SURROGATE_DUAL_PREDICTOR_ONLY 等变量切换执行模式。
 """
 
 import os
@@ -113,6 +113,11 @@ DUAL_BATCH_SIZE = 8
 DUAL_BATCH_STRATEGY = 'full-batch'   # 'full-batch' / 'mini-batch'
 DUAL_SHUFFLE = True
 DUAL_LR = 5e-4
+# 对偶预测器：不将启停作为输入；用网络结构 + 目标标准化 + 组合损失减轻「退化为列均值」
+DUAL_PREDICTOR_NET_VARIANT = 'mlp'  # 'mlp' | 'temporal_conv'（需 input_dim==2*nb*T，即 load+renew 展平）
+DUAL_PREDICTOR_NORMALIZE_TARGETS = False
+DUAL_PREDICTOR_COSINE_LOSS_WEIGHT = 0.0
+DUAL_PREDICTOR_SMOOTH_L1_BETA = 1.0
 MAX_ITER = 300             # backward-compatible shared fallback
 BCD_MAX_ITER = MAX_ITER
 SUBPROBLEM_MAX_ITER = MAX_ITER
@@ -145,6 +150,8 @@ BCD_MODEL_FILE = None
 BCD_CONTINUE_TRAINING = False
 SURROGATE_MODEL_DIR = None
 SURROGATE_CONTINUE_TRAINING = False
+# surrogate 模式：为 True 时只训练/微调 dual_predictor（写出 dual_predictor.pth），跳过各机组子问题代理
+SURROGATE_DUAL_PREDICTOR_ONLY = False
 SPARSE_TOP_K_VARIABLES = 20
 SPARSE_MAX_GROUPS = 5
 SPARSE_GROUP_SIZE = 3
@@ -269,7 +276,7 @@ try:
     from uc_NN_subproblem_parallel import ParallelSubproblemSurrogateTrainer
     from case_registry import get_case_ppc
     from mti118_data_loader import load_case118_ppc_with_mti_limits
-    from scenario_utils import has_meaningful_renewable_data, normalize_sample_arrays
+    from dataset_json_utils import load_v3_active_set_json
     from subproblem_lp_solver import get_cvxpy_highs_status, is_lp_backend_available
     from training_logger import TrainingLogger
     from training_visualizer import TrainingVisualizer
@@ -342,24 +349,7 @@ def resolve_nn_hidden_dims(size_option: str, dim_options: dict[str, list[int]], 
 
 def load_json_data(data_file: Path) -> list:
     """加载 JSON 数据文件并规范化为 v3 所需格式。"""
-    log(f"加载数据文件: {data_file.name}")
-    with open(data_file, 'r', encoding='utf-8') as f:
-        data = json.load(f)
-
-    all_samples = data.get('all_samples', [])
-    if not all_samples:
-        raise ValueError("JSON 文件中没有样本数据 (all_samples 为空)")
-
-    log(f"  原始样本数: {len(all_samples)}")
-
-    has_dataset_renewable = any(has_meaningful_renewable_data(sample) for sample in all_samples)
-
-    for sample in all_samples:
-        if not has_dataset_renewable:
-            sample.pop('renewable_data', None)
-        normalize_sample_arrays(sample)
-
-    return all_samples
+    return load_v3_active_set_json(data_file, announce=log)
 
 
 def inject_bcd_lambda(all_samples: list, bcd_lambdas: list, T: int) -> None:
@@ -669,7 +659,12 @@ def run_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS,
                   pg_block_prox_weight: float = SUBPROBLEM_PG_BLOCK_PROX_WEIGHT,
                   dual_block_prox_weight: float = SUBPROBLEM_DUAL_BLOCK_PROX_WEIGHT,
                   iter_delta_reg_weight: float = SUBPROBLEM_ITER_DELTA_REG_WEIGHT,
-                  iter_delta_reg_deadband: float = SUBPROBLEM_ITER_DELTA_REG_DEADBAND):
+                  iter_delta_reg_deadband: float = SUBPROBLEM_ITER_DELTA_REG_DEADBAND,
+                  dual_predictor_only: bool = False,
+                  dual_net_variant: str = 'mlp',
+                  dual_normalize_targets: bool = False,
+                  dual_cosine_loss_weight: float = 0.0,
+                  dual_smooth_l1_beta: float = 1.0):
     """V3 代理约束训练（样本级并行），返回 (dual_predictor, trainers)。"""
     import os
     from pypower.ext2int import ext2int
@@ -692,6 +687,10 @@ def run_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS,
     log(
         f"dual_nn: batch_strategy={dual_batch_strategy}, batch_size={DUAL_BATCH_SIZE}, "
         f"shuffle={dual_shuffle}, lr={dual_learning_rate}"
+    )
+    log(
+        f"dual_predictor: net_variant={dual_net_variant}, normalize_targets={dual_normalize_targets}, "
+        f"cosine_loss_w={dual_cosine_loss_weight}, smooth_l1_beta={dual_smooth_l1_beta}"
     )
     log(
         f"subproblem_nn: batch_strategy={subproblem_nn_batch_strategy}, "
@@ -730,6 +729,9 @@ def run_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS,
     )
     print("=" * 70)
 
+    if save_dir:
+        os.makedirs(save_dir, exist_ok=True)
+
     # 步骤 1：对偶变量预测器（串行，NN 训练无需并行化）
     dual_save_path = os.path.join(save_dir, 'dual_predictor.pth') if save_dir else None
     load_path = resolve_existing_path(load_dir, 'surrogate model dir') if load_dir else None
@@ -764,12 +766,17 @@ def run_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS,
             shuffle=dual_shuffle,
             learning_rate=dual_learning_rate,
             save_path=dual_save_path,
+            dual_net_variant=dual_net_variant,
+            dual_normalize_targets=dual_normalize_targets,
+            dual_cosine_loss_weight=dual_cosine_loss_weight,
+            dual_smooth_l1_beta=dual_smooth_l1_beta,
         )
 
-    # 步骤 2：训练代理约束（支持机组级并行或样本级并行）
-    if save_dir:
-        os.makedirs(save_dir, exist_ok=True)
+    if dual_predictor_only:
+        log("dual_predictor_only=True：已结束对偶预测器训练，跳过子问题代理约束训练")
+        return dual_predictor, {}
 
+    # 步骤 2：训练代理约束（支持机组级并行或样本级并行）
     # B1：机组级并行（Level 1）
     if N_WORKERS_UNIT > 1:
         from uc_NN_subproblem_parallel import train_all_surrogates_parallel
@@ -1546,6 +1553,10 @@ def main():
     DUAL_BATCH_STRATEGY_VALUE = DUAL_BATCH_STRATEGY
     DUAL_SHUFFLE_VALUE = DUAL_SHUFFLE
     DUAL_LR_VALUE = DUAL_LR
+    DUAL_PREDICTOR_NET_VARIANT_VALUE = DUAL_PREDICTOR_NET_VARIANT
+    DUAL_PREDICTOR_NORMALIZE_TARGETS_VALUE = DUAL_PREDICTOR_NORMALIZE_TARGETS
+    DUAL_PREDICTOR_COSINE_LOSS_WEIGHT_VALUE = DUAL_PREDICTOR_COSINE_LOSS_WEIGHT
+    DUAL_PREDICTOR_SMOOTH_L1_BETA_VALUE = DUAL_PREDICTOR_SMOOTH_L1_BETA
     BCD_MAX_ITER_VALUE = BCD_MAX_ITER
     SUBPROBLEM_MAX_ITER_VALUE = SUBPROBLEM_MAX_ITER
     BCD_LAMBDA_INIT_STRATEGY_VALUE = BCD_LAMBDA_INIT_STRATEGY
@@ -1863,14 +1874,25 @@ def main():
                     dual_block_prox_weight=SUBPROBLEM_DUAL_BLOCK_PROX_WEIGHT_VALUE,
                     iter_delta_reg_weight=SUBPROBLEM_ITER_DELTA_REG_WEIGHT,
                     iter_delta_reg_deadband=SUBPROBLEM_ITER_DELTA_REG_DEADBAND,
+                    dual_predictor_only=SURROGATE_DUAL_PREDICTOR_ONLY,
+                    dual_net_variant=DUAL_PREDICTOR_NET_VARIANT_VALUE,
+                    dual_normalize_targets=DUAL_PREDICTOR_NORMALIZE_TARGETS_VALUE,
+                    dual_cosine_loss_weight=DUAL_PREDICTOR_COSINE_LOSS_WEIGHT_VALUE,
+                    dual_smooth_l1_beta=DUAL_PREDICTOR_SMOOTH_L1_BETA_VALUE,
                 )
-            print_surrogate_results(trainers, all_samples)
+            if trainers:
+                print_surrogate_results(trainers, all_samples)
+            elif SURROGATE_DUAL_PREDICTOR_ONLY:
+                log("SURROGATE_DUAL_PREDICTOR_ONLY：无子问题代理，跳过 print_surrogate_results")
 
             if RUN_FP:
-                run_feasibility_pump_test(
-                    ppc, all_samples, dual_predictor, trainers,
-                    T_DELTA, FP_TEST_SAMPLES,
-                )
+                if not trainers:
+                    log("警告: SURROGATE_DUAL_PREDICTOR_ONLY 且无子问题代理，跳过 RUN_FP")
+                else:
+                    run_feasibility_pump_test(
+                        ppc, all_samples, dual_predictor, trainers,
+                        T_DELTA, FP_TEST_SAMPLES,
+                    )
 
         elif MODE == 'both':
             # Step 1: BCD 训练（或从已有模型加载跳过）
@@ -2162,6 +2184,11 @@ def main():
                     dual_block_prox_weight=SUBPROBLEM_DUAL_BLOCK_PROX_WEIGHT_VALUE,
                     iter_delta_reg_weight=SUBPROBLEM_ITER_DELTA_REG_WEIGHT,
                     iter_delta_reg_deadband=SUBPROBLEM_ITER_DELTA_REG_DEADBAND,
+                    dual_predictor_only=False,
+                    dual_net_variant=DUAL_PREDICTOR_NET_VARIANT_VALUE,
+                    dual_normalize_targets=DUAL_PREDICTOR_NORMALIZE_TARGETS_VALUE,
+                    dual_cosine_loss_weight=DUAL_PREDICTOR_COSINE_LOSS_WEIGHT_VALUE,
+                    dual_smooth_l1_beta=DUAL_PREDICTOR_SMOOTH_L1_BETA_VALUE,
                 )
             print_surrogate_results(trainers, all_samples)
 

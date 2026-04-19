@@ -414,7 +414,8 @@ class TrainingVisualizer:
     def plot_surrogate_violation(self, trainers: Optional[Dict] = None,
                                  sample: int = 0,
                                  save_dir: Optional[Path] = None) -> Optional[plt.Figure]:
-        if trainers is None:
+        # None 或空 dict（例如仅训练 dual_predictor、无子问题代理）都不画
+        if not trainers:
             return None
 
         unit_ids = sorted(trainers.keys())
@@ -443,6 +444,9 @@ class TrainingVisualizer:
         mat = np.zeros((len(unit_ids), max_nc))
         for i, row in enumerate(viol_rows):
             mat[i, :len(row)] = row
+
+        if mat.size == 0 or mat.shape[0] < 1 or mat.shape[1] < 1:
+            return None
 
         fig, ax = plt.subplots(figsize=self.FIGSIZE_SINGLE)
         im = ax.imshow(mat, aspect="auto", cmap=_VIOL_CMAP, interpolation="nearest")

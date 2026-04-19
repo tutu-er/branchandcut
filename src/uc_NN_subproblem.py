@@ -803,6 +803,66 @@ class DualVariablePredictorNet(nn.Module):
         return self.network(x)
 
 
+class DualVariablePredictorNetTemporalConv(nn.Module):
+    """沿时段 T 卷积编码 (load, renew) 拼成的 (2*nb, T)，再映射到 ng*T 维电价型对偶。
+
+    要求输入为 ``get_feature_vector_from_sample`` 的拼接顺序：
+    ``load_data.reshape(-1)`` 后接 ``renewable_data.reshape(-1)``，且二者形状均为 (nb, T)。
+    """
+
+    def __init__(
+        self,
+        nb: int,
+        T: int,
+        output_dim: int,
+        hidden_ch: int = 192,
+        n_stacks: int = 3,
+    ):
+        super().__init__()
+        self.nb = nb
+        self.T = T
+        cin = 2 * nb
+        layers: List[nn.Module] = []
+        c = cin
+        for _ in range(int(n_stacks)):
+            layers += [
+                nn.Conv1d(c, hidden_ch, kernel_size=5, padding=2),
+                nn.BatchNorm1d(hidden_ch),
+                nn.LeakyReLU(0.01),
+                nn.Dropout(0.05),
+            ]
+            c = hidden_ch
+        self.body = nn.Sequential(*layers)
+        flat = c * T
+        hid2 = min(2048, max(512, flat // 2))
+        self.head = nn.Sequential(
+            nn.Linear(flat, hid2),
+            nn.LayerNorm(hid2),
+            nn.LeakyReLU(0.01),
+            nn.Dropout(0.1),
+            nn.Linear(hid2, output_dim),
+        )
+        for module in self.head.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.kaiming_normal_(module.weight, mode="fan_in", nonlinearity="leaky_relu")
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+
+    def forward(self, x_flat: torch.Tensor) -> torch.Tensor:
+        b = x_flat.shape[0]
+        x = x_flat.reshape(b, 2 * self.nb, self.T)
+        h = self.body(x)
+        return self.head(h.reshape(b, -1))
+
+
+def _dual_predictor_batch_cosine_loss(pred: torch.Tensor, target: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    """1 - cosine(pred, target)，按 batch 样本分别计算再取均值。"""
+    pn = torch.linalg.norm(pred, dim=1).clamp(min=eps)
+    tn = torch.linalg.norm(target, dim=1).clamp(min=eps)
+    cos = (pred * target).sum(dim=1) / (pn * tn)
+    return (1.0 - cos).mean()
+
+
 class DualVariablePredictorTrainer:
     """
     对偶变量预测网络的独立训练器
@@ -5337,12 +5397,76 @@ def _load_surrogate_model_metadata(filepath: str, device=None) -> dict:
     }
 
 
+def build_lambda_pg_electricity_price_targets(
+    ppc,
+    active_set_data: List[Dict],
+    T_delta: float,
+) -> Tuple[np.ndarray, Dict]:
+    """
+    Build the same label matrix Y as DualVariablePredictorTrainer._solve_for_true_dual_variables:
+    each row is ``lambda_pg_electricity_price`` for one sample, shape (N, ng*T).
+
+    Returns:
+        Y: float array (n_samples, ng * T)
+        meta: counts and dimensions (n_from_cache, n_from_ed, ng, T, ...)
+    """
+    ppc_int = ext2int(ppc)
+    ng = int(ppc_int["gen"].shape[0])
+    nl = int(ppc_int["branch"].shape[0])
+    n_samples = len(active_set_data)
+    T = int(active_set_data[0]["pd_data"].shape[1])
+    sens = _build_generator_injection_sensitivity(ppc)
+
+    n_from_cache = 0
+    n_from_ed = 0
+    rows: List[np.ndarray] = []
+
+    for sample_id in range(n_samples):
+        sample = active_set_data[sample_id]
+        effective = _get_effective_pg_prices_from_sample_or_dual_payload(
+            sample, T, ng, nl, sens,
+        )
+        if effective is None:
+            n_from_ed += 1
+            x_sol = _recover_unit_commitment_matrix(sample, ng, T)
+            payload = _solve_pg_electricity_price_from_ed(
+                ppc,
+                sample["pd_data"],
+                T_delta,
+                x_sol,
+                renewable_data=sample.get("renewable_data"),
+                verbose=False,
+            )
+            effective = np.asarray(payload["lambda_pg_electricity_price"], dtype=float)
+            sample["lambda_pg_electricity_price"] = effective.copy()
+        else:
+            n_from_cache += 1
+            effective = np.asarray(effective, dtype=float)
+
+        rows.append(effective.reshape(-1))
+
+    Y = np.asarray(rows, dtype=float)
+    meta = {
+        "n_samples": n_samples,
+        "ng": ng,
+        "T": T,
+        "output_dim": ng * T,
+        "n_from_cache": n_from_cache,
+        "n_from_ed": n_from_ed,
+    }
+    return Y, meta
+
+
 def train_dual_predictor_from_data(ppc, active_set_data: List[Dict], T_delta: float = 1.0,
                                     num_epochs: int = 100, batch_size: int = 8,
                                     batch_strategy: str = "full-batch",
                                     shuffle: bool = True,
                                     learning_rate: float = 1e-3,
-                                    save_path: str = None, device=None) -> DualVariablePredictorTrainer:
+                                    save_path: str = None, device=None,
+                                    dual_net_variant: str = "mlp",
+                                    dual_normalize_targets: bool = False,
+                                    dual_cosine_loss_weight: float = 0.0,
+                                    dual_smooth_l1_beta: float = 1.0) -> DualVariablePredictorTrainer:
     """
     训练对偶变量预测器
     
@@ -5372,6 +5496,10 @@ def train_dual_predictor_from_data(ppc, active_set_data: List[Dict], T_delta: fl
         batch_size=batch_size,
         shuffle=shuffle,
         learning_rate=learning_rate,
+        dual_net_variant=dual_net_variant,
+        dual_normalize_targets=dual_normalize_targets,
+        dual_cosine_loss_weight=dual_cosine_loss_weight,
+        dual_smooth_l1_beta=dual_smooth_l1_beta,
     )
     
     # 训练
@@ -5738,9 +5866,27 @@ def load_trained_models(ppc, active_set_data: List[Dict], T_delta: float,
     
     print(f"从 {load_dir} 加载模型...", flush=True)
     
-    # 加载对偶预测器
-    dual_predictor = DualVariablePredictorTrainer(ppc, active_set_data, T_delta, device)
+    # 加载对偶预测器（预读 checkpoint 以对齐网络结构与标准化参数）
     dual_path = os.path.join(load_dir, 'dual_predictor.pth')
+    peek: dict = {}
+    if os.path.exists(dual_path) and TORCH_AVAILABLE:
+        try:
+            try:
+                peek = torch.load(dual_path, map_location='cpu', weights_only=False)
+            except TypeError:
+                peek = torch.load(dual_path, map_location='cpu')
+        except Exception as exc:
+            print(f"警告: 预读 dual_predictor.pth 失败: {exc}", flush=True)
+    dual_predictor = DualVariablePredictorTrainer(
+        ppc,
+        active_set_data,
+        T_delta,
+        device,
+        dual_net_variant=str(peek.get('dual_net_variant', 'mlp')),
+        dual_normalize_targets=bool(peek.get('dual_normalize_targets', False)),
+        dual_cosine_loss_weight=float(peek.get('dual_cosine_loss_weight', 0.0)),
+        dual_smooth_l1_beta=float(peek.get('dual_smooth_l1_beta', 1.0)),
+    )
     if os.path.exists(dual_path):
         dual_predictor.load(dual_path)
     else:
@@ -6709,6 +6855,10 @@ def _dual_predictor_trainer_init(
     batch_size: int = 8,
     shuffle: bool = True,
     learning_rate: float = 1e-3,
+    dual_net_variant: str = "mlp",
+    dual_normalize_targets: bool = False,
+    dual_cosine_loss_weight: float = 0.0,
+    dual_smooth_l1_beta: float = 1.0,
 ):
     self.ppc = ppc
     ppc_int = ext2int(ppc)
@@ -6747,13 +6897,40 @@ def _dual_predictor_trainer_init(
     self.batch_size = max(int(batch_size), 1)
     self.shuffle = bool(shuffle)
     self.learning_rate = max(float(learning_rate), 1e-8)
+    self.dual_net_variant = str(dual_net_variant or "mlp").strip().lower()
+    self.dual_normalize_targets = bool(dual_normalize_targets)
+    self.dual_cosine_loss_weight = max(float(dual_cosine_loss_weight), 0.0)
+    self.dual_smooth_l1_beta = max(float(dual_smooth_l1_beta), 1e-6)
+    self._dual_y_mean_np: Optional[np.ndarray] = None
+    self._dual_y_std_np: Optional[np.ndarray] = None
 
-    if TORCH_AVAILABLE:
-        self.network = DualVariablePredictorNet(self.input_dim, self.output_dim).to(self.device)
-        self.optimizer = optim.Adam(self.network.parameters(), lr=self.learning_rate)
-
+    # 先求监督标签，再做目标标准化与网络构造（标准化仅用负荷侧可得的统计量）
     self.lambda_targets = self._solve_for_true_dual_variables()
     self.lambda_true = self.lambda_targets
+    if self.dual_normalize_targets and self.lambda_targets.size:
+        y = np.asarray(self.lambda_targets, dtype=np.float64)
+        self._dual_y_mean_np = y.mean(axis=0)
+        self._dual_y_std_np = np.maximum(y.std(axis=0), 1e-3)
+
+    if TORCH_AVAILABLE:
+        use_temporal = (
+            self.dual_net_variant == "temporal_conv"
+            and self.input_dim == 2 * self.nb * self.T
+        )
+        if self.dual_net_variant == "temporal_conv" and not use_temporal:
+            print(
+                f"[DualPredictor] temporal_conv 需要 input_dim==2*nb*T "
+                f"（当前 input_dim={self.input_dim}, 2*nb*T={2 * self.nb * self.T}），回退到 MLP",
+                flush=True,
+            )
+        if use_temporal:
+            self.network = DualVariablePredictorNetTemporalConv(
+                self.nb, self.T, self.output_dim
+            ).to(self.device)
+        else:
+            self.network = DualVariablePredictorNet(self.input_dim, self.output_dim).to(self.device)
+        self.optimizer = optim.Adam(self.network.parameters(), lr=self.learning_rate)
+
     if self.lambda_targets.size:
         y_flat = self.lambda_targets.reshape(-1)
         print(
@@ -6762,6 +6939,12 @@ def _dual_predictor_trainer_init(
             f"mean_abs={float(np.mean(np.abs(y_flat))):.4g}, std={float(np.std(y_flat)):.4g}",
             flush=True,
         )
+    print(
+        f"[DualPredictor] 训练配置: net={self.dual_net_variant}, "
+        f"normalize_targets={self.dual_normalize_targets}, "
+        f"cosine_w={self.dual_cosine_loss_weight}, smooth_l1_beta={self.dual_smooth_l1_beta}",
+        flush=True,
+    )
 
 
 def _dual_predictor_trainer_solve_true(self) -> np.ndarray:
@@ -6838,20 +7021,44 @@ def _dual_predictor_trainer_train(
         batch_size=resolved_batch_size,
         shuffle=resolved_shuffle and self.n_samples > 1,
     )
-    criterion = nn.MSELoss()
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(self.optimizer, patience=10, factor=0.5)
     self.network.train()
 
+    y_mean_t: torch.Tensor | None = None
+    y_std_t: torch.Tensor | None = None
+    if self.dual_normalize_targets and self._dual_y_mean_np is not None:
+        y_mean_t = torch.as_tensor(self._dual_y_mean_np, dtype=torch.float32, device=self.device)
+        y_std_t = torch.as_tensor(self._dual_y_std_np, dtype=torch.float32, device=self.device)
+
+    beta = float(self.dual_smooth_l1_beta)
+    cos_w = float(self.dual_cosine_loss_weight)
+
     print_interval = max(1, num_epochs // 10)
-    print(f"[DualPredictor] 开始训练 (epochs={num_epochs}, batch_strategy={resolved_batch_strategy}, "
-          f"batch_size={resolved_batch_size}, lr={resolved_learning_rate:.1e}, device={self.device})", flush=True)
+    print(
+        f"[DualPredictor] 开始训练 (epochs={num_epochs}, batch_strategy={resolved_batch_strategy}, "
+        f"batch_size={resolved_batch_size}, lr={resolved_learning_rate:.1e}, device={self.device}, "
+        f"loss=SmoothL1(beta={beta})"
+        + (f"+{cos_w}*cosine" if cos_w > 0 else "")
+        + ")",
+        flush=True,
+    )
 
     for _epoch in range(num_epochs):
         epoch_loss = 0.0
         for batch_X, batch_Y in dataloader:
             self.optimizer.zero_grad()
             pred = self.network(batch_X)
-            loss = criterion(pred, batch_Y)
+            if y_mean_t is not None and y_std_t is not None:
+                y_norm = (batch_Y - y_mean_t) / y_std_t
+                loss_fit = torch.nn.functional.smooth_l1_loss(pred, y_norm, beta=beta)
+                pred_phys = pred * y_std_t + y_mean_t
+            else:
+                loss_fit = torch.nn.functional.smooth_l1_loss(pred, batch_Y, beta=beta)
+                pred_phys = pred
+            if cos_w > 0:
+                loss = loss_fit + cos_w * _dual_predictor_batch_cosine_loss(pred_phys, batch_Y)
+            else:
+                loss = loss_fit
             loss.backward()
             self.optimizer.step()
             epoch_loss += loss.item() * batch_X.size(0)
@@ -6912,7 +7119,12 @@ def _dual_predictor_trainer_predict(self, pd_data, renewable_data=None, unit_id=
 
         self.network.eval()
         packed = self.network(pd_tensor.unsqueeze(0)).squeeze(0).cpu().numpy()
-        payload = packed.reshape(self.ng, self.T)
+        flat = np.asarray(packed, dtype=np.float64).reshape(-1)
+        if getattr(self, "dual_normalize_targets", False) and getattr(self, "_dual_y_mean_np", None) is not None:
+            flat = flat * np.asarray(self._dual_y_std_np, dtype=np.float64) + np.asarray(
+                self._dual_y_mean_np, dtype=np.float64
+            )
+        payload = flat.reshape(self.ng, self.T)
         if unit_id is not None:
             return payload[unit_id]
         return payload
@@ -6943,12 +7155,22 @@ def _dual_predictor_trainer_save(self, filepath: str):
         state['batch_strategy'] = getattr(self, 'batch_strategy', 'full-batch')
         state['batch_size'] = getattr(self, 'batch_size', 8)
         state['shuffle'] = getattr(self, 'shuffle', True)
+        state['dual_net_variant'] = getattr(self, 'dual_net_variant', 'mlp')
+        state['dual_normalize_targets'] = bool(getattr(self, 'dual_normalize_targets', False))
+        state['dual_cosine_loss_weight'] = float(getattr(self, 'dual_cosine_loss_weight', 0.0))
+        state['dual_smooth_l1_beta'] = float(getattr(self, 'dual_smooth_l1_beta', 1.0))
+        if getattr(self, '_dual_y_mean_np', None) is not None:
+            state['dual_y_mean'] = np.asarray(self._dual_y_mean_np, dtype=np.float64)
+            state['dual_y_std'] = np.asarray(self._dual_y_std_np, dtype=np.float64)
         torch.save(state, filepath)
 
 
 def _dual_predictor_trainer_load(self, filepath: str):
     if TORCH_AVAILABLE:
-        state = torch.load(filepath, map_location=self.device)
+        try:
+            state = torch.load(filepath, map_location=self.device, weights_only=False)
+        except TypeError:
+            state = torch.load(filepath, map_location=self.device)
         self.learning_rate = max(float(state.get('learning_rate', getattr(self, 'learning_rate', 1e-3))), 1e-8)
         self.batch_strategy = normalize_nn_batch_strategy(
             state.get('batch_strategy', getattr(self, 'batch_strategy', 'full-batch'))
@@ -6973,12 +7195,33 @@ def _dual_predictor_trainer_load(self, filepath: str):
             ):
                 optimizer.load_state_dict(optimizer_state)
         else:
+            self.dual_net_variant = str(state.get('dual_net_variant', 'mlp')).strip().lower()
+            self.dual_normalize_targets = bool(state.get('dual_normalize_targets', False))
+            self.dual_cosine_loss_weight = float(state.get('dual_cosine_loss_weight', 0.0))
+            self.dual_smooth_l1_beta = float(state.get('dual_smooth_l1_beta', 1.0))
+            if state.get('dual_y_mean') is not None and state.get('dual_y_std') is not None:
+                self._dual_y_mean_np = np.asarray(state['dual_y_mean'], dtype=np.float64)
+                self._dual_y_std_np = np.asarray(state['dual_y_std'], dtype=np.float64)
             legacy_dim = state.get('lambda_output_dim')
             if legacy_dim == self.output_dim:
                 self._legacy_mode = None
+                use_temporal = (
+                    self.dual_net_variant == 'temporal_conv'
+                    and self.input_dim == 2 * self.nb * self.T
+                )
+                if use_temporal:
+                    self.network = DualVariablePredictorNetTemporalConv(
+                        self.nb, self.T, self.output_dim
+                    ).to(self.device)
+                else:
+                    self.network = DualVariablePredictorNet(self.input_dim, self.output_dim).to(self.device)
+                self.optimizer = optim.Adam(self.network.parameters(), lr=self.learning_rate)
                 self.network.load_state_dict(state['network_state_dict'])
                 if 'optimizer_state_dict' in state:
-                    self.optimizer.load_state_dict(state['optimizer_state_dict'])
+                    try:
+                        self.optimizer.load_state_dict(state['optimizer_state_dict'])
+                    except Exception:
+                        pass
             elif legacy_dim == self.T + 2 * self.nl * self.T:
                 self._legacy_mode = 'global_dual_payload'
                 self.network = DualVariablePredictorNet(self.input_dim, legacy_dim).to(self.device)
