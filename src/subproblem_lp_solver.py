@@ -1478,14 +1478,31 @@ def solve_dual_block(
     if defer_log:
         trainer._deferred_lp_block_log = None
     # 与 solve_primal_block 一致：每个机组仅打印前 3 个样本（sample_id 0..2）
+    # dual_block_prox_weight==0 时 obj_dual_prox 为 Python float（无 .value），须与 primal 的 obj_prox 同理处理
     if display_sample_id <= 2:
         try:
-            obj_dual_pg_v = float(np.asarray(obj_dual_pg.value).reshape(-1)[0]) if obj_dual_pg is not None else 0.0
-            obj_dual_x_v = float(np.asarray(obj_dual_x.value).reshape(-1)[0]) if obj_dual_x is not None else 0.0
-            obj_dual_coc_v = float(np.asarray(obj_dual_coc.value).reshape(-1)[0]) if obj_dual_coc is not None else 0.0
+            def _maybe_float(val):
+                if val is None:
+                    return None
+                try:
+                    return float(np.asarray(val, dtype=float).reshape(-1)[0])
+                except Exception:
+                    return None
+
+            def _term_solved_value(term) -> float:
+                if term is None:
+                    return 0.0
+                if isinstance(term, (int, float, np.integer, np.floating)):
+                    return float(term)
+                v = _maybe_float(getattr(term, "value", None))
+                return 0.0 if v is None else v
+
+            obj_dual_pg_v = _term_solved_value(obj_dual_pg)
+            obj_dual_x_v = _term_solved_value(obj_dual_x)
+            obj_dual_coc_v = _term_solved_value(obj_dual_coc)
             obj_dual_v = obj_dual_pg_v + obj_dual_x_v + obj_dual_coc_v
-            obj_opt_v = float(np.asarray(obj_opt.value).reshape(-1)[0]) if obj_opt is not None else 0.0
-            obj_dual_prox_v = float(np.asarray(obj_dual_prox.value).reshape(-1)[0]) if obj_dual_prox is not None else 0.0
+            obj_opt_v = _term_solved_value(obj_opt)
+            obj_dual_prox_v = _term_solved_value(obj_dual_prox)
             status = getattr(problem, "status", None)
             line = (
                 f"[Unit-{g}] dual_block, sample_id: {display_sample_id}, "
