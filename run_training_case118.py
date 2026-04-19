@@ -60,6 +60,23 @@ SUBPROBLEM_LIGHT_MAX_SAMPLES: int | None = None
 SUBPROBLEM_LIGHT_N_WORKERS_UNIT: int | None = None
 SUBPROBLEM_LIGHT_N_WORKERS_SAMPLE: int | None = None
 
+# ── Case118 子问题 c_pg（发电边际修正头）────────────────────────────────
+# 与 118 节点系统、裁剪电价 λ 的典型量级及较长子问题 BCD 外循环对齐：
+# - 略增大 pg_cost_scale 倍率，避免 tanh 饱和导致无法闭合 pg 驻点残差；
+# - c_pg 分支用 large 宽度，便于拟合时段相关的 pg_const；
+# - 略提前启用 c_pg，使外循环后半段有更多轮次专门压 obj_dual_pg；
+# - surr_lr 为 BCD 内 c_pg 步实际使用的 Adam 学习率（见 uc_NN_subproblem.iter_with_c_pg_nn）。
+CASE118_SUBPROBLEM_C_PG_NN_SIZE = "large"
+CASE118_SUBPROBLEM_PG_COST_SCALE_MULTIPLIER = 2.75
+CASE118_SUBPROBLEM_PG_COST_NN_EPOCHS = 14
+CASE118_SUBPROBLEM_PG_COST_START_ROUND = 32
+CASE118_SUBPROBLEM_PG_COST_LR = 1e-4
+CASE118_SUBPROBLEM_PG_COST_SURR_LR = 2e-4
+CASE118_SUBPROBLEM_PG_COST_REG_DEADBAND = 1.0
+CASE118_SUBPROBLEM_PG_COST_SMOOTH_ABS_EPS = 1e-5
+CASE118_SUBPROBLEM_RHO_DUAL_PG_INIT = 0.15
+CASE118_SUBPROBLEM_LOSS_RATIO_DUAL_PG = 1.25
+
 
 def _cpu_count() -> int:
     return max(1, os.cpu_count() or 1)
@@ -272,7 +289,7 @@ def _configure_subproblem_bcd() -> None:
     rt.SUBPROBLEM_MAX_ITER = 80
 
     rt.SUBPROBLEM_NN_SIZE = "medium"
-    rt.SUBPROBLEM_C_PG_NN_SIZE = "medium"
+    rt.SUBPROBLEM_C_PG_NN_SIZE = CASE118_SUBPROBLEM_C_PG_NN_SIZE
     rt.SUBPROBLEM_NN_BATCH_STRATEGY = "full-batch"
     rt.SUBPROBLEM_NN_BATCH_SIZE = 8
     rt.SUBPROBLEM_NN_SHUFFLE = True
@@ -282,7 +299,7 @@ def _configure_subproblem_bcd() -> None:
     rt.SUBPROBLEM_GAMMA_BASE = 1e-3
     rt.SUBPROBLEM_RHO_PRIMAL_INIT = 1e-1
     rt.SUBPROBLEM_RHO_DUAL_INIT = 1e-3
-    rt.SUBPROBLEM_RHO_DUAL_PG_INIT = 1e-1
+    rt.SUBPROBLEM_RHO_DUAL_PG_INIT = CASE118_SUBPROBLEM_RHO_DUAL_PG_INIT
     rt.SUBPROBLEM_RHO_DUAL_X_INIT = 1e-1
     rt.SUBPROBLEM_RHO_DUAL_COC_INIT = 1e1
     rt.SUBPROBLEM_RHO_BINARY_INIT = 1e2
@@ -295,11 +312,16 @@ def _configure_subproblem_bcd() -> None:
     rt.SUBPROBLEM_MU_SIGN_HYSTERESIS_ROUNDS = 2
     rt.SUBPROBLEM_MU_SIGN_FLIP_MIN_SHARE = 0.67
 
-    rt.SUBPROBLEM_PG_COST_NN_EPOCHS = 8
-    rt.SUBPROBLEM_PG_COST_START_ROUND = 40
+    rt.SUBPROBLEM_LOSS_RATIO_DUAL_PG = CASE118_SUBPROBLEM_LOSS_RATIO_DUAL_PG
+
+    rt.SUBPROBLEM_PG_COST_NN_EPOCHS = CASE118_SUBPROBLEM_PG_COST_NN_EPOCHS
+    rt.SUBPROBLEM_PG_COST_START_ROUND = CASE118_SUBPROBLEM_PG_COST_START_ROUND
+    rt.SUBPROBLEM_PG_COST_SCALE_MULTIPLIER = CASE118_SUBPROBLEM_PG_COST_SCALE_MULTIPLIER
     rt.SUBPROBLEM_X_COST_NN_LR = 5e-6
-    rt.SUBPROBLEM_PG_COST_LR = 5e-5
-    rt.SUBPROBLEM_PG_COST_SURR_LR = 1e-4
+    rt.SUBPROBLEM_PG_COST_LR = CASE118_SUBPROBLEM_PG_COST_LR
+    rt.SUBPROBLEM_PG_COST_SURR_LR = CASE118_SUBPROBLEM_PG_COST_SURR_LR
+    rt.SUBPROBLEM_PG_COST_REG_DEADBAND = CASE118_SUBPROBLEM_PG_COST_REG_DEADBAND
+    rt.SUBPROBLEM_PG_COST_SMOOTH_ABS_EPS = CASE118_SUBPROBLEM_PG_COST_SMOOTH_ABS_EPS
 
 
 def _validate_inputs() -> None:
@@ -374,6 +396,17 @@ def main() -> None:
             f"normalize_targets={rt.DUAL_PREDICTOR_NORMALIZE_TARGETS}, "
             f"cosine_w={rt.DUAL_PREDICTOR_COSINE_LOSS_WEIGHT}, "
             f"smooth_l1_beta={rt.DUAL_PREDICTOR_SMOOTH_L1_BETA}",
+            flush=True,
+        )
+        print(
+            "case118_c_pg: "
+            f"c_pg_size={CASE118_SUBPROBLEM_C_PG_NN_SIZE}, "
+            f"pg_cost_scale_mult={CASE118_SUBPROBLEM_PG_COST_SCALE_MULTIPLIER}, "
+            f"pg_cost_start_round={CASE118_SUBPROBLEM_PG_COST_START_ROUND}, "
+            f"pg_cost_nn_epochs={CASE118_SUBPROBLEM_PG_COST_NN_EPOCHS}, "
+            f"rho_dual_pg_init={CASE118_SUBPROBLEM_RHO_DUAL_PG_INIT}, "
+            f"loss_ratio_dual_pg={CASE118_SUBPROBLEM_LOSS_RATIO_DUAL_PG}, "
+            f"pg_cost_surr_lr={CASE118_SUBPROBLEM_PG_COST_SURR_LR}",
             flush=True,
         )
         if light_overrides:

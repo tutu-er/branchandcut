@@ -3,6 +3,7 @@
 """Case118 子问题 BCD 轻量并行入口。
 
 在标准 ``subproblem_bcd`` 配置基础上，减少训练样本数与并行度，便于联调、冒烟测试或资源紧张环境。
+子问题 ``c_pg`` 等超参由 ``run_training_case118.py`` 内 ``CASE118_SUBPROBLEM_*`` 常量统一设定。
 
 示例::
 
