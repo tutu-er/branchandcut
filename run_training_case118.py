@@ -260,7 +260,7 @@ def _configure_subproblem_bcd() -> None:
         rt.SUBPROBLEM_LP_BACKEND = "gurobi"
 
     # Dual predictor + per-unit subproblem training.
-    rt.DUAL_EPOCHS = 120
+    rt.DUAL_EPOCHS = 320
     rt.DUAL_BATCH_SIZE = 16
     rt.DUAL_BATCH_STRATEGY = "mini-batch"
     rt.DUAL_SHUFFLE = True
