@@ -229,7 +229,7 @@ def _configure_dual_predictor() -> None:
     else:
         rt.SUBPROBLEM_LP_BACKEND = "gurobi"
 
-    rt.DUAL_EPOCHS = 160
+    rt.DUAL_EPOCHS = 320
     rt.DUAL_BATCH_SIZE = 16
     rt.DUAL_BATCH_STRATEGY = "mini-batch"
     rt.DUAL_SHUFFLE = True
