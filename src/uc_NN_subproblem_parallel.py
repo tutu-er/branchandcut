@@ -24,6 +24,7 @@ Level 2（样本级，跨线程）
 import copy
 import os
 import sys
+import threading
 import time
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -248,6 +249,7 @@ class ParallelSubproblemSurrogateTrainer(SubproblemSurrogateTrainer):
         # Process spawning re-imports the whole training entrypoint in each child,
         # which is expensive and can fail when optional heavy modules (for example
         # pandas via case118 loaders) are imported under tight virtual-memory limits.
+        ordered_logs: Dict[int, str] = {}
         with ThreadPoolExecutor(max_workers=self.n_workers) as executor:
             future_to_sid = {}
             for s, alphas, betas, gammas, deltas, costs, pg_costs in block_args:
@@ -270,11 +272,16 @@ class ParallelSubproblemSurrogateTrainer(SubproblemSurrogateTrainer):
                 try:
                     payload = future.result()
                     results[s] = payload['result']
+                    msg = payload.get('lp_log')
+                    if msg:
+                        ordered_logs[s] = msg
                 except Exception as exc:
-                    print(f"{prefix} {block}_block sample={s} 寮傚父: {exc}", flush=True)
+                    print(f"{prefix} {block}_block sample={s} 异常: {exc}", flush=True)
                     if _strict_cvxpy_highs_diagnostics_enabled():
                         raise
                     results[s] = (None, None, None, None) if block == 'primal' else (None, None)
+        for sid in sorted(ordered_logs):
+            print(ordered_logs[sid], flush=True)
         return results
 
     def iter(
@@ -333,23 +340,33 @@ class ParallelSubproblemSurrogateTrainer(SubproblemSurrogateTrainer):
             if self._lp_backend == LP_BACKEND_CVXPY_HIGHS and self.n_workers > 1:
                 primal_results = self._run_cvxpy_highs_sample_pool('primal', primal_args, prefix)
             else:
-                with ThreadPoolExecutor(max_workers=self.n_workers) as executor:
-                    future_to_sid = {
-                        executor.submit(
-                            self.iter_with_primal_block,
-                            s, alphas, betas, gammas, deltas, costs, pg_costs,
-                        ): s
-                        for s, alphas, betas, gammas, deltas, costs, pg_costs in primal_args
-                    }
-                    for future in as_completed(future_to_sid):
-                        s = future_to_sid[future]
-                        try:
-                            primal_results[s] = future.result()
-                        except Exception as exc:
-                            print(f"{prefix} primal_block sample={s} 异常: {exc}", flush=True)
-                            if _strict_cvxpy_highs_diagnostics_enabled():
-                                raise
-                            primal_results[s] = (None, None, None, None)
+                # 非 CVXPY 池路径（Gurobi，或 CVXPY 且 n_workers==1）：Gurobi 块经 _emit_subproblem_block_log 入队后按 sample_id 输出；CVXPY 仍在 solve_* 内直接打印
+                self._pending_block_logs = []
+                self._pending_block_logs_lock = threading.Lock()
+                self._defer_subproblem_block_log = True
+                primal_results = {}
+                try:
+                    with ThreadPoolExecutor(max_workers=self.n_workers) as executor:
+                        future_to_sid = {
+                            executor.submit(
+                                self.iter_with_primal_block,
+                                s, alphas, betas, gammas, deltas, costs, pg_costs,
+                            ): s
+                            for s, alphas, betas, gammas, deltas, costs, pg_costs in primal_args
+                        }
+                        for future in as_completed(future_to_sid):
+                            s = future_to_sid[future]
+                            try:
+                                primal_results[s] = future.result()
+                            except Exception as exc:
+                                print(f"{prefix} primal_block sample={s} 异常: {exc}", flush=True)
+                                if _strict_cvxpy_highs_diagnostics_enabled():
+                                    raise
+                                primal_results[s] = (None, None, None, None)
+                finally:
+                    self._defer_subproblem_block_log = False
+                for _, line in sorted(self._pending_block_logs, key=lambda x: x[0]):
+                    print(line, flush=True)
 
             # 顺序写入状态（避免并发写）
             for s in range(self.n_samples):
@@ -381,23 +398,32 @@ class ParallelSubproblemSurrogateTrainer(SubproblemSurrogateTrainer):
             if self._lp_backend == LP_BACKEND_CVXPY_HIGHS and self.n_workers > 1:
                 dual_results = self._run_cvxpy_highs_sample_pool('dual', dual_args, prefix)
             else:
-                with ThreadPoolExecutor(max_workers=self.n_workers) as executor:
-                    future_to_sid = {
-                        executor.submit(
-                            self.iter_with_dual_block,
-                            s, alphas, betas, gammas, deltas, costs, pg_costs,
-                        ): s
-                        for s, alphas, betas, gammas, deltas, costs, pg_costs in dual_args
-                    }
-                    for future in as_completed(future_to_sid):
-                        s = future_to_sid[future]
-                        try:
-                            dual_results[s] = future.result()
-                        except Exception as exc:
-                            print(f"{prefix} dual_block sample={s} 异常: {exc}", flush=True)
-                            if _strict_cvxpy_highs_diagnostics_enabled():
-                                raise
-                            dual_results[s] = (None, None)
+                self._pending_block_logs = []
+                self._pending_block_logs_lock = threading.Lock()
+                self._defer_subproblem_block_log = True
+                dual_results = {}
+                try:
+                    with ThreadPoolExecutor(max_workers=self.n_workers) as executor:
+                        future_to_sid = {
+                            executor.submit(
+                                self.iter_with_dual_block,
+                                s, alphas, betas, gammas, deltas, costs, pg_costs,
+                            ): s
+                            for s, alphas, betas, gammas, deltas, costs, pg_costs in dual_args
+                        }
+                        for future in as_completed(future_to_sid):
+                            s = future_to_sid[future]
+                            try:
+                                dual_results[s] = future.result()
+                            except Exception as exc:
+                                print(f"{prefix} dual_block sample={s} 异常: {exc}", flush=True)
+                                if _strict_cvxpy_highs_diagnostics_enabled():
+                                    raise
+                                dual_results[s] = (None, None)
+                finally:
+                    self._defer_subproblem_block_log = False
+                for _, line in sorted(self._pending_block_logs, key=lambda x: x[0]):
+                    print(line, flush=True)
 
             # 顺序写入状态
             for s in range(self.n_samples):
@@ -496,8 +522,8 @@ class ParallelSubproblemSurrogateTrainer(SubproblemSurrogateTrainer):
                 f"ρ_dual={self.rho_dual:.4f}, ρ_opt={self.rho_opt:.4f}",
                 flush=True,
             )
-            # 与非并行版(`uc_NN_subproblem.py`)保持一致的分隔线输出格式
-            print("  " + "-" * 40, flush=True)
+            # 与非并行版一致；带机组前缀便于机组级多进程 stdout 交错时辨认
+            print(f"{prefix} " + "-" * 40, flush=True)
 
         print(f"{prefix} ✓ 样本级并行训练完成", flush=True)
 
@@ -555,6 +581,8 @@ class _SampleWorkerTrainerProxy(SimpleNamespace):
 
 def _solve_sample_block_worker(task: dict) -> dict:
     proxy = _SampleWorkerTrainerProxy(**task['trainer_state'])
+    # 延迟到主线程按 sample_id 排序后打印，避免线程完成顺序导致 primal/dual 行交错难读
+    proxy._defer_lp_block_log = True
     sample_id = 0
     if task['block'] == 'primal':
         result = solve_primal_block_backend(
@@ -583,6 +611,7 @@ def _solve_sample_block_worker(task: dict) -> dict:
     return {
         'sample_id': int(task['sample_id']),
         'result': result,
+        'lp_log': getattr(proxy, '_deferred_lp_block_log', None),
     }
 
 

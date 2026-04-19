@@ -2968,6 +2968,17 @@ class SubproblemSurrogateTrainer:
 
     # ------------------------------------------------------------------
 
+    def _emit_subproblem_block_log(self, sample_id: int, line: str) -> None:
+        """Gurobi 块日志：默认直接打印；样本级线程并行时先入队，由主线程按 sample_id 排序后输出。"""
+        if getattr(self, '_defer_subproblem_block_log', False):
+            lock = getattr(self, '_pending_block_logs_lock', None)
+            bucket = getattr(self, '_pending_block_logs', None)
+            if lock is not None and bucket is not None:
+                with lock:
+                    bucket.append((int(sample_id), line))
+                return
+        print(line, flush=True)
+
     def iter_with_primal_block(
         self,
         sample_id: int,
@@ -3022,16 +3033,22 @@ class SubproblemSurrogateTrainer:
             coc = vars_dict['coc']
             cp  = vars_dict['cpower']
             if sample_id <= 2:
-                print(f"primal_block, sample_id: {sample_id}, "
-                      f"obj_primal: {vars_dict['obj_primal'].getValue():.4f}, "
-                      f"obj_binary: {vars_dict['obj_binary'].getValue():.4f}", flush=True)
+                self._emit_subproblem_block_log(
+                    sample_id,
+                    f"[Unit-{self.unit_id}] primal_block, sample_id: {sample_id}, "
+                    f"obj_primal: {vars_dict['obj_primal'].getValue():.4f}, "
+                    f"obj_binary: {vars_dict['obj_binary'].getValue():.4f}",
+                )
             pg_sol     = np.array([pg[t].X  for t in range(self.T)])
             x_sol      = np.array([x[t].X   for t in range(self.T)])
             coc_sol    = np.array([coc[t].X for t in range(self.T-1)])
             cpower_sol = np.array([cp[t].X  for t in range(self.T)])
             return pg_sol, x_sol, coc_sol, cpower_sol
         else:
-            print(f"警告: 原始块求解失败，状态: {model.status}", flush=True)
+            print(
+                f"[Unit-{self.unit_id}] 警告: 原始块求解失败，状态: {model.status}",
+                flush=True,
+            )
             return None, None, None, None
     
     # ------------------------------------------------------------------
@@ -3409,7 +3426,8 @@ class SubproblemSurrogateTrainer:
                 obj_d = obj_dp + obj_dx + obj_dc
                 obj_o = float(vars_dict['obj_opt'].getValue())
                 obj_px = float(vars_dict['obj_dual_prox'].getValue())
-                print(
+                self._emit_subproblem_block_log(
+                    sample_id,
                     f"[Unit-{self.unit_id}] dual_block, sample_id: {sample_id}, "
                     f"status: optimal, "
                     f"obj_dual_pg: {obj_dp:.6f}, "
@@ -3418,11 +3436,13 @@ class SubproblemSurrogateTrainer:
                     f"obj_dual: {obj_d:.6f}, "
                     f"obj_opt: {obj_o:.6f}, "
                     f"obj_dual_prox: {obj_px:.6f}",
-                    flush=True,
                 )
             return lambda_inherent_sol, mu_sol
         else:
-            print(f"警告: 对偶块求解失败 sample={sample_id}，状态: {model.status}", flush=True)
+            print(
+                f"[Unit-{self.unit_id}] 警告: 对偶块求解失败 sample={sample_id}，状态: {model.status}",
+                flush=True,
+            )
             return None, None
 
     def _iter_with_dual_block_original(self, sample_id: int,
@@ -3752,7 +3772,10 @@ class SubproblemSurrogateTrainer:
 
             return lambda_inherent_sol, mu_sol
         else:
-            print(f"警告: 对偶块求解失败 sample={sample_id}，状态: {model.status}", flush=True)
+            print(
+                f"[Unit-{self.unit_id}] 警告: 对偶块求解失败 sample={sample_id}，状态: {model.status}",
+                flush=True,
+            )
             return None, None
     
     def _extract_features(self, sample_id: int) -> np.ndarray:
@@ -4252,7 +4275,11 @@ class SubproblemSurrogateTrainer:
             self._surr_scheduler.step()
 
             if epoch == 0 or epoch == num_epochs - 1:
-                print(f"  [NN-main] epoch {epoch+1}/{num_epochs}, avg_loss = {epoch_loss/self.n_samples:.6f}", flush=True)
+                print(
+                    f"  [Unit-{self.unit_id}][NN-main] epoch {epoch+1}/{num_epochs}, "
+                    f"avg_loss = {epoch_loss/self.n_samples:.6f}",
+                    flush=True,
+                )
 
         # 记录最终 epoch loss 供 logger 使用
         if self.n_samples > 0:
@@ -4356,7 +4383,8 @@ class SubproblemSurrogateTrainer:
 
                 if epoch == 0 or epoch == num_epochs - 1:
                     print(
-                        f"  [NN-c_pg] epoch {epoch+1}/{num_epochs}, avg_loss = {epoch_loss/self.n_samples:.6f}",
+                        f"  [Unit-{self.unit_id}][NN-c_pg] epoch {epoch+1}/{num_epochs}, "
+                        f"avg_loss = {epoch_loss/self.n_samples:.6f}",
                         flush=True,
                     )
 
@@ -4716,9 +4744,10 @@ class SubproblemSurrogateTrainer:
         resolved_pg_cost_nn_epochs = (
             self.pg_cost_nn_epochs if pg_cost_nn_epochs is None else max(int(pg_cost_nn_epochs), 1)
         )
+        log_u = f"[Unit-{self.unit_id}]"
 
         for i in range(max_iter):
-            print(f"🔄 迭代 {i+1}/{max_iter}", flush=True)
+            print(f"{log_u} 🔄 迭代 {i+1}/{max_iter}", flush=True)
             self.iter_number = i
             self._sync_surrogate_direction_strategy_state()
             
@@ -4842,12 +4871,12 @@ class SubproblemSurrogateTrainer:
                 self.rho_opt    = min(self.rho_opt    + gamma * obj_opt,    self.rho_max)
 
             print(
-                f"  ρ_primal={self.rho_primal:.4f}, ρ_dual_pg={self.rho_dual_pg:.4f}, "
+                f"{log_u}   ρ_primal={self.rho_primal:.4f}, ρ_dual_pg={self.rho_dual_pg:.4f}, "
                 f"ρ_dual_x={self.rho_dual_x:.4f}, ρ_dual_coc={self.rho_dual_coc:.4f}, "
                 f"ρ_dual={self.rho_dual:.4f}, ρ_opt={self.rho_opt:.4f}",
                 flush=True,
             )
-            print("  " + "-" * 40, flush=True)
+            print(f"{log_u} " + "-" * 40, flush=True)
 
             # logger 钩子
             if i == max_iter - 1:

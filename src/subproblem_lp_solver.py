@@ -1156,6 +1156,9 @@ def solve_primal_block(
                 pass
         raise
     display_sample_id = int(getattr(trainer, "display_sample_id", sample_id))
+    defer_log = bool(getattr(trainer, "_defer_lp_block_log", False))
+    if defer_log:
+        trainer._deferred_lp_block_log = None
     if display_sample_id <= 2:
         try:
             def _maybe_float(val):
@@ -1171,15 +1174,18 @@ def solve_primal_block(
             obj_binary_v = _maybe_float(getattr(obj_binary, "value", None))
             obj_prox_v = _maybe_float(getattr(obj_prox, "value", None))
             status = getattr(problem, "status", None)
-            print(
-                f"primal_block, sample_id: {display_sample_id}, "
+            line = (
+                f"[Unit-{g}] primal_block, sample_id: {display_sample_id}, "
                 f"status: {status}, "
                 f"obj_primal: {obj_primal_v if obj_primal_v is not None else 'None'}, "
                 f"obj_opt: {obj_opt_v if obj_opt_v is not None else 'None'}, "
                 f"obj_binary: {obj_binary_v if obj_binary_v is not None else 'None'}, "
-                f"obj_prox: {obj_prox_v if obj_prox_v is not None else 'None'}",
-                flush=True,
+                f"obj_prox: {obj_prox_v if obj_prox_v is not None else 'None'}"
             )
+            if defer_log:
+                trainer._deferred_lp_block_log = line
+            else:
+                print(line, flush=True)
         except Exception:
             pass
 
@@ -1468,6 +1474,9 @@ def solve_dual_block(
         return None, None
 
     display_sample_id = int(getattr(trainer, "display_sample_id", sample_id))
+    defer_log = bool(getattr(trainer, "_defer_lp_block_log", False))
+    if defer_log:
+        trainer._deferred_lp_block_log = None
     # 与 solve_primal_block 一致：每个机组仅打印前 3 个样本（sample_id 0..2）
     if display_sample_id <= 2:
         try:
@@ -1478,7 +1487,7 @@ def solve_dual_block(
             obj_opt_v = float(np.asarray(obj_opt.value).reshape(-1)[0]) if obj_opt is not None else 0.0
             obj_dual_prox_v = float(np.asarray(obj_dual_prox.value).reshape(-1)[0]) if obj_dual_prox is not None else 0.0
             status = getattr(problem, "status", None)
-            print(
+            line = (
                 f"[Unit-{g}] dual_block, sample_id: {display_sample_id}, "
                 f"status: {status}, "
                 f"obj_dual_pg: {obj_dual_pg_v:.6f}, "
@@ -1486,9 +1495,12 @@ def solve_dual_block(
                 f"obj_dual_coc: {obj_dual_coc_v:.6f}, "
                 f"obj_dual: {obj_dual_v:.6f}, "
                 f"obj_opt: {obj_opt_v:.6f}, "
-                f"obj_dual_prox: {obj_dual_prox_v:.6f}",
-                flush=True,
+                f"obj_dual_prox: {obj_dual_prox_v:.6f}"
             )
+            if defer_log:
+                trainer._deferred_lp_block_log = line
+            else:
+                print(line, flush=True)
         except Exception:
             pass
 
