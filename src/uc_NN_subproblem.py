@@ -1069,17 +1069,8 @@ class DualVariablePredictorTrainer:
     def save(self, filepath: str):
         """保存模型"""
         if TORCH_AVAILABLE:
-            # #region agent log
-            import json as _json_debug; _log_path = r'd:\0-python_workspace\branchandcut\.cursor\debug.log'; _log_data = {"location": "uc_NN_subproblem.py:save:427", "message": "DualVariablePredictorTrainer.save called", "data": {"filepath": filepath, "cwd": os.getcwd(), "abs_filepath": os.path.abspath(filepath)}, "timestamp": int(__import__('time').time()*1000), "sessionId": "debug-session", "hypothesisId": "A"}; open(_log_path, 'a', encoding='utf-8').write(_json_debug.dumps(_log_data) + '\n')
-            # #endregion
             dirpath = os.path.dirname(os.path.abspath(filepath))
-            # #region agent log
-            _log_data2 = {"location": "uc_NN_subproblem.py:save:430", "message": "Checking dirpath", "data": {"dirpath": dirpath, "exists": os.path.exists(dirpath)}, "timestamp": int(__import__('time').time()*1000), "sessionId": "debug-session", "hypothesisId": "B"}; open(_log_path, 'a', encoding='utf-8').write(_json_debug.dumps(_log_data2) + '\n')
-            # #endregion
             if dirpath and not os.path.exists(dirpath):
-                # #region agent log
-                _log_data3 = {"location": "uc_NN_subproblem.py:save:433", "message": "Creating directory", "data": {"dirpath": dirpath}, "timestamp": int(__import__('time').time()*1000), "sessionId": "debug-session", "hypothesisId": "C"}; open(_log_path, 'a', encoding='utf-8').write(_json_debug.dumps(_log_data3) + '\n')
-                # #endregion
                 os.makedirs(dirpath, exist_ok=True)
             torch.save({
                 'network_state_dict': self.network.state_dict(),
@@ -2327,6 +2318,25 @@ class SubproblemSurrogateTrainer:
             alpha_t = 1 - 2 * x_hat
             delta_t = x_hat * (1 - 2 * x_hat)        # 等价 alpha_t * x_hat
         """
+        expected_in = None
+        try:
+            net = (
+                self.unit_predictor.get_network(self.unit_id)
+                if getattr(self, "unit_predictor", None) is not None
+                else None
+            )
+            if net is not None:
+                first_linear = next((m for m in net.network if isinstance(m, nn.Linear)), None)
+                expected_in = None if first_linear is None else int(first_linear.in_features)
+        except Exception:
+            expected_in = None
+
+        # The unit predictor is trained on scenario features only (no lambda/unit_params).
+        # Align feature dimension to predictor input_dim to avoid shape mismatch.
+        if expected_in is not None and features_tensor.ndim >= 1:
+            got = int(features_tensor.shape[-1])
+            if got > expected_in:
+                features_tensor = features_tensor[..., :expected_in]
         logits = self.unit_predictor.forward_logits(self.unit_id, features_tensor)
         x_hat = torch.sigmoid(logits)
         alpha = 1.0 - 2.0 * x_hat
@@ -7164,10 +7174,6 @@ def main():
     script_dir = os.path.dirname(os.path.abspath(__file__))
     project_root = os.path.dirname(script_dir)  # src的父目录即为项目根目录
     result_dir = os.path.join(project_root, 'result', 'subproblem_models')
-    
-    # #region agent log
-    import json as _json_debug; _log_path = r'd:\0-python_workspace\branchandcut\.cursor\debug.log'; _log_data = {"location": "uc_NN_subproblem.py:main:2147", "message": "Path calculation", "data": {"script_dir": script_dir, "project_root": project_root, "result_dir": result_dir, "cwd": os.getcwd()}, "timestamp": int(__import__('time').time()*1000), "sessionId": "debug-session", "hypothesisId": "D"}; open(_log_path, 'a', encoding='utf-8').write(_json_debug.dumps(_log_data) + '\n')
-    # #endregion
     
     # ==================== 训练模式 ====================
     if mode == 1:
