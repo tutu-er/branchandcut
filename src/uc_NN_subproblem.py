@@ -1096,6 +1096,324 @@ class DualVariablePredictorTrainer:
             print(f"✓ 对偶预测模型已加载: {filepath}", flush=True)
 
 
+# ========================== 第一部分·补充：单机组 0/1 变量预测器 ==========================
+
+class SingleUnitBinaryPredictorNet(nn.Module):
+    """场景特征 → 单机组 T 维 0/1 logits。
+
+    每个实例对应一台机组。训练监督标签来自 active_set / unit_commitment_matrix
+    中对应机组的 0/1 序列（最优 MIP 解的整数部分）。
+    """
+
+    def __init__(self, input_dim: int, T: int, hidden_dims: List[int] | None = None):
+        super().__init__()
+        if hidden_dims is None:
+            hidden_dims = [256, 128]
+        layers: List[nn.Module] = []
+        prev_dim = int(input_dim)
+        for hidden_dim in hidden_dims:
+            layers.append(nn.Linear(prev_dim, hidden_dim))
+            layers.append(nn.LayerNorm(hidden_dim))
+            layers.append(nn.LeakyReLU(0.01))
+            layers.append(nn.Dropout(0.1))
+            prev_dim = hidden_dim
+        layers.append(nn.Linear(prev_dim, int(T)))
+        self.network = nn.Sequential(*layers)
+        self._init_weights()
+
+    def _init_weights(self):
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.kaiming_normal_(module.weight, mode='fan_in', nonlinearity='leaky_relu')
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.network(x)
+
+
+class SingleUnitBinaryPredictorTrainer:
+    """管理 ng 个独立 ``SingleUnitBinaryPredictorNet`` 的批量训练器。
+
+    - 预训练阶段：BCEWithLogitsLoss 以 ``unit_commitment_matrix`` 作为监督标签。
+    - BCD 阶段：被 ``SubproblemSurrogateTrainer`` 以小学习率做端到端微调。
+    - 存储：按 ``unit_id`` 懒初始化（避免为未训练机组浪费显存）。
+    """
+
+    def __init__(
+        self,
+        ppc,
+        active_set_data,
+        T_delta,
+        unit_ids: List[int] | None = None,
+        hidden_dims: List[int] | None = None,
+        learning_rate: float = 1e-3,
+        weight_decay: float = 1e-4,
+        batch_strategy: str = 'full-batch',
+        batch_size: int = 32,
+        shuffle: bool = True,
+        device=None,
+    ):
+        self.ppc = ppc
+        ppc_int = ext2int(ppc)
+        self.gen = ppc_int['gen']
+        self.bus = ppc_int['bus']
+        self.branch = ppc_int['branch']
+        self.gencost = ppc_int['gencost']
+        self.baseMVA = ppc_int['baseMVA']
+        self.ng = int(self.gen.shape[0])
+        self.nb = int(self.bus.shape[0])
+        self.nl = int(self.branch.shape[0])
+        self.n_samples = len(active_set_data)
+        self.T_delta = float(T_delta)
+        self.active_set_data = active_set_data
+        if isinstance(active_set_data, list):
+            first_sample = active_set_data[0]
+        else:
+            first_sample = active_set_data
+        self.T = int(first_sample['pd_data'].shape[1])
+
+        if device is None:
+            if TORCH_AVAILABLE and torch.cuda.is_available():
+                self.device = torch.device('cuda')
+                print(
+                    f"[UnitPredictor] 使用 CUDA 设备: {torch.cuda.get_device_name(0)}",
+                    flush=True,
+                )
+            else:
+                self.device = torch.device('cpu')
+        else:
+            self.device = device
+
+        self.input_dim = len(get_feature_vector_from_sample(dict(first_sample)))
+        self.hidden_dims = normalize_nn_hidden_dims(hidden_dims, [256, 128])
+        self.learning_rate = max(float(learning_rate), 1e-8)
+        self.weight_decay = max(float(weight_decay), 0.0)
+        self.batch_strategy = normalize_nn_batch_strategy(batch_strategy)
+        self.batch_size = max(int(batch_size), 1)
+        self.shuffle = bool(shuffle)
+        if unit_ids is None:
+            self.unit_ids = list(range(self.ng))
+        else:
+            self.unit_ids = [int(g) for g in unit_ids]
+
+        self.networks: Dict[int, SingleUnitBinaryPredictorNet] = {}
+        self.optimizers: Dict[int, 'optim.Optimizer'] = {}
+        if TORCH_AVAILABLE:
+            for g in self.unit_ids:
+                self._ensure_network(g)
+
+        self.x_true = self._extract_x_labels()
+        pos_rate = float(self.x_true.mean()) if self.x_true.size else 0.0
+        print(
+            f"[UnitPredictor] 训练器就绪: ng={self.ng}, T={self.T}, "
+            f"input_dim={self.input_dim}, n_samples={self.n_samples}, "
+            f"unit_ids={self.unit_ids}, hidden_dims={self.hidden_dims}, "
+            f"pos_rate={pos_rate:.3f}, device={self.device}",
+            flush=True,
+        )
+
+    def _ensure_network(self, unit_id: int) -> None:
+        if not TORCH_AVAILABLE:
+            return
+        g_int = int(unit_id)
+        if g_int in self.networks:
+            return
+        net = SingleUnitBinaryPredictorNet(
+            input_dim=self.input_dim, T=self.T, hidden_dims=self.hidden_dims,
+        ).to(self.device)
+        self.networks[g_int] = net
+        self.optimizers[g_int] = optim.Adam(
+            net.parameters(), lr=self.learning_rate, weight_decay=self.weight_decay,
+        )
+        if g_int not in self.unit_ids:
+            self.unit_ids.append(g_int)
+
+    def _extract_x_labels(self) -> np.ndarray:
+        """还原 (n_samples, ng, T) 的 0/1 监督标签。优先用 active_set，回落 unit_commitment_matrix。"""
+        labels = np.zeros((self.n_samples, self.ng, self.T), dtype=np.float32)
+        for sample_id in range(self.n_samples):
+            sample = self.active_set_data[sample_id]
+            if 'active_set' in sample and sample['active_set'] is not None:
+                for item in sample['active_set']:
+                    if isinstance(item, list) and len(item) == 2 and isinstance(item[0], list):
+                        g, t = item[0]
+                        g_int = int(g)
+                        t_int = int(t)
+                        if 0 <= g_int < self.ng and 0 <= t_int < self.T:
+                            labels[sample_id, g_int, t_int] = float(item[1])
+            elif 'unit_commitment_matrix' in sample:
+                uc = np.asarray(sample['unit_commitment_matrix'], dtype=float)
+                if uc.ndim == 2:
+                    rows = min(uc.shape[0], self.ng)
+                    cols = min(uc.shape[1], self.T)
+                    labels[sample_id, :rows, :cols] = uc[:rows, :cols]
+        return labels
+
+    def _extract_features(self, sample_id: int) -> np.ndarray:
+        return get_feature_vector_from_sample(dict(self.active_set_data[sample_id]))
+
+    def train_unit(
+        self,
+        unit_id: int,
+        num_epochs: int = 100,
+        batch_size: int | None = None,
+        batch_strategy: str | None = None,
+        shuffle: bool | None = None,
+        learning_rate: float | None = None,
+    ) -> float | None:
+        if not TORCH_AVAILABLE:
+            print("[UnitPredictor] PyTorch 不可用，跳过训练", flush=True)
+            return None
+        self._ensure_network(unit_id)
+        g_int = int(unit_id)
+
+        resolved_batch_strategy = normalize_nn_batch_strategy(
+            self.batch_strategy if batch_strategy is None else batch_strategy
+        )
+        resolved_shuffle = self.shuffle if shuffle is None else bool(shuffle)
+        if resolved_batch_strategy == 'full-batch':
+            resolved_batch_size = max(1, self.n_samples)
+        else:
+            base_batch = self.batch_size if batch_size is None else int(batch_size)
+            resolved_batch_size = max(1, base_batch)
+        resolved_lr = self.learning_rate if learning_rate is None else max(float(learning_rate), 1e-8)
+
+        X = np.array([self._extract_features(i) for i in range(self.n_samples)])
+        Y = self.x_true[:, g_int, :]
+        X_tensor = torch.tensor(X, dtype=torch.float32, device=self.device)
+        Y_tensor = torch.tensor(Y, dtype=torch.float32, device=self.device)
+        dataset = torch.utils.data.TensorDataset(X_tensor, Y_tensor)
+        dataloader = DataLoader(
+            dataset,
+            batch_size=resolved_batch_size,
+            shuffle=resolved_shuffle and self.n_samples > 1,
+        )
+
+        net = self.networks[g_int]
+        optimizer = optim.Adam(
+            net.parameters(), lr=resolved_lr, weight_decay=self.weight_decay,
+        )
+        self.optimizers[g_int] = optimizer
+        scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=10, factor=0.5)
+        criterion = nn.BCEWithLogitsLoss()
+        net.train()
+
+        print_interval = max(1, num_epochs // 10)
+        print(
+            f"[UnitPredictor-{g_int}] 开始预训练 (epochs={num_epochs}, "
+            f"batch_size={resolved_batch_size}, lr={resolved_lr:.1e}, "
+            f"pos_rate={float(Y.mean()):.3f})",
+            flush=True,
+        )
+        epoch_loss = 0.0
+        for epoch in range(num_epochs):
+            epoch_loss = 0.0
+            for batch_X, batch_Y in dataloader:
+                optimizer.zero_grad()
+                logits = net(batch_X)
+                loss = criterion(logits, batch_Y)
+                loss.backward()
+                optimizer.step()
+                epoch_loss += loss.item() * batch_X.size(0)
+            epoch_loss /= max(len(dataset), 1)
+            scheduler.step(epoch_loss)
+            if (epoch + 1) % print_interval == 0 or epoch == 0 or epoch == num_epochs - 1:
+                current_lr = optimizer.param_groups[0]['lr']
+                print(
+                    f"  [UnitPredictor-{g_int}] Epoch {epoch+1}/{num_epochs}, "
+                    f"Loss: {epoch_loss:.6f}, LR: {current_lr:.1e}",
+                    flush=True,
+                )
+        net.eval()
+        return epoch_loss
+
+    def train_all(
+        self,
+        num_epochs: int = 100,
+        batch_size: int | None = None,
+        batch_strategy: str | None = None,
+        shuffle: bool | None = None,
+        learning_rate: float | None = None,
+    ) -> None:
+        for g in self.unit_ids:
+            self.train_unit(
+                unit_id=g,
+                num_epochs=num_epochs,
+                batch_size=batch_size,
+                batch_strategy=batch_strategy,
+                shuffle=shuffle,
+                learning_rate=learning_rate,
+            )
+
+    def forward_logits(self, unit_id: int, features_tensor: torch.Tensor) -> torch.Tensor:
+        """带梯度的 logits 输出 (B, T)。供 BCD 内部微调使用。"""
+        self._ensure_network(unit_id)
+        return self.networks[int(unit_id)](features_tensor)
+
+    def get_network(self, unit_id: int) -> SingleUnitBinaryPredictorNet:
+        self._ensure_network(unit_id)
+        return self.networks[int(unit_id)]
+
+    def predict_probs(self, unit_id: int, sample_or_features) -> np.ndarray:
+        """no_grad 下返回 (T,) sigmoid 概率。"""
+        if not TORCH_AVAILABLE:
+            raise RuntimeError("PyTorch 不可用")
+        self._ensure_network(unit_id)
+        if isinstance(sample_or_features, dict):
+            features = get_feature_vector_from_sample(dict(sample_or_features))
+        else:
+            features = np.asarray(sample_or_features, dtype=float).reshape(-1)
+        features_tensor = torch.tensor(
+            features, dtype=torch.float32, device=self.device,
+        ).unsqueeze(0)
+        net = self.networks[int(unit_id)]
+        was_training = net.training
+        net.eval()
+        with torch.no_grad():
+            probs = torch.sigmoid(net(features_tensor)).squeeze(0).cpu().numpy()
+        if was_training:
+            net.train()
+        return probs
+
+    def save(self, filepath: str) -> None:
+        if not TORCH_AVAILABLE:
+            return
+        dirpath = os.path.dirname(os.path.abspath(filepath))
+        if dirpath and not os.path.exists(dirpath):
+            os.makedirs(dirpath, exist_ok=True)
+        payload = {
+            'metadata': {
+                'ng': self.ng,
+                'T': self.T,
+                'input_dim': self.input_dim,
+                'hidden_dims': list(self.hidden_dims),
+                'unit_ids': list(self.unit_ids),
+                'learning_rate': self.learning_rate,
+            },
+            'state_dicts': {int(g): self.networks[g].state_dict() for g in self.networks},
+        }
+        torch.save(payload, filepath)
+        print(f"✓ 单机组 0/1 预测器已保存: {filepath}", flush=True)
+
+    def load(self, filepath: str) -> None:
+        if not TORCH_AVAILABLE:
+            return
+        state = torch.load(filepath, map_location=self.device)
+        state_dicts = state.get('state_dicts', {})
+        for g, sd in state_dicts.items():
+            g_int = int(g)
+            if g_int not in self.unit_ids:
+                self.unit_ids.append(g_int)
+            self._ensure_network(g_int)
+            self.networks[g_int].load_state_dict(sd)
+        print(
+            f"✓ 单机组 0/1 预测器已加载: {filepath} "
+            f"（已恢复机组: {sorted(self.networks.keys())}）",
+            flush=True,
+        )
+
+
 # ========================== 第二部分：子问题代理约束训练（BCD方式） ==========================
 
 class ResBlock(nn.Module):
@@ -1580,6 +1898,10 @@ class SubproblemSurrogateTrainer:
                  pg_block_prox_weight: float = 2e-2,
                  dual_block_prox_weight: float = 1e-2,
                  ignore_startup_shutdown_costs: bool = False,
+                 unit_predictor: 'SingleUnitBinaryPredictorTrainer | None' = None,
+                 use_unit_predictor: bool = False,
+                 unit_predictor_finetune_lr: float = 1e-5,
+                 unit_predictor_weight_decay: float = 1e-4,
                  device=None):
         """
         初始化单机组子问题代理约束训练器 - V3三时段版本
@@ -1734,6 +2056,14 @@ class SubproblemSurrogateTrainer:
         self.x_cost_scale = 2.0
         self.pg_cost_scale = 1.0
         self._sync_rho_dual_summary()
+
+        # 单机组 0/1 预测器（可选代理约束生成方式）
+        self.unit_predictor = unit_predictor
+        self.use_unit_predictor = bool(use_unit_predictor)
+        self.unit_predictor_finetune_lr = max(float(unit_predictor_finetune_lr), 1e-10)
+        self.unit_predictor_weight_decay = max(float(unit_predictor_weight_decay), 0.0)
+        self._unit_predictor_optimizer = None  # 在 iter_with_surrogate_nn 中按需构造
+        self._unit_predictor_scheduler = None
         
         # 初始化原始变量和对偶变量存储
         self.pg = np.zeros((self.n_samples, self.T))
@@ -1951,6 +2281,136 @@ class SubproblemSurrogateTrainer:
 
     def _pg_costs_active(self) -> bool:
         return self.iter_number >= self.pg_cost_start_round
+
+    # --------- 单机组 0/1 预测器（用于 single-time 切片的 alpha/delta 生成） ---------
+
+    def _unit_predictor_active(self) -> bool:
+        """当开关启用、predictor 存在、且策略包含 single-time 段时返回 True。"""
+        if not getattr(self, 'use_unit_predictor', False):
+            return False
+        if getattr(self, 'unit_predictor', None) is None:
+            return False
+        if not TORCH_AVAILABLE:
+            return False
+        return self.constraint_generation_strategy in (
+            CONSTRAINT_STRATEGY_ALL_SINGLE_TIME,
+            CONSTRAINT_STRATEGY_ALL_TEMPLATES_SIGN4_PLUS_SINGLE,
+        )
+
+    def _unit_predictor_slice(self) -> tuple[int, int]:
+        """返回 single-time 段在约束向量中的 [start, end) 范围；不启用时返回 (0, 0)。"""
+        if not self._unit_predictor_active():
+            return (0, 0)
+        nc = int(self.num_coupling_constraints)
+        if self.constraint_generation_strategy == CONSTRAINT_STRATEGY_ALL_SINGLE_TIME:
+            end = min(self.T, nc)
+            return (0, end)
+        if self.constraint_generation_strategy == CONSTRAINT_STRATEGY_ALL_TEMPLATES_SIGN4_PLUS_SINGLE:
+            head = self.all_mode_group_size * max(self.T - 2, 0)
+            end = min(head + self.T, nc)
+            start = min(head, end)
+            return (start, end)
+        return (0, 0)
+
+    def _unit_predictor_parameters(self) -> list:
+        if not self._unit_predictor_active():
+            return []
+        return list(self.unit_predictor.get_network(self.unit_id).parameters())
+
+    def _compute_single_time_alpha_delta_tensor(
+        self, features_tensor: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """用 predictor 可微前向得到 (alpha, delta)，形状与 forward_logits 输出一致。
+
+        mapping:
+            x_hat   = sigmoid(logits)
+            alpha_t = 1 - 2 * x_hat
+            delta_t = x_hat * (1 - 2 * x_hat)        # 等价 alpha_t * x_hat
+        """
+        logits = self.unit_predictor.forward_logits(self.unit_id, features_tensor)
+        x_hat = torch.sigmoid(logits)
+        alpha = 1.0 - 2.0 * x_hat
+        delta = x_hat * alpha
+        return alpha, delta
+
+    def _apply_unit_predictor_override(
+        self,
+        alphas_tensor: torch.Tensor,
+        betas_tensor: torch.Tensor,
+        gammas_tensor: torch.Tensor,
+        deltas_tensor: torch.Tensor,
+        features_tensor: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """把 single-time 段的 (alpha, beta, gamma, delta) 替换为 predictor 派生值。
+
+        输入/输出均假设 (..., nc) 的一维或二维张量（最后一维为约束数）。
+        beta/gamma 在 single-time 段会被置零；sign4 段保持原张量不动。
+        """
+        if not self._unit_predictor_active():
+            return alphas_tensor, betas_tensor, gammas_tensor, deltas_tensor
+        start, end = self._unit_predictor_slice()
+        if end <= start:
+            return alphas_tensor, betas_tensor, gammas_tensor, deltas_tensor
+
+        alpha_pred, delta_pred = self._compute_single_time_alpha_delta_tensor(features_tensor)
+        # alpha_pred / delta_pred 形状: (B, T) 或 (T,)；需要按张量 ndim 对齐
+        target_len = end - start
+        if alphas_tensor.ndim == 1:
+            # 1D 约束张量对应 batch=1 或 squeeze 过的情形；把 predictor (B, T) 压成 (T,)
+            alpha_flat = alpha_pred.reshape(-1)
+            delta_flat = delta_pred.reshape(-1)
+            if alpha_flat.numel() > self.T:
+                alpha_flat = alpha_flat[: self.T]
+                delta_flat = delta_flat[: self.T]
+            segment_alpha = alpha_flat[:target_len]
+            segment_delta = delta_flat[:target_len]
+            zeros_seg = torch.zeros_like(segment_alpha)
+            new_alpha = torch.cat([alphas_tensor[:start], segment_alpha, alphas_tensor[end:]])
+            new_beta = torch.cat([betas_tensor[:start], zeros_seg, betas_tensor[end:]])
+            new_gamma = torch.cat([gammas_tensor[:start], zeros_seg, gammas_tensor[end:]])
+            new_delta = torch.cat([deltas_tensor[:start], segment_delta, deltas_tensor[end:]])
+            return new_alpha, new_beta, new_gamma, new_delta
+        # 2D 情形 (B, nc)
+        if alpha_pred.ndim == 1:
+            alpha_pred = alpha_pred.unsqueeze(0).expand(alphas_tensor.shape[0], -1)
+            delta_pred = delta_pred.unsqueeze(0).expand(alphas_tensor.shape[0], -1)
+        segment_alpha = alpha_pred[:, :target_len]
+        segment_delta = delta_pred[:, :target_len]
+        zeros_seg = torch.zeros_like(segment_alpha)
+        new_alpha = torch.cat(
+            [alphas_tensor[:, :start], segment_alpha, alphas_tensor[:, end:]], dim=1,
+        )
+        new_beta = torch.cat(
+            [betas_tensor[:, :start], zeros_seg, betas_tensor[:, end:]], dim=1,
+        )
+        new_gamma = torch.cat(
+            [gammas_tensor[:, :start], zeros_seg, gammas_tensor[:, end:]], dim=1,
+        )
+        new_delta = torch.cat(
+            [deltas_tensor[:, :start], segment_delta, deltas_tensor[:, end:]], dim=1,
+        )
+        return new_alpha, new_beta, new_gamma, new_delta
+
+    def _ensure_unit_predictor_optimizer(self, learning_rate: float | None = None) -> None:
+        """按 finetune LR 为 predictor 对应机组的网络构造优化器（重复调用安全）。"""
+        if not self._unit_predictor_active():
+            self._unit_predictor_optimizer = None
+            self._unit_predictor_scheduler = None
+            return
+        resolved_lr = (
+            self.unit_predictor_finetune_lr if learning_rate is None
+            else max(float(learning_rate), 1e-10)
+        )
+        params = self._unit_predictor_parameters()
+        current_lr = None
+        if self._unit_predictor_optimizer is not None:
+            current_lr = self._unit_predictor_optimizer.param_groups[0].get('lr')
+        if self._unit_predictor_optimizer is None or current_lr != resolved_lr:
+            self._unit_predictor_optimizer = optim.Adam(
+                params,
+                lr=resolved_lr,
+                weight_decay=self.unit_predictor_weight_decay,
+            )
 
     def _sync_rho_dual_summary(self) -> None:
         self.rho_dual = float(np.mean([
@@ -2269,6 +2729,10 @@ class SubproblemSurrogateTrainer:
                 pg_costs = torch.zeros_like(pg_costs)
             elif not self._pg_costs_active():
                 pg_costs = torch.zeros_like(pg_costs)
+
+            alphas, betas, gammas, deltas = self._apply_unit_predictor_override(
+                alphas, betas, gammas, deltas, feat_tensor,
+            )
 
         self.alpha_values = alphas.detach().cpu().numpy()
         self.beta_values = betas.detach().cpu().numpy()
@@ -4223,12 +4687,20 @@ class SubproblemSurrogateTrainer:
             self._surr_scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
                 self._surr_optimizer, T_0=max(num_epochs, 1), T_mult=1)
 
+        # 单机组预测器微调优化器（仅在 _unit_predictor_active 时生效）
+        predictor_active = self._unit_predictor_active()
+        if predictor_active:
+            self._ensure_unit_predictor_optimizer()
+            self.unit_predictor.get_network(self.unit_id).train()
+
         self.surrogate_net.train()
 
         for epoch in range(num_epochs):
             epoch_loss = 0.0
             self._surr_optimizer.zero_grad()
             self._surr_cost_optimizer.zero_grad()
+            if predictor_active and self._unit_predictor_optimizer is not None:
+                self._unit_predictor_optimizer.zero_grad()
             batch_count = 0
             sample_indices = np.arange(self.n_samples, dtype=int)
             if resolved_shuffle and self.n_samples > 1:
@@ -4254,6 +4726,18 @@ class SubproblemSurrogateTrainer:
                 )
                 costs_tensor = costs_out.squeeze(0)[:self.T]  # (T,)
 
+                # 可选：用 0/1 预测器覆盖 single-time 段的 (alpha, beta, gamma, delta)
+                if predictor_active:
+                    alphas_tensor, betas_tensor, gammas_tensor, deltas_tensor = (
+                        self._apply_unit_predictor_override(
+                            alphas_tensor,
+                            betas_tensor,
+                            gammas_tensor,
+                            deltas_tensor,
+                            features_tensor,
+                        )
+                    )
+
                 # 主 loss 不再包含 c_pg 对应项
                 loss = self.loss_function_differentiable(
                     sample_id, alphas_tensor, betas_tensor, gammas_tensor, deltas_tensor,
@@ -4266,10 +4750,18 @@ class SubproblemSurrogateTrainer:
                 # batch 满或 epoch 结束：clip + step
                 if batch_count == resolved_batch_size or sample_pos == self.n_samples - 1:
                     torch.nn.utils.clip_grad_norm_(self.surrogate_net.parameters(), max_norm=1.0)
+                    if predictor_active and self._unit_predictor_optimizer is not None:
+                        torch.nn.utils.clip_grad_norm_(
+                            self._unit_predictor_parameters(), max_norm=1.0,
+                        )
                     self._surr_optimizer.step()
                     self._surr_cost_optimizer.step()
+                    if predictor_active and self._unit_predictor_optimizer is not None:
+                        self._unit_predictor_optimizer.step()
                     self._surr_optimizer.zero_grad()
                     self._surr_cost_optimizer.zero_grad()
+                    if predictor_active and self._unit_predictor_optimizer is not None:
+                        self._unit_predictor_optimizer.zero_grad()
                     batch_count = 0
 
             self._surr_scheduler.step()
@@ -5487,6 +5979,63 @@ def train_dual_predictor_from_data(ppc, active_set_data: List[Dict], T_delta: fl
     if save_path:
         predictor.save(save_path)
     
+    return predictor
+
+
+def train_unit_predictor_from_data(
+    ppc,
+    active_set_data: List[Dict],
+    T_delta: float = 1.0,
+    unit_ids: List[int] | None = None,
+    num_epochs: int = 200,
+    batch_size: int = 32,
+    batch_strategy: str = 'full-batch',
+    shuffle: bool = True,
+    learning_rate: float = 1e-3,
+    weight_decay: float = 1e-4,
+    hidden_dims: List[int] | None = None,
+    save_path: str | None = None,
+    load_path: str | None = None,
+    device=None,
+) -> SingleUnitBinaryPredictorTrainer:
+    """构造并预训练每机组独立的 0/1 变量预测器。
+
+    - 首次训练：BCEWithLogitsLoss 拟合 ``unit_commitment_matrix`` 标签。
+    - 继续训练：若 ``load_path`` 指向已有 checkpoint，则先 load 再 finetune。
+    - ``save_path`` 非空则保存到该路径（供进程池 worker 加载）。
+    """
+    print("=" * 60, flush=True)
+    print("训练单机组 0/1 变量预测器", flush=True)
+    print("=" * 60, flush=True)
+
+    predictor = SingleUnitBinaryPredictorTrainer(
+        ppc,
+        active_set_data,
+        T_delta,
+        unit_ids=unit_ids,
+        hidden_dims=hidden_dims,
+        learning_rate=learning_rate,
+        weight_decay=weight_decay,
+        batch_strategy=batch_strategy,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        device=device,
+    )
+
+    if load_path is not None and os.path.exists(load_path):
+        predictor.load(load_path)
+
+    predictor.train_all(
+        num_epochs=num_epochs,
+        batch_size=batch_size,
+        batch_strategy=batch_strategy,
+        shuffle=shuffle,
+        learning_rate=learning_rate,
+    )
+
+    if save_path:
+        predictor.save(save_path)
+
     return predictor
 
 

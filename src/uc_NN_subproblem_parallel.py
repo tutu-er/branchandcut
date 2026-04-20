@@ -143,6 +143,10 @@ class ParallelSubproblemSurrogateTrainer(SubproblemSurrogateTrainer):
         pg_block_prox_weight: float = 2e-2,
         dual_block_prox_weight: float = 1e-2,
         ignore_startup_shutdown_costs: bool = False,
+        unit_predictor=None,
+        use_unit_predictor: bool = False,
+        unit_predictor_finetune_lr: float = 1e-5,
+        unit_predictor_weight_decay: float = 1e-4,
         device=None,
         n_workers: int = 4,
     ):
@@ -193,6 +197,10 @@ class ParallelSubproblemSurrogateTrainer(SubproblemSurrogateTrainer):
             pg_block_prox_weight=pg_block_prox_weight,
             dual_block_prox_weight=dual_block_prox_weight,
             ignore_startup_shutdown_costs=ignore_startup_shutdown_costs,
+            unit_predictor=unit_predictor,
+            use_unit_predictor=use_unit_predictor,
+            unit_predictor_finetune_lr=unit_predictor_finetune_lr,
+            unit_predictor_weight_decay=unit_predictor_weight_decay,
             device=device,
         )
         self.n_workers = min(n_workers, self.n_samples)
@@ -636,7 +644,10 @@ def _train_unit_worker(args: dict) -> dict:
         if _p not in sys.path:
             sys.path.insert(0, _p)
 
-    from uc_NN_subproblem import SubproblemSurrogateTrainer
+    from uc_NN_subproblem import (
+        SubproblemSurrogateTrainer,
+        SingleUnitBinaryPredictorTrainer,
+    )
 
     unit_id = args['unit_id']
     ppc = args['ppc']
@@ -688,7 +699,12 @@ def _train_unit_worker(args: dict) -> dict:
     sample_n_workers    = args.get('sample_n_workers', 4)
     use_sample_parallel = args.get('use_sample_parallel', True)
     lp_backend          = args.get('lp_backend', LP_BACKEND_GUROBI)
+    constraint_generation_strategy = args.get('constraint_generation_strategy', 'sensitive')
     save_dir            = args.get('save_dir')
+    unit_predictor_path = args.get('unit_predictor_path')
+    use_unit_predictor_flag = bool(args.get('use_unit_predictor', False))
+    unit_predictor_finetune_lr = args.get('unit_predictor_finetune_lr', 1e-5)
+    unit_predictor_weight_decay = args.get('unit_predictor_weight_decay', 1e-4)
     # 机组级 ProcessPool 多进程时，各子进程若均默认选用 CUDA，常在 NN 首次 forward
     # （_refresh_cached_surrogate_outputs）处互斥/死锁或长时间无输出；默认强制 NN 用 CPU。
     force_nn_cpu_for_multiprocess = bool(args.get('force_nn_cpu_for_multiprocess', False))
@@ -716,6 +732,29 @@ def _train_unit_worker(args: dict) -> dict:
         for i, sample in enumerate(active_set_data):
             sample['lambda_pg_electricity_price'] = copy.deepcopy(lambda_vals[i])
 
+    # 单机组 0/1 预测器：通过磁盘路径重建（跨进程 pickle PyTorch 模型不可靠）
+    unit_predictor_obj = None
+    if use_unit_predictor_flag and unit_predictor_path and os.path.exists(unit_predictor_path):
+        try:
+            unit_predictor_obj = SingleUnitBinaryPredictorTrainer(
+                ppc, active_set_data, T_delta,
+                unit_ids=[unit_id],
+                weight_decay=unit_predictor_weight_decay,
+                device=nn_device,
+            )
+            unit_predictor_obj.load(unit_predictor_path)
+            print(
+                f"{prefix} 已在子进程加载 unit_predictor: {unit_predictor_path}",
+                flush=True,
+            )
+        except Exception as exc:
+            print(
+                f"{prefix} 加载 unit_predictor 失败，改为禁用覆盖: {exc}",
+                flush=True,
+            )
+            unit_predictor_obj = None
+    effective_use_unit_predictor = unit_predictor_obj is not None
+
     # 构建 trainer
     if use_sample_parallel:
         # 导入并行 trainer（子进程中重新 import，无问题）
@@ -724,6 +763,7 @@ def _train_unit_worker(args: dict) -> dict:
             ppc, active_set_data, T_delta, unit_id,
             lambda_predictor=None,
             lp_backend=lp_backend,
+            constraint_generation_strategy=constraint_generation_strategy,
             rho_primal_init=rho_primal_init,
             rho_dual_init=rho_dual_init,
             rho_dual_pg_init=rho_dual_pg_init,
@@ -758,6 +798,10 @@ def _train_unit_worker(args: dict) -> dict:
             pg_cost_surr_lr=pg_cost_surr_lr,
             pg_block_prox_weight=pg_block_prox_weight,
             dual_block_prox_weight=dual_block_prox_weight,
+            unit_predictor=unit_predictor_obj,
+            use_unit_predictor=effective_use_unit_predictor,
+            unit_predictor_finetune_lr=unit_predictor_finetune_lr,
+            unit_predictor_weight_decay=unit_predictor_weight_decay,
             device=nn_device,
             n_workers=sample_n_workers,
         )
@@ -766,6 +810,7 @@ def _train_unit_worker(args: dict) -> dict:
             ppc, active_set_data, T_delta, unit_id,
             lambda_predictor=None,
             lp_backend=lp_backend,
+            constraint_generation_strategy=constraint_generation_strategy,
             rho_primal_init=rho_primal_init,
             rho_dual_init=rho_dual_init,
             rho_dual_pg_init=rho_dual_pg_init,
@@ -800,6 +845,10 @@ def _train_unit_worker(args: dict) -> dict:
             pg_cost_surr_lr=pg_cost_surr_lr,
             pg_block_prox_weight=pg_block_prox_weight,
             dual_block_prox_weight=dual_block_prox_weight,
+            unit_predictor=unit_predictor_obj,
+            use_unit_predictor=effective_use_unit_predictor,
+            unit_predictor_finetune_lr=unit_predictor_finetune_lr,
+            unit_predictor_weight_decay=unit_predictor_weight_decay,
             device=nn_device,
         )
 
@@ -995,11 +1044,16 @@ def train_all_surrogates_parallel(
     pg_cost_surr_lr: float = 5e-5,
     pg_block_prox_weight: float = 2e-2,
     dual_block_prox_weight: float = 1e-2,
+    constraint_generation_strategy: str = "sensitive",
     save_dir: Optional[str] = None,
     device=None,
     n_workers: Optional[int] = None,
     sample_n_workers: int = 4,
     use_sample_parallel: bool = True,
+    unit_predictor_path: Optional[str] = None,
+    use_unit_predictor: bool = False,
+    unit_predictor_finetune_lr: float = 1e-5,
+    unit_predictor_weight_decay: float = 1e-4,
 ) -> Dict[int, dict]:
     """并行训练所有机组的子问题代理约束（Level 1：机组级进程并行）。
 
@@ -1015,6 +1069,8 @@ def train_all_surrogates_parallel(
         max_iter: BCD 最大迭代次数。
         nn_epochs: 每次 BCD 迭代内 NN 训练轮数。
         save_dir: 模型保存目录（可选）。
+        constraint_generation_strategy: 与 ``SubproblemSurrogateTrainer`` 一致；须与主进程
+            ``run_surrogate`` / ``load_trained_models`` 所用策略相同，否则保存的 pth 元数据会不匹配。
         device: 计算设备（子进程重新初始化，此参数目前未传递至子进程）。
         n_workers: 并发进程数，默认 min(len(unit_ids), 4)（Gurobi 许可证限制）。
         sample_n_workers: 每个进程内的样本级线程数（Level 2）。
@@ -1116,12 +1172,18 @@ def train_all_surrogates_parallel(
             'pg_cost_surr_lr':    pg_cost_surr_lr,
             'pg_block_prox_weight': pg_block_prox_weight,
             'dual_block_prox_weight': dual_block_prox_weight,
+            'constraint_generation_strategy': constraint_generation_strategy,
             'sample_n_workers':   sample_n_workers,
             'use_sample_parallel': use_sample_parallel,
             'lp_backend':         lp_backend,
             'save_dir':           save_dir,
             # n_workers>1 时子进程内强制 NN 用 CPU，见 _train_unit_worker
             'force_nn_cpu_for_multiprocess': (n_workers > 1),
+            # 单机组 0/1 预测器（通过磁盘路径 lazy 加载，避免跨进程 pickle 模型）
+            'unit_predictor_path': unit_predictor_path,
+            'use_unit_predictor':  bool(use_unit_predictor and unit_predictor_path),
+            'unit_predictor_finetune_lr': unit_predictor_finetune_lr,
+            'unit_predictor_weight_decay': unit_predictor_weight_decay,
         }
         for g in unit_ids
     ]

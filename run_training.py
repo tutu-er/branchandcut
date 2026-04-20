@@ -118,6 +118,17 @@ DUAL_PREDICTOR_NET_VARIANT = 'temporal_conv'  # 'mlp' | 'temporal_conv'
 DUAL_PREDICTOR_NORMALIZE_TARGETS = True
 DUAL_PREDICTOR_COSINE_LOSS_WEIGHT = 0.12
 DUAL_PREDICTOR_SMOOTH_L1_BETA = 2.0
+# 单机组 0/1 变量预测器：为 True 时在 BCD 之前预训练 per-unit predictor，
+# 并在 all_single_time / all_templates_sign4_plus_single 策略下用其派生 single-time (alpha, delta)。
+USE_UNIT_PREDICTOR = True
+UNIT_PREDICTOR_EPOCHS = 200
+UNIT_PREDICTOR_BATCH_STRATEGY = 'full-batch'   # 'full-batch' / 'mini-batch'
+UNIT_PREDICTOR_BATCH_SIZE = 32
+UNIT_PREDICTOR_SHUFFLE = True
+UNIT_PREDICTOR_LR = 1e-3
+UNIT_PREDICTOR_HIDDEN_DIMS = [256, 128]
+UNIT_PREDICTOR_FINETUNE_LR = 1e-5        # BCD 阶段对 predictor 的微调学习率
+UNIT_PREDICTOR_WEIGHT_DECAY = 1e-4
 MAX_ITER = 300             # backward-compatible shared fallback
 BCD_MAX_ITER = MAX_ITER
 SUBPROBLEM_MAX_ITER = MAX_ITER
@@ -267,6 +278,8 @@ try:
     import pypower.case118
     from uc_NN_subproblem import (
         train_dual_predictor_from_data,
+        train_unit_predictor_from_data,
+        SingleUnitBinaryPredictorTrainer,
         SubproblemSurrogateTrainer,
         ActiveSetReader,
         load_trained_models,
@@ -550,7 +563,11 @@ def create_subproblem_trainer(ppc, all_samples, T_DELTA, unit_id: int, *,
                               pg_block_prox_weight: float = SUBPROBLEM_PG_BLOCK_PROX_WEIGHT,
                               dual_block_prox_weight: float = SUBPROBLEM_DUAL_BLOCK_PROX_WEIGHT,
                               iter_delta_reg_weight: float = SUBPROBLEM_ITER_DELTA_REG_WEIGHT,
-                              iter_delta_reg_deadband: float = SUBPROBLEM_ITER_DELTA_REG_DEADBAND):
+                              iter_delta_reg_deadband: float = SUBPROBLEM_ITER_DELTA_REG_DEADBAND,
+                              unit_predictor: 'SingleUnitBinaryPredictorTrainer | None' = None,
+                              use_unit_predictor: bool = False,
+                              unit_predictor_finetune_lr: float = 1e-5,
+                              unit_predictor_weight_decay: float = 1e-4):
     trainer_kwargs = dict(
         lambda_predictor=lambda_predictor,
         lp_backend=lp_backend,
@@ -596,6 +613,10 @@ def create_subproblem_trainer(ppc, all_samples, T_DELTA, unit_id: int, *,
         dual_block_prox_weight=dual_block_prox_weight,
         iter_delta_reg_weight=iter_delta_reg_weight,
         iter_delta_reg_deadband=iter_delta_reg_deadband,
+        unit_predictor=unit_predictor,
+        use_unit_predictor=use_unit_predictor,
+        unit_predictor_finetune_lr=unit_predictor_finetune_lr,
+        unit_predictor_weight_decay=unit_predictor_weight_decay,
     )
     if n_workers <= 1:
         return SubproblemSurrogateTrainer(ppc, all_samples, T_DELTA, unit_id, **trainer_kwargs)
@@ -661,7 +682,16 @@ def run_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS,
                   dual_net_variant: str = 'temporal_conv',
                   dual_normalize_targets: bool = True,
                   dual_cosine_loss_weight: float = 0.12,
-                  dual_smooth_l1_beta: float = 2.0):
+                  dual_smooth_l1_beta: float = 2.0,
+                  use_unit_predictor: bool = False,
+                  unit_predictor_epochs: int = 200,
+                  unit_predictor_batch_strategy: str = 'full-batch',
+                  unit_predictor_batch_size: int = 32,
+                  unit_predictor_shuffle: bool = True,
+                  unit_predictor_lr: float = 1e-3,
+                  unit_predictor_hidden_dims: list[int] | None = None,
+                  unit_predictor_finetune_lr: float = 1e-5,
+                  unit_predictor_weight_decay: float = 1e-4):
     """V3 代理约束训练（样本级并行），返回 (dual_predictor, trainers)。"""
     import os
     from pypower.ext2int import ext2int
@@ -773,6 +803,49 @@ def run_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS,
         log("dual_predictor_only=True：已结束对偶预测器训练，跳过子问题代理约束训练")
         return dual_predictor, {}
 
+    # 步骤 1.5：单机组 0/1 预测器预训练（可选）
+    unit_predictor = None
+    unit_predictor_save_path = None
+    if use_unit_predictor:
+        if constraint_generation_strategy not in (
+            'all_single_time', 'all_templates_sign4_plus_single',
+        ):
+            log(
+                f"[unit_predictor] constraint_strategy={constraint_generation_strategy} 不包含 single-time 段，"
+                "跳过单机组 0/1 预测器"
+            )
+        else:
+            unit_predictor_save_path = (
+                os.path.join(save_dir, 'unit_predictor.pth') if save_dir else None
+            )
+            unit_predictor_load_path = (
+                str(load_path / 'unit_predictor.pth')
+                if load_path and (load_path / 'unit_predictor.pth').exists()
+                else None
+            )
+            log(
+                f"[unit_predictor] 预训练单机组 0/1 预测器: "
+                f"units={unit_ids}, epochs={unit_predictor_epochs}, "
+                f"batch={unit_predictor_batch_size}/{unit_predictor_batch_strategy}, "
+                f"lr={unit_predictor_lr}, hidden_dims={unit_predictor_hidden_dims}, "
+                f"finetune_lr={unit_predictor_finetune_lr}"
+            )
+            unit_predictor = train_unit_predictor_from_data(
+                ppc,
+                all_samples,
+                T_delta=T_DELTA,
+                unit_ids=unit_ids,
+                hidden_dims=unit_predictor_hidden_dims,
+                num_epochs=unit_predictor_epochs,
+                batch_size=unit_predictor_batch_size,
+                batch_strategy=unit_predictor_batch_strategy,
+                shuffle=unit_predictor_shuffle,
+                learning_rate=unit_predictor_lr,
+                weight_decay=unit_predictor_weight_decay,
+                save_path=unit_predictor_save_path,
+                load_path=unit_predictor_load_path,
+            )
+
     # 步骤 2：训练代理约束（支持机组级并行或样本级并行）
     # B1：机组级并行（Level 1）
     if N_WORKERS_UNIT > 1:
@@ -787,6 +860,7 @@ def run_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS,
             T_delta=T_DELTA,
             lambda_predictor=dual_predictor,
             lp_backend=lp_backend,
+            constraint_generation_strategy=constraint_generation_strategy,
             unit_ids=unit_ids,
             max_iter=SUBPROBLEM_MAX_ITER,
             nn_epochs=NN_EPOCHS,
@@ -828,6 +902,10 @@ def run_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS,
             n_workers=N_WORKERS_UNIT,
             sample_n_workers=N_WORKERS_SAMPLE,
             use_sample_parallel=(N_WORKERS_SAMPLE > 1),
+            unit_predictor_path=unit_predictor_save_path,
+            use_unit_predictor=(unit_predictor is not None),
+            unit_predictor_finetune_lr=unit_predictor_finetune_lr,
+            unit_predictor_weight_decay=unit_predictor_weight_decay,
         )
 
         # train_all_surrogates_parallel 返回的是 state_dict；为了保持 run_surrogate 的返回形态
@@ -897,6 +975,10 @@ def run_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS,
                 dual_block_prox_weight=dual_block_prox_weight,
                 iter_delta_reg_weight=iter_delta_reg_weight,
                 iter_delta_reg_deadband=iter_delta_reg_deadband,
+                unit_predictor=unit_predictor,
+                use_unit_predictor=(unit_predictor is not None),
+                unit_predictor_finetune_lr=unit_predictor_finetune_lr,
+                unit_predictor_weight_decay=unit_predictor_weight_decay,
             )
         else:
             log(f"  机组 {g} ({i+1}/{len(unit_ids)}) — 样本级并行 n_workers={n_workers}")
@@ -946,6 +1028,10 @@ def run_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS,
                 dual_block_prox_weight=dual_block_prox_weight,
                 iter_delta_reg_weight=iter_delta_reg_weight,
                 iter_delta_reg_deadband=iter_delta_reg_deadband,
+                unit_predictor=unit_predictor,
+                use_unit_predictor=(unit_predictor is not None),
+                unit_predictor_finetune_lr=unit_predictor_finetune_lr,
+                unit_predictor_weight_decay=unit_predictor_weight_decay,
                 n_workers=n_workers,
             )
         if load_path is not None:
@@ -1552,6 +1638,15 @@ def main():
     DUAL_PREDICTOR_NORMALIZE_TARGETS_VALUE = DUAL_PREDICTOR_NORMALIZE_TARGETS
     DUAL_PREDICTOR_COSINE_LOSS_WEIGHT_VALUE = DUAL_PREDICTOR_COSINE_LOSS_WEIGHT
     DUAL_PREDICTOR_SMOOTH_L1_BETA_VALUE = DUAL_PREDICTOR_SMOOTH_L1_BETA
+    USE_UNIT_PREDICTOR_VALUE = USE_UNIT_PREDICTOR
+    UNIT_PREDICTOR_EPOCHS_VALUE = UNIT_PREDICTOR_EPOCHS
+    UNIT_PREDICTOR_BATCH_STRATEGY_VALUE = UNIT_PREDICTOR_BATCH_STRATEGY
+    UNIT_PREDICTOR_BATCH_SIZE_VALUE = UNIT_PREDICTOR_BATCH_SIZE
+    UNIT_PREDICTOR_SHUFFLE_VALUE = UNIT_PREDICTOR_SHUFFLE
+    UNIT_PREDICTOR_LR_VALUE = UNIT_PREDICTOR_LR
+    UNIT_PREDICTOR_HIDDEN_DIMS_VALUE = UNIT_PREDICTOR_HIDDEN_DIMS
+    UNIT_PREDICTOR_FINETUNE_LR_VALUE = UNIT_PREDICTOR_FINETUNE_LR
+    UNIT_PREDICTOR_WEIGHT_DECAY_VALUE = UNIT_PREDICTOR_WEIGHT_DECAY
     BCD_MAX_ITER_VALUE = BCD_MAX_ITER
     SUBPROBLEM_MAX_ITER_VALUE = SUBPROBLEM_MAX_ITER
     BCD_LAMBDA_INIT_STRATEGY_VALUE = BCD_LAMBDA_INIT_STRATEGY
@@ -1874,6 +1969,15 @@ def main():
                     dual_normalize_targets=DUAL_PREDICTOR_NORMALIZE_TARGETS_VALUE,
                     dual_cosine_loss_weight=DUAL_PREDICTOR_COSINE_LOSS_WEIGHT_VALUE,
                     dual_smooth_l1_beta=DUAL_PREDICTOR_SMOOTH_L1_BETA_VALUE,
+                    use_unit_predictor=USE_UNIT_PREDICTOR_VALUE,
+                    unit_predictor_epochs=UNIT_PREDICTOR_EPOCHS_VALUE,
+                    unit_predictor_batch_strategy=UNIT_PREDICTOR_BATCH_STRATEGY_VALUE,
+                    unit_predictor_batch_size=UNIT_PREDICTOR_BATCH_SIZE_VALUE,
+                    unit_predictor_shuffle=UNIT_PREDICTOR_SHUFFLE_VALUE,
+                    unit_predictor_lr=UNIT_PREDICTOR_LR_VALUE,
+                    unit_predictor_hidden_dims=UNIT_PREDICTOR_HIDDEN_DIMS_VALUE,
+                    unit_predictor_finetune_lr=UNIT_PREDICTOR_FINETUNE_LR_VALUE,
+                    unit_predictor_weight_decay=UNIT_PREDICTOR_WEIGHT_DECAY_VALUE,
                 )
             if trainers:
                 print_surrogate_results(trainers, all_samples)
@@ -2184,6 +2288,15 @@ def main():
                     dual_normalize_targets=DUAL_PREDICTOR_NORMALIZE_TARGETS_VALUE,
                     dual_cosine_loss_weight=DUAL_PREDICTOR_COSINE_LOSS_WEIGHT_VALUE,
                     dual_smooth_l1_beta=DUAL_PREDICTOR_SMOOTH_L1_BETA_VALUE,
+                    use_unit_predictor=USE_UNIT_PREDICTOR_VALUE,
+                    unit_predictor_epochs=UNIT_PREDICTOR_EPOCHS_VALUE,
+                    unit_predictor_batch_strategy=UNIT_PREDICTOR_BATCH_STRATEGY_VALUE,
+                    unit_predictor_batch_size=UNIT_PREDICTOR_BATCH_SIZE_VALUE,
+                    unit_predictor_shuffle=UNIT_PREDICTOR_SHUFFLE_VALUE,
+                    unit_predictor_lr=UNIT_PREDICTOR_LR_VALUE,
+                    unit_predictor_hidden_dims=UNIT_PREDICTOR_HIDDEN_DIMS_VALUE,
+                    unit_predictor_finetune_lr=UNIT_PREDICTOR_FINETUNE_LR_VALUE,
+                    unit_predictor_weight_decay=UNIT_PREDICTOR_WEIGHT_DECAY_VALUE,
                 )
             print_surrogate_results(trainers, all_samples)
 

@@ -59,6 +59,8 @@ CASE118_ACTIVE_SET_JSON = CASE118_ACTIVE_SET_JSON_PRICE_CLIPPED
 SUBPROBLEM_LIGHT_MAX_SAMPLES: int | None = None
 SUBPROBLEM_LIGHT_N_WORKERS_UNIT: int | None = None
 SUBPROBLEM_LIGHT_N_WORKERS_SAMPLE: int | None = None
+# 仅训练部分机组时设为列表（如 [0, 1, 5]）；None 表示全部机组（与 run_training.UNIT_IDS 一致）
+CASE118_SUBPROBLEM_UNIT_IDS: list[int] | None = [0, 1, 2]
 
 # ── Case118 子问题 c_pg（发电边际修正头）────────────────────────────────
 # 与 118 节点系统、裁剪电价 λ 的典型量级及较长子问题 BCD 外循环对齐：
@@ -76,6 +78,19 @@ CASE118_SUBPROBLEM_PG_COST_REG_DEADBAND = 1.0
 CASE118_SUBPROBLEM_PG_COST_SMOOTH_ABS_EPS = 1e-5
 CASE118_SUBPROBLEM_RHO_DUAL_PG_INIT = 0.15
 CASE118_SUBPROBLEM_LOSS_RATIO_DUAL_PG = 1.25
+
+# ── 单机组 0/1 变量预测器（Case118 子问题训练专用，可切换开关）────────────
+# 注意：仅当 constraint_generation_strategy 包含 single-time 段时才生效
+#        （all_single_time / all_templates_sign4_plus_single）。
+CASE118_USE_UNIT_PREDICTOR = True
+CASE118_UNIT_PREDICTOR_EPOCHS = 200
+CASE118_UNIT_PREDICTOR_BATCH_STRATEGY = "full-batch"
+CASE118_UNIT_PREDICTOR_BATCH_SIZE = 32
+CASE118_UNIT_PREDICTOR_SHUFFLE = True
+CASE118_UNIT_PREDICTOR_LR = 1e-3
+CASE118_UNIT_PREDICTOR_HIDDEN_DIMS = [256, 128]
+CASE118_UNIT_PREDICTOR_FINETUNE_LR = 1e-5
+CASE118_UNIT_PREDICTOR_WEIGHT_DECAY = 1e-4
 
 
 def _cpu_count() -> int:
@@ -260,6 +275,8 @@ def _configure_subproblem_bcd() -> None:
     rt.MODE = "surrogate"
     rt.SURROGATE_DUAL_PREDICTOR_ONLY = False
     rt.UNIT_IDS = None
+    if CASE118_SUBPROBLEM_UNIT_IDS is not None:
+        rt.UNIT_IDS = list(CASE118_SUBPROBLEM_UNIT_IDS)
 
     if SUBPROBLEM_SOLVE_PRESET == "server":
         # 服务器：让子问题 LP 用 HiGHS（cvxpy + highspy），并增大并行度
@@ -322,6 +339,16 @@ def _configure_subproblem_bcd() -> None:
     rt.SUBPROBLEM_PG_COST_SURR_LR = CASE118_SUBPROBLEM_PG_COST_SURR_LR
     rt.SUBPROBLEM_PG_COST_REG_DEADBAND = CASE118_SUBPROBLEM_PG_COST_REG_DEADBAND
     rt.SUBPROBLEM_PG_COST_SMOOTH_ABS_EPS = CASE118_SUBPROBLEM_PG_COST_SMOOTH_ABS_EPS
+
+    rt.USE_UNIT_PREDICTOR = CASE118_USE_UNIT_PREDICTOR
+    rt.UNIT_PREDICTOR_EPOCHS = CASE118_UNIT_PREDICTOR_EPOCHS
+    rt.UNIT_PREDICTOR_BATCH_STRATEGY = CASE118_UNIT_PREDICTOR_BATCH_STRATEGY
+    rt.UNIT_PREDICTOR_BATCH_SIZE = CASE118_UNIT_PREDICTOR_BATCH_SIZE
+    rt.UNIT_PREDICTOR_SHUFFLE = CASE118_UNIT_PREDICTOR_SHUFFLE
+    rt.UNIT_PREDICTOR_LR = CASE118_UNIT_PREDICTOR_LR
+    rt.UNIT_PREDICTOR_HIDDEN_DIMS = CASE118_UNIT_PREDICTOR_HIDDEN_DIMS
+    rt.UNIT_PREDICTOR_FINETUNE_LR = CASE118_UNIT_PREDICTOR_FINETUNE_LR
+    rt.UNIT_PREDICTOR_WEIGHT_DECAY = CASE118_UNIT_PREDICTOR_WEIGHT_DECAY
 
 
 def _validate_inputs() -> None:
@@ -387,7 +414,8 @@ def main() -> None:
             f"{SUBPROBLEM_SOLVE_PRESET}, "
             f"backend={rt.SUBPROBLEM_LP_BACKEND}, "
             f"n_workers_sample={rt.N_WORKERS_SAMPLE}, "
-            f"n_workers_unit={rt.N_WORKERS_UNIT}",
+            f"n_workers_unit={rt.N_WORKERS_UNIT}, "
+            f"unit_ids={rt.UNIT_IDS!r}",
             flush=True,
         )
         print(
