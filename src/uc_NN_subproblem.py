@@ -2066,11 +2066,53 @@ class SingleUnitBinaryPredictorTrainer:
             if self.shared_model is None:
                 raise RuntimeError("shared_model is not initialized for tcn_shared_film")
             if shared.get('shared_model') is not None:
-                self.shared_model.load_state_dict(shared.get('shared_model'))
+                loaded_sd = shared.get('shared_model') or {}
+                if not isinstance(loaded_sd, dict) or len(loaded_sd) == 0:
+                    print(f"! [UnitPredictor] checkpoint shared_model 为空或格式异常，跳过加载: {filepath}", flush=True)
+                else:
+                    current_sd = self.shared_model.state_dict()
+                    filtered_sd = {}
+                    skipped = []
+                    for k, v in loaded_sd.items():
+                        if k not in current_sd:
+                            skipped.append((k, "missing_key"))
+                            continue
+                        try:
+                            if tuple(current_sd[k].shape) != tuple(v.shape):
+                                skipped.append((k, f"shape {tuple(v.shape)} -> {tuple(current_sd[k].shape)}"))
+                                continue
+                        except Exception:
+                            skipped.append((k, "shape_check_failed"))
+                            continue
+                        filtered_sd[k] = v
+
+                    # 只加载完全匹配的参数，避免 shape mismatch 直接报错
+                    if len(filtered_sd) == 0:
+                        print(
+                            "! [UnitPredictor] checkpoint 与当前 SharedTCNFiLMNet 结构不兼容（无可用参数），跳过加载并从头训练。"
+                            f" ckpt={filepath}",
+                            flush=True,
+                        )
+                    else:
+                        missing, unexpected = self.shared_model.load_state_dict(filtered_sd, strict=False)
+                        n_total = len(current_sd)
+                        n_loaded = len(filtered_sd)
+                        n_skipped = len(skipped)
+                        print(
+                            f"✓ 单机组 0/1 预测器已加载(共享骨干, 兼容模式): {filepath} "
+                            f"(loaded={n_loaded}/{n_total}, skipped={n_skipped}, missing={len(missing)}, unexpected={len(unexpected)})",
+                            flush=True,
+                        )
+                        if n_skipped > 0:
+                            preview = ", ".join([f"{k}({reason})" for k, reason in skipped[:6]])
+                            more = "" if n_skipped <= 6 else f", ...(+{n_skipped-6})"
+                            print(f"  [UnitPredictor] skipped params: {preview}{more}", flush=True)
             self.shared_optimizer = optim.Adam(
                 self.shared_model.parameters(), lr=self.learning_rate, weight_decay=self.weight_decay
             )
-            print(f"✓ 单机组 0/1 预测器已加载(共享骨干): {filepath}", flush=True)
+            # 注：上面兼容加载已经打印过一次更详细的统计；这里保留兜底提示以兼容旧日志习惯
+            if shared.get('shared_model') is None:
+                print(f"✓ 单机组 0/1 预测器已加载(共享骨干): {filepath}", flush=True)
             return
 
         state_dicts = state.get('state_dicts', {}) or {}
@@ -2560,6 +2602,12 @@ class SubproblemSurrogateTrainer:
                  pg_cost_reg_deadband: float = 0.5,
                  nn_smooth_abs_eps: float = 1e-6,
                  pg_cost_smooth_abs_eps: float = 1e-6,
+                 pg_cost_batch_strategy: str | None = None,
+                 pg_cost_batch_size: int | None = None,
+                 pg_cost_shuffle: bool | None = None,
+                 pg_cost_use_sample_weights: bool = True,
+                 pg_cost_sample_weight_power: float = 1.0,
+                 pg_cost_sample_weight_clip: float = 10.0,
                  iter_delta_reg_weight: float = 5e-5,
                  iter_delta_reg_deadband: float = 0.10,
                  loss_ratio_primal: float = 1.0,
@@ -2622,6 +2670,16 @@ class SubproblemSurrogateTrainer:
         self.pg_cost_reg_deadband = max(float(pg_cost_reg_deadband), 0.0)
         self.nn_smooth_abs_eps = max(float(nn_smooth_abs_eps), 0.0)
         self.pg_cost_smooth_abs_eps = max(float(pg_cost_smooth_abs_eps), 0.0)
+        self.pg_cost_batch_strategy = (
+            normalize_nn_batch_strategy(pg_cost_batch_strategy)
+            if pg_cost_batch_strategy is not None
+            else None
+        )
+        self.pg_cost_batch_size = None if pg_cost_batch_size is None else max(int(pg_cost_batch_size), 1)
+        self.pg_cost_shuffle = None if pg_cost_shuffle is None else bool(pg_cost_shuffle)
+        self.pg_cost_use_sample_weights = bool(pg_cost_use_sample_weights)
+        self.pg_cost_sample_weight_power = max(float(pg_cost_sample_weight_power), 0.0)
+        self.pg_cost_sample_weight_clip = max(float(pg_cost_sample_weight_clip), 1.0)
         self.requested_max_constraints = max_constraints
         self.max_constraints = max_constraints  # V3新增
         
@@ -5550,6 +5608,12 @@ class SubproblemSurrogateTrainer:
                         pg_costs_tensor,
                         self.device,
                     )
+                    # 难样本加权：按当前样本 loss 大小提升其梯度权重（mean≈1，clip 防止爆炸）
+                    if self.pg_cost_use_sample_weights and self.pg_cost_sample_weight_power > 0:
+                        with torch.no_grad():
+                            w = float(max(loss.detach().cpu().item(), 0.0)) ** float(self.pg_cost_sample_weight_power)
+                            w = min(max(w, 1e-6), float(self.pg_cost_sample_weight_clip))
+                        loss = loss * float(w)
                     (loss / actual_batch_size).backward()
                     epoch_loss += loss.detach().cpu().item()
                     batch_count += 1
@@ -6020,9 +6084,9 @@ class SubproblemSurrogateTrainer:
             )
             self.iter_with_c_pg_nn(
                 num_epochs=resolved_pg_cost_nn_epochs,
-                batch_size=nn_batch_size,
-                batch_strategy=nn_batch_strategy,
-                shuffle=nn_shuffle,
+                batch_size=(self.pg_cost_batch_size if self.pg_cost_batch_size is not None else nn_batch_size),
+                batch_strategy=(self.pg_cost_batch_strategy if self.pg_cost_batch_strategy is not None else nn_batch_strategy),
+                shuffle=(self.pg_cost_shuffle if self.pg_cost_shuffle is not None else nn_shuffle),
                 learning_rate=pg_cost_surr_learning_rate,
             )
             self._refresh_cached_surrogate_outputs()

@@ -22,80 +22,23 @@
 
 from __future__ import annotations
 
-import argparse
 import os
 import sys
 from pathlib import Path
 
-
-def _parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument(
-        "--mode",
-        choices=("surrogate", "bcd", "both"),
-        default="surrogate",
-        help="测试模式，与 run_test.MODE 一致，默认 surrogate（加载子问题代理+V3）",
-    )
-    p.add_argument(
-        "--model-dir",
-        type=str,
-        default=None,
-        metavar="DIR",
-        help="surrogate 输出目录（含 dual_predictor.pth 与 surrogate_unit_*.pth）；"
-        "默认 None=自动选 result/surrogate_models/subproblem_models_case118_* 最新",
-    )
-    p.add_argument(
-        "--bcd-model",
-        type=str,
-        default=None,
-        metavar="PATH",
-        help="bcd / both 模式下的 BCD .pth；默认自动发现 result/bcd_models/bcd_model_case118_*.pth",
-    )
-    p.add_argument(
-        "--strategy",
-        type=str,
-        default="all_templates_sign4_plus_single",
-        metavar="NAME",
-        help="代理约束生成策略，须与训练时一致；也可设 auto 让 run_test 从 checkpoint 读取",
-    )
-    p.add_argument(
-        "--max-samples",
-        type=int,
-        default=None,
-        metavar="N",
-        help="最多使用前 N 条样本（run_test.MAX_SAMPLES）",
-    )
-    p.add_argument(
-        "--sample-range",
-        type=str,
-        default="0:8",
-        metavar="START:END",
-        help="左闭右开区间，默认 0:8 做快速抽查",
-    )
-    p.add_argument(
-        "--test-samples",
-        type=int,
-        default=8,
-        metavar="K",
-        help="若干分析/FP 子流程使用的样本数上界（run_test.TEST_SAMPLES）",
-    )
-    p.add_argument(
-        "--no-fp",
-        action="store_true",
-        help="关闭可行性泵（run_test.RUN_FP=False），显著加快",
-    )
-    p.add_argument(
-        "--units",
-        type=str,
-        default=None,
-        metavar="IDS",
-        help="仅评估所列机组代理（逗号分隔）；默认 None=全部 checkpoint 中的机组",
-    )
-    return p.parse_args()
-
-
 def main() -> None:
-    args = _parse_args()
+    # -----------------------
+    # 显式参数设置（不使用命令行）
+    # -----------------------
+    mode: str = "surrogate"  # "surrogate" | "bcd" | "both"
+    model_dir: str | None = "result/surrogate_models/subproblem_models_case118_20260420_175002"  # None=自动选 result/surrogate_models/subproblem_models_case118_* 最新
+    bcd_model: str | None = None  # None=自动发现 result/bcd_models/bcd_model_case118_*.pth
+    strategy: str = "all_templates_sign4_plus_single"  # 或 "auto" 让 run_test 从 checkpoint 读取
+    max_samples: int | None = None
+    sample_range: str = "0:8"
+    test_samples: int = 8
+    run_fp: bool = True
+    units: list[int] | None = [0]  # None=全部；或例如 [1,2,3]
 
     root = Path(__file__).resolve().parent
     # 与训练入口共用 active set 路径，避免数据/λ 分布不一致
@@ -111,21 +54,19 @@ def main() -> None:
 
     import run_test as rt
 
-    rt.MODE = args.mode
+    rt.MODE = mode
     rt.CASE_NAME = "case118"
     rt.ACTIVE_SETS_FILE = active
-    rt.SURROGATE_CONSTRAINT_STRATEGY = args.strategy
+    rt.SURROGATE_CONSTRAINT_STRATEGY = strategy
     rt.SUBPROBLEM_IGNORE_STARTUP_SHUTDOWN_COSTS = True
-    rt.UNIT_IDS = None
-    if args.units:
-        rt.UNIT_IDS = [int(x.strip()) for x in str(args.units).split(",") if x.strip()]
+    rt.UNIT_IDS = units
 
-    rt.MODEL_DIR = args.model_dir
-    rt.BCD_MODEL_PATH = args.bcd_model
-    rt.MAX_SAMPLES = args.max_samples
-    rt.SAMPLE_RANGE = args.sample_range
-    rt.TEST_SAMPLES = max(1, int(args.test_samples))
-    rt.RUN_FP = not args.no_fp
+    rt.MODEL_DIR = model_dir
+    rt.BCD_MODEL_PATH = bcd_model
+    rt.MAX_SAMPLES = max_samples
+    rt.SAMPLE_RANGE = sample_range
+    rt.TEST_SAMPLES = max(1, int(test_samples))
+    rt.RUN_FP = bool(run_fp)
 
     print("=" * 72, flush=True)
     print("run_test_case118.py", flush=True)
