@@ -92,6 +92,9 @@ BCD_GAMMA_BASE = 1e-2
 # 设为 None 则自动查找 result/surrogate_models/ 下最新的匹配目录
 # 环境变量 RUN_TEST_SURROGATE_MODEL_DIR 可覆盖本常量（agentic_fp_optimizer 会注入）
 MODEL_DIR = None
+# 可选：测试时注入外部 unit_predictor（当 MODEL_DIR 下缺少 unit_predictor.pth 时自动复制一份）
+# 环境变量 RUN_TEST_UNIT_PREDICTOR_DIR 可覆盖本常量
+UNIT_PREDICTOR_DIR = None
 
 # bcd / both 模式：已训练 BCD 模型 .pth 文件路径
 # 设为 None 则自动查找 result/bcd_models/ 下最新的匹配文件
@@ -3035,6 +3038,10 @@ def main():
     _env_surr = os.environ.get("RUN_TEST_SURROGATE_MODEL_DIR")
     if _env_surr and _env_surr.strip():
         resolved_model_dir = _env_surr.strip()
+    _env_up = os.environ.get("RUN_TEST_UNIT_PREDICTOR_DIR")
+    resolved_unit_predictor_dir = UNIT_PREDICTOR_DIR
+    if _env_up and _env_up.strip():
+        resolved_unit_predictor_dir = _env_up.strip()
     _env_bcd = os.environ.get("RUN_TEST_BCD_MODEL_PATH")
     if _env_bcd and _env_bcd.strip():
         resolved_bcd_path = _env_bcd.strip()
@@ -3049,6 +3056,35 @@ def main():
         log(f"错误: 未找到 {CASE_NAME} 的 surrogate 模型目录")
         log("请先运行 run_training.py 生成模型，或在顶部手动设置 MODEL_DIR")
         sys.exit(1)
+
+    # ── 确保 unit_predictor.pth 可用（若外部提供则复制到 model_dir 里） ─────────
+    try:
+        if resolved_unit_predictor_dir and resolved_model_dir:
+            model_dir_abs = str((Path(__file__).parent / resolved_model_dir).resolve())
+            target = Path(model_dir_abs) / "unit_predictor.pth"
+            if not target.exists():
+                src = Path((Path(__file__).parent / str(resolved_unit_predictor_dir)).resolve())
+                if src.is_dir():
+                    latest = src / "LATEST.txt"
+                    if latest.exists():
+                        try:
+                            p = latest.read_text(encoding="utf-8").strip()
+                            if p:
+                                src_file = Path(p)
+                            else:
+                                src_file = src / "unit_predictor.pth"
+                        except Exception:
+                            src_file = src / "unit_predictor.pth"
+                    else:
+                        src_file = src / "unit_predictor.pth"
+                else:
+                    src_file = src
+                if src_file.exists():
+                    import shutil
+                    shutil.copy2(str(src_file), str(target))
+                    log(f"unit_predictor injected for test: {src_file} -> {target}")
+    except Exception as exc:
+        log(f"warning: failed to inject unit_predictor for test: {exc}")
     if MODE in ('bcd', 'both') and resolved_bcd_path is None:
         log(f"错误: 未找到 {CASE_NAME} 的 BCD 模型文件")
         log("请先运行 run_training.py MODE='bcd'/'both' 生成模型，或在顶部手动设置 BCD_MODEL_PATH")

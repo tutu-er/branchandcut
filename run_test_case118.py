@@ -27,9 +27,6 @@ import os
 import sys
 from pathlib import Path
 
-# 与训练入口共用 active set 路径，避免数据/λ 分布不一致
-import run_training_case118 as case118_cfg
-
 
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
@@ -101,6 +98,9 @@ def main() -> None:
     args = _parse_args()
 
     root = Path(__file__).resolve().parent
+    # 与训练入口共用 active set 路径，避免数据/λ 分布不一致
+    import run_training_case118 as case118_cfg
+
     active = case118_cfg.CASE118_ACTIVE_SET_JSON
     if not (root / active).exists():
         print(

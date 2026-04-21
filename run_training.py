@@ -127,6 +127,39 @@ UNIT_PREDICTOR_BATCH_SIZE = 32
 UNIT_PREDICTOR_SHUFFLE = True
 UNIT_PREDICTOR_LR = 1e-3
 UNIT_PREDICTOR_HIDDEN_DIMS = [256, 128]
+# UnitPredictor 结构与“距离型”损失配置（默认保持兼容：mlp + BCE）
+UNIT_PREDICTOR_NET_VARIANT = "mlp"   # "mlp" | "resmlp" | "tconv" | "tcn"
+UNIT_PREDICTOR_TCN_CHANNELS = 64
+UNIT_PREDICTOR_TCN_DEPTH = 6
+UNIT_PREDICTOR_TCONV_CHANNELS = 64
+UNIT_PREDICTOR_TCONV_DEPTH = 4
+UNIT_PREDICTOR_DROPOUT = 0.1
+UNIT_PREDICTOR_ENABLE_POS_WEIGHT = False
+UNIT_PREDICTOR_POS_WEIGHT_CLIP = 20.0
+UNIT_PREDICTOR_LOSS_WEIGHT_BCE = 1.0
+UNIT_PREDICTOR_LOSS_WEIGHT_MSE = 0.0
+UNIT_PREDICTOR_LOSS_WEIGHT_L1 = 0.0
+UNIT_PREDICTOR_LOSS_WEIGHT_TV = 0.0
+UNIT_PREDICTOR_LOSS_WEIGHT_TRANSITION = 0.0
+UNIT_PREDICTOR_LOSS_WEIGHT_BINARIZE = 0.0
+UNIT_PREDICTOR_LOSS_WEIGHT_STD_FLOOR = 0.0
+UNIT_PREDICTOR_STD_FLOOR_SCALE = 0.5
+UNIT_PREDICTOR_LOSS_WEIGHT_TV_FLOOR = 0.0
+UNIT_PREDICTOR_TV_FLOOR_SCALE = 0.8
+# 可选：直接加载外部训练好的 unit_predictor（覆盖 SURROGATE_MODEL_DIR 的继续训练逻辑）
+# - None: 按原逻辑（若 SURROGATE_MODEL_DIR 下存在 unit_predictor.pth 则继续训练）
+# - file: 直接加载该文件
+# - dir: 读取 <dir>/LATEST.txt 或 <dir>/unit_predictor.pth
+# - LATEST.txt: 读取其中指向的模型路径
+UNIT_PREDICTOR_LOAD_PATH = None
+# 可选：仅对 unit=1 追加 TV 微调（在预训练后对单个机组继续训练，避免拖累其它机组）
+UNIT_PREDICTOR_UNIT1_EXTRA_TV_EPOCHS = 0
+UNIT_PREDICTOR_UNIT1_EXTRA_TV_WEIGHT = 0.02
+# 自动挑选“变化不足”的机组做 TV 微调
+UNIT_PREDICTOR_AUTO_EXTRA_TV = False
+UNIT_PREDICTOR_AUTO_EXTRA_TV_EPOCHS = 160
+UNIT_PREDICTOR_AUTO_EXTRA_TV_TV_THRESHOLD = 0.02
+UNIT_PREDICTOR_AUTO_EXTRA_TV_WEIGHT = 0.02
 UNIT_PREDICTOR_FINETUNE_LR = 1e-5        # BCD 阶段对 predictor 的微调学习率
 UNIT_PREDICTOR_WEIGHT_DECAY = 1e-4
 MAX_ITER = 300             # backward-compatible shared fallback
@@ -690,11 +723,63 @@ def run_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS,
                   unit_predictor_shuffle: bool = True,
                   unit_predictor_lr: float = 1e-3,
                   unit_predictor_hidden_dims: list[int] | None = None,
+                  unit_predictor_net_variant: str = "mlp",
+                  unit_predictor_tcn_channels: int = 64,
+                  unit_predictor_tcn_depth: int = 6,
+                  unit_predictor_tconv_channels: int = 64,
+                  unit_predictor_tconv_depth: int = 4,
+                  unit_predictor_dropout: float = 0.1,
+                  unit_predictor_enable_pos_weight: bool = False,
+                  unit_predictor_pos_weight_clip: float = 20.0,
+                  unit_predictor_loss_weight_bce: float = 1.0,
+                  unit_predictor_loss_weight_mse: float = 0.0,
+                  unit_predictor_loss_weight_l1: float = 0.0,
+                  unit_predictor_loss_weight_tv: float = 0.0,
+                  unit_predictor_loss_weight_transition: float = 0.0,
+                  unit_predictor_loss_weight_binarize: float = 0.0,
+                  unit_predictor_loss_weight_std_floor: float = 0.0,
+                  unit_predictor_std_floor_scale: float = 0.5,
+                  unit_predictor_loss_weight_tv_floor: float = 0.0,
+                  unit_predictor_tv_floor_scale: float = 0.8,
+                  unit_predictor_load_path: str | None = None,
+                  unit_predictor_unit1_extra_tv_epochs: int = 0,
+                  unit_predictor_unit1_extra_tv_weight: float = 0.02,
+                  unit_predictor_auto_extra_tv: bool = False,
+                  unit_predictor_auto_extra_tv_epochs: int = 160,
+                  unit_predictor_auto_extra_tv_tv_threshold: float = 0.02,
+                  unit_predictor_auto_extra_tv_weight: float = 0.02,
                   unit_predictor_finetune_lr: float = 1e-5,
                   unit_predictor_weight_decay: float = 1e-4):
     """V3 代理约束训练（样本级并行），返回 (dual_predictor, trainers)。"""
     import os
     from pypower.ext2int import ext2int
+
+    def _resolve_unit_predictor_load_path(text: str | None) -> str | None:
+        if text is None:
+            return None
+        p = str(text).strip()
+        if not p:
+            return None
+        # directory: prefer LATEST.txt then unit_predictor.pth
+        if os.path.isdir(p):
+            latest = os.path.join(p, "LATEST.txt")
+            if os.path.exists(latest):
+                try:
+                    target = open(latest, "r", encoding="utf-8").read().strip()
+                    if target:
+                        return target
+                except Exception:
+                    pass
+            cand = os.path.join(p, "unit_predictor.pth")
+            return cand if os.path.exists(cand) else None
+        # file: if LATEST.txt, follow it
+        if os.path.isfile(p) and os.path.basename(p).lower() == "latest.txt":
+            try:
+                target = open(p, "r", encoding="utf-8").read().strip()
+                return target if target else None
+            except Exception:
+                return None
+        return p if os.path.exists(p) else None
 
     ppc_int = ext2int(ppc)
     ng = ppc_int['gen'].shape[0]
@@ -818,7 +903,8 @@ def run_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS,
             unit_predictor_save_path = (
                 os.path.join(save_dir, 'unit_predictor.pth') if save_dir else None
             )
-            unit_predictor_load_path = (
+            resolved_external = _resolve_unit_predictor_load_path(unit_predictor_load_path)
+            unit_predictor_load_path = resolved_external or (
                 str(load_path / 'unit_predictor.pth')
                 if load_path and (load_path / 'unit_predictor.pth').exists()
                 else None
@@ -830,21 +916,136 @@ def run_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS,
                 f"lr={unit_predictor_lr}, hidden_dims={unit_predictor_hidden_dims}, "
                 f"finetune_lr={unit_predictor_finetune_lr}"
             )
+            # 若指定了外部 load_path，则默认不再额外预训练（避免覆盖外部模型）
+            effective_epochs = 0 if unit_predictor_load_path else int(unit_predictor_epochs)
             unit_predictor = train_unit_predictor_from_data(
                 ppc,
                 all_samples,
                 T_delta=T_DELTA,
                 unit_ids=unit_ids,
                 hidden_dims=unit_predictor_hidden_dims,
-                num_epochs=unit_predictor_epochs,
+                num_epochs=effective_epochs,
                 batch_size=unit_predictor_batch_size,
                 batch_strategy=unit_predictor_batch_strategy,
                 shuffle=unit_predictor_shuffle,
                 learning_rate=unit_predictor_lr,
                 weight_decay=unit_predictor_weight_decay,
+                net_variant=unit_predictor_net_variant,
+                tcn_channels=unit_predictor_tcn_channels,
+                tcn_depth=unit_predictor_tcn_depth,
+                tconv_channels=unit_predictor_tconv_channels,
+                tconv_depth=unit_predictor_tconv_depth,
+                dropout=unit_predictor_dropout,
+                enable_pos_weight=unit_predictor_enable_pos_weight,
+                pos_weight_clip=unit_predictor_pos_weight_clip,
+                loss_weight_bce=unit_predictor_loss_weight_bce,
+                loss_weight_mse=unit_predictor_loss_weight_mse,
+                loss_weight_l1=unit_predictor_loss_weight_l1,
+                loss_weight_tv=unit_predictor_loss_weight_tv,
+                loss_weight_transition=unit_predictor_loss_weight_transition,
+                loss_weight_binarize=unit_predictor_loss_weight_binarize,
+                loss_weight_std_floor=unit_predictor_loss_weight_std_floor,
+                std_floor_scale=unit_predictor_std_floor_scale,
+                loss_weight_tv_floor=unit_predictor_loss_weight_tv_floor,
+                tv_floor_scale=unit_predictor_tv_floor_scale,
                 save_path=unit_predictor_save_path,
                 load_path=unit_predictor_load_path,
             )
+
+            # 可选：仅对 unit=1 追加 TV 微调（避免 TV 拖累其它机组）
+            try:
+                extra_epochs = int(unit_predictor_unit1_extra_tv_epochs)
+            except Exception:
+                extra_epochs = 0
+            if (
+                unit_predictor is not None
+                and extra_epochs > 0
+                and any(int(x) == 1 for x in (unit_ids or []))
+            ):
+                log(
+                    f"[unit_predictor] unit=1 extra TV finetune: "
+                    f"epochs={extra_epochs}, tv_w={float(unit_predictor_unit1_extra_tv_weight)}"
+                )
+                unit_predictor.train_unit(
+                    unit_id=1,
+                    num_epochs=extra_epochs,
+                    batch_size=unit_predictor_batch_size,
+                    batch_strategy=unit_predictor_batch_strategy,
+                    shuffle=unit_predictor_shuffle,
+                    learning_rate=unit_predictor_lr,
+                    enable_scheduler=True,
+                    scheduler_patience=10,
+                    scheduler_factor=0.5,
+                    scheduler_min_lr=1e-5,
+                    enable_pos_weight=False,
+                    pos_weight_clip=unit_predictor_pos_weight_clip,
+                    loss_weight_bce=0.0,
+                    loss_weight_mse=1.0,
+                    loss_weight_l1=0.0,
+                    loss_weight_tv=float(unit_predictor_unit1_extra_tv_weight),
+                    loss_weight_transition=0.25,
+                    loss_weight_binarize=0.05,
+                    loss_weight_std_floor=0.2,
+                    std_floor_scale=unit_predictor_std_floor_scale,
+                    loss_weight_tv_floor=unit_predictor_loss_weight_tv_floor,
+                    tv_floor_scale=unit_predictor_tv_floor_scale,
+                )
+
+            # 自动 TV 微调：挑选预测变化不足（tv 很小）的机组，追加一段 TV+transition+std_floor 微调
+            if unit_predictor is not None and bool(unit_predictor_auto_extra_tv):
+                try:
+                    auto_epochs = max(0, int(unit_predictor_auto_extra_tv_epochs))
+                except Exception:
+                    auto_epochs = 0
+                tv_thr = float(unit_predictor_auto_extra_tv_tv_threshold)
+                tv_w = float(unit_predictor_auto_extra_tv_weight)
+                if auto_epochs > 0:
+                    # 计算每台机组在训练集上的预测 tv（不依赖阈值）
+                    import numpy as _np
+                    import torch as _torch
+
+                    X = _np.array([unit_predictor._extract_features(i) for i in range(unit_predictor.n_samples)])
+                    X_tensor = _torch.tensor(X, dtype=_torch.float32, device=unit_predictor.device)
+                    low_tv_units: list[int] = []
+                    for g in unit_ids:
+                        g_int = int(g)
+                        net = unit_predictor.get_network(g_int)
+                        with _torch.no_grad():
+                            logits = net(X_tensor).detach()
+                            probs = _torch.sigmoid(logits)
+                            tv_val = float(_torch.mean(_torch.abs(probs[:, 1:] - probs[:, :-1])).item())
+                        if tv_val < tv_thr:
+                            low_tv_units.append(g_int)
+                    if low_tv_units:
+                        log(
+                            "[unit_predictor] auto extra TV finetune: "
+                            f"units={low_tv_units}, epochs={auto_epochs}, tv_w={tv_w}, tv_thr={tv_thr}"
+                        )
+                        for g_int in low_tv_units:
+                            unit_predictor.train_unit(
+                                unit_id=g_int,
+                                num_epochs=auto_epochs,
+                                batch_size=unit_predictor_batch_size,
+                                batch_strategy=unit_predictor_batch_strategy,
+                                shuffle=unit_predictor_shuffle,
+                                learning_rate=unit_predictor_lr,
+                                enable_scheduler=False,
+                                scheduler_patience=10,
+                                scheduler_factor=0.5,
+                                scheduler_min_lr=1e-5,
+                                enable_pos_weight=False,
+                                pos_weight_clip=unit_predictor_pos_weight_clip,
+                                loss_weight_bce=0.0,
+                                loss_weight_mse=1.0,
+                                loss_weight_l1=0.0,
+                                loss_weight_tv=tv_w,
+                                loss_weight_transition=unit_predictor_loss_weight_transition,
+                                loss_weight_binarize=unit_predictor_loss_weight_binarize,
+                                loss_weight_std_floor=unit_predictor_loss_weight_std_floor,
+                                std_floor_scale=unit_predictor_std_floor_scale,
+                                loss_weight_tv_floor=max(float(unit_predictor_loss_weight_tv_floor), float(tv_w)),
+                                tv_floor_scale=unit_predictor_tv_floor_scale,
+                            )
 
     # 步骤 2：训练代理约束（支持机组级并行或样本级并行）
     # B1：机组级并行（Level 1）
@@ -1645,6 +1846,31 @@ def main():
     UNIT_PREDICTOR_SHUFFLE_VALUE = UNIT_PREDICTOR_SHUFFLE
     UNIT_PREDICTOR_LR_VALUE = UNIT_PREDICTOR_LR
     UNIT_PREDICTOR_HIDDEN_DIMS_VALUE = UNIT_PREDICTOR_HIDDEN_DIMS
+    UNIT_PREDICTOR_NET_VARIANT_VALUE = UNIT_PREDICTOR_NET_VARIANT
+    UNIT_PREDICTOR_TCN_CHANNELS_VALUE = UNIT_PREDICTOR_TCN_CHANNELS
+    UNIT_PREDICTOR_TCN_DEPTH_VALUE = UNIT_PREDICTOR_TCN_DEPTH
+    UNIT_PREDICTOR_TCONV_CHANNELS_VALUE = UNIT_PREDICTOR_TCONV_CHANNELS
+    UNIT_PREDICTOR_TCONV_DEPTH_VALUE = UNIT_PREDICTOR_TCONV_DEPTH
+    UNIT_PREDICTOR_DROPOUT_VALUE = UNIT_PREDICTOR_DROPOUT
+    UNIT_PREDICTOR_ENABLE_POS_WEIGHT_VALUE = UNIT_PREDICTOR_ENABLE_POS_WEIGHT
+    UNIT_PREDICTOR_POS_WEIGHT_CLIP_VALUE = UNIT_PREDICTOR_POS_WEIGHT_CLIP
+    UNIT_PREDICTOR_LOSS_WEIGHT_BCE_VALUE = UNIT_PREDICTOR_LOSS_WEIGHT_BCE
+    UNIT_PREDICTOR_LOSS_WEIGHT_MSE_VALUE = UNIT_PREDICTOR_LOSS_WEIGHT_MSE
+    UNIT_PREDICTOR_LOSS_WEIGHT_L1_VALUE = UNIT_PREDICTOR_LOSS_WEIGHT_L1
+    UNIT_PREDICTOR_LOSS_WEIGHT_TV_VALUE = UNIT_PREDICTOR_LOSS_WEIGHT_TV
+    UNIT_PREDICTOR_LOSS_WEIGHT_TRANSITION_VALUE = UNIT_PREDICTOR_LOSS_WEIGHT_TRANSITION
+    UNIT_PREDICTOR_LOSS_WEIGHT_BINARIZE_VALUE = UNIT_PREDICTOR_LOSS_WEIGHT_BINARIZE
+    UNIT_PREDICTOR_LOSS_WEIGHT_STD_FLOOR_VALUE = UNIT_PREDICTOR_LOSS_WEIGHT_STD_FLOOR
+    UNIT_PREDICTOR_STD_FLOOR_SCALE_VALUE = UNIT_PREDICTOR_STD_FLOOR_SCALE
+    UNIT_PREDICTOR_LOSS_WEIGHT_TV_FLOOR_VALUE = UNIT_PREDICTOR_LOSS_WEIGHT_TV_FLOOR
+    UNIT_PREDICTOR_TV_FLOOR_SCALE_VALUE = UNIT_PREDICTOR_TV_FLOOR_SCALE
+    UNIT_PREDICTOR_LOAD_PATH_VALUE = UNIT_PREDICTOR_LOAD_PATH
+    UNIT_PREDICTOR_UNIT1_EXTRA_TV_EPOCHS_VALUE = UNIT_PREDICTOR_UNIT1_EXTRA_TV_EPOCHS
+    UNIT_PREDICTOR_UNIT1_EXTRA_TV_WEIGHT_VALUE = UNIT_PREDICTOR_UNIT1_EXTRA_TV_WEIGHT
+    UNIT_PREDICTOR_AUTO_EXTRA_TV_VALUE = UNIT_PREDICTOR_AUTO_EXTRA_TV
+    UNIT_PREDICTOR_AUTO_EXTRA_TV_EPOCHS_VALUE = UNIT_PREDICTOR_AUTO_EXTRA_TV_EPOCHS
+    UNIT_PREDICTOR_AUTO_EXTRA_TV_TV_THRESHOLD_VALUE = UNIT_PREDICTOR_AUTO_EXTRA_TV_TV_THRESHOLD
+    UNIT_PREDICTOR_AUTO_EXTRA_TV_WEIGHT_VALUE = UNIT_PREDICTOR_AUTO_EXTRA_TV_WEIGHT
     UNIT_PREDICTOR_FINETUNE_LR_VALUE = UNIT_PREDICTOR_FINETUNE_LR
     UNIT_PREDICTOR_WEIGHT_DECAY_VALUE = UNIT_PREDICTOR_WEIGHT_DECAY
     BCD_MAX_ITER_VALUE = BCD_MAX_ITER
@@ -1976,6 +2202,31 @@ def main():
                     unit_predictor_shuffle=UNIT_PREDICTOR_SHUFFLE_VALUE,
                     unit_predictor_lr=UNIT_PREDICTOR_LR_VALUE,
                     unit_predictor_hidden_dims=UNIT_PREDICTOR_HIDDEN_DIMS_VALUE,
+                    unit_predictor_net_variant=UNIT_PREDICTOR_NET_VARIANT_VALUE,
+                    unit_predictor_tcn_channels=UNIT_PREDICTOR_TCN_CHANNELS_VALUE,
+                    unit_predictor_tcn_depth=UNIT_PREDICTOR_TCN_DEPTH_VALUE,
+                    unit_predictor_tconv_channels=UNIT_PREDICTOR_TCONV_CHANNELS_VALUE,
+                    unit_predictor_tconv_depth=UNIT_PREDICTOR_TCONV_DEPTH_VALUE,
+                    unit_predictor_dropout=UNIT_PREDICTOR_DROPOUT_VALUE,
+                    unit_predictor_enable_pos_weight=UNIT_PREDICTOR_ENABLE_POS_WEIGHT_VALUE,
+                    unit_predictor_pos_weight_clip=UNIT_PREDICTOR_POS_WEIGHT_CLIP_VALUE,
+                    unit_predictor_loss_weight_bce=UNIT_PREDICTOR_LOSS_WEIGHT_BCE_VALUE,
+                    unit_predictor_loss_weight_mse=UNIT_PREDICTOR_LOSS_WEIGHT_MSE_VALUE,
+                    unit_predictor_loss_weight_l1=UNIT_PREDICTOR_LOSS_WEIGHT_L1_VALUE,
+                    unit_predictor_loss_weight_tv=UNIT_PREDICTOR_LOSS_WEIGHT_TV_VALUE,
+                    unit_predictor_loss_weight_transition=UNIT_PREDICTOR_LOSS_WEIGHT_TRANSITION_VALUE,
+                    unit_predictor_loss_weight_binarize=UNIT_PREDICTOR_LOSS_WEIGHT_BINARIZE_VALUE,
+                    unit_predictor_loss_weight_std_floor=UNIT_PREDICTOR_LOSS_WEIGHT_STD_FLOOR_VALUE,
+                    unit_predictor_std_floor_scale=UNIT_PREDICTOR_STD_FLOOR_SCALE_VALUE,
+                    unit_predictor_loss_weight_tv_floor=UNIT_PREDICTOR_LOSS_WEIGHT_TV_FLOOR_VALUE,
+                    unit_predictor_tv_floor_scale=UNIT_PREDICTOR_TV_FLOOR_SCALE_VALUE,
+                    unit_predictor_load_path=UNIT_PREDICTOR_LOAD_PATH_VALUE,
+                    unit_predictor_unit1_extra_tv_epochs=UNIT_PREDICTOR_UNIT1_EXTRA_TV_EPOCHS_VALUE,
+                    unit_predictor_unit1_extra_tv_weight=UNIT_PREDICTOR_UNIT1_EXTRA_TV_WEIGHT_VALUE,
+                    unit_predictor_auto_extra_tv=UNIT_PREDICTOR_AUTO_EXTRA_TV_VALUE,
+                    unit_predictor_auto_extra_tv_epochs=UNIT_PREDICTOR_AUTO_EXTRA_TV_EPOCHS_VALUE,
+                    unit_predictor_auto_extra_tv_tv_threshold=UNIT_PREDICTOR_AUTO_EXTRA_TV_TV_THRESHOLD_VALUE,
+                    unit_predictor_auto_extra_tv_weight=UNIT_PREDICTOR_AUTO_EXTRA_TV_WEIGHT_VALUE,
                     unit_predictor_finetune_lr=UNIT_PREDICTOR_FINETUNE_LR_VALUE,
                     unit_predictor_weight_decay=UNIT_PREDICTOR_WEIGHT_DECAY_VALUE,
                 )
@@ -2295,6 +2546,31 @@ def main():
                     unit_predictor_shuffle=UNIT_PREDICTOR_SHUFFLE_VALUE,
                     unit_predictor_lr=UNIT_PREDICTOR_LR_VALUE,
                     unit_predictor_hidden_dims=UNIT_PREDICTOR_HIDDEN_DIMS_VALUE,
+                    unit_predictor_net_variant=UNIT_PREDICTOR_NET_VARIANT_VALUE,
+                    unit_predictor_tcn_channels=UNIT_PREDICTOR_TCN_CHANNELS_VALUE,
+                    unit_predictor_tcn_depth=UNIT_PREDICTOR_TCN_DEPTH_VALUE,
+                    unit_predictor_tconv_channels=UNIT_PREDICTOR_TCONV_CHANNELS_VALUE,
+                    unit_predictor_tconv_depth=UNIT_PREDICTOR_TCONV_DEPTH_VALUE,
+                    unit_predictor_dropout=UNIT_PREDICTOR_DROPOUT_VALUE,
+                    unit_predictor_enable_pos_weight=UNIT_PREDICTOR_ENABLE_POS_WEIGHT_VALUE,
+                    unit_predictor_pos_weight_clip=UNIT_PREDICTOR_POS_WEIGHT_CLIP_VALUE,
+                    unit_predictor_loss_weight_bce=UNIT_PREDICTOR_LOSS_WEIGHT_BCE_VALUE,
+                    unit_predictor_loss_weight_mse=UNIT_PREDICTOR_LOSS_WEIGHT_MSE_VALUE,
+                    unit_predictor_loss_weight_l1=UNIT_PREDICTOR_LOSS_WEIGHT_L1_VALUE,
+                    unit_predictor_loss_weight_tv=UNIT_PREDICTOR_LOSS_WEIGHT_TV_VALUE,
+                    unit_predictor_loss_weight_transition=UNIT_PREDICTOR_LOSS_WEIGHT_TRANSITION_VALUE,
+                    unit_predictor_loss_weight_binarize=UNIT_PREDICTOR_LOSS_WEIGHT_BINARIZE_VALUE,
+                    unit_predictor_loss_weight_std_floor=UNIT_PREDICTOR_LOSS_WEIGHT_STD_FLOOR_VALUE,
+                    unit_predictor_std_floor_scale=UNIT_PREDICTOR_STD_FLOOR_SCALE_VALUE,
+                    unit_predictor_loss_weight_tv_floor=UNIT_PREDICTOR_LOSS_WEIGHT_TV_FLOOR_VALUE,
+                    unit_predictor_tv_floor_scale=UNIT_PREDICTOR_TV_FLOOR_SCALE_VALUE,
+                    unit_predictor_load_path=UNIT_PREDICTOR_LOAD_PATH_VALUE,
+                    unit_predictor_unit1_extra_tv_epochs=UNIT_PREDICTOR_UNIT1_EXTRA_TV_EPOCHS_VALUE,
+                    unit_predictor_unit1_extra_tv_weight=UNIT_PREDICTOR_UNIT1_EXTRA_TV_WEIGHT_VALUE,
+                    unit_predictor_auto_extra_tv=UNIT_PREDICTOR_AUTO_EXTRA_TV_VALUE,
+                    unit_predictor_auto_extra_tv_epochs=UNIT_PREDICTOR_AUTO_EXTRA_TV_EPOCHS_VALUE,
+                    unit_predictor_auto_extra_tv_tv_threshold=UNIT_PREDICTOR_AUTO_EXTRA_TV_TV_THRESHOLD_VALUE,
+                    unit_predictor_auto_extra_tv_weight=UNIT_PREDICTOR_AUTO_EXTRA_TV_WEIGHT_VALUE,
                     unit_predictor_finetune_lr=UNIT_PREDICTOR_FINETUNE_LR_VALUE,
                     unit_predictor_weight_decay=UNIT_PREDICTOR_WEIGHT_DECAY_VALUE,
                 )

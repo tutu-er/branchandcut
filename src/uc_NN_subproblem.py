@@ -20,7 +20,10 @@ from typing import Dict, List, Optional, Tuple
 import warnings
 
 import os
-import matplotlib.pyplot as plt
+try:
+    import matplotlib.pyplot as plt
+except Exception:
+    plt = None
 
 
 def _require_gurobi_available(context: str = "Gurobi code path") -> None:
@@ -40,7 +43,20 @@ try:
     TORCH_AVAILABLE = True
 except ImportError:
     TORCH_AVAILABLE = False
+    # 允许在无 torch 环境下 import 本模块（例如仅跑 LP/数据工具脚本）。
+    # 注意：任何依赖 torch 的训练/推理路径在运行时仍会报错。
     print("警告: PyTorch未安装，将无法使用神经网络功能", flush=True)
+    import types
+
+    class _TorchStub:
+        def __getattr__(self, name: str):
+            raise ImportError("PyTorch is required for neural network components")
+
+    torch = _TorchStub()  # type: ignore
+    optim = _TorchStub()  # type: ignore
+    Dataset = object  # type: ignore
+    DataLoader = object  # type: ignore
+    nn = types.SimpleNamespace(Module=object)  # type: ignore
 
 # 导入必要的工具函数
 from pypower.ext2int import ext2int
@@ -1123,6 +1139,307 @@ class SingleUnitBinaryPredictorNet(nn.Module):
         return self.network(x)
 
 
+class _ResidualMLPBlock(nn.Module):
+    def __init__(self, dim: int, dropout: float = 0.1):
+        super().__init__()
+        self.fc1 = nn.Linear(dim, dim)
+        self.norm1 = nn.LayerNorm(dim)
+        self.act = nn.LeakyReLU(0.01)
+        self.drop = nn.Dropout(float(dropout))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        y = self.fc1(x)
+        y = self.norm1(y)
+        y = self.act(y)
+        y = self.drop(y)
+        return x + y
+
+
+class SingleUnitBinaryPredictorResMLPNet(nn.Module):
+    """更稳定的残差 MLP：输入投影→多层残差块→输出 T logits。"""
+
+    def __init__(
+        self,
+        input_dim: int,
+        T: int,
+        width: int = 512,
+        depth: int = 4,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        self.in_proj = nn.Sequential(
+            nn.Linear(int(input_dim), int(width)),
+            nn.LayerNorm(int(width)),
+            nn.LeakyReLU(0.01),
+            nn.Dropout(float(dropout)),
+        )
+        blocks = []
+        for _ in range(max(0, int(depth))):
+            blocks.append(_ResidualMLPBlock(int(width), dropout=float(dropout)))
+        self.blocks = nn.Sequential(*blocks)
+        self.out = nn.Linear(int(width), int(T))
+        self._init_weights()
+
+    def _init_weights(self):
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.kaiming_normal_(module.weight, mode='fan_in', nonlinearity='leaky_relu')
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.in_proj(x)
+        x = self.blocks(x)
+        return self.out(x)
+
+
+class SingleUnitBinaryPredictorTemporalConvNet(nn.Module):
+    """时间卷积结构：把 (load, renewable) 的 (nb, T) 特征还原后沿时间做 1D Conv。
+
+    输入特征假设来自 `scenario_utils.get_feature_vector_from_sample`：
+    - new-format: concat([load.flatten(), renewable.flatten()])
+      其中 load/renewable 形状为 (nb, T)，flatten 为行优先（先 bus 后 time）。
+
+    输出：每个 time slot 一个 logits，形状 (B, T)。
+    """
+
+    def __init__(
+        self,
+        input_dim: int,
+        T: int,
+        channels: int = 64,
+        depth: int = 4,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        self.input_dim = int(input_dim)
+        self.T = int(T)
+        if self.T <= 0 or self.input_dim <= 0 or (self.input_dim % self.T) != 0:
+            raise ValueError(f"TemporalConv expects input_dim % T == 0, got input_dim={input_dim}, T={T}")
+        per_t = self.input_dim // self.T
+        if per_t % 2 != 0:
+            raise ValueError(f"TemporalConv expects per-time features even (2*nb), got per_t={per_t}")
+        self.nb = per_t // 2
+        self.in_channels = per_t
+
+        ch = int(max(4, channels))
+        d = int(max(1, depth))
+        p = float(dropout)
+
+        layers: List[nn.Module] = []
+        layers.append(nn.Conv1d(self.in_channels, ch, kernel_size=3, padding=1))
+        layers.append(nn.LeakyReLU(0.01))
+        layers.append(nn.Dropout(p))
+        for _ in range(d - 1):
+            layers.append(nn.Conv1d(ch, ch, kernel_size=3, padding=1))
+            layers.append(nn.LeakyReLU(0.01))
+            layers.append(nn.Dropout(p))
+        self.body = nn.Sequential(*layers)
+        self.head = nn.Conv1d(ch, 1, kernel_size=1)
+        self._init_weights()
+
+    def _init_weights(self):
+        for module in self.modules():
+            if isinstance(module, nn.Conv1d):
+                nn.init.kaiming_normal_(module.weight, mode='fan_in', nonlinearity='leaky_relu')
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (B, input_dim)
+        B = x.shape[0]
+        nb = self.nb
+        T = self.T
+        # restore load/renewable time-major features: (B, T, 2*nb)
+        load = x[:, : nb * T].reshape(B, nb, T).permute(0, 2, 1)
+        ren = x[:, nb * T : 2 * nb * T].reshape(B, nb, T).permute(0, 2, 1)
+        feat = torch.cat([load, ren], dim=2)  # (B, T, 2*nb)
+        feat = feat.permute(0, 2, 1).contiguous()  # (B, 2*nb, T)
+        y = self.body(feat)
+        y = self.head(y)  # (B,1,T)
+        return y.squeeze(1)  # (B,T)
+
+
+class _TCNResBlock(nn.Module):
+    def __init__(self, channels: int, *, dilation: int, dropout: float = 0.1):
+        super().__init__()
+        ch = int(channels)
+        d = int(max(1, dilation))
+        p = float(dropout)
+        self.conv1 = nn.Conv1d(ch, ch, kernel_size=3, padding=d, dilation=d)
+        self.norm1 = nn.GroupNorm(8 if ch >= 8 else 1, ch)
+        self.act = nn.SiLU()
+        self.drop = nn.Dropout(p)
+        self.conv2 = nn.Conv1d(ch, ch, kernel_size=3, padding=d, dilation=d)
+        self.norm2 = nn.GroupNorm(8 if ch >= 8 else 1, ch)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        y = self.conv1(x)
+        y = self.norm1(y)
+        y = self.act(y)
+        y = self.drop(y)
+        y = self.conv2(y)
+        y = self.norm2(y)
+        y = self.act(y)
+        y = self.drop(y)
+        return x + y
+
+
+class SingleUnitBinaryPredictorTCNNet(nn.Module):
+    """TCN（空洞残差卷积）：沿时间维度建模，更贴近 x_hat 与真值的距离优化。"""
+
+    def __init__(
+        self,
+        input_dim: int,
+        T: int,
+        channels: int = 64,
+        depth: int = 6,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        self.input_dim = int(input_dim)
+        self.T = int(T)
+        if self.T <= 0 or self.input_dim <= 0 or (self.input_dim % self.T) != 0:
+            raise ValueError(f"TCN expects input_dim % T == 0, got input_dim={input_dim}, T={T}")
+        per_t = self.input_dim // self.T
+        if per_t % 2 != 0:
+            raise ValueError(f"TCN expects per-time features even (2*nb), got per_t={per_t}")
+        self.nb = per_t // 2
+        self.in_channels = per_t
+
+        ch = int(max(8, channels))
+        d = int(max(1, depth))
+        p = float(dropout)
+
+        self.in_proj = nn.Sequential(
+            nn.Conv1d(self.in_channels, ch, kernel_size=1),
+            nn.GroupNorm(8 if ch >= 8 else 1, ch),
+            nn.SiLU(),
+        )
+        blocks: List[nn.Module] = []
+        for i in range(d):
+            blocks.append(_TCNResBlock(ch, dilation=2**i, dropout=p))
+        self.blocks = nn.Sequential(*blocks)
+        self.head = nn.Conv1d(ch, 1, kernel_size=1)
+        self._init_weights()
+
+    def _init_weights(self):
+        for module in self.modules():
+            if isinstance(module, nn.Conv1d):
+                nn.init.kaiming_normal_(module.weight, mode='fan_in', nonlinearity='relu')
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B = x.shape[0]
+        nb = self.nb
+        T = self.T
+        load = x[:, : nb * T].reshape(B, nb, T).permute(0, 2, 1)
+        ren = x[:, nb * T : 2 * nb * T].reshape(B, nb, T).permute(0, 2, 1)
+        feat = torch.cat([load, ren], dim=2).permute(0, 2, 1).contiguous()  # (B, 2*nb, T)
+        y = self.in_proj(feat)
+        y = self.blocks(y)
+        y = self.head(y)
+        return y.squeeze(1)
+
+
+class _SharedTCNBackbone(nn.Module):
+    """共享 TCN 骨干：输出 (B, ch, T) 的时序特征。"""
+
+    def __init__(self, *, input_dim: int, T: int, channels: int = 64, depth: int = 6, dropout: float = 0.1):
+        super().__init__()
+        self.input_dim = int(input_dim)
+        self.T = int(T)
+        if self.T <= 0 or self.input_dim <= 0 or (self.input_dim % self.T) != 0:
+            raise ValueError(f"SharedTCN expects input_dim % T == 0, got input_dim={input_dim}, T={T}")
+        per_t = self.input_dim // self.T
+        if per_t % 2 != 0:
+            raise ValueError(f"SharedTCN expects per-time features even (2*nb), got per_t={per_t}")
+        self.nb = per_t // 2
+        self.in_channels = per_t
+
+        ch = int(max(8, channels))
+        d = int(max(1, depth))
+        p = float(dropout)
+
+        self.in_proj = nn.Sequential(
+            nn.Conv1d(self.in_channels, ch, kernel_size=1),
+            nn.GroupNorm(8 if ch >= 8 else 1, ch),
+            nn.SiLU(),
+        )
+        blocks: List[nn.Module] = []
+        for i in range(d):
+            blocks.append(_TCNResBlock(ch, dilation=2**i, dropout=p))
+        self.blocks = nn.Sequential(*blocks)
+        self.out_channels = ch
+
+        for module in self.modules():
+            if isinstance(module, nn.Conv1d):
+                nn.init.kaiming_normal_(module.weight, mode='fan_in', nonlinearity='relu')
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B = x.shape[0]
+        nb = self.nb
+        T = self.T
+        load = x[:, : nb * T].reshape(B, nb, T).permute(0, 2, 1)
+        ren = x[:, nb * T : 2 * nb * T].reshape(B, nb, T).permute(0, 2, 1)
+        feat = torch.cat([load, ren], dim=2).permute(0, 2, 1).contiguous()  # (B, 2*nb, T)
+        y = self.in_proj(feat)
+        y = self.blocks(y)
+        return y  # (B, ch, T)
+
+
+class SharedTCNFiLMNet(nn.Module):
+    """方案 B（正确训练形态）：共享 backbone + unit embedding FiLM + per-unit head，输出 (B, ng, T)。"""
+
+    def __init__(self, *, input_dim: int, T: int, ng: int, channels: int = 64, depth: int = 6, dropout: float = 0.1):
+        super().__init__()
+        self.ng = int(ng)
+        self.backbone = _SharedTCNBackbone(input_dim=input_dim, T=T, channels=channels, depth=depth, dropout=dropout)
+        ch = int(getattr(self.backbone, "out_channels", channels))
+        self.ch = ch
+        self.emb_dim = 16
+        self.unit_embedding = nn.Embedding(self.ng, self.emb_dim)
+        nn.init.normal_(self.unit_embedding.weight, mean=0.0, std=0.02)
+        self.film = nn.Linear(self.emb_dim, 2 * ch)
+        # per-unit head: logits_g(t) = sum_c W[g,c] * h_g[c,t] + b[g]
+        self.head_w = nn.Parameter(torch.zeros(self.ng, ch))
+        self.head_b = nn.Parameter(torch.zeros(self.ng))
+        nn.init.kaiming_normal_(self.head_w, mode='fan_in', nonlinearity='relu')
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # h: (B, ch, T)
+        h = self.backbone(x)
+        B, ch, T = h.shape
+        # FiLM params for all units: (ng, 2ch)
+        gb = self.film(self.unit_embedding.weight)
+        gamma, beta = torch.split(gb, ch, dim=1)  # (ng,ch)
+        gamma = gamma.view(1, self.ng, ch, 1)
+        beta = beta.view(1, self.ng, ch, 1)
+        # broadcast h -> (B, ng, ch, T)
+        h4 = h.unsqueeze(1)
+        h_mod = h4 * (1.0 + gamma) + beta
+        w = self.head_w.view(1, self.ng, ch, 1)
+        b = self.head_b.view(1, self.ng, 1)
+        logits = torch.sum(h_mod * w, dim=2) + b  # (B, ng, T)
+        return logits
+
+
+class _SharedTCNFiLMUnitWrapper(nn.Module):
+    """单机组视角包装：从 shared net 输出中取 unit_id 对应的 (B,T)。"""
+
+    def __init__(self, *, unit_id: int, shared: SharedTCNFiLMNet):
+        super().__init__()
+        self.unit_id = int(unit_id)
+        self.shared = shared
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        y = self.shared(x)  # (B, ng, T)
+        return y[:, self.unit_id, :]
+
+
 class SingleUnitBinaryPredictorTrainer:
     """管理 ng 个独立 ``SingleUnitBinaryPredictorNet`` 的批量训练器。
 
@@ -1138,6 +1455,14 @@ class SingleUnitBinaryPredictorTrainer:
         T_delta,
         unit_ids: List[int] | None = None,
         hidden_dims: List[int] | None = None,
+        net_variant: str = "mlp",
+        resmlp_width: int = 512,
+        resmlp_depth: int = 4,
+        tconv_channels: int = 64,
+        tconv_depth: int = 4,
+        tcn_channels: int = 64,
+        tcn_depth: int = 6,
+        dropout: float = 0.1,
         learning_rate: float = 1e-3,
         weight_decay: float = 1e-4,
         batch_strategy: str = 'full-batch',
@@ -1178,6 +1503,14 @@ class SingleUnitBinaryPredictorTrainer:
 
         self.input_dim = len(get_feature_vector_from_sample(dict(first_sample)))
         self.hidden_dims = normalize_nn_hidden_dims(hidden_dims, [256, 128])
+        self.net_variant = str(net_variant or "mlp").strip().lower()
+        self.resmlp_width = max(1, int(resmlp_width))
+        self.resmlp_depth = max(0, int(resmlp_depth))
+        self.tconv_channels = max(4, int(tconv_channels))
+        self.tconv_depth = max(1, int(tconv_depth))
+        self.tcn_channels = max(8, int(tcn_channels))
+        self.tcn_depth = max(1, int(tcn_depth))
+        self.dropout = float(dropout)
         self.learning_rate = max(float(learning_rate), 1e-8)
         self.weight_decay = max(float(weight_decay), 0.0)
         self.batch_strategy = normalize_nn_batch_strategy(batch_strategy)
@@ -1188,18 +1521,30 @@ class SingleUnitBinaryPredictorTrainer:
         else:
             self.unit_ids = [int(g) for g in unit_ids]
 
-        self.networks: Dict[int, SingleUnitBinaryPredictorNet] = {}
+        self.networks: Dict[int, nn.Module] = {}
         self.optimizers: Dict[int, 'optim.Optimizer'] = {}
+        # 共享骨干（方案 B）：仅在 net_variant == "tcn_shared_film" 时启用
+        self.shared_model: SharedTCNFiLMNet | None = None
+        self.shared_optimizer: 'optim.Optimizer' | None = None
         if TORCH_AVAILABLE:
             for g in self.unit_ids:
                 self._ensure_network(g)
+
+        # 共享网络需要单一优化器（避免对同一参数维护多份 Adam 状态）
+        if TORCH_AVAILABLE and self.net_variant == "tcn_shared_film":
+            if self.shared_model is None:
+                raise RuntimeError("shared_model is not initialized for tcn_shared_film")
+            self.shared_optimizer = optim.Adam(
+                self.shared_model.parameters(), lr=self.learning_rate, weight_decay=self.weight_decay
+            )
 
         self.x_true = self._extract_x_labels()
         pos_rate = float(self.x_true.mean()) if self.x_true.size else 0.0
         print(
             f"[UnitPredictor] 训练器就绪: ng={self.ng}, T={self.T}, "
             f"input_dim={self.input_dim}, n_samples={self.n_samples}, "
-            f"unit_ids={self.unit_ids}, hidden_dims={self.hidden_dims}, "
+            f"unit_ids={self.unit_ids}, net={self.net_variant}, "
+            f"hidden_dims={self.hidden_dims}, "
             f"pos_rate={pos_rate:.3f}, device={self.device}",
             flush=True,
         )
@@ -1210,13 +1555,55 @@ class SingleUnitBinaryPredictorTrainer:
         g_int = int(unit_id)
         if g_int in self.networks:
             return
-        net = SingleUnitBinaryPredictorNet(
-            input_dim=self.input_dim, T=self.T, hidden_dims=self.hidden_dims,
-        ).to(self.device)
+        if self.net_variant == "tcn_shared_film":
+            # 共享 backbone + embedding + FiLM
+            if self.shared_model is None:
+                self.shared_model = SharedTCNFiLMNet(
+                    input_dim=self.input_dim,
+                    T=self.T,
+                    ng=self.ng,
+                    channels=self.tcn_channels,
+                    depth=self.tcn_depth,
+                    dropout=self.dropout,
+                ).to(self.device)
+            net = _SharedTCNFiLMUnitWrapper(unit_id=g_int, shared=self.shared_model).to(self.device)
+            self.networks[g_int] = net
+            # optimizer：共享模式下只使用 self.shared_optimizer
+            if g_int not in self.optimizers:
+                self.optimizers[g_int] = None  # type: ignore
+            if g_int not in self.unit_ids:
+                self.unit_ids.append(g_int)
+            return
+        if self.net_variant == "resmlp":
+            net = SingleUnitBinaryPredictorResMLPNet(
+                input_dim=self.input_dim,
+                T=self.T,
+                width=self.resmlp_width,
+                depth=self.resmlp_depth,
+                dropout=self.dropout,
+            ).to(self.device)
+        elif self.net_variant == "tcn":
+            net = SingleUnitBinaryPredictorTCNNet(
+                input_dim=self.input_dim,
+                T=self.T,
+                channels=self.tcn_channels,
+                depth=self.tcn_depth,
+                dropout=self.dropout,
+            ).to(self.device)
+        elif self.net_variant in ("tconv", "temporal_conv", "conv"):
+            net = SingleUnitBinaryPredictorTemporalConvNet(
+                input_dim=self.input_dim,
+                T=self.T,
+                channels=self.tconv_channels,
+                depth=self.tconv_depth,
+                dropout=self.dropout,
+            ).to(self.device)
+        else:
+            net = SingleUnitBinaryPredictorNet(
+                input_dim=self.input_dim, T=self.T, hidden_dims=self.hidden_dims,
+            ).to(self.device)
         self.networks[g_int] = net
-        self.optimizers[g_int] = optim.Adam(
-            net.parameters(), lr=self.learning_rate, weight_decay=self.weight_decay,
-        )
+        self.optimizers[g_int] = optim.Adam(net.parameters(), lr=self.learning_rate, weight_decay=self.weight_decay)
         if g_int not in self.unit_ids:
             self.unit_ids.append(g_int)
 
@@ -1252,6 +1639,22 @@ class SingleUnitBinaryPredictorTrainer:
         batch_strategy: str | None = None,
         shuffle: bool | None = None,
         learning_rate: float | None = None,
+        enable_scheduler: bool = True,
+        scheduler_patience: int = 10,
+        scheduler_factor: float = 0.5,
+        scheduler_min_lr: float = 0.0,
+        enable_pos_weight: bool = False,
+        pos_weight_clip: float = 20.0,
+        loss_weight_bce: float = 1.0,
+        loss_weight_mse: float = 0.0,
+        loss_weight_l1: float = 0.0,
+        loss_weight_tv: float = 0.0,
+        loss_weight_transition: float = 0.0,
+        loss_weight_binarize: float = 0.0,
+        loss_weight_std_floor: float = 0.0,
+        std_floor_scale: float = 0.5,
+        loss_weight_tv_floor: float = 0.0,
+        tv_floor_scale: float = 0.8,
     ) -> float | None:
         if not TORCH_AVAILABLE:
             print("[UnitPredictor] PyTorch 不可用，跳过训练", flush=True)
@@ -1282,12 +1685,33 @@ class SingleUnitBinaryPredictorTrainer:
         )
 
         net = self.networks[g_int]
-        optimizer = optim.Adam(
-            net.parameters(), lr=resolved_lr, weight_decay=self.weight_decay,
-        )
-        self.optimizers[g_int] = optimizer
-        scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=10, factor=0.5)
+        if self.net_variant == "tcn_shared_film":
+            # 警告：共享模型逐机组 train_unit 会导致遗忘；仅用于小规模微调/诊断
+            if self.shared_optimizer is None:
+                raise RuntimeError("shared_optimizer is not initialized for tcn_shared_film")
+            optimizer = self.shared_optimizer
+            for pg in optimizer.param_groups:
+                pg["lr"] = resolved_lr
+        else:
+            optimizer = optim.Adam(net.parameters(), lr=resolved_lr, weight_decay=self.weight_decay)
+            self.optimizers[g_int] = optimizer
+        scheduler = None
+        if enable_scheduler:
+            scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+                optimizer,
+                patience=max(0, int(scheduler_patience)),
+                factor=float(scheduler_factor),
+                min_lr=max(0.0, float(scheduler_min_lr)),
+            )
         criterion = nn.BCEWithLogitsLoss()
+        if enable_pos_weight:
+            # 针对每个 time slot 估计 pos_weight（防止极端不平衡导致梯度被负类淹没）
+            y_mean = np.asarray(Y, dtype=float).mean(axis=0)  # (T,)
+            eps = 1e-6
+            pos_w = (1.0 - y_mean + eps) / (y_mean + eps)
+            pos_w = np.clip(pos_w, 1.0, float(pos_weight_clip))
+            pos_w_tensor = torch.tensor(pos_w, dtype=torch.float32, device=self.device)
+            criterion = nn.BCEWithLogitsLoss(pos_weight=pos_w_tensor)
         net.train()
 
         print_interval = max(1, num_epochs // 10)
@@ -1303,12 +1727,49 @@ class SingleUnitBinaryPredictorTrainer:
             for batch_X, batch_Y in dataloader:
                 optimizer.zero_grad()
                 logits = net(batch_X)
-                loss = criterion(logits, batch_Y)
+                # 主目标：缩小 x_hat 与真值 x 的距离；同时保留 BCE 以稳定概率学习
+                loss = 0.0
+                if float(loss_weight_bce) != 0.0:
+                    loss = loss + float(loss_weight_bce) * criterion(logits, batch_Y)
+                probs = torch.sigmoid(logits)
+                if float(loss_weight_mse) != 0.0:
+                    loss = loss + float(loss_weight_mse) * torch.mean((probs - batch_Y) ** 2)
+                if float(loss_weight_l1) != 0.0:
+                    loss = loss + float(loss_weight_l1) * torch.mean(torch.abs(probs - batch_Y))
+                if float(loss_weight_tv) != 0.0:
+                    # 时间平滑：惩罚相邻时段输出抖动（更贴近启停序列形态）
+                    loss = loss + float(loss_weight_tv) * torch.mean(torch.abs(probs[:, 1:] - probs[:, :-1]))
+                if float(loss_weight_tv_floor) != 0.0:
+                    # 反“均值塌陷”：要求预测的 TV >= scale * 真值 TV（仅在真值 TV>0 时起作用）
+                    eps = 1e-6
+                    dy_true = torch.abs(batch_Y[:, 1:] - batch_Y[:, :-1])
+                    dy_pred = torch.abs(probs[:, 1:] - probs[:, :-1])
+                    tv_true = torch.mean(dy_true, dim=1)  # (B,)
+                    tv_pred = torch.mean(dy_pred, dim=1)  # (B,)
+                    target = float(tv_floor_scale) * tv_true
+                    loss = loss + float(loss_weight_tv_floor) * torch.mean(torch.relu(target - tv_pred + eps))
+                if float(loss_weight_transition) != 0.0:
+                    # 启停变化一致性：让预测的变化幅度 |Δx_hat| 贴近真值 |Δx|
+                    dy_true = torch.abs(batch_Y[:, 1:] - batch_Y[:, :-1])
+                    dy_pred = torch.abs(probs[:, 1:] - probs[:, :-1])
+                    loss = loss + float(loss_weight_transition) * torch.mean(torch.abs(dy_pred - dy_true))
+                if float(loss_weight_binarize) != 0.0:
+                    # 远离“均值输出”：惩罚 p*(1-p)，推动输出更接近 0/1
+                    loss = loss + float(loss_weight_binarize) * torch.mean(probs * (1.0 - probs))
+                if float(loss_weight_std_floor) != 0.0:
+                    # 防“均值塌陷”：要求预测在时间维的标准差 >= scale * 真值标准差
+                    # （真值是 0/1 序列，std 反映启停变化强度；scale<1 允许更保守）
+                    eps = 1e-6
+                    y_std = torch.std(batch_Y, dim=1)  # (B,)
+                    p_std = torch.std(probs, dim=1)    # (B,)
+                    target = float(std_floor_scale) * y_std
+                    loss = loss + float(loss_weight_std_floor) * torch.mean(torch.relu(target - p_std + eps))
                 loss.backward()
                 optimizer.step()
                 epoch_loss += loss.item() * batch_X.size(0)
             epoch_loss /= max(len(dataset), 1)
-            scheduler.step(epoch_loss)
+            if scheduler is not None:
+                scheduler.step(epoch_loss)
             if (epoch + 1) % print_interval == 0 or epoch == 0 or epoch == num_epochs - 1:
                 current_lr = optimizer.param_groups[0]['lr']
                 print(
@@ -1319,6 +1780,144 @@ class SingleUnitBinaryPredictorTrainer:
         net.eval()
         return epoch_loss
 
+    def train_all_shared_joint(
+        self,
+        *,
+        num_epochs: int = 200,
+        batch_size: int | None = None,
+        batch_strategy: str | None = None,
+        shuffle: bool | None = None,
+        learning_rate: float | None = None,
+        enable_scheduler: bool = True,
+        scheduler_patience: int = 10,
+        scheduler_factor: float = 0.5,
+        scheduler_min_lr: float = 0.0,
+        enable_pos_weight: bool = False,
+        pos_weight_clip: float = 20.0,
+        loss_weight_bce: float = 1.0,
+        loss_weight_mse: float = 0.0,
+        loss_weight_l1: float = 0.0,
+        loss_weight_tv: float = 0.0,
+        loss_weight_transition: float = 0.0,
+        loss_weight_binarize: float = 0.0,
+        loss_weight_std_floor: float = 0.0,
+        std_floor_scale: float = 0.5,
+        loss_weight_tv_floor: float = 0.0,
+        tv_floor_scale: float = 0.8,
+        unit_loss_weights: List[float] | None = None,
+    ) -> None:
+        if self.net_variant != "tcn_shared_film":
+            raise RuntimeError("train_all_shared_joint is only for tcn_shared_film")
+        if self.shared_model is None or self.shared_optimizer is None:
+            raise RuntimeError("shared_model/shared_optimizer is not initialized")
+
+        resolved_batch_strategy = normalize_nn_batch_strategy(self.batch_strategy if batch_strategy is None else batch_strategy)
+        resolved_shuffle = self.shuffle if shuffle is None else bool(shuffle)
+        if resolved_batch_strategy == 'full-batch':
+            resolved_batch_size = max(1, self.n_samples)
+        else:
+            base_batch = self.batch_size if batch_size is None else int(batch_size)
+            resolved_batch_size = max(1, base_batch)
+        resolved_lr = self.learning_rate if learning_rate is None else max(float(learning_rate), 1e-8)
+
+        X = np.array([self._extract_features(i) for i in range(self.n_samples)])
+        Y = self.x_true[:, :, :]  # (N, ng, T)
+        X_tensor = torch.tensor(X, dtype=torch.float32, device=self.device)
+        Y_tensor = torch.tensor(Y, dtype=torch.float32, device=self.device)
+        dataset = torch.utils.data.TensorDataset(X_tensor, Y_tensor)
+        dataloader = DataLoader(dataset, batch_size=resolved_batch_size, shuffle=resolved_shuffle and self.n_samples > 1)
+
+        optimizer = self.shared_optimizer
+        for pg in optimizer.param_groups:
+            pg["lr"] = resolved_lr
+        scheduler = None
+        if enable_scheduler:
+            scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+                optimizer,
+                patience=max(0, int(scheduler_patience)),
+                factor=float(scheduler_factor),
+                min_lr=max(0.0, float(scheduler_min_lr)),
+            )
+
+        criterion = nn.BCEWithLogitsLoss()
+        if enable_pos_weight:
+            y_mean = np.asarray(Y, dtype=float).mean(axis=0)  # (ng, T)
+            eps = 1e-6
+            pos_w = (1.0 - y_mean + eps) / (y_mean + eps)
+            pos_w = np.clip(pos_w, 1.0, float(pos_weight_clip))
+            pos_w_tensor = torch.tensor(pos_w, dtype=torch.float32, device=self.device)
+            criterion = nn.BCEWithLogitsLoss(pos_weight=pos_w_tensor)
+
+        self.shared_model.train()
+        w_unit = None
+        if unit_loss_weights is not None:
+            w_np = np.asarray(unit_loss_weights, dtype=float).reshape(-1)
+            if w_np.size != int(self.ng):
+                raise ValueError(f"unit_loss_weights size mismatch: got {w_np.size}, expected {self.ng}")
+            # normalize to mean=1 for stability
+            w_np = w_np / max(float(w_np.mean()), 1e-12)
+            w_unit = torch.tensor(w_np, dtype=torch.float32, device=self.device).view(1, self.ng, 1)
+        print_interval = max(1, int(num_epochs) // 10)
+        for epoch in range(int(num_epochs)):
+            epoch_loss = 0.0
+            for batch_X, batch_Y in dataloader:
+                optimizer.zero_grad()
+                logits = self.shared_model(batch_X)  # (B, ng, T)
+                probs = torch.sigmoid(logits)
+                loss = 0.0
+                if float(loss_weight_bce) != 0.0:
+                    if w_unit is None:
+                        loss = loss + float(loss_weight_bce) * criterion(logits, batch_Y)
+                    else:
+                        bce_el = torch.nn.functional.binary_cross_entropy_with_logits(
+                            logits, batch_Y, reduction="none"
+                        )  # (B,ng,T)
+                        loss = loss + float(loss_weight_bce) * torch.mean(bce_el * w_unit)
+                if float(loss_weight_mse) != 0.0:
+                    mse_el = (probs - batch_Y) ** 2
+                    loss = loss + float(loss_weight_mse) * (torch.mean(mse_el) if w_unit is None else torch.mean(mse_el * w_unit))
+                if float(loss_weight_l1) != 0.0:
+                    l1_el = torch.abs(probs - batch_Y)
+                    loss = loss + float(loss_weight_l1) * (torch.mean(l1_el) if w_unit is None else torch.mean(l1_el * w_unit))
+                if float(loss_weight_tv) != 0.0:
+                    tv_el = torch.abs(probs[:, :, 1:] - probs[:, :, :-1])  # (B,ng,T-1)
+                    loss = loss + float(loss_weight_tv) * (torch.mean(tv_el) if w_unit is None else torch.mean(tv_el * w_unit))
+                if float(loss_weight_tv_floor) != 0.0:
+                    eps = 1e-6
+                    dy_true = torch.abs(batch_Y[:, :, 1:] - batch_Y[:, :, :-1])
+                    dy_pred = torch.abs(probs[:, :, 1:] - probs[:, :, :-1])
+                    tv_true = torch.mean(dy_true, dim=2)  # (B,ng)
+                    tv_pred = torch.mean(dy_pred, dim=2)  # (B,ng)
+                    target = float(tv_floor_scale) * tv_true
+                    floor_el = torch.relu(target - tv_pred + eps).unsqueeze(-1)  # (B,ng,1)
+                    loss = loss + float(loss_weight_tv_floor) * (torch.mean(floor_el) if w_unit is None else torch.mean(floor_el * w_unit))
+                if float(loss_weight_transition) != 0.0:
+                    dy_true = torch.abs(batch_Y[:, :, 1:] - batch_Y[:, :, :-1])
+                    dy_pred = torch.abs(probs[:, :, 1:] - probs[:, :, :-1])
+                    tr_el = torch.abs(dy_pred - dy_true)  # (B,ng,T-1)
+                    loss = loss + float(loss_weight_transition) * (torch.mean(tr_el) if w_unit is None else torch.mean(tr_el * w_unit))
+                if float(loss_weight_binarize) != 0.0:
+                    bin_el = probs * (1.0 - probs)
+                    loss = loss + float(loss_weight_binarize) * (torch.mean(bin_el) if w_unit is None else torch.mean(bin_el * w_unit))
+                if float(loss_weight_std_floor) != 0.0:
+                    eps = 1e-6
+                    y_std = torch.std(batch_Y, dim=2)  # (B,ng)
+                    p_std = torch.std(probs, dim=2)    # (B,ng)
+                    target = float(std_floor_scale) * y_std
+                    std_el = torch.relu(target - p_std + eps).unsqueeze(-1)  # (B,ng,1)
+                    loss = loss + float(loss_weight_std_floor) * (torch.mean(std_el) if w_unit is None else torch.mean(std_el * w_unit))
+
+                loss.backward()
+                optimizer.step()
+                epoch_loss += float(loss.item()) * batch_X.size(0)
+            epoch_loss /= max(len(dataset), 1)
+            if scheduler is not None:
+                scheduler.step(epoch_loss)
+            if (epoch + 1) % print_interval == 0 or epoch == 0 or epoch == int(num_epochs) - 1:
+                current_lr = optimizer.param_groups[0]['lr']
+                print(f"  [UnitPredictor-shared] Epoch {epoch+1}/{num_epochs}, Loss: {epoch_loss:.6f}, LR: {current_lr:.1e}", flush=True)
+        self.shared_model.eval()
+
     def train_all(
         self,
         num_epochs: int = 100,
@@ -1326,7 +1925,50 @@ class SingleUnitBinaryPredictorTrainer:
         batch_strategy: str | None = None,
         shuffle: bool | None = None,
         learning_rate: float | None = None,
+        enable_scheduler: bool = True,
+        scheduler_patience: int = 10,
+        scheduler_factor: float = 0.5,
+        scheduler_min_lr: float = 0.0,
+        enable_pos_weight: bool = False,
+        pos_weight_clip: float = 20.0,
+        loss_weight_bce: float = 1.0,
+        loss_weight_mse: float = 0.0,
+        loss_weight_l1: float = 0.0,
+        loss_weight_tv: float = 0.0,
+        loss_weight_transition: float = 0.0,
+        loss_weight_binarize: float = 0.0,
+        loss_weight_std_floor: float = 0.0,
+        std_floor_scale: float = 0.5,
+        loss_weight_tv_floor: float = 0.0,
+        tv_floor_scale: float = 0.8,
+        unit_loss_weights: List[float] | None = None,
     ) -> None:
+        if self.net_variant == "tcn_shared_film":
+            self.train_all_shared_joint(
+                num_epochs=num_epochs,
+                batch_size=batch_size,
+                batch_strategy=batch_strategy,
+                shuffle=shuffle,
+                learning_rate=learning_rate,
+                enable_scheduler=enable_scheduler,
+                scheduler_patience=scheduler_patience,
+                scheduler_factor=scheduler_factor,
+                scheduler_min_lr=scheduler_min_lr,
+                enable_pos_weight=enable_pos_weight,
+                pos_weight_clip=pos_weight_clip,
+                loss_weight_bce=loss_weight_bce,
+                loss_weight_mse=loss_weight_mse,
+                loss_weight_l1=loss_weight_l1,
+                loss_weight_tv=loss_weight_tv,
+                loss_weight_transition=loss_weight_transition,
+                loss_weight_binarize=loss_weight_binarize,
+                loss_weight_std_floor=loss_weight_std_floor,
+                std_floor_scale=std_floor_scale,
+                loss_weight_tv_floor=loss_weight_tv_floor,
+                tv_floor_scale=tv_floor_scale,
+                unit_loss_weights=unit_loss_weights,
+            )
+            return
         for g in self.unit_ids:
             self.train_unit(
                 unit_id=g,
@@ -1335,6 +1977,22 @@ class SingleUnitBinaryPredictorTrainer:
                 batch_strategy=batch_strategy,
                 shuffle=shuffle,
                 learning_rate=learning_rate,
+                enable_scheduler=enable_scheduler,
+                scheduler_patience=scheduler_patience,
+                scheduler_factor=scheduler_factor,
+                scheduler_min_lr=scheduler_min_lr,
+                enable_pos_weight=enable_pos_weight,
+                pos_weight_clip=pos_weight_clip,
+                loss_weight_bce=loss_weight_bce,
+                loss_weight_mse=loss_weight_mse,
+                loss_weight_l1=loss_weight_l1,
+                loss_weight_tv=loss_weight_tv,
+                loss_weight_transition=loss_weight_transition,
+                loss_weight_binarize=loss_weight_binarize,
+                loss_weight_std_floor=loss_weight_std_floor,
+                std_floor_scale=std_floor_scale,
+                loss_weight_tv_floor=loss_weight_tv_floor,
+                tv_floor_scale=tv_floor_scale,
             )
 
     def forward_logits(self, unit_id: int, features_tensor: torch.Tensor) -> torch.Tensor:
@@ -1342,7 +2000,7 @@ class SingleUnitBinaryPredictorTrainer:
         self._ensure_network(unit_id)
         return self.networks[int(unit_id)](features_tensor)
 
-    def get_network(self, unit_id: int) -> SingleUnitBinaryPredictorNet:
+    def get_network(self, unit_id: int) -> nn.Module:
         self._ensure_network(unit_id)
         return self.networks[int(unit_id)]
 
@@ -1381,9 +2039,15 @@ class SingleUnitBinaryPredictorTrainer:
                 'hidden_dims': list(self.hidden_dims),
                 'unit_ids': list(self.unit_ids),
                 'learning_rate': self.learning_rate,
+                'net_variant': self.net_variant,
             },
-            'state_dicts': {int(g): self.networks[g].state_dict() for g in self.networks},
         }
+        if self.net_variant == "tcn_shared_film":
+            payload['shared'] = {
+                'shared_model': None if self.shared_model is None else self.shared_model.state_dict(),
+            }
+        else:
+            payload['state_dicts'] = {int(g): self.networks[g].state_dict() for g in self.networks}
         torch.save(payload, filepath)
         print(f"✓ 单机组 0/1 预测器已保存: {filepath}", flush=True)
 
@@ -1391,7 +2055,25 @@ class SingleUnitBinaryPredictorTrainer:
         if not TORCH_AVAILABLE:
             return
         state = torch.load(filepath, map_location=self.device)
-        state_dicts = state.get('state_dicts', {})
+        meta = state.get('metadata', {}) or {}
+        loaded_variant = str(meta.get('net_variant', self.net_variant) or self.net_variant).strip().lower()
+        # 允许从 checkpoint 恢复共享网络（仅当当前也配置为共享网络）
+        if loaded_variant == "tcn_shared_film" and self.net_variant == "tcn_shared_film":
+            shared = state.get('shared', {}) or {}
+            # 确保 shared 组件存在
+            for g in (meta.get('unit_ids') or self.unit_ids):
+                self._ensure_network(int(g))
+            if self.shared_model is None:
+                raise RuntimeError("shared_model is not initialized for tcn_shared_film")
+            if shared.get('shared_model') is not None:
+                self.shared_model.load_state_dict(shared.get('shared_model'))
+            self.shared_optimizer = optim.Adam(
+                self.shared_model.parameters(), lr=self.learning_rate, weight_decay=self.weight_decay
+            )
+            print(f"✓ 单机组 0/1 预测器已加载(共享骨干): {filepath}", flush=True)
+            return
+
+        state_dicts = state.get('state_dicts', {}) or {}
         for g, sd in state_dicts.items():
             g_int = int(g)
             if g_int not in self.unit_ids:
@@ -6004,8 +6686,32 @@ def train_unit_predictor_from_data(
     learning_rate: float = 1e-3,
     weight_decay: float = 1e-4,
     hidden_dims: List[int] | None = None,
+    net_variant: str = "mlp",
+    resmlp_width: int = 512,
+    resmlp_depth: int = 4,
+    tconv_channels: int = 64,
+    tconv_depth: int = 4,
+    tcn_channels: int = 64,
+    tcn_depth: int = 6,
+    dropout: float = 0.1,
     save_path: str | None = None,
     load_path: str | None = None,
+    enable_scheduler: bool = True,
+    scheduler_patience: int = 10,
+    scheduler_factor: float = 0.5,
+    scheduler_min_lr: float = 0.0,
+    enable_pos_weight: bool = False,
+    pos_weight_clip: float = 20.0,
+    loss_weight_bce: float = 1.0,
+    loss_weight_mse: float = 0.0,
+    loss_weight_l1: float = 0.0,
+    loss_weight_tv: float = 0.0,
+    loss_weight_transition: float = 0.0,
+    loss_weight_binarize: float = 0.0,
+    loss_weight_std_floor: float = 0.0,
+    std_floor_scale: float = 0.5,
+    loss_weight_tv_floor: float = 0.0,
+    tv_floor_scale: float = 0.8,
     device=None,
 ) -> SingleUnitBinaryPredictorTrainer:
     """构造并预训练每机组独立的 0/1 变量预测器。
@@ -6024,6 +6730,14 @@ def train_unit_predictor_from_data(
         T_delta,
         unit_ids=unit_ids,
         hidden_dims=hidden_dims,
+        net_variant=net_variant,
+        resmlp_width=resmlp_width,
+        resmlp_depth=resmlp_depth,
+        tconv_channels=tconv_channels,
+        tconv_depth=tconv_depth,
+        tcn_channels=tcn_channels,
+        tcn_depth=tcn_depth,
+        dropout=dropout,
         learning_rate=learning_rate,
         weight_decay=weight_decay,
         batch_strategy=batch_strategy,
@@ -6041,6 +6755,22 @@ def train_unit_predictor_from_data(
         batch_strategy=batch_strategy,
         shuffle=shuffle,
         learning_rate=learning_rate,
+        enable_scheduler=enable_scheduler,
+        scheduler_patience=scheduler_patience,
+        scheduler_factor=scheduler_factor,
+        scheduler_min_lr=scheduler_min_lr,
+        enable_pos_weight=enable_pos_weight,
+        pos_weight_clip=pos_weight_clip,
+        loss_weight_bce=loss_weight_bce,
+        loss_weight_mse=loss_weight_mse,
+        loss_weight_l1=loss_weight_l1,
+        loss_weight_tv=loss_weight_tv,
+        loss_weight_transition=loss_weight_transition,
+        loss_weight_binarize=loss_weight_binarize,
+        loss_weight_std_floor=loss_weight_std_floor,
+        std_floor_scale=std_floor_scale,
+        loss_weight_tv_floor=loss_weight_tv_floor,
+        tv_floor_scale=tv_floor_scale,
     )
 
     if save_path:

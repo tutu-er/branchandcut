@@ -25,7 +25,7 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument(
         "--max-samples",
         type=int,
-        default=48,
+        default=12,
         metavar="N",
         help="截取前 N 个样本（传给 run_training.MAX_SAMPLES），默认 48",
     )
