@@ -69,6 +69,7 @@ try:
         LP_BACKEND_GUROBI,
         assert_lp_backend_available,
         normalize_lp_backend,
+        _recover_unit_x_from_sample,
         solve_dual_block as solve_dual_block_backend,
         solve_ed_electricity_price,
         solve_init_lp as solve_init_lp_backend,
@@ -80,6 +81,7 @@ except ImportError:
         LP_BACKEND_GUROBI,
         assert_lp_backend_available,
         normalize_lp_backend,
+        _recover_unit_x_from_sample,
         solve_dual_block as solve_dual_block_backend,
         solve_ed_electricity_price,
         solve_init_lp as solve_init_lp_backend,
@@ -522,7 +524,15 @@ def _has_global_dual_payload(lambda_field, T: int, nl: int) -> bool:
 
 
 def _recover_unit_commitment_matrix(sample: Dict, ng: int, T: int) -> np.ndarray:
-    x_sol = np.zeros((ng, T), dtype=float)
+    """全矩阵恢复：与 ``_recover_unit_x_from_sample`` 一致，先 UCM 再 active_set 覆盖。"""
+    if 'unit_commitment_matrix' in sample:
+        uc = np.asarray(sample['unit_commitment_matrix'], dtype=float)
+        rows = min(uc.shape[0], ng)
+        cols = min(uc.shape[1], T)
+        x_sol = np.zeros((ng, T), dtype=float)
+        x_sol[:rows, :cols] = uc[:rows, :cols]
+    else:
+        x_sol = np.zeros((ng, T), dtype=float)
     if 'active_set' in sample:
         active_set = sample['active_set']
         for item in active_set:
@@ -531,12 +541,6 @@ def _recover_unit_commitment_matrix(sample: Dict, ng: int, T: int) -> np.ndarray
                 value = item[1]
                 if 0 <= g < ng and 0 <= t < T:
                     x_sol[g, t] = value
-        return x_sol
-    if 'unit_commitment_matrix' in sample:
-        uc = np.asarray(sample['unit_commitment_matrix'], dtype=float)
-        rows = min(uc.shape[0], ng)
-        cols = min(uc.shape[1], T)
-        x_sol[:rows, :cols] = uc[:rows, :cols]
     return x_sol
 
 
@@ -2246,7 +2250,7 @@ class SubproblemSurrogateNet(nn.Module):
             nn.Linear(head_hidden, head_mid), nn.LayerNorm(head_mid), nn.LeakyReLU(0.01),
             nn.Linear(head_mid, self.T)
         )
-        # pg 调整项头：输出 T 个值，后续经 tanh 缩放到边际成本量级
+        # pg 调整项头：输出 T 个无界标量；幅度由训练器侧 softbound（对 |c_pg| 超出 pg_cost_scale 的平滑惩罚）约束
         self.pg_cost_net = nn.Sequential(
             nn.Linear(pg_feat_dim, pg_head_hidden), nn.LayerNorm(pg_head_hidden), nn.LeakyReLU(0.01),
             nn.Linear(pg_head_hidden, pg_head_mid), nn.LayerNorm(pg_head_mid), nn.LeakyReLU(0.01),
@@ -2297,10 +2301,9 @@ class SubproblemSurrogateNet(nn.Module):
         return alphas, betas, gammas, deltas, costs
 
     def forward_pg_cost(self, x):
-        """c_pg 单独前向传播。"""
+        """c_pg 单独前向：线性头直接输出 T 维修正量（不再经 tanh 硬饱和）。"""
         features = self.encode_pg_features(x)
-        pg_costs = torch.tanh(self.pg_cost_net(features)) * self.pg_cost_scale
-        return pg_costs
+        return self.pg_cost_net(features)
 
     def forward(self, x):
         """
@@ -2600,6 +2603,7 @@ class SubproblemSurrogateTrainer:
                  nn_shuffle: bool = True,
                  pg_cost_nn_epochs: int | None = None,
                  pg_cost_reg_deadband: float = 0.5,
+                 pg_cost_softbound_weight: float = 1.0,
                  nn_smooth_abs_eps: float = 1e-6,
                  pg_cost_smooth_abs_eps: float = 1e-6,
                  pg_cost_batch_strategy: str | None = None,
@@ -2623,6 +2627,8 @@ class SubproblemSurrogateTrainer:
                  use_unit_predictor: bool = False,
                  unit_predictor_finetune_lr: float = 1e-5,
                  unit_predictor_weight_decay: float = 1e-4,
+                 pg_cost_single_sample_reg_scale: float | None = None,
+                 pg_cost_c_pg_adam_weight_decay: float | None = None,
                  device=None):
         """
         初始化单机组子问题代理约束训练器 - V3三时段版本
@@ -2668,6 +2674,7 @@ class SubproblemSurrogateTrainer:
         self.coeff_reg_deadband = 0.35
         self.aux_cost_reg_deadband = 0.5
         self.pg_cost_reg_deadband = max(float(pg_cost_reg_deadband), 0.0)
+        self.pg_cost_softbound_weight = max(float(pg_cost_softbound_weight), 0.0)
         self.nn_smooth_abs_eps = max(float(nn_smooth_abs_eps), 0.0)
         self.pg_cost_smooth_abs_eps = max(float(pg_cost_smooth_abs_eps), 0.0)
         self.pg_cost_batch_strategy = (
@@ -2795,6 +2802,16 @@ class SubproblemSurrogateTrainer:
         self.unit_predictor_weight_decay = max(float(unit_predictor_weight_decay), 0.0)
         self._unit_predictor_optimizer = None  # 在 iter_with_surrogate_nn 中按需构造
         self._unit_predictor_scheduler = None
+
+        # 单样本时 c_pg 正则与驻点项冲突更明显：默认可压 reg、并去掉 c_pg Adam 的 weight decay，便于将 obj_dual_pg 压到 0 附近
+        if pg_cost_single_sample_reg_scale is not None:
+            self._c_pg_reg_loss_scale = max(float(pg_cost_single_sample_reg_scale), 0.0)
+        else:
+            self._c_pg_reg_loss_scale = 0.1 if self.n_samples == 1 else 1.0
+        if pg_cost_c_pg_adam_weight_decay is not None:
+            self.pg_cost_c_pg_adam_weight_decay = max(float(pg_cost_c_pg_adam_weight_decay), 0.0)
+        else:
+            self.pg_cost_c_pg_adam_weight_decay = 0.0 if self.n_samples == 1 else 1e-4
         
         # 初始化原始变量和对偶变量存储
         self.pg = np.zeros((self.n_samples, self.T))
@@ -2987,6 +3004,9 @@ class SubproblemSurrogateTrainer:
             f"main_nn_lr={self.nn_learning_rate:.2e}, x_cost_nn_lr={self.cost_learning_rate:.2e}, "
             f"c_pg_lr={self.pg_cost_lr:.2e}, c_pg_surr_lr={self.pg_cost_surr_lr:.2e}, "
             f"c_pg_epochs={self.pg_cost_nn_epochs}, c_pg_deadband={self.pg_cost_reg_deadband:.4f}, "
+            f"c_pg_softbound_w={self.pg_cost_softbound_weight:.4g}, "
+            f"c_pg_reg_scale={self._c_pg_reg_loss_scale:.3g} (L2/iter/soft reg), "
+            f"c_pg_wd={self.pg_cost_c_pg_adam_weight_decay:.1e}, "
             f"nn_smooth_eps={self.nn_smooth_abs_eps:.1e}, "
             f"c_pg_smooth_eps={self.pg_cost_smooth_abs_eps:.1e}",
             flush=True,
@@ -3042,6 +3062,38 @@ class SubproblemSurrogateTrainer:
             start = min(head, end)
             return (start, end)
         return (0, 0)
+
+    def _single_time_coupling_slice(self) -> tuple[int, int]:
+        """single-time 尾段在 μ 向量中的 [start, end)；仅由 constraint_generation_strategy 决定（不依赖 predictor）。"""
+        nc = int(self.num_coupling_constraints)
+        if self.constraint_generation_strategy == CONSTRAINT_STRATEGY_ALL_SINGLE_TIME:
+            end = min(self.T, nc)
+            return (0, end)
+        if self.constraint_generation_strategy == CONSTRAINT_STRATEGY_ALL_TEMPLATES_SIGN4_PLUS_SINGLE:
+            head = self.all_mode_group_size * max(self.T - 2, 0)
+            end = min(head + self.T, nc)
+            start = min(head, end)
+            return (start, end)
+        return (0, 0)
+
+    def _apply_mu2_coupling_dual_init(
+        self, sample_id: int, mu2_per_t: np.ndarray | None
+    ) -> None:
+        """将按时段的真值边界 LP 对偶写入 μ₂ 段；μ₁ 不动。mu2_per_t 长度应为 T。"""
+        if mu2_per_t is None:
+            return
+        st, en = self._single_time_coupling_slice()
+        if st >= en:
+            return
+        vec = np.asarray(mu2_per_t, dtype=float).reshape(-1)
+        width = en - st
+        if vec.size == 0:
+            return
+        take = min(width, vec.size)
+        seg = np.abs(vec[:take])
+        out = np.full(width, float(self.mu_lower_bound), dtype=float)
+        out[:take] = np.maximum(seg, float(self.mu_lower_bound))
+        self.mu[sample_id, st:en] = out
 
     def _unit_predictor_parameters(self) -> list:
         if not self._unit_predictor_active():
@@ -3766,9 +3818,8 @@ class SubproblemSurrogateTrainer:
                         f"（已用 {time.perf_counter() - t_init:.1f}s）",
                         flush=True,
                     )
+                # init LP 非最优时 solve_init_lp 直接 raise；不在此用假对偶继续 BCD。
                 result = solve_init_lp_backend(self, sample_id)
-                if result is None:
-                    continue
                 x_lp = result['x_sol']
                 self.pg[sample_id] = result['pg_sol']
                 self.x[sample_id] = x_lp
@@ -3786,6 +3837,9 @@ class SubproblemSurrogateTrainer:
                 self.coc[sample_id] = result['coc_sol']
                 self.cpower[sample_id] = result['cpower_sol']
                 self.lambda_inherent[sample_id] = result['lambda_inherent']
+                self._apply_mu2_coupling_dual_init(
+                    sample_id, result.get("mu2_coupling_dual")
+                )
             print(
                 f"  [Unit-{self.unit_id}] 初始化求解完成（{self.n_samples} 个样本，"
                 f"共 {time.perf_counter() - t_init:.1f}s）",
@@ -3808,23 +3862,17 @@ class SubproblemSurrogateTrainer:
                 )
             lambda_val = self.lambda_vals[sample_id]
 
-            # 恢复x：优先用 active_set，否则用 unit_commitment_matrix
-            x_init = np.zeros(self.T)
-            _x_source = 'none'
-            if 'active_set' in self.active_set_data[sample_id]:
-                active_set = self.active_set_data[sample_id]['active_set']
-                for item in active_set:
-                    if isinstance(item, list) and len(item) == 2 and isinstance(item[0], list):
-                        g_idx, t = item[0]
-                        value = item[1]
-                        if g_idx == g:
-                            x_init[t] = value
+            # 与 solve_init_lp / _recover_unit_x_from_sample 一致：先 UCM 行，再 active_set 覆盖
+            x_init = _recover_unit_x_from_sample(self, sample_id)
+            s0 = self.active_set_data[sample_id]
+            if 'unit_commitment_matrix' in s0 and 'active_set' in s0:
+                _x_source = 'ucm+active_set'
+            elif 'unit_commitment_matrix' in s0:
+                _x_source = 'unit_commitment_matrix'
+            elif 'active_set' in s0:
                 _x_source = 'active_set'
-            elif 'unit_commitment_matrix' in self.active_set_data[sample_id]:
-                uc = self.active_set_data[sample_id]['unit_commitment_matrix']
-                if isinstance(uc, np.ndarray) and uc.ndim == 2 and g < uc.shape[0]:
-                    x_init = uc[g].astype(float)
-                    _x_source = 'unit_commitment_matrix'
+            else:
+                _x_source = 'none'
 
             if np.all(x_init == 0) and _x_source != 'none':
                 print(f"  ⚠ 样本 {sample_id} 机组 {g}: x_init 全零（来源={_x_source}），"
@@ -3878,6 +3926,13 @@ class SubproblemSurrogateTrainer:
             for t in range(self.T):
                 model.addConstr(cpower[t] == a * pg[t] + b * x[t], name=f'cpower_{t}')
 
+            # 真值边界（μ₂ 初值影子价格）；x_init 与 active_set / unit_commitment_matrix 一致
+            for t in range(self.T):
+                if float(x_init[t]) >= 0.5:
+                    model.addConstr(x[t] >= 1.0, name=f'mu2_xfix_ge_{t}')
+                else:
+                    model.addConstr(x[t] <= 0.0, name=f'mu2_xfix_le_{t}')
+
             # 目标: min cost - λᵀpg（用于提取有意义的对偶变量）
             obj = (gp.quicksum(cpower[t] for t in range(self.T)) +
                    gp.quicksum(coc[t]    for t in range(self.T-1)) -
@@ -3930,6 +3985,17 @@ class SubproblemSurrogateTrainer:
                     'lambda_x_upper':    np.zeros(self.T),
                     'lambda_x_lower':    np.zeros(self.T),
                 }
+                mu2_per_t = np.zeros(self.T, dtype=float)
+                for t in range(self.T):
+                    if float(x_init[t]) >= 0.5:
+                        mu2_per_t[t] = _get_pi(model, f'mu2_xfix_ge_{t}')
+                    else:
+                        mu2_per_t[t] = _get_pi(model, f'mu2_xfix_le_{t}')
+                self._apply_mu2_coupling_dual_init(sample_id, mu2_per_t)
+            else:
+                raise RuntimeError(
+                    f"init LP（Gurobi）未最优: unit_id={g}, sample_id={sample_id}, status={model.status}"
+                )
 
             try:
                 model.dispose()
@@ -5310,6 +5376,18 @@ class SubproblemSurrogateTrainer:
                 prev_pg_costs,
                 self.iter_delta_reg_deadband,
             )
+        if self.pg_cost_softbound_weight > 0 and self.pg_cost_scale > 0:
+            s = torch.as_tensor(
+                float(self.pg_cost_scale),
+                dtype=pg_costs_tensor.dtype,
+                device=pg_costs_tensor.device,
+            )
+            excess = self._smooth_relu(
+                torch.abs(pg_costs_tensor) - s,
+                eps=self.pg_cost_smooth_abs_eps,
+            )
+            reg_loss = reg_loss + self.pg_cost_softbound_weight * torch.sum(excess * excess)
+        reg_loss = reg_loss * self._c_pg_reg_loss_scale
         dual_pg_term = self.loss_ratio_dual_pg * self.rho_dual_pg * obj_dual_pg
         reg_term = self.loss_ratio_reg * reg_loss
         loss = dual_pg_term + reg_term
@@ -5571,10 +5649,15 @@ class SubproblemSurrogateTrainer:
             self._surr_pg_cost_optimizer = optim.Adam(
                 self._pg_network_parameters(),
                 lr=resolved_learning_rate,
-                weight_decay=1e-4,
+                weight_decay=self.pg_cost_c_pg_adam_weight_decay,
             )
-            self._surr_pg_cost_scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
-                self._surr_pg_cost_optimizer, T_0=max(num_epochs, 1), T_mult=1)
+            # 单样本时余弦退火会无谓扰动学习率，固定 lr 更利于把驻点残差压到 0
+            if self.n_samples > 1:
+                self._surr_pg_cost_scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
+                    self._surr_pg_cost_optimizer, T_0=max(num_epochs, 1), T_mult=1,
+                )
+            else:
+                self._surr_pg_cost_scheduler = None
 
         self.surrogate_net.train()
         self._set_c_pg_training_mode(True)
@@ -5627,7 +5710,8 @@ class SubproblemSurrogateTrainer:
                         self._surr_pg_cost_optimizer.zero_grad()
                         batch_count = 0
 
-                self._surr_pg_cost_scheduler.step()
+                if self._surr_pg_cost_scheduler is not None:
+                    self._surr_pg_cost_scheduler.step()
 
                 if epoch == 0 or epoch == num_epochs - 1:
                     print(
@@ -6374,6 +6458,7 @@ class SubproblemSurrogateTrainer:
                 'nn_batch_size': self.nn_batch_size,
                 'nn_shuffle': self.nn_shuffle,
                 'pg_cost_reg_deadband': self.pg_cost_reg_deadband,
+                'pg_cost_softbound_weight': self.pg_cost_softbound_weight,
                 'nn_smooth_abs_eps': self.nn_smooth_abs_eps,
                 'pg_cost_smooth_abs_eps': self.pg_cost_smooth_abs_eps,
                 'loss_ratio_primal': self.loss_ratio_primal,
@@ -6397,7 +6482,124 @@ class SubproblemSurrogateTrainer:
             
             torch.save(state, filepath)
             print(f"✓ V3三时段耦合代理约束模型已保存: {filepath}", flush=True)
-    
+
+    def collect_c_pg_loss_snapshot(self) -> dict:
+        """收集当前 trainer 状态下 c_pg 可微损失相关的原始量（便于落盘与离线复现/针对性测试）。
+
+        在多样本训练任意 BCD 轮次、刚更新完对偶/缓存后调用，可得到与
+        ``loss_function_c_pg_differentiable`` 一致分解的 per-sample 数据
+        （含 ``pg_const``、当前 ``forward_pg_cost`` 与 loss 各项）。
+
+        Returns:
+            可 JSON 序列化的 dict（``schema_version``=1），键 ``samples`` 为每样本一条记录。
+        """
+        if not TORCH_AVAILABLE:
+            raise RuntimeError("collect_c_pg_loss_snapshot requires PyTorch")
+        g = self.unit_id
+        a_val = float(self.gencost[g, -2] / self.T_delta)
+        prev_list = None
+        if self._prev_pg_cost_values is not None:
+            prev_list = np.asarray(self._prev_pg_cost_values, dtype=float).tolist()
+
+        out: dict = {
+            "schema_version": 1,
+            "unit_id": int(g),
+            "T": int(self.T),
+            "n_samples": int(self.n_samples),
+            "iter_number": int(self.iter_number),
+            "a_linear_per_step": a_val,
+            "pg_cost_scale": float(self.pg_cost_scale),
+            "rho_dual_pg": float(self.rho_dual_pg),
+            "loss_ratio_dual_pg": float(self.loss_ratio_dual_pg),
+            "loss_ratio_reg": float(self.loss_ratio_reg),
+            "_c_pg_reg_loss_scale": float(self._c_pg_reg_loss_scale),
+            "reg_weight": float(self.reg_weight),
+            "pg_cost_reg_deadband": float(self.pg_cost_reg_deadband),
+            "iter_delta_reg_weight": float(self.iter_delta_reg_weight),
+            "iter_delta_reg_deadband": float(self.iter_delta_reg_deadband),
+            "pg_cost_softbound_weight": float(self.pg_cost_softbound_weight),
+            "pg_cost_smooth_abs_eps": float(self.pg_cost_smooth_abs_eps),
+            "prev_pg_cost_values": prev_list,
+            "samples": [],
+        }
+        was_training = self.surrogate_net.training
+        self.surrogate_net.eval()
+        try:
+            for sample_id in range(self.n_samples):
+                features = np.asarray(self._extract_features(sample_id), dtype=np.float64).reshape(-1)
+                lam = np.asarray(self.lambda_vals[sample_id], dtype=np.float64).reshape(-1)
+                li = self.lambda_inherent[sample_id]
+                li_cpg = None
+                pg_const_t: list[float] = []
+                if li is not None:
+                    lam_ru = li["lambda_ramp_up"]
+                    lam_rd = li["lambda_ramp_down"]
+                    li_cpg = {
+                        "lambda_pg_lower": np.asarray(
+                            li["lambda_pg_lower"], dtype=float
+                        ).reshape(-1).tolist(),
+                        "lambda_pg_upper": np.asarray(
+                            li["lambda_pg_upper"], dtype=float
+                        ).reshape(-1).tolist(),
+                        "lambda_ramp_up": np.asarray(
+                            li["lambda_ramp_up"], dtype=float
+                        ).reshape(-1).tolist(),
+                        "lambda_ramp_down": np.asarray(
+                            li["lambda_ramp_down"], dtype=float
+                        ).reshape(-1).tolist(),
+                    }
+                    for t in range(self.T):
+                        pg_const = a_val - float(lam[t])
+                        pg_const -= float(li["lambda_pg_lower"][t])
+                        pg_const += float(li["lambda_pg_upper"][t])
+                        if t > 0:
+                            pg_const += float(lam_ru[t - 1])
+                            pg_const -= float(lam_rd[t - 1])
+                        if t < self.T - 1:
+                            pg_const -= float(lam_ru[t])
+                            pg_const += float(lam_rd[t])
+                        pg_const_t.append(float(pg_const))
+                features_tensor = torch.tensor(
+                    features, dtype=torch.float32, device=self.device
+                ).unsqueeze(0)
+                with torch.no_grad():
+                    pg_out = self.surrogate_net.forward_pg_cost(features_tensor)
+                pg_tensor = self._gate_pg_cost_tensor(
+                    pg_out.squeeze(0)[: self.T]
+                )
+                loss, comp = self.loss_function_c_pg_differentiable(
+                    sample_id, pg_tensor, self.device, return_components=True
+                )
+                out["samples"].append(
+                    {
+                        "sample_id": int(sample_id),
+                        "features": features.astype(float).tolist(),
+                        "lambda_vals": lam.astype(float).tolist(),
+                        "lambda_inherent_is_none": li is None,
+                        "lambda_inherent_c_pg": li_cpg,
+                        "pg_const_per_t": pg_const_t,
+                        "implied_c_pg_zero_residual": [
+                            -float(x) for x in pg_const_t
+                        ] if pg_const_t else [],
+                        "pg_cost_cached": np.asarray(
+                            self.pg_cost_values[sample_id], dtype=float
+                        ).tolist(),
+                        "pg_cost_forward": pg_tensor.detach()
+                        .cpu()
+                        .numpy()
+                        .astype(float)
+                        .tolist(),
+                        "loss_total": float(loss.detach().cpu().item()),
+                        "obj_dual_pg": float(comp["obj_dual_pg"].cpu().item()),
+                        "dual_pg_term": float(comp["dual_pg_term"].cpu().item()),
+                        "reg_term": float(comp["reg_term"].cpu().item()),
+                    }
+                )
+        finally:
+            if was_training:
+                self.surrogate_net.train()
+        return out
+
     def load(self, filepath: str):
         """加载V3模型"""
         if TORCH_AVAILABLE:
@@ -6549,6 +6751,10 @@ class SubproblemSurrogateTrainer:
             self.pg_cost_reg_deadband = state.get(
                 'pg_cost_reg_deadband',
                 self.pg_cost_reg_deadband,
+            )
+            self.pg_cost_softbound_weight = max(
+                float(state.get('pg_cost_softbound_weight', self.pg_cost_softbound_weight)),
+                0.0,
             )
             self.nn_smooth_abs_eps = max(
                 float(state.get('nn_smooth_abs_eps', self.nn_smooth_abs_eps)),

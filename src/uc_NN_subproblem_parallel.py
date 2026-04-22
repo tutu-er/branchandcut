@@ -130,6 +130,7 @@ class ParallelSubproblemSurrogateTrainer(SubproblemSurrogateTrainer):
         nn_shuffle: bool = True,
         pg_cost_nn_epochs: int | None = None,
         pg_cost_reg_deadband: float = 0.25,
+        pg_cost_softbound_weight: float = 1.0,
         nn_smooth_abs_eps: float = 1e-6,
         pg_cost_smooth_abs_eps: float = 1e-6,
         iter_delta_reg_weight: float = 5e-5,
@@ -147,6 +148,8 @@ class ParallelSubproblemSurrogateTrainer(SubproblemSurrogateTrainer):
         use_unit_predictor: bool = False,
         unit_predictor_finetune_lr: float = 1e-5,
         unit_predictor_weight_decay: float = 1e-4,
+        pg_cost_single_sample_reg_scale: float | None = None,
+        pg_cost_c_pg_adam_weight_decay: float | None = None,
         device=None,
         n_workers: int = 4,
     ):
@@ -184,6 +187,7 @@ class ParallelSubproblemSurrogateTrainer(SubproblemSurrogateTrainer):
             nn_shuffle=nn_shuffle,
             pg_cost_nn_epochs=pg_cost_nn_epochs,
             pg_cost_reg_deadband=pg_cost_reg_deadband,
+            pg_cost_softbound_weight=pg_cost_softbound_weight,
             nn_smooth_abs_eps=nn_smooth_abs_eps,
             pg_cost_smooth_abs_eps=pg_cost_smooth_abs_eps,
             iter_delta_reg_weight=iter_delta_reg_weight,
@@ -201,6 +205,8 @@ class ParallelSubproblemSurrogateTrainer(SubproblemSurrogateTrainer):
             use_unit_predictor=use_unit_predictor,
             unit_predictor_finetune_lr=unit_predictor_finetune_lr,
             unit_predictor_weight_decay=unit_predictor_weight_decay,
+            pg_cost_single_sample_reg_scale=pg_cost_single_sample_reg_scale,
+            pg_cost_c_pg_adam_weight_decay=pg_cost_c_pg_adam_weight_decay,
             device=device,
         )
         self.n_workers = min(n_workers, self.n_samples)
@@ -694,6 +700,18 @@ def _train_unit_worker(args: dict) -> dict:
     pg_cost_start_round = args.get('pg_cost_start_round', 3)
     pg_cost_lr          = args.get('pg_cost_lr', 2e-5)
     pg_cost_surr_lr     = args.get('pg_cost_surr_lr', 5e-5)
+    pg_cost_batch_strategy = args.get('pg_cost_batch_strategy')
+    pg_cost_batch_size  = args.get('pg_cost_batch_size')
+    pg_cost_shuffle     = args.get('pg_cost_shuffle')
+    pg_cost_use_sample_weights = args.get('pg_cost_use_sample_weights', True)
+    pg_cost_sample_weight_power = args.get('pg_cost_sample_weight_power', 1.0)
+    pg_cost_sample_weight_clip = args.get('pg_cost_sample_weight_clip', 10.0)
+    pg_cost_single_sample_reg_scale = args.get('pg_cost_single_sample_reg_scale')
+    pg_cost_c_pg_adam_weight_decay = args.get('pg_cost_c_pg_adam_weight_decay')
+    pg_cost_reg_deadband = args.get('pg_cost_reg_deadband', 0.25)
+    pg_cost_softbound_weight = args.get('pg_cost_softbound_weight', 1.0)
+    iter_delta_reg_weight = args.get('iter_delta_reg_weight', 5e-5)
+    iter_delta_reg_deadband = args.get('iter_delta_reg_deadband', 0.10)
     pg_block_prox_weight = args.get('pg_block_prox_weight', 2e-2)
     dual_block_prox_weight = args.get('dual_block_prox_weight', 1e-2)
     sample_n_workers    = args.get('sample_n_workers', 4)
@@ -796,6 +814,18 @@ def _train_unit_worker(args: dict) -> dict:
             pg_cost_start_round=pg_cost_start_round,
             pg_cost_lr=pg_cost_lr,
             pg_cost_surr_lr=pg_cost_surr_lr,
+            pg_cost_batch_strategy=pg_cost_batch_strategy,
+            pg_cost_batch_size=pg_cost_batch_size,
+            pg_cost_shuffle=pg_cost_shuffle,
+            pg_cost_use_sample_weights=pg_cost_use_sample_weights,
+            pg_cost_sample_weight_power=pg_cost_sample_weight_power,
+            pg_cost_sample_weight_clip=pg_cost_sample_weight_clip,
+            pg_cost_single_sample_reg_scale=pg_cost_single_sample_reg_scale,
+            pg_cost_c_pg_adam_weight_decay=pg_cost_c_pg_adam_weight_decay,
+            pg_cost_reg_deadband=pg_cost_reg_deadband,
+            pg_cost_softbound_weight=pg_cost_softbound_weight,
+            iter_delta_reg_weight=iter_delta_reg_weight,
+            iter_delta_reg_deadband=iter_delta_reg_deadband,
             pg_block_prox_weight=pg_block_prox_weight,
             dual_block_prox_weight=dual_block_prox_weight,
             unit_predictor=unit_predictor_obj,
@@ -843,6 +873,18 @@ def _train_unit_worker(args: dict) -> dict:
             pg_cost_start_round=pg_cost_start_round,
             pg_cost_lr=pg_cost_lr,
             pg_cost_surr_lr=pg_cost_surr_lr,
+            pg_cost_batch_strategy=pg_cost_batch_strategy,
+            pg_cost_batch_size=pg_cost_batch_size,
+            pg_cost_shuffle=pg_cost_shuffle,
+            pg_cost_use_sample_weights=pg_cost_use_sample_weights,
+            pg_cost_sample_weight_power=pg_cost_sample_weight_power,
+            pg_cost_sample_weight_clip=pg_cost_sample_weight_clip,
+            pg_cost_single_sample_reg_scale=pg_cost_single_sample_reg_scale,
+            pg_cost_c_pg_adam_weight_decay=pg_cost_c_pg_adam_weight_decay,
+            pg_cost_reg_deadband=pg_cost_reg_deadband,
+            pg_cost_softbound_weight=pg_cost_softbound_weight,
+            iter_delta_reg_weight=iter_delta_reg_weight,
+            iter_delta_reg_deadband=iter_delta_reg_deadband,
             pg_block_prox_weight=pg_block_prox_weight,
             dual_block_prox_weight=dual_block_prox_weight,
             unit_predictor=unit_predictor_obj,
@@ -1042,6 +1084,18 @@ def train_all_surrogates_parallel(
     pg_cost_start_round: int = 3,
     pg_cost_lr: float = 2e-5,
     pg_cost_surr_lr: float = 5e-5,
+    pg_cost_batch_strategy: str | None = None,
+    pg_cost_batch_size: int | None = None,
+    pg_cost_shuffle: bool | None = None,
+    pg_cost_use_sample_weights: bool = True,
+    pg_cost_sample_weight_power: float = 1.0,
+    pg_cost_sample_weight_clip: float = 10.0,
+    pg_cost_single_sample_reg_scale: float | None = None,
+    pg_cost_c_pg_adam_weight_decay: float | None = None,
+    pg_cost_reg_deadband: float = 0.25,
+    pg_cost_softbound_weight: float = 1.0,
+    iter_delta_reg_weight: float = 5e-5,
+    iter_delta_reg_deadband: float = 0.10,
     pg_block_prox_weight: float = 2e-2,
     dual_block_prox_weight: float = 1e-2,
     constraint_generation_strategy: str = "sensitive",
@@ -1170,6 +1224,18 @@ def train_all_surrogates_parallel(
             'pg_cost_start_round': pg_cost_start_round,
             'pg_cost_lr':         pg_cost_lr,
             'pg_cost_surr_lr':    pg_cost_surr_lr,
+            'pg_cost_batch_strategy': pg_cost_batch_strategy,
+            'pg_cost_batch_size': pg_cost_batch_size,
+            'pg_cost_shuffle':    pg_cost_shuffle,
+            'pg_cost_use_sample_weights': pg_cost_use_sample_weights,
+            'pg_cost_sample_weight_power': pg_cost_sample_weight_power,
+            'pg_cost_sample_weight_clip': pg_cost_sample_weight_clip,
+            'pg_cost_single_sample_reg_scale': pg_cost_single_sample_reg_scale,
+            'pg_cost_c_pg_adam_weight_decay': pg_cost_c_pg_adam_weight_decay,
+            'pg_cost_reg_deadband': pg_cost_reg_deadband,
+            'pg_cost_softbound_weight': pg_cost_softbound_weight,
+            'iter_delta_reg_weight': iter_delta_reg_weight,
+            'iter_delta_reg_deadband': iter_delta_reg_deadband,
             'pg_block_prox_weight': pg_block_prox_weight,
             'dual_block_prox_weight': dual_block_prox_weight,
             'constraint_generation_strategy': constraint_generation_strategy,

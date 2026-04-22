@@ -266,20 +266,40 @@ def build_surrogate_constraint_expression(
 
 
 def _recover_unit_x_from_sample(trainer, sample_id: int) -> np.ndarray:
+    """恢复真值启停行向量 x_init（长度 T），供 init LP 的「真值钉死」约束使用。
+
+    与 ``uc_NN_subproblem`` 中 Gurobi 初值路径**必须**语义一致。
+
+    规则（重要）:
+    - 若存在 ``unit_commitment_matrix``：先取完整行 ``uc[g, :T]`` 作为基线，避免
+      pattern_library 等仅**稀疏** ``active_set`` 时、未在列表中的 ``(g,t)`` 被
+      误当作 0 而与矩阵真值矛盾。
+    - 若同时存在 ``active_set``：对列出的 ``(g_idx,t)`` 再**覆盖**相应分量（可修正
+      与矩阵不一致的单元）。
+    - 仅 ``active_set`` 时：从全零起按列表填写（与旧行为相同）。
+    """
     g = trainer.unit_id
-    x_init = np.zeros(trainer.T, dtype=float)
+    T = trainer.T
     sample = trainer.active_set_data[sample_id]
+
+    if "unit_commitment_matrix" in sample:
+        uc = sample["unit_commitment_matrix"]
+        if isinstance(uc, np.ndarray) and uc.ndim == 2 and g < uc.shape[0]:
+            n_t = int(min(uc.shape[1], T))
+            x_init = np.zeros(T, dtype=float)
+            x_init[:n_t] = np.asarray(uc[g, :n_t], dtype=float)
+        else:
+            x_init = np.zeros(T, dtype=float)
+    else:
+        x_init = np.zeros(T, dtype=float)
+
     if "active_set" in sample:
         for item in sample["active_set"]:
             if isinstance(item, list) and len(item) == 2 and isinstance(item[0], list):
                 g_idx, t = item[0]
                 value = item[1]
-                if g_idx == g:
-                    x_init[t] = value
-    elif "unit_commitment_matrix" in sample:
-        uc = sample["unit_commitment_matrix"]
-        if isinstance(uc, np.ndarray) and uc.ndim == 2 and g < uc.shape[0]:
-            x_init = uc[g].astype(float)
+                if g_idx == g and 0 <= int(t) < T:
+                    x_init[int(t)] = float(value)
     return x_init
 
 
@@ -849,6 +869,30 @@ def _solve_ed_electricity_price_cvxpy_highs(
 
 
 def solve_init_lp(trainer, sample_id: int):
+    """单机组初始化 LP（cvxpy+HiGHS）：在**固定 MILP 真值启停轨迹**下求 pg/coc/cpower 及固有约束对偶。
+
+    **“真值”单机组启停 x 如何来**
+    - 函数 ``_recover_unit_x_from_sample`` 按样本 ``active_set_data[sample_id]`` 恢复长度 T 的向量 ``x_init``：
+      * 若存在 ``active_set``：遍历 ``[[机组 g, 时段 t], 值]``，只取 **当前机组** ``g == unit_id`` 的条目写入 ``x_init[t]``；
+      * 否则若存在 ``unit_commitment_matrix``：取第 ``g`` 行 ``uc[g, :]`` 作为 ``x_init``。
+    - **不**在此处做 0/1 舍入；舍入在约束里用阈值 ``x_true_eps=0.5``：
+      * ``x_init[t] >= 0.5`` → 加 ``x[t] >= 1.0``（开机）；
+      * 否则 → 加 ``x[t] <= 0.0``（停机）。
+    即 init LP 中 **x 被钉在 0/1**，与 JSON 标签一致，再在连续变量 **pg, coc, cpower** 上求可行最小成本。返回的
+    ``x_true`` 为上述 ``x_init`` 的拷贝，供 ``x_true``/敏感时段等后续使用。
+
+    **init LP 包含的约束（与 Gurobi 初值路径语义对齐）**
+    - ``0 <= x <= 1``，随后被每时段的 ``x>=1`` 或 ``x<=0`` **收紧为 MILP 标签对应的 0/1**；
+    - 发电上下界：``pg[t] >= Pmin*x[t]``, ``pg[t] <= Pmax*x[t]``；
+    - 爬坡：``t>=1`` 的 ramp up / ramp down（含 Ru_co, Rd_co 项）；
+    - 最小开/关时间：``Ton=Toff=min(4,T)`` 下的 min_on / min_off 线性化；
+    - 启停成本：``coc`` 的 start/shut 线性不等式（``ignore_startup_shutdown_costs`` 时 sc=shc=0）；
+    - 电力成本定义：``cpower[t] == a*pg[t] + b*x[t]``（``a,b`` 来自 gencost / T_delta）；
+    - 目标：``min sum(cpower)+sum(coc) - lambda_vals·pg``（与节点电价 ``lambda`` 一致）。
+
+    **成功条件**  
+    仅当 HiGHS 使 ``problem.status`` 为 ``OPTIMAL`` 或 ``OPTIMAL_INACCURATE`` 时成功；否则抛出 ``RuntimeError``，**不**在调用方用假对偶回退。
+    """
     assert_lp_backend_available(LP_BACKEND_CVXPY_HIGHS)
 
     g = trainer.unit_id
@@ -921,11 +965,31 @@ def solve_init_lp(trainer, sample_id: int):
     for t in range(trainer.T):
         constraints.append(cpower[t] == a * pg[t] + b * x[t])
 
+    # 真值边界：与 MILP 标签一致，用于提取 μ₂（single-time 耦合对偶）初值的影子价格
+    x_true_eps = 0.5
+    x_true_fix_meta = []
+    for t in range(trainer.T):
+        if float(x_init[t]) >= x_true_eps:
+            cons = x[t] >= 1.0
+            constraints.append(cons)
+            x_true_fix_meta.append(("ge", cons))
+        else:
+            cons = x[t] <= 0.0
+            constraints.append(cons)
+            x_true_fix_meta.append(("le", cons))
+
     objective = cp.sum(cpower) + cp.sum(coc) - lambda_val @ pg
     problem = cp.Problem(cp.Minimize(objective), constraints)
     _solve_with_cvxpy_highs(problem, verbose=False)
     if not _problem_is_optimal(problem):
-        return None
+        st = getattr(problem, "status", None)
+        val = getattr(problem, "value", None)
+        raise RuntimeError(
+            f"init LP 未得到可接受最优解: unit_id={g}, sample_id={sample_id}, "
+            f"status={st!r}, objective_value={val!r}. "
+            "需要 HiGHS 状态为 OPTIMAL 或 OPTIMAL_INACCURATE；"
+            "请检查真值 x 与机组参数（爬坡/最小开停等）是否导致不可行或数值问题。"
+        )
 
     lambda_inherent = {
         "lambda_pg_lower": np.array([_nonnegative_pi(cons, "ge") for cons in pg_lower_cons]),
@@ -953,6 +1017,11 @@ def solve_init_lp(trainer, sample_id: int):
         "lambda_x_lower": np.zeros(trainer.T, dtype=float),
     }
 
+    mu2_coupling_dual = np.array(
+        [_nonnegative_pi(cons, sense) for sense, cons in x_true_fix_meta],
+        dtype=float,
+    )
+
     return {
         "pg_sol": np.asarray(pg.value, dtype=float),
         "x_sol": np.asarray(x.value, dtype=float),
@@ -960,6 +1029,7 @@ def solve_init_lp(trainer, sample_id: int):
         "cpower_sol": np.asarray(cpower.value, dtype=float),
         "x_true": x_init.copy(),
         "lambda_inherent": lambda_inherent,
+        "mu2_coupling_dual": mu2_coupling_dual,
     }
 
 

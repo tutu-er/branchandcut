@@ -59,31 +59,38 @@ CASE118_ACTIVE_SET_JSON = CASE118_ACTIVE_SET_JSON_PRICE_CLIPPED
 SUBPROBLEM_LIGHT_MAX_SAMPLES: int | None = None
 SUBPROBLEM_LIGHT_N_WORKERS_UNIT: int | None = None
 SUBPROBLEM_LIGHT_N_WORKERS_SAMPLE: int | None = None
+# 可选：从命令行覆盖外循环轮次与 predictor warmup（None = 使用 preset 默认值）
+SUBPROBLEM_LIGHT_MAX_ITER: int | None = None
+SUBPROBLEM_LIGHT_PREDICTOR_WARMUP_ROUNDS: int | None = None
 # 仅训练部分机组时设为列表（如 [0, 1, 5]）；None 表示全部机组（与 run_training.UNIT_IDS 一致）
 CASE118_SUBPROBLEM_UNIT_IDS: list[int] | None = [0, 1, 2]
 
 # ── Case118 子问题 c_pg（发电边际修正头）────────────────────────────────
 # 与 118 节点系统、裁剪电价 λ 的典型量级及较长子问题 BCD 外循环对齐：
-# - 略增大 pg_cost_scale 倍率，避免 tanh 饱和导致无法闭合 pg 驻点残差；
+# - 略增大 pg_cost_scale 倍率；c_pg 头为线性输出 + 损失内对 |c_pg|>pg_cost_scale 的软惩罚（不再用 tanh 硬饱和）
 # - c_pg 分支用 large 宽度，便于拟合时段相关的 pg_const；
 # - 略提前启用 c_pg，使外循环后半段有更多轮次专门压 obj_dual_pg；
-# - surr_lr 为 BCD 内 c_pg 步实际使用的 Adam 学习率（见 uc_NN_subproblem.iter_with_c_pg_nn）。
+# - surr_lr：BCD 内 c_pg 步的 Adam 学习率；full-batch + 关 shuffle 降低方差，利于可微驻点项下降
+# - rho_dual_pg / loss_ratio_dual_pg：放大可微 loss 中 smooth_abs(驻点残差) 相对 reg/软箱 的权重
+# - softbound/deadband 略减，减轻与「压残差」的拉扯；iter_delta 略减，减轻跨轮 c_pg 冻结在旧值
 CASE118_SUBPROBLEM_C_PG_NN_SIZE = "large"
 CASE118_SUBPROBLEM_PG_COST_SCALE_MULTIPLIER = 2.75
-CASE118_SUBPROBLEM_PG_COST_NN_EPOCHS = 14
-CASE118_SUBPROBLEM_PG_COST_START_ROUND = 32
+CASE118_SUBPROBLEM_PG_COST_NN_EPOCHS = 80
+CASE118_SUBPROBLEM_PG_COST_START_ROUND = 32  # c_pg 启动绝对轮次（与 MaxIter 无关，越早训越多轮）
 CASE118_SUBPROBLEM_PG_COST_LR = 1e-4
-CASE118_SUBPROBLEM_PG_COST_SURR_LR = 2e-4
-CASE118_SUBPROBLEM_PG_COST_REG_DEADBAND = 1.0
-CASE118_SUBPROBLEM_PG_COST_SMOOTH_ABS_EPS = 1e-5
-CASE118_SUBPROBLEM_PG_COST_BATCH_STRATEGY: str | None = "mini-batch"
-CASE118_SUBPROBLEM_PG_COST_BATCH_SIZE: int | None = 32
-CASE118_SUBPROBLEM_PG_COST_SHUFFLE: bool | None = True
-CASE118_SUBPROBLEM_PG_COST_USE_SAMPLE_WEIGHTS: bool = True
+CASE118_SUBPROBLEM_PG_COST_SURR_LR = 4e-4
+CASE118_SUBPROBLEM_PG_COST_REG_DEADBAND = 0.22
+CASE118_SUBPROBLEM_PG_COST_SOFTBOUND_WEIGHT = 0.35
+CASE118_SUBPROBLEM_PG_COST_SMOOTH_ABS_EPS = 5e-5
+CASE118_SUBPROBLEM_PG_COST_BATCH_STRATEGY: str | None = "full-batch"
+CASE118_SUBPROBLEM_PG_COST_BATCH_SIZE: int | None = None  # full-batch 下由 n_samples 决定有效 batch
+CASE118_SUBPROBLEM_PG_COST_SHUFFLE: bool | None = False
+CASE118_SUBPROBLEM_PG_COST_USE_SAMPLE_WEIGHTS: bool = False
 CASE118_SUBPROBLEM_PG_COST_SAMPLE_WEIGHT_POWER: float = 1.0
 CASE118_SUBPROBLEM_PG_COST_SAMPLE_WEIGHT_CLIP: float = 10.0
-CASE118_SUBPROBLEM_RHO_DUAL_PG_INIT = 0.15
-CASE118_SUBPROBLEM_LOSS_RATIO_DUAL_PG = 1.25
+CASE118_SUBPROBLEM_RHO_DUAL_PG_INIT = 0.22
+CASE118_SUBPROBLEM_LOSS_RATIO_DUAL_PG = 1.6
+CASE118_SUBPROBLEM_ITER_DELTA_REG_WEIGHT = 2.5e-5
 
 # ── 单机组 0/1 变量预测器（Case118 子问题训练专用，可切换开关）────────────
 # 注意：仅当 constraint_generation_strategy 包含 single-time 段时才生效
@@ -124,10 +131,30 @@ CASE118_UNIT_PREDICTOR_AUTO_EXTRA_TV_WEIGHT = 0.02
 # 若已用独立脚本训练好 unit_predictor，可在此指定目录/文件供主流程直接加载使用
 # 例如: "result/surrogate_models/unit_predictor_case118_20260421_173107"
 CASE118_UNIT_PREDICTOR_LOAD_PATH: str | None = "result/surrogate_models/unit_predictor_case118_20260421_173107"
+# 为 True 且 LOAD_PATH 非空时：跳过 unit1 extra TV 与 auto extra TV（只加载权重，不额外“预训练”）
+CASE118_UNIT_PREDICTOR_NO_FINETUNE_WHEN_LOADED = True
 
 # BCD 对偶符号松弛间隔（dual floor active 期间每隔 k 轮松弛一次符号）
 # 该值写入 run_training.BCD_DUAL_SIGN_RELAX_INTERVAL，影响 main_bcd / subproblem_bcd / dual_predictor 三种入口下的 BCD/子问题训练。
 CASE118_BCD_DUAL_SIGN_RELAX_INTERVAL = 10
+
+# ── 子问题 BCD MaxIter 与 predictor warmup（按 preset 区分）────────────────────
+# case118 有 54 台机组，比通用默认算例更复杂；轮次不应低于 run_training.py 的通用默认（300）。
+# server  preset: 300 轮（与通用默认持平，服务器算力充足）
+# desktop preset: 200 轮（本地适度缩减）
+#
+# 时序关系（以 server 为例）：
+#   warmup(10%=30) < c_pg_start(绝对值32) < individual_floor(19%=57) < decay_floor(38%=114)
+CASE118_SUBPROBLEM_MAX_ITER_SERVER  = 300
+CASE118_SUBPROBLEM_MAX_ITER_DESKTOP = 200
+CASE118_SUBPROBLEM_PREDICTOR_WARMUP_ROUNDS_SERVER  = 30   # 10 % of 300
+CASE118_SUBPROBLEM_PREDICTOR_WARMUP_ROUNDS_DESKTOP = 20   # 10 % of 200
+# mu floor 个体阶段结束轮次（约 19 % MaxIter）；predictor 激活后仍在 floor 保护下运行
+CASE118_SUBPROBLEM_MU_INDIVIDUAL_ROUND_SERVER  = 57   # 19 % of 300
+CASE118_SUBPROBLEM_MU_INDIVIDUAL_ROUND_DESKTOP = 38   # 19 % of 200
+# mu floor 组衰减完毕轮次（约 38 % MaxIter）；衰减后 mu 自由探索
+CASE118_SUBPROBLEM_MU_DECAY_ROUND_SERVER  = 114   # 38 % of 300
+CASE118_SUBPROBLEM_MU_DECAY_ROUND_DESKTOP =  76   # 38 % of 200
 
 
 def _cpu_count() -> int:
@@ -326,12 +353,28 @@ def _configure_subproblem_bcd() -> None:
         rt.N_WORKERS_UNIT = min(4, cpu)
         rt.N_WORKERS_SAMPLE = max(1, min(32, cpu - 2))
         rt.N_WORKERS_SUBPROBLEM = rt.N_WORKERS_SAMPLE
+
+        # 子问题 BCD 外循环：case118 服务器预设使用更多轮次以改善收敛
+        rt.MAX_ITER = CASE118_SUBPROBLEM_MAX_ITER_SERVER
+        rt.SUBPROBLEM_MAX_ITER = CASE118_SUBPROBLEM_MAX_ITER_SERVER
+        # predictor warmup：前 16 轮 surrogate_net 独立 BCD，之后才启用 predictor override
+        rt.SUBPROBLEM_PREDICTOR_WARMUP_ROUNDS = CASE118_SUBPROBLEM_PREDICTOR_WARMUP_ROUNDS_SERVER
+        # mu floor 时序与 MaxIter 同比例
+        rt.SUBPROBLEM_MU_DUAL_FLOOR_INDIVIDUAL_ROUND = CASE118_SUBPROBLEM_MU_INDIVIDUAL_ROUND_SERVER
+        rt.SUBPROBLEM_MU_DUAL_FLOOR_DECAY_ROUND      = CASE118_SUBPROBLEM_MU_DECAY_ROUND_SERVER
     else:
         # 本地：unit 串行（Windows 更稳），sample 轻度并行
         rt.N_WORKERS_UNIT = 1
         rt.N_WORKERS_SAMPLE = min(3, cpu)
         rt.N_WORKERS_SUBPROBLEM = rt.N_WORKERS_SAMPLE
         rt.SUBPROBLEM_LP_BACKEND = "gurobi"
+
+        # desktop 预设适度增加轮次
+        rt.MAX_ITER = CASE118_SUBPROBLEM_MAX_ITER_DESKTOP
+        rt.SUBPROBLEM_MAX_ITER = CASE118_SUBPROBLEM_MAX_ITER_DESKTOP
+        rt.SUBPROBLEM_PREDICTOR_WARMUP_ROUNDS = CASE118_SUBPROBLEM_PREDICTOR_WARMUP_ROUNDS_DESKTOP
+        rt.SUBPROBLEM_MU_DUAL_FLOOR_INDIVIDUAL_ROUND = CASE118_SUBPROBLEM_MU_INDIVIDUAL_ROUND_DESKTOP
+        rt.SUBPROBLEM_MU_DUAL_FLOOR_DECAY_ROUND      = CASE118_SUBPROBLEM_MU_DECAY_ROUND_DESKTOP
 
     # Dual predictor + per-unit subproblem training.
     rt.DUAL_EPOCHS = 320
@@ -342,8 +385,6 @@ def _configure_subproblem_bcd() -> None:
     # 对偶预测器新设定见文件顶部 CASE118_DUAL_* 与 _configure_common
 
     rt.NN_EPOCHS = 5
-    rt.MAX_ITER = 80
-    rt.SUBPROBLEM_MAX_ITER = 80
 
     rt.SUBPROBLEM_NN_SIZE = "medium"
     rt.SUBPROBLEM_C_PG_NN_SIZE = CASE118_SUBPROBLEM_C_PG_NN_SIZE
@@ -363,8 +404,7 @@ def _configure_subproblem_bcd() -> None:
     rt.SUBPROBLEM_RHO_OPT_INIT = 1e-1
 
     rt.SUBPROBLEM_MU_DUAL_FLOOR_INIT = 1.0
-    rt.SUBPROBLEM_MU_DUAL_FLOOR_INDIVIDUAL_ROUND = 20
-    rt.SUBPROBLEM_MU_DUAL_FLOOR_DECAY_ROUND = 40
+    # INDIVIDUAL_ROUND 和 DECAY_ROUND 已在 server/desktop 预设块中按比例设置
     rt.SUBPROBLEM_MU_SIGNED_ROUND_INTERVAL = 10
     rt.SUBPROBLEM_MU_SIGN_HYSTERESIS_ROUNDS = 2
     rt.SUBPROBLEM_MU_SIGN_FLIP_MIN_SHARE = 0.67
@@ -378,6 +418,7 @@ def _configure_subproblem_bcd() -> None:
     rt.SUBPROBLEM_PG_COST_LR = CASE118_SUBPROBLEM_PG_COST_LR
     rt.SUBPROBLEM_PG_COST_SURR_LR = CASE118_SUBPROBLEM_PG_COST_SURR_LR
     rt.SUBPROBLEM_PG_COST_REG_DEADBAND = CASE118_SUBPROBLEM_PG_COST_REG_DEADBAND
+    rt.SUBPROBLEM_PG_COST_SOFTBOUND_WEIGHT = CASE118_SUBPROBLEM_PG_COST_SOFTBOUND_WEIGHT
     rt.SUBPROBLEM_PG_COST_SMOOTH_ABS_EPS = CASE118_SUBPROBLEM_PG_COST_SMOOTH_ABS_EPS
     rt.SUBPROBLEM_PG_COST_BATCH_STRATEGY = CASE118_SUBPROBLEM_PG_COST_BATCH_STRATEGY
     rt.SUBPROBLEM_PG_COST_BATCH_SIZE = CASE118_SUBPROBLEM_PG_COST_BATCH_SIZE
@@ -385,6 +426,7 @@ def _configure_subproblem_bcd() -> None:
     rt.SUBPROBLEM_PG_COST_USE_SAMPLE_WEIGHTS = CASE118_SUBPROBLEM_PG_COST_USE_SAMPLE_WEIGHTS
     rt.SUBPROBLEM_PG_COST_SAMPLE_WEIGHT_POWER = CASE118_SUBPROBLEM_PG_COST_SAMPLE_WEIGHT_POWER
     rt.SUBPROBLEM_PG_COST_SAMPLE_WEIGHT_CLIP = CASE118_SUBPROBLEM_PG_COST_SAMPLE_WEIGHT_CLIP
+    rt.SUBPROBLEM_ITER_DELTA_REG_WEIGHT = CASE118_SUBPROBLEM_ITER_DELTA_REG_WEIGHT
 
     rt.USE_UNIT_PREDICTOR = CASE118_USE_UNIT_PREDICTOR
     rt.UNIT_PREDICTOR_EPOCHS = CASE118_UNIT_PREDICTOR_EPOCHS
@@ -417,6 +459,12 @@ def _configure_subproblem_bcd() -> None:
     rt.UNIT_PREDICTOR_AUTO_EXTRA_TV_TV_THRESHOLD = CASE118_UNIT_PREDICTOR_AUTO_EXTRA_TV_TV_THRESHOLD
     rt.UNIT_PREDICTOR_AUTO_EXTRA_TV_WEIGHT = CASE118_UNIT_PREDICTOR_AUTO_EXTRA_TV_WEIGHT
     rt.UNIT_PREDICTOR_LOAD_PATH = CASE118_UNIT_PREDICTOR_LOAD_PATH
+    if (
+        CASE118_UNIT_PREDICTOR_NO_FINETUNE_WHEN_LOADED
+        and CASE118_UNIT_PREDICTOR_LOAD_PATH
+    ):
+        rt.UNIT_PREDICTOR_UNIT1_EXTRA_TV_EPOCHS = 0
+        rt.UNIT_PREDICTOR_AUTO_EXTRA_TV = False
 
 
 def _validate_inputs() -> None:
@@ -438,6 +486,19 @@ def _apply_subproblem_light_runtime_overrides() -> bool:
         w = max(1, int(SUBPROBLEM_LIGHT_N_WORKERS_SAMPLE))
         rt.N_WORKERS_SAMPLE = w
         rt.N_WORKERS_SUBPROBLEM = w
+        changed = True
+    if SUBPROBLEM_LIGHT_MAX_ITER is not None:
+        n = max(1, int(SUBPROBLEM_LIGHT_MAX_ITER))
+        rt.MAX_ITER = n
+        rt.SUBPROBLEM_MAX_ITER = n
+        # warmup 与 mu floor 同步按新 MaxIter 的固定比例重算，保持时序合理
+        # （若 WARMUP_ROUNDS 也被显式覆盖，后面的分支会再次覆写）
+        rt.SUBPROBLEM_PREDICTOR_WARMUP_ROUNDS  = round(n * 0.10)
+        rt.SUBPROBLEM_MU_DUAL_FLOOR_INDIVIDUAL_ROUND = round(n * 0.19)
+        rt.SUBPROBLEM_MU_DUAL_FLOOR_DECAY_ROUND      = round(n * 0.38)
+        changed = True
+    if SUBPROBLEM_LIGHT_PREDICTOR_WARMUP_ROUNDS is not None:
+        rt.SUBPROBLEM_PREDICTOR_WARMUP_ROUNDS = max(0, int(SUBPROBLEM_LIGHT_PREDICTOR_WARMUP_ROUNDS))
         changed = True
     return changed
 
@@ -487,6 +548,16 @@ def main() -> None:
             flush=True,
         )
         print(
+            "subproblem_iter: "
+            f"max_iter={rt.SUBPROBLEM_MAX_ITER}, "
+            f"nn_epochs={rt.NN_EPOCHS}, "
+            f"predictor_warmup_rounds={rt.SUBPROBLEM_PREDICTOR_WARMUP_ROUNDS}, "
+            f"mu_individual_round={rt.SUBPROBLEM_MU_DUAL_FLOOR_INDIVIDUAL_ROUND}, "
+            f"mu_decay_round={rt.SUBPROBLEM_MU_DUAL_FLOOR_DECAY_ROUND}, "
+            f"pg_cost_start_round={rt.SUBPROBLEM_PG_COST_START_ROUND}",
+            flush=True,
+        )
+        print(
             "dual_predictor_preset: "
             f"net={rt.DUAL_PREDICTOR_NET_VARIANT}, "
             f"normalize_targets={rt.DUAL_PREDICTOR_NORMALIZE_TARGETS}, "
@@ -500,12 +571,16 @@ def main() -> None:
             f"pg_cost_scale_mult={CASE118_SUBPROBLEM_PG_COST_SCALE_MULTIPLIER}, "
             f"pg_cost_start_round={CASE118_SUBPROBLEM_PG_COST_START_ROUND}, "
             f"pg_cost_nn_epochs={CASE118_SUBPROBLEM_PG_COST_NN_EPOCHS}, "
+            f"pg_cost_deadband={CASE118_SUBPROBLEM_PG_COST_REG_DEADBAND}, "
+            f"pg_cost_softbound_w={CASE118_SUBPROBLEM_PG_COST_SOFTBOUND_WEIGHT}, "
             f"rho_dual_pg_init={CASE118_SUBPROBLEM_RHO_DUAL_PG_INIT}, "
             f"loss_ratio_dual_pg={CASE118_SUBPROBLEM_LOSS_RATIO_DUAL_PG}, "
             f"pg_cost_surr_lr={CASE118_SUBPROBLEM_PG_COST_SURR_LR}, "
             f"pg_cost_batch={CASE118_SUBPROBLEM_PG_COST_BATCH_STRATEGY}/"
-            f"{CASE118_SUBPROBLEM_PG_COST_BATCH_SIZE}, "
-            f"pg_cost_w={CASE118_SUBPROBLEM_PG_COST_USE_SAMPLE_WEIGHTS}",
+            f"{CASE118_SUBPROBLEM_PG_COST_BATCH_SIZE or 'n_samples'}, "
+            f"pg_cost_shuffle={CASE118_SUBPROBLEM_PG_COST_SHUFFLE}, "
+            f"pg_cost_w={CASE118_SUBPROBLEM_PG_COST_USE_SAMPLE_WEIGHTS}, "
+            f"iter_delta_w={CASE118_SUBPROBLEM_ITER_DELTA_REG_WEIGHT}",
             flush=True,
         )
         if light_overrides:
@@ -513,7 +588,9 @@ def main() -> None:
                 "subproblem_light_overrides: "
                 f"max_samples={rt.MAX_SAMPLES}, "
                 f"n_workers_unit={rt.N_WORKERS_UNIT}, "
-                f"n_workers_sample={rt.N_WORKERS_SAMPLE}",
+                f"n_workers_sample={rt.N_WORKERS_SAMPLE}, "
+                f"max_iter={rt.SUBPROBLEM_MAX_ITER}, "
+                f"predictor_warmup_rounds={rt.SUBPROBLEM_PREDICTOR_WARMUP_ROUNDS}",
                 flush=True,
             )
     elif TRAIN_TARGET == "dual_predictor":

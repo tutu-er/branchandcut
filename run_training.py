@@ -249,6 +249,9 @@ SUBPROBLEM_GAMMA_BASE = 1e-3
 SUBPROBLEM_MU_DUAL_FLOOR_INIT = 2
 SUBPROBLEM_MU_DUAL_FLOOR_INDIVIDUAL_ROUND = round(SUBPROBLEM_MAX_ITER/4)
 SUBPROBLEM_MU_DUAL_FLOOR_DECAY_ROUND = round(SUBPROBLEM_MAX_ITER/2)
+# predictor override 热身轮数：前 N 轮禁用 single-time 段覆写，让 surrogate_net 独立 bootstrap mu
+# 设为 0 保持原有行为（Plan B 实现前该参数由训练流程读取但尚未透传给 trainer）
+SUBPROBLEM_PREDICTOR_WARMUP_ROUNDS = round(SUBPROBLEM_MAX_ITER * 0.10)
 SUBPROBLEM_MU_SIGNED_ROUND_INTERVAL = 10
 SUBPROBLEM_MU_SIGN_HYSTERESIS_ROUNDS = 2
 SUBPROBLEM_MU_SIGN_FLIP_MIN_SHARE = 0.67
@@ -261,12 +264,13 @@ SUBPROBLEM_NN_SHUFFLE = True
 SUBPROBLEM_NN_LR = 5e-4
 SUBPROBLEM_IGNORE_STARTUP_SHUTDOWN_COSTS = True
 SUBPROBLEM_X_COST_NN_LR = 1e-5
-SUBPROBLEM_PG_COST_NN_EPOCHS = 12
+SUBPROBLEM_PG_COST_NN_EPOCHS = 64
 SUBPROBLEM_PG_COST_START_ROUND = round(SUBPROBLEM_MAX_ITER/2)
 SUBPROBLEM_PG_COST_SCALE_MULTIPLIER = 2
 SUBPROBLEM_PG_COST_LR = 1e-4
 SUBPROBLEM_PG_COST_SURR_LR = 2e-4
-SUBPROBLEM_PG_COST_REG_DEADBAND = 1.0
+SUBPROBLEM_PG_COST_REG_DEADBAND = 0.35
+SUBPROBLEM_PG_COST_SOFTBOUND_WEIGHT = 1.0
 SUBPROBLEM_PG_COST_SMOOTH_ABS_EPS = 1e-5
 SUBPROBLEM_PG_COST_BATCH_STRATEGY: str | None = "mini-batch"
 SUBPROBLEM_PG_COST_BATCH_SIZE: int | None = 32
@@ -274,6 +278,9 @@ SUBPROBLEM_PG_COST_SHUFFLE: bool | None = True
 SUBPROBLEM_PG_COST_USE_SAMPLE_WEIGHTS: bool = True
 SUBPROBLEM_PG_COST_SAMPLE_WEIGHT_POWER: float = 1.0
 SUBPROBLEM_PG_COST_SAMPLE_WEIGHT_CLIP: float = 10.0
+# None：由 SubproblemSurrogateTrainer 在 n_samples==1 时自动收紧 c_pg 正则与 Adam weight decay
+SUBPROBLEM_PG_COST_SINGLE_SAMPLE_REG_SCALE: float | None = None
+SUBPROBLEM_PG_COST_C_PG_ADAM_WD: float | None = None
 
 # 迭代间输出差异正则：温和抑制相邻 BCD 轮次输出跳变；可按算例继续调节
 BCD_ITER_DELTA_REG_WEIGHT = 1e-4
@@ -598,8 +605,17 @@ def create_subproblem_trainer(ppc, all_samples, T_DELTA, unit_id: int, *,
                               pg_cost_lr: float = 2e-5,
                               pg_cost_surr_lr: float = 5e-5,
                               pg_cost_reg_deadband: float = 0.25,
-                              pg_cost_smooth_abs_eps: float = 1e-6,
-                              pg_block_prox_weight: float = SUBPROBLEM_PG_BLOCK_PROX_WEIGHT,
+                              pg_cost_softbound_weight: float = SUBPROBLEM_PG_COST_SOFTBOUND_WEIGHT,
+                  pg_cost_smooth_abs_eps: float = 1e-6,
+                  pg_cost_batch_strategy: str | None = None,
+                  pg_cost_batch_size: int | None = None,
+                  pg_cost_shuffle: bool | None = None,
+                  pg_cost_use_sample_weights: bool = True,
+                  pg_cost_sample_weight_power: float = 1.0,
+                  pg_cost_sample_weight_clip: float = 10.0,
+                  pg_cost_single_sample_reg_scale: float | None = None,
+                  pg_cost_c_pg_adam_weight_decay: float | None = None,
+                  pg_block_prox_weight: float = SUBPROBLEM_PG_BLOCK_PROX_WEIGHT,
                               dual_block_prox_weight: float = SUBPROBLEM_DUAL_BLOCK_PROX_WEIGHT,
                               iter_delta_reg_weight: float = SUBPROBLEM_ITER_DELTA_REG_WEIGHT,
                               iter_delta_reg_deadband: float = SUBPROBLEM_ITER_DELTA_REG_DEADBAND,
@@ -647,7 +663,16 @@ def create_subproblem_trainer(ppc, all_samples, T_DELTA, unit_id: int, *,
         pg_cost_lr=pg_cost_lr,
         pg_cost_surr_lr=pg_cost_surr_lr,
         pg_cost_reg_deadband=pg_cost_reg_deadband,
+        pg_cost_softbound_weight=pg_cost_softbound_weight,
         pg_cost_smooth_abs_eps=pg_cost_smooth_abs_eps,
+        pg_cost_batch_strategy=pg_cost_batch_strategy,
+        pg_cost_batch_size=pg_cost_batch_size,
+        pg_cost_shuffle=pg_cost_shuffle,
+        pg_cost_use_sample_weights=pg_cost_use_sample_weights,
+        pg_cost_sample_weight_power=pg_cost_sample_weight_power,
+        pg_cost_sample_weight_clip=pg_cost_sample_weight_clip,
+        pg_cost_single_sample_reg_scale=pg_cost_single_sample_reg_scale,
+        pg_cost_c_pg_adam_weight_decay=pg_cost_c_pg_adam_weight_decay,
         pg_block_prox_weight=pg_block_prox_weight,
         dual_block_prox_weight=dual_block_prox_weight,
         iter_delta_reg_weight=iter_delta_reg_weight,
@@ -712,7 +737,16 @@ def run_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS,
                   pg_cost_lr: float = 2e-5,
                   pg_cost_surr_lr: float = 5e-5,
                   pg_cost_reg_deadband: float = 0.25,
+                  pg_cost_softbound_weight: float = SUBPROBLEM_PG_COST_SOFTBOUND_WEIGHT,
                   pg_cost_smooth_abs_eps: float = 1e-6,
+                  pg_cost_batch_strategy: str | None = None,
+                  pg_cost_batch_size: int | None = None,
+                  pg_cost_shuffle: bool | None = None,
+                  pg_cost_use_sample_weights: bool = True,
+                  pg_cost_sample_weight_power: float = 1.0,
+                  pg_cost_sample_weight_clip: float = 10.0,
+                  pg_cost_single_sample_reg_scale: float | None = None,
+                  pg_cost_c_pg_adam_weight_decay: float | None = None,
                   pg_block_prox_weight: float = SUBPROBLEM_PG_BLOCK_PROX_WEIGHT,
                   dual_block_prox_weight: float = SUBPROBLEM_DUAL_BLOCK_PROX_WEIGHT,
                   iter_delta_reg_weight: float = SUBPROBLEM_ITER_DELTA_REG_WEIGHT,
@@ -819,7 +853,12 @@ def run_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS,
         f"main_lr={subproblem_nn_learning_rate}, x_cost_lr={subproblem_cost_learning_rate}, "
         f"nn_smooth_eps={subproblem_nn_smooth_abs_eps}, "
         f"c_pg_epochs={pg_cost_nn_epochs}, c_pg_surr_lr={pg_cost_surr_lr}, "
-        f"c_pg_smooth_eps={pg_cost_smooth_abs_eps}"
+        f"c_pg_softbound_w={pg_cost_softbound_weight}, "
+        f"c_pg_smooth_eps={pg_cost_smooth_abs_eps}, "
+        f"c_pg_batch={pg_cost_batch_strategy or '(inherit subproblem_nn)'}/"
+        f"{pg_cost_batch_size or '(inherit)'}, c_pg_shuffle={pg_cost_shuffle}, "
+        f"c_pg_sample_w={pg_cost_use_sample_weights}, "
+        f"c_pg_sw_power={pg_cost_sample_weight_power}, c_pg_sw_clip={pg_cost_sample_weight_clip}"
     )
     log(
         f"iter_delta_reg: subproblem_weight={iter_delta_reg_weight}, "
@@ -1103,6 +1142,14 @@ def run_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS,
             pg_cost_start_round=pg_cost_start_round,
             pg_cost_lr=pg_cost_lr,
             pg_cost_surr_lr=pg_cost_surr_lr,
+            pg_cost_batch_strategy=pg_cost_batch_strategy,
+            pg_cost_batch_size=pg_cost_batch_size,
+            pg_cost_shuffle=pg_cost_shuffle,
+            pg_cost_use_sample_weights=pg_cost_use_sample_weights,
+            pg_cost_sample_weight_power=pg_cost_sample_weight_power,
+            pg_cost_sample_weight_clip=pg_cost_sample_weight_clip,
+            pg_cost_single_sample_reg_scale=pg_cost_single_sample_reg_scale,
+            pg_cost_c_pg_adam_weight_decay=pg_cost_c_pg_adam_weight_decay,
             pg_block_prox_weight=pg_block_prox_weight,
             dual_block_prox_weight=dual_block_prox_weight,
             save_dir=save_dir,
@@ -1176,8 +1223,17 @@ def run_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS,
                 pg_cost_lr=pg_cost_lr,
                 pg_cost_surr_lr=pg_cost_surr_lr,
                 pg_cost_reg_deadband=pg_cost_reg_deadband,
+                pg_cost_softbound_weight=pg_cost_softbound_weight,
                 pg_cost_nn_epochs=pg_cost_nn_epochs,
                 pg_cost_smooth_abs_eps=pg_cost_smooth_abs_eps,
+                pg_cost_batch_strategy=pg_cost_batch_strategy,
+                pg_cost_batch_size=pg_cost_batch_size,
+                pg_cost_shuffle=pg_cost_shuffle,
+                pg_cost_use_sample_weights=pg_cost_use_sample_weights,
+                pg_cost_sample_weight_power=pg_cost_sample_weight_power,
+                pg_cost_sample_weight_clip=pg_cost_sample_weight_clip,
+                pg_cost_single_sample_reg_scale=pg_cost_single_sample_reg_scale,
+                pg_cost_c_pg_adam_weight_decay=pg_cost_c_pg_adam_weight_decay,
                 pg_block_prox_weight=pg_block_prox_weight,
                 dual_block_prox_weight=dual_block_prox_weight,
                 iter_delta_reg_weight=iter_delta_reg_weight,
@@ -1229,8 +1285,17 @@ def run_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS,
                 pg_cost_lr=pg_cost_lr,
                 pg_cost_surr_lr=pg_cost_surr_lr,
                 pg_cost_reg_deadband=pg_cost_reg_deadband,
+                pg_cost_softbound_weight=pg_cost_softbound_weight,
                 pg_cost_nn_epochs=pg_cost_nn_epochs,
                 pg_cost_smooth_abs_eps=pg_cost_smooth_abs_eps,
+                pg_cost_batch_strategy=pg_cost_batch_strategy,
+                pg_cost_batch_size=pg_cost_batch_size,
+                pg_cost_shuffle=pg_cost_shuffle,
+                pg_cost_use_sample_weights=pg_cost_use_sample_weights,
+                pg_cost_sample_weight_power=pg_cost_sample_weight_power,
+                pg_cost_sample_weight_clip=pg_cost_sample_weight_clip,
+                pg_cost_single_sample_reg_scale=pg_cost_single_sample_reg_scale,
+                pg_cost_c_pg_adam_weight_decay=pg_cost_c_pg_adam_weight_decay,
                 pg_block_prox_weight=pg_block_prox_weight,
                 dual_block_prox_weight=dual_block_prox_weight,
                 iter_delta_reg_weight=iter_delta_reg_weight,
@@ -1950,6 +2015,7 @@ def main():
     SUBPROBLEM_PG_COST_LR_VALUE = SUBPROBLEM_PG_COST_LR
     SUBPROBLEM_PG_COST_SURR_LR_VALUE = SUBPROBLEM_PG_COST_SURR_LR
     SUBPROBLEM_PG_COST_REG_DEADBAND_VALUE = SUBPROBLEM_PG_COST_REG_DEADBAND
+    SUBPROBLEM_PG_COST_SOFTBOUND_WEIGHT_VALUE = SUBPROBLEM_PG_COST_SOFTBOUND_WEIGHT
     SUBPROBLEM_PG_COST_SMOOTH_ABS_EPS_VALUE = SUBPROBLEM_PG_COST_SMOOTH_ABS_EPS
     SUBPROBLEM_PG_COST_BATCH_STRATEGY_VALUE = SUBPROBLEM_PG_COST_BATCH_STRATEGY
     SUBPROBLEM_PG_COST_BATCH_SIZE_VALUE = SUBPROBLEM_PG_COST_BATCH_SIZE
@@ -1957,6 +2023,8 @@ def main():
     SUBPROBLEM_PG_COST_USE_SAMPLE_WEIGHTS_VALUE = SUBPROBLEM_PG_COST_USE_SAMPLE_WEIGHTS
     SUBPROBLEM_PG_COST_SAMPLE_WEIGHT_POWER_VALUE = SUBPROBLEM_PG_COST_SAMPLE_WEIGHT_POWER
     SUBPROBLEM_PG_COST_SAMPLE_WEIGHT_CLIP_VALUE = SUBPROBLEM_PG_COST_SAMPLE_WEIGHT_CLIP
+    SUBPROBLEM_PG_COST_SINGLE_SAMPLE_REG_SCALE_VALUE = SUBPROBLEM_PG_COST_SINGLE_SAMPLE_REG_SCALE
+    SUBPROBLEM_PG_COST_C_PG_ADAM_WD_VALUE = SUBPROBLEM_PG_COST_C_PG_ADAM_WD
     SUBPROBLEM_PG_BLOCK_PROX_WEIGHT_VALUE = SUBPROBLEM_PG_BLOCK_PROX_WEIGHT
     SUBPROBLEM_DUAL_BLOCK_PROX_WEIGHT_VALUE = SUBPROBLEM_DUAL_BLOCK_PROX_WEIGHT
 
@@ -2197,6 +2265,7 @@ def main():
                     pg_cost_lr=SUBPROBLEM_PG_COST_LR_VALUE,
                     pg_cost_surr_lr=SUBPROBLEM_PG_COST_SURR_LR_VALUE,
                     pg_cost_reg_deadband=SUBPROBLEM_PG_COST_REG_DEADBAND_VALUE,
+                    pg_cost_softbound_weight=SUBPROBLEM_PG_COST_SOFTBOUND_WEIGHT_VALUE,
                     pg_cost_smooth_abs_eps=SUBPROBLEM_PG_COST_SMOOTH_ABS_EPS_VALUE,
                     pg_cost_batch_strategy=SUBPROBLEM_PG_COST_BATCH_STRATEGY_VALUE,
                     pg_cost_batch_size=SUBPROBLEM_PG_COST_BATCH_SIZE_VALUE,
@@ -2204,6 +2273,8 @@ def main():
                     pg_cost_use_sample_weights=SUBPROBLEM_PG_COST_USE_SAMPLE_WEIGHTS_VALUE,
                     pg_cost_sample_weight_power=SUBPROBLEM_PG_COST_SAMPLE_WEIGHT_POWER_VALUE,
                     pg_cost_sample_weight_clip=SUBPROBLEM_PG_COST_SAMPLE_WEIGHT_CLIP_VALUE,
+                    pg_cost_single_sample_reg_scale=SUBPROBLEM_PG_COST_SINGLE_SAMPLE_REG_SCALE_VALUE,
+                    pg_cost_c_pg_adam_weight_decay=SUBPROBLEM_PG_COST_C_PG_ADAM_WD_VALUE,
                     pg_block_prox_weight=SUBPROBLEM_PG_BLOCK_PROX_WEIGHT_VALUE,
                     dual_block_prox_weight=SUBPROBLEM_DUAL_BLOCK_PROX_WEIGHT_VALUE,
                     iter_delta_reg_weight=SUBPROBLEM_ITER_DELTA_REG_WEIGHT,
@@ -2547,6 +2618,7 @@ def main():
                     pg_cost_lr=SUBPROBLEM_PG_COST_LR_VALUE,
                     pg_cost_surr_lr=SUBPROBLEM_PG_COST_SURR_LR_VALUE,
                     pg_cost_reg_deadband=SUBPROBLEM_PG_COST_REG_DEADBAND_VALUE,
+                    pg_cost_softbound_weight=SUBPROBLEM_PG_COST_SOFTBOUND_WEIGHT_VALUE,
                     pg_cost_smooth_abs_eps=SUBPROBLEM_PG_COST_SMOOTH_ABS_EPS_VALUE,
                     pg_cost_batch_strategy=SUBPROBLEM_PG_COST_BATCH_STRATEGY_VALUE,
                     pg_cost_batch_size=SUBPROBLEM_PG_COST_BATCH_SIZE_VALUE,
@@ -2554,6 +2626,8 @@ def main():
                     pg_cost_use_sample_weights=SUBPROBLEM_PG_COST_USE_SAMPLE_WEIGHTS_VALUE,
                     pg_cost_sample_weight_power=SUBPROBLEM_PG_COST_SAMPLE_WEIGHT_POWER_VALUE,
                     pg_cost_sample_weight_clip=SUBPROBLEM_PG_COST_SAMPLE_WEIGHT_CLIP_VALUE,
+                    pg_cost_single_sample_reg_scale=SUBPROBLEM_PG_COST_SINGLE_SAMPLE_REG_SCALE_VALUE,
+                    pg_cost_c_pg_adam_weight_decay=SUBPROBLEM_PG_COST_C_PG_ADAM_WD_VALUE,
                     pg_block_prox_weight=SUBPROBLEM_PG_BLOCK_PROX_WEIGHT_VALUE,
                     dual_block_prox_weight=SUBPROBLEM_DUAL_BLOCK_PROX_WEIGHT_VALUE,
                     iter_delta_reg_weight=SUBPROBLEM_ITER_DELTA_REG_WEIGHT,
