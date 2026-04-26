@@ -5613,10 +5613,18 @@ class SubproblemSurrogateTrainer:
         batch_strategy: str | None = None,
         shuffle: bool | None = None,
         learning_rate: float | None = None,
+        log_interval: int | None = None,
+        log_metrics: bool = False,
     ):
         """
         BCD迭代：c_pg 单独训练器。
         仅更新 pg_cost_net，并使用独立 loss。
+
+        Args:
+            log_interval: 若 ``None``，仅在第 1 与最后一轮打印 ``avg_loss``；
+            若为正整数 ``k``，则每 ``k`` 轮打印一次，且始终包含第 1 轮与最后一轮。
+            log_metrics: 为 True 时在每次打印时额外 ``cal_nn_logging_components`` 输出
+            ``obj_dual_pg`` / ``reg_pg``（略增开销）。
         """
         if not TORCH_AVAILABLE or not self._pg_costs_active():
             self._last_pg_cost_nn_loss = None
@@ -5713,12 +5721,34 @@ class SubproblemSurrogateTrainer:
                 if self._surr_pg_cost_scheduler is not None:
                     self._surr_pg_cost_scheduler.step()
 
-                if epoch == 0 or epoch == num_epochs - 1:
-                    print(
-                        f"  [Unit-{self.unit_id}][NN-c_pg] epoch {epoch+1}/{num_epochs}, "
-                        f"avg_loss = {epoch_loss/self.n_samples:.6f}",
-                        flush=True,
+                avg = epoch_loss / max(self.n_samples, 1)
+                lr_cur = float(self._surr_pg_cost_optimizer.param_groups[0].get("lr", 0.0))
+                if log_interval is None or int(log_interval) <= 0:
+                    do_log = epoch == 0 or epoch == num_epochs - 1
+                else:
+                    k = int(log_interval)
+                    do_log = (
+                        epoch == 0
+                        or epoch == num_epochs - 1
+                        or (epoch + 1) % k == 0
                     )
+                if do_log:
+                    line = (
+                        f"  [Unit-{self.unit_id}][NN-c_pg] epoch {epoch+1:>4}/{num_epochs}, "
+                        f"avg_loss={avg:.6f}, sum_loss={epoch_loss:.6f}, lr={lr_cur:.2e}"
+                    )
+                    if log_metrics:
+                        try:
+                            # cal_nn_logging_components 用 self.pg_cost_values 等缓存；
+                            # 仅 backward 时网络在变，不刷新则指标一直为进循环前的数。
+                            self._refresh_cached_surrogate_outputs()
+                            m = self.cal_nn_logging_components()
+                            line += (
+                                f", obj_dual_pg={m['obj_dual_pg']:.6f}, reg_pg={m['reg_pg']:.6f}"
+                            )
+                        except Exception as exc:
+                            line += f", metrics_err={exc!r}"
+                    print(line, flush=True)
 
             if self.n_samples > 0:
                 self._last_pg_cost_nn_loss = epoch_loss / self.n_samples
