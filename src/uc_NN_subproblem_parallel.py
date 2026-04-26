@@ -150,6 +150,8 @@ class ParallelSubproblemSurrogateTrainer(SubproblemSurrogateTrainer):
         unit_predictor_weight_decay: float = 1e-4,
         pg_cost_single_sample_reg_scale: float | None = None,
         pg_cost_c_pg_adam_weight_decay: float | None = None,
+        main_direct_train_config: dict | None = None,
+        c_pg_direct_train_config: dict | None = None,
         device=None,
         n_workers: int = 4,
     ):
@@ -207,6 +209,8 @@ class ParallelSubproblemSurrogateTrainer(SubproblemSurrogateTrainer):
             unit_predictor_weight_decay=unit_predictor_weight_decay,
             pg_cost_single_sample_reg_scale=pg_cost_single_sample_reg_scale,
             pg_cost_c_pg_adam_weight_decay=pg_cost_c_pg_adam_weight_decay,
+            main_direct_train_config=main_direct_train_config,
+            c_pg_direct_train_config=c_pg_direct_train_config,
             device=device,
         )
         self.n_workers = min(n_workers, self.n_samples)
@@ -708,6 +712,8 @@ def _train_unit_worker(args: dict) -> dict:
     pg_cost_sample_weight_clip = args.get('pg_cost_sample_weight_clip', 10.0)
     pg_cost_single_sample_reg_scale = args.get('pg_cost_single_sample_reg_scale')
     pg_cost_c_pg_adam_weight_decay = args.get('pg_cost_c_pg_adam_weight_decay')
+    main_direct_train_config = args.get('main_direct_train_config')
+    c_pg_direct_train_config = args.get('c_pg_direct_train_config')
     pg_cost_reg_deadband = args.get('pg_cost_reg_deadband', 0.25)
     pg_cost_softbound_weight = args.get('pg_cost_softbound_weight', 1.0)
     iter_delta_reg_weight = args.get('iter_delta_reg_weight', 5e-5)
@@ -822,6 +828,8 @@ def _train_unit_worker(args: dict) -> dict:
             pg_cost_sample_weight_clip=pg_cost_sample_weight_clip,
             pg_cost_single_sample_reg_scale=pg_cost_single_sample_reg_scale,
             pg_cost_c_pg_adam_weight_decay=pg_cost_c_pg_adam_weight_decay,
+            main_direct_train_config=main_direct_train_config,
+            c_pg_direct_train_config=c_pg_direct_train_config,
             pg_cost_reg_deadband=pg_cost_reg_deadband,
             pg_cost_softbound_weight=pg_cost_softbound_weight,
             iter_delta_reg_weight=iter_delta_reg_weight,
@@ -881,6 +889,8 @@ def _train_unit_worker(args: dict) -> dict:
             pg_cost_sample_weight_clip=pg_cost_sample_weight_clip,
             pg_cost_single_sample_reg_scale=pg_cost_single_sample_reg_scale,
             pg_cost_c_pg_adam_weight_decay=pg_cost_c_pg_adam_weight_decay,
+            main_direct_train_config=main_direct_train_config,
+            c_pg_direct_train_config=c_pg_direct_train_config,
             pg_cost_reg_deadband=pg_cost_reg_deadband,
             pg_cost_softbound_weight=pg_cost_softbound_weight,
             iter_delta_reg_weight=iter_delta_reg_weight,
@@ -1092,6 +1102,8 @@ def train_all_surrogates_parallel(
     pg_cost_sample_weight_clip: float = 10.0,
     pg_cost_single_sample_reg_scale: float | None = None,
     pg_cost_c_pg_adam_weight_decay: float | None = None,
+    main_direct_train_config: dict | None = None,
+    c_pg_direct_train_config: dict | None = None,
     pg_cost_reg_deadband: float = 0.25,
     pg_cost_softbound_weight: float = 1.0,
     iter_delta_reg_weight: float = 5e-5,
@@ -1232,6 +1244,8 @@ def train_all_surrogates_parallel(
             'pg_cost_sample_weight_clip': pg_cost_sample_weight_clip,
             'pg_cost_single_sample_reg_scale': pg_cost_single_sample_reg_scale,
             'pg_cost_c_pg_adam_weight_decay': pg_cost_c_pg_adam_weight_decay,
+            'main_direct_train_config': main_direct_train_config,
+            'c_pg_direct_train_config': c_pg_direct_train_config,
             'pg_cost_reg_deadband': pg_cost_reg_deadband,
             'pg_cost_softbound_weight': pg_cost_softbound_weight,
             'iter_delta_reg_weight': iter_delta_reg_weight,

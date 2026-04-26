@@ -38,6 +38,7 @@ def _require_gurobi_available(context: str = "Gurobi code path") -> None:
 try:
     import torch
     import torch.nn as nn
+    import torch.nn.functional as F
     import torch.optim as optim
     from torch.utils.data import Dataset, DataLoader
     TORCH_AVAILABLE = True
@@ -2629,6 +2630,8 @@ class SubproblemSurrogateTrainer:
                  unit_predictor_weight_decay: float = 1e-4,
                  pg_cost_single_sample_reg_scale: float | None = None,
                  pg_cost_c_pg_adam_weight_decay: float | None = None,
+                 main_direct_train_config: dict | None = None,
+                 c_pg_direct_train_config: dict | None = None,
                  device=None):
         """
         初始化单机组子问题代理约束训练器 - V3三时段版本
@@ -2812,6 +2815,8 @@ class SubproblemSurrogateTrainer:
             self.pg_cost_c_pg_adam_weight_decay = max(float(pg_cost_c_pg_adam_weight_decay), 0.0)
         else:
             self.pg_cost_c_pg_adam_weight_decay = 0.0 if self.n_samples == 1 else 1e-4
+        self.main_direct_train_config = dict(main_direct_train_config or {})
+        self.c_pg_direct_train_config = dict(c_pg_direct_train_config or {})
         
         # 初始化原始变量和对偶变量存储
         self.pg = np.zeros((self.n_samples, self.T))
@@ -2879,6 +2884,9 @@ class SubproblemSurrogateTrainer:
         self._prev_delta_values = None
         self._prev_cost_values = None
         self._prev_pg_cost_values = None
+        self._loss_tensor_cache = None
+        self._loss_tensor_cache_signature = None
+        self._loss_tensor_cache_dirty = True
 
         print(f"✓ 机组{unit_id}子问题代理约束训练器初始化完成", flush=True)
     
@@ -3032,6 +3040,249 @@ class SubproblemSurrogateTrainer:
 
     def _pg_costs_active(self) -> bool:
         return self.iter_number >= self.pg_cost_start_round
+
+    def _invalidate_loss_tensor_cache(self) -> None:
+        """Mark cached loss tensors stale after BCD state or restored state changes."""
+        self._loss_tensor_cache_dirty = True
+
+    def _loss_tensor_cache_key(self, device) -> tuple:
+        lambda_ids = tuple(id(x) for x in self.lambda_inherent)
+        sensitive_key = tuple(tuple(int(v) for v in ts) for ts in self.sensitive_timesteps)
+        offsets_key = tuple(
+            tuple(tuple(int(o) for o in offsets) for offsets in sample_offsets)
+            for sample_offsets in self.surrogate_constraint_offsets
+        )
+        direction_key = tuple(np.asarray(self._get_surrogate_direction_signs(), dtype=float).reshape(-1).tolist())
+        return (
+            str(device),
+            id(self.x),
+            id(self.mu),
+            id(self.lambda_vals),
+            lambda_ids,
+            sensitive_key,
+            offsets_key,
+            direction_key,
+            id(self._prev_alpha_values),
+            id(self._prev_beta_values),
+            id(self._prev_gamma_values),
+            id(self._prev_delta_values),
+            id(self._prev_cost_values),
+            id(self._prev_pg_cost_values),
+            bool(self.ignore_startup_shutdown_costs),
+        )
+
+    def _lambda_inherent_tensor_dict(self, sample_id: int, device) -> dict | None:
+        lam_inh = self.lambda_inherent[sample_id]
+        if lam_inh is None:
+            return None
+        out = {}
+        for key, value in lam_inh.items():
+            try:
+                out[key] = torch.as_tensor(value, dtype=torch.float32, device=device)
+            except Exception:
+                pass
+        return out
+
+    def _x_stationarity_inherent_np(self, sample_id: int) -> np.ndarray:
+        """Constant part of x-stationarity before surrogate alpha/beta/gamma and c_x terms."""
+        g = self.unit_id
+        lam_inh = self.lambda_inherent[sample_id]
+        out = np.zeros(self.T, dtype=np.float32)
+        b_val = float(self.gencost[g, -1] / self.T_delta)
+        pmin_v = float(self.gen[g, PMIN])
+        pmax_v = float(self.gen[g, PMAX])
+        ru_v = float(self.Ru_all[g])
+        rd_v = float(self.Rd_all[g])
+        ru_co_v = float(self.Ru_co_all[g])
+        rd_co_v = float(self.Rd_co_all[g])
+        start_c = 0.0 if self.ignore_startup_shutdown_costs else float(self.gencost[g, 1])
+        shut_c = 0.0 if self.ignore_startup_shutdown_costs else float(self.gencost[g, 2])
+        ton_l = min(4, self.T)
+        toff_l = min(4, self.T)
+        for t in range(self.T):
+            val = b_val
+            if lam_inh is not None:
+                val += pmin_v * float(lam_inh['lambda_pg_lower'][t])
+                val -= pmax_v * float(lam_inh['lambda_pg_upper'][t])
+                lam_ru = lam_inh['lambda_ramp_up']
+                lam_rd = lam_inh['lambda_ramp_down']
+                if t < self.T - 1:
+                    val += (ru_co_v - ru_v) * float(lam_ru[t])
+                if t > 0:
+                    val += (rd_co_v - rd_v) * float(lam_rd[t - 1])
+
+                lam_mon = lam_inh['lambda_min_on']
+                lam_moff = lam_inh['lambda_min_off']
+                for tau in range(1, ton_l + 1):
+                    tau_row = lam_mon[tau - 1]
+                    for t1 in range(self.T - tau):
+                        k = float(tau_row[t1])
+                        if t == t1 + 1:
+                            val += k
+                        if t == t1:
+                            val -= k
+                        if t == t1 + tau:
+                            val -= k
+                for tau in range(1, toff_l + 1):
+                    tau_row = lam_moff[tau - 1]
+                    for t1 in range(self.T - tau):
+                        k = float(tau_row[t1])
+                        if t == t1 + 1:
+                            val -= k
+                        if t == t1:
+                            val += k
+                        if t == t1 + tau:
+                            val += k
+
+                lam_sc = lam_inh['lambda_start_cost']
+                lam_shc = lam_inh['lambda_shut_cost']
+                if t > 0:
+                    val += start_c * float(lam_sc[t - 1])
+                    val -= shut_c * float(lam_shc[t - 1])
+                if t < self.T - 1:
+                    val -= start_c * float(lam_sc[t])
+                    val += shut_c * float(lam_shc[t])
+                val += float(lam_inh['lambda_x_upper'][t]) - float(lam_inh['lambda_x_lower'][t])
+            out[t] = val
+        return out
+
+    def _pg_stationarity_const_np(self, sample_id: int) -> np.ndarray:
+        """Constant part of pg-stationarity before c_pg[t]."""
+        g = self.unit_id
+        lam_inh = self.lambda_inherent[sample_id]
+        out = np.zeros(self.T, dtype=np.float32)
+        a_val = float(self.gencost[g, -2] / self.T_delta)
+        lambda_val = np.asarray(self.lambda_vals[sample_id], dtype=float).reshape(-1)
+        if lam_inh is None:
+            return out
+        lam_ru = lam_inh['lambda_ramp_up']
+        lam_rd = lam_inh['lambda_ramp_down']
+        for t in range(self.T):
+            pg_const = a_val - float(lambda_val[t])
+            pg_const -= float(lam_inh['lambda_pg_lower'][t])
+            pg_const += float(lam_inh['lambda_pg_upper'][t])
+            if t > 0:
+                pg_const += float(lam_ru[t - 1])
+                pg_const -= float(lam_rd[t - 1])
+            if t < self.T - 1:
+                pg_const -= float(lam_ru[t])
+                pg_const += float(lam_rd[t])
+            out[t] = pg_const
+        return out
+
+    def _build_loss_constraint_metadata(self, sample_id: int, device) -> dict:
+        sensitive_t = list(self.sensitive_timesteps[sample_id])
+        offsets_by_k = self._constraint_offsets_for_sample(sample_id)
+        x_np = np.asarray(self.x[sample_id], dtype=np.float32).reshape(-1)
+        n_constraints = len(sensitive_t)
+        x_alpha = np.zeros(n_constraints, dtype=np.float32)
+        x_beta = np.zeros(n_constraints, dtype=np.float32)
+        x_gamma = np.zeros(n_constraints, dtype=np.float32)
+        term_times: list[int] = []
+        term_k: list[int] = []
+        term_kind: list[int] = []
+        for k, ts in enumerate(sensitive_t):
+            for time_idx, kind in iterate_surrogate_constraint_terms(
+                int(ts),
+                offsets_by_k[k],
+                0,
+                1,
+                2,
+                self.T,
+            ):
+                if kind == 0:
+                    x_alpha[k] = x_np[int(time_idx)]
+                elif kind == 1:
+                    x_beta[k] = x_np[int(time_idx)]
+                else:
+                    x_gamma[k] = x_np[int(time_idx)]
+                term_times.append(int(time_idx))
+                term_k.append(int(k))
+                term_kind.append(int(kind))
+        return {
+            'n_constraints': n_constraints,
+            'x_alpha': torch.as_tensor(x_alpha, dtype=torch.float32, device=device),
+            'x_beta': torch.as_tensor(x_beta, dtype=torch.float32, device=device),
+            'x_gamma': torch.as_tensor(x_gamma, dtype=torch.float32, device=device),
+            'term_times': torch.as_tensor(term_times, dtype=torch.long, device=device),
+            'term_k': torch.as_tensor(term_k, dtype=torch.long, device=device),
+            'term_kind': torch.as_tensor(term_kind, dtype=torch.long, device=device),
+        }
+
+    def _refresh_loss_tensor_cache(self, device=None, force: bool = False) -> dict:
+        """Build tensors and sparse metadata reused by all differentiable loss calls."""
+        if device is None:
+            device = self.device
+        signature = self._loss_tensor_cache_key(device)
+        if (
+            not force
+            and not self._loss_tensor_cache_dirty
+            and self._loss_tensor_cache is not None
+            and self._loss_tensor_cache_signature == signature
+        ):
+            return self._loss_tensor_cache
+
+        cache = {
+            'x': torch.as_tensor(self.x, dtype=torch.float32, device=device),
+            'mu': torch.as_tensor(self.mu, dtype=torch.float32, device=device),
+            'mu_abs': torch.abs(torch.as_tensor(self.mu, dtype=torch.float32, device=device)),
+            'lambda_vals': torch.as_tensor(self.lambda_vals, dtype=torch.float32, device=device),
+            'direction_signs': torch.as_tensor(
+                self._get_surrogate_direction_signs(),
+                dtype=torch.float32,
+                device=device,
+            ),
+            'template_rhs_base': torch.as_tensor(
+                self.template_rhs_base_vector[: self.num_coupling_constraints],
+                dtype=torch.float32,
+                device=device,
+            ),
+            'lambda_inherent': [
+                self._lambda_inherent_tensor_dict(sample_id, device)
+                for sample_id in range(self.n_samples)
+            ],
+            'x_stationarity_const': torch.as_tensor(
+                np.asarray([
+                    self._x_stationarity_inherent_np(sample_id)
+                    for sample_id in range(self.n_samples)
+                ], dtype=np.float32),
+                dtype=torch.float32,
+                device=device,
+            ),
+            'pg_stationarity_const': torch.as_tensor(
+                np.asarray([
+                    self._pg_stationarity_const_np(sample_id)
+                    for sample_id in range(self.n_samples)
+                ], dtype=np.float32),
+                dtype=torch.float32,
+                device=device,
+            ),
+            'metadata': [
+                self._build_loss_constraint_metadata(sample_id, device)
+                for sample_id in range(self.n_samples)
+            ],
+            'prev': {},
+        }
+        prev_specs = [
+            ('alpha', self._prev_alpha_values),
+            ('beta', self._prev_beta_values),
+            ('gamma', self._prev_gamma_values),
+            ('delta', self._prev_delta_values),
+            ('cost', self._prev_cost_values),
+            ('pg_cost', self._prev_pg_cost_values),
+        ]
+        for name, value in prev_specs:
+            if value is not None:
+                cache['prev'][name] = torch.as_tensor(value, dtype=torch.float32, device=device)
+
+        self._loss_tensor_cache = cache
+        self._loss_tensor_cache_signature = signature
+        self._loss_tensor_cache_dirty = False
+        return cache
+
+    def _loss_cached_sample(self, sample_id: int, device=None) -> tuple[dict, dict]:
+        cache = self._refresh_loss_tensor_cache(device=device)
+        return cache, cache['metadata'][sample_id]
 
     # --------- 单机组 0/1 预测器（用于 single-time 切片的 alpha/delta 生成） ---------
 
@@ -3488,6 +3739,440 @@ class SubproblemSurrogateTrainer:
         if enabled:
             for param in self._pg_network_parameters():
                 param.requires_grad_(True)
+
+    def _set_main_training_mode(self, enabled: bool) -> None:
+        """冻结 c_pg 分支，仅训练 alpha/beta/gamma/delta 与 x-cost 分支。"""
+        for param in self.surrogate_net.parameters():
+            param.requires_grad_(not enabled)
+        if enabled:
+            for param in self._main_network_parameters() + self._cost_network_parameters():
+                param.requires_grad_(True)
+
+    def _main_direct_target_bounds(self, nc: int) -> tuple[np.ndarray, np.ndarray]:
+        coeff_scale = float(getattr(self.surrogate_net, "coupling_coeff_scale", 2.0))
+        cost_scale = float(getattr(self.surrogate_net, "x_cost_scale", getattr(self, "x_cost_scale", 2.0)))
+        delta_base = float(getattr(self.surrogate_net, "delta_base", 3.0))
+        delta_scale = float(getattr(self.surrogate_net, "delta_scale", 2.0))
+        if self._uses_template_rhs_bases():
+            base = np.asarray(self.template_rhs_base_vector[:nc], dtype=np.float64)
+        else:
+            base = np.zeros(nc, dtype=np.float64)
+        lower = np.concatenate([
+            np.full(3 * nc, -coeff_scale, dtype=np.float64),
+            base + delta_base - delta_scale,
+            np.full(self.T, -cost_scale, dtype=np.float64),
+        ])
+        upper = np.concatenate([
+            np.full(3 * nc, coeff_scale, dtype=np.float64),
+            base + delta_base + delta_scale,
+            np.full(self.T, cost_scale, dtype=np.float64),
+        ])
+        return lower, upper
+
+    def _build_main_direct_targets(self, config: dict) -> dict[str, np.ndarray | float]:
+        """构造 NN-main 直接拟合标签：用当前 x/mu/固有对偶解一个带锚点的 KKT 代理最小二乘。"""
+        n = int(self.n_samples)
+        nc = int(self.num_coupling_constraints)
+        n_vars = 4 * nc + self.T
+        target_blend = min(max(float(config.get("target_blend", 0.75)), 0.0), 1.0)
+        mu_threshold = float(config.get("mu_active_threshold", 1e-7))
+        dual_w = float(config.get("dual_eq_weight", 1.0))
+        active_w = float(config.get("active_opt_weight", 0.8))
+        inactive_w = float(config.get("inactive_margin_weight", 0.0))
+        inactive_margin = float(config.get("inactive_margin", 0.0))
+        anchor = float(config.get("anchor_weight", 0.15))
+        coeff_anchor = float(config.get("coeff_anchor_weight", anchor))
+        delta_anchor = float(config.get("delta_anchor_weight", anchor))
+        cost_anchor = float(config.get("cost_anchor_weight", anchor))
+
+        lower, upper = self._main_direct_target_bounds(nc)
+        alphas = np.zeros((n, nc), dtype=np.float32)
+        betas = np.zeros((n, nc), dtype=np.float32)
+        gammas = np.zeros((n, nc), dtype=np.float32)
+        deltas = np.zeros((n, nc), dtype=np.float32)
+        costs = np.zeros((n, self.T), dtype=np.float32)
+        solved_residuals: list[float] = []
+
+        for sample_id in range(n):
+            y0 = np.concatenate([
+                np.asarray(self.alpha_values[sample_id][:nc], dtype=np.float64),
+                np.asarray(self.beta_values[sample_id][:nc], dtype=np.float64),
+                np.asarray(self.gamma_values[sample_id][:nc], dtype=np.float64),
+                np.asarray(self.delta_values[sample_id][:nc], dtype=np.float64),
+                np.asarray(self.cost_values[sample_id][:self.T], dtype=np.float64),
+            ])
+            rows: list[np.ndarray] = []
+            rhs: list[float] = []
+            weights: list[float] = []
+            x_val = np.asarray(self.x[sample_id], dtype=np.float64).reshape(-1)
+            mu_val = np.asarray(self.mu[sample_id], dtype=np.float64).reshape(-1)[:nc]
+            inherent = self._x_stationarity_inherent_np(sample_id)
+            offsets_by_k = self._constraint_offsets_for_sample(sample_id)
+            signs = self._get_surrogate_direction_signs(nc)
+
+            for t in range(self.T):
+                row = np.zeros(n_vars, dtype=np.float64)
+                row[4 * nc + t] = 1.0
+                for k, ts in enumerate(self.sensitive_timesteps[sample_id][:nc]):
+                    for time_idx, kind in iterate_surrogate_constraint_terms(
+                        int(ts), offsets_by_k[k], 0, 1, 2, self.T,
+                    ):
+                        if int(time_idx) != t:
+                            continue
+                        row[int(kind) * nc + k] += float(mu_val[k])
+                rows.append(row)
+                rhs.append(-float(inherent[t]))
+                weights.append(max(dual_w, 0.0))
+
+            for k, ts in enumerate(self.sensitive_timesteps[sample_id][:nc]):
+                row = np.zeros(n_vars, dtype=np.float64)
+                for time_idx, kind in iterate_surrogate_constraint_terms(
+                    int(ts), offsets_by_k[k], 0, 1, 2, self.T,
+                ):
+                    row[int(kind) * nc + k] += float(signs[k]) * float(x_val[int(time_idx)])
+                row[3 * nc + k] = -float(signs[k])
+                if abs(float(mu_val[k])) > mu_threshold and active_w > 0:
+                    rows.append(row)
+                    rhs.append(0.0)
+                    weights.append(active_w)
+                elif inactive_w > 0:
+                    rows.append(row)
+                    rhs.append(-inactive_margin)
+                    weights.append(inactive_w)
+
+            if rows:
+                mat = np.vstack(rows)
+                vec = np.asarray(rhs, dtype=np.float64)
+                w = np.sqrt(np.maximum(np.asarray(weights, dtype=np.float64), 0.0))
+                mat_w = mat * w[:, None]
+                vec_w = vec * w
+                anchor_diag = np.concatenate([
+                    np.full(3 * nc, max(coeff_anchor, 1e-8), dtype=np.float64),
+                    np.full(nc, max(delta_anchor, 1e-8), dtype=np.float64),
+                    np.full(self.T, max(cost_anchor, 1e-8), dtype=np.float64),
+                ])
+                lhs = mat_w.T @ mat_w + np.diag(anchor_diag)
+                rhs_vec = mat_w.T @ vec_w + anchor_diag * y0
+                try:
+                    y = np.linalg.solve(lhs, rhs_vec)
+                except np.linalg.LinAlgError:
+                    y = np.linalg.lstsq(lhs, rhs_vec, rcond=None)[0]
+                solved_residuals.append(float(np.mean(np.abs(mat @ y - vec))) if vec.size else 0.0)
+            else:
+                y = y0.copy()
+                solved_residuals.append(0.0)
+            y = np.clip(y, lower, upper)
+            y = (1.0 - target_blend) * y0 + target_blend * y
+            alphas[sample_id] = y[:nc]
+            betas[sample_id] = y[nc:2 * nc]
+            gammas[sample_id] = y[2 * nc:3 * nc]
+            deltas[sample_id] = y[3 * nc:4 * nc]
+            costs[sample_id] = y[4 * nc:4 * nc + self.T]
+
+        return {
+            "alphas": alphas,
+            "betas": betas,
+            "gammas": gammas,
+            "deltas": deltas,
+            "costs": costs,
+            "proxy_residual_mean": float(np.mean(solved_residuals)) if solved_residuals else 0.0,
+        }
+
+    def _main_direct_fast_metrics(self, sample_features, targets, target_scales) -> dict[str, float]:
+        nc = int(self.num_coupling_constraints)
+        totals = {"direct_mae": 0.0, "obj_primal": 0.0, "obj_dual_x": 0.0, "obj_opt": 0.0}
+        with torch.no_grad():
+            for sample_id, features in enumerate(sample_features):
+                out = self.surrogate_net.forward_main(features.unsqueeze(0))
+                a = out[0].squeeze(0)[:nc]
+                b = out[1].squeeze(0)[:nc]
+                g = out[2].squeeze(0)[:nc]
+                d = self._postprocess_delta_tensor(out[3].squeeze(0)[:nc])
+                c = out[4].squeeze(0)[:self.T]
+                direct_err = (
+                    torch.mean(torch.abs((a - targets["alphas"][sample_id]) / target_scales["coeff"]))
+                    + torch.mean(torch.abs((b - targets["betas"][sample_id]) / target_scales["coeff"]))
+                    + torch.mean(torch.abs((g - targets["gammas"][sample_id]) / target_scales["coeff"]))
+                    + torch.mean(torch.abs((d - targets["deltas"][sample_id]) / target_scales["delta"]))
+                    + torch.mean(torch.abs((c - targets["costs"][sample_id]) / target_scales["cost"]))
+                ) / 5.0
+                totals["direct_mae"] += float(direct_err.detach().cpu().item())
+                _, comps = self.loss_function_differentiable(
+                    sample_id, a, b, g, d, c, self.device, return_components=True,
+                )
+                totals["obj_primal"] += float(comps["obj_primal"].detach().cpu().item())
+                totals["obj_dual_x"] += float(comps["obj_dual_x"].detach().cpu().item())
+                totals["obj_opt"] += float(comps["obj_opt"].detach().cpu().item())
+        denom = max(self.n_samples, 1)
+        return {k: float(v / denom) for k, v in totals.items()}
+
+    def iter_with_main_direct_targets(self, config: dict | None = None):
+        """按 snapshot 脚本中的 NN-main direct-target 策略预训练主代理分支。"""
+        config = dict(self.main_direct_train_config if config is None else config)
+        epochs = int(config.get("direct_epochs", 0) or 0)
+        if not TORCH_AVAILABLE or epochs <= 0:
+            return None
+        _, batch_size, shuffle = self._resolve_nn_batch_config(
+            batch_size=config.get("direct_batch_size"),
+            batch_strategy=config.get("direct_batch_strategy", "full-batch"),
+            shuffle=config.get("direct_shuffle", False),
+        )
+        nc = int(self.num_coupling_constraints)
+        lr = float(config.get("direct_lr", 2e-3))
+        cost_lr = float(config.get("direct_cost_lr", lr * 0.25))
+        eta_min_ratio = float(config.get("direct_eta_min_ratio", 0.1))
+        grad_clip = float(config.get("direct_grad_clip", 3.0))
+        wd = float(config.get("adam_weight_decay", 0.0) or 0.0)
+        loss_kind = str(config.get("direct_loss", "mse")).strip().lower()
+        beta = float(config.get("direct_beta", 1.0))
+        log_interval = int(config.get("direct_log_interval", 50) or 0)
+        target_check_interval = int(config.get("direct_target_check_interval", log_interval) or 0)
+        direct_mae_target = config.get("direct_mae_target")
+        direct_mae_target = None if direct_mae_target is None else float(direct_mae_target)
+        feature_noise_std = max(float(config.get("feature_noise_std", 0.0) or 0.0), 0.0)
+        coeff_w = float(config.get("coeff_loss_weight", 1.0))
+        delta_w = float(config.get("delta_loss_weight", 0.6))
+        cost_w = float(config.get("cost_loss_weight", 0.8))
+        proxy_kkt_w = float(config.get("proxy_kkt_loss_weight", 0.0))
+
+        np_targets = self._build_main_direct_targets(config)
+        sample_features = [
+            torch.tensor(self._extract_features(i), dtype=torch.float32, device=self.device)
+            for i in range(self.n_samples)
+        ]
+        targets = {
+            key: torch.tensor(np_targets[key], dtype=torch.float32, device=self.device)
+            for key in ("alphas", "betas", "gammas", "deltas", "costs")
+        }
+        target_scales = {
+            "coeff": torch.clamp(
+                torch.mean(torch.abs(torch.cat([targets["alphas"], targets["betas"], targets["gammas"]], dim=1))),
+                min=0.25,
+            ),
+            "delta": torch.clamp(torch.mean(torch.abs(targets["deltas"])), min=1.0),
+            "cost": torch.clamp(torch.mean(torch.abs(targets["costs"])), min=0.25),
+        }
+        print(
+            f"[Unit-{self.unit_id}][direct-NN-main] direct_loss={loss_kind}, "
+            f"proxy_residual_mean={np_targets['proxy_residual_mean']:.6f}",
+            flush=True,
+        )
+
+        def group_loss(pred, target, scale, weight):
+            err = (pred - target) / scale
+            if loss_kind in ("mse", "l2"):
+                return weight * torch.sum(err * err)
+            return weight * F.smooth_l1_loss(err, torch.zeros_like(err), beta=beta, reduction="sum")
+
+        self.surrogate_net.train()
+        self._set_main_training_mode(True)
+        optimizer_main = optim.AdamW(self._main_network_parameters(), lr=lr, weight_decay=wd)
+        optimizer_cost = optim.AdamW(self._cost_network_parameters(), lr=cost_lr, weight_decay=wd)
+        scheduler_main = optim.lr_scheduler.CosineAnnealingLR(
+            optimizer_main, T_max=max(epochs, 1), eta_min=lr * max(eta_min_ratio, 0.0),
+        )
+        scheduler_cost = optim.lr_scheduler.CosineAnnealingLR(
+            optimizer_cost, T_max=max(epochs, 1), eta_min=cost_lr * max(eta_min_ratio, 0.0),
+        )
+        last_avg = None
+        last_fast = None
+        try:
+            for epoch in range(epochs):
+                epoch_loss = 0.0
+                optimizer_main.zero_grad()
+                optimizer_cost.zero_grad()
+                sample_indices = np.arange(self.n_samples, dtype=int)
+                if shuffle and self.n_samples > 1:
+                    np.random.shuffle(sample_indices)
+                for sample_pos, _sample_id in enumerate(sample_indices):
+                    batch_start = (sample_pos // batch_size) * batch_size
+                    is_batch_end = ((sample_pos + 1) % batch_size == 0) or sample_pos == self.n_samples - 1
+                    if not is_batch_end:
+                        continue
+                    batch_ids = sample_indices[batch_start: sample_pos + 1]
+                    features_tensor = torch.stack([sample_features[int(i)] for i in batch_ids], dim=0)
+                    if feature_noise_std > 0:
+                        features_tensor = features_tensor + torch.randn_like(features_tensor) * feature_noise_std
+                    out = self.surrogate_net.forward_main(features_tensor)
+                    pred_a = out[0][:, :nc]
+                    pred_b = out[1][:, :nc]
+                    pred_g = out[2][:, :nc]
+                    pred_d = self._postprocess_delta_tensor(out[3][:, :nc])
+                    pred_c = out[4][:, :self.T]
+                    batch_index = torch.as_tensor(batch_ids, dtype=torch.long, device=self.device)
+                    loss = (
+                        group_loss(pred_a, targets["alphas"].index_select(0, batch_index), target_scales["coeff"], coeff_w)
+                        + group_loss(pred_b, targets["betas"].index_select(0, batch_index), target_scales["coeff"], coeff_w)
+                        + group_loss(pred_g, targets["gammas"].index_select(0, batch_index), target_scales["coeff"], coeff_w)
+                        + group_loss(pred_d, targets["deltas"].index_select(0, batch_index), target_scales["delta"], delta_w)
+                        + group_loss(pred_c, targets["costs"].index_select(0, batch_index), target_scales["cost"], cost_w)
+                    )
+                    if proxy_kkt_w > 0:
+                        for local_pos, sid in enumerate(batch_ids):
+                            loss = loss + proxy_kkt_w * self.loss_function_differentiable(
+                                int(sid),
+                                pred_a[local_pos],
+                                pred_b[local_pos],
+                                pred_g[local_pos],
+                                pred_d[local_pos],
+                                pred_c[local_pos],
+                                self.device,
+                            )
+                    (loss / max(1, len(batch_ids))).backward()
+                    epoch_loss += float(loss.detach().cpu().item())
+                    params = self._main_network_parameters() + self._cost_network_parameters()
+                    torch.nn.utils.clip_grad_norm_(params, max_norm=grad_clip)
+                    optimizer_main.step()
+                    optimizer_cost.step()
+                    optimizer_main.zero_grad()
+                    optimizer_cost.zero_grad()
+                scheduler_main.step()
+                scheduler_cost.step()
+                last_avg = epoch_loss / max(self.n_samples, 1)
+                do_log = epoch == 0 or epoch == epochs - 1 or (log_interval > 0 and (epoch + 1) % log_interval == 0)
+                do_target_check = (
+                    direct_mae_target is not None
+                    and (do_log or epoch == epochs - 1 or (target_check_interval > 0 and (epoch + 1) % target_check_interval == 0))
+                )
+                if do_log or do_target_check:
+                    last_fast = self._main_direct_fast_metrics(sample_features, targets, target_scales)
+                if do_log:
+                    print(
+                        f"  [Unit-{self.unit_id}][direct-NN-main] epoch {epoch+1:>4}/{epochs}, "
+                        f"avg_target_loss={last_avg:.6f}, lr={optimizer_main.param_groups[0]['lr']:.2e}, "
+                        f"cost_lr={optimizer_cost.param_groups[0]['lr']:.2e}, "
+                        f"direct_mae={last_fast['direct_mae']:.6f}",
+                        flush=True,
+                    )
+        finally:
+            self._set_main_training_mode(False)
+        self._refresh_cached_surrogate_outputs()
+        return {
+            "avg_target_loss": None if last_avg is None else float(last_avg),
+            "fast": last_fast,
+        }
+
+    def _c_pg_direct_target_for_sample(self, sample_id: int) -> np.ndarray:
+        """c_pg[t] = -pg stationarity constant."""
+        return -self._pg_stationarity_const_np(sample_id).astype(np.float32)
+
+    def iter_with_c_pg_direct_targets(self, config: dict | None = None):
+        """按 snapshot 脚本中的 c_pg direct-target 策略预训练 c_pg 分支。"""
+        config = dict(self.c_pg_direct_train_config if config is None else config)
+        epochs = int(config.get("direct_epochs", 0) or 0)
+        if not TORCH_AVAILABLE or epochs <= 0 or not self._pg_costs_active():
+            return None
+        _, batch_size, shuffle = self._resolve_nn_batch_config(
+            batch_size=config.get("direct_batch_size"),
+            batch_strategy=config.get("direct_batch_strategy", "full-batch"),
+            shuffle=config.get("direct_shuffle", False),
+        )
+        lr = float(config.get("direct_lr", 2e-3))
+        eta_min_ratio = float(config.get("direct_eta_min_ratio", 0.05))
+        beta = float(config.get("direct_beta", 1.0))
+        loss_kind = str(config.get("direct_loss", "huber")).strip().lower()
+        grad_clip = float(config.get("direct_grad_clip", 2.0))
+        feature_noise_std = max(float(config.get("feature_noise_std", 0.0) or 0.0), 0.0)
+        log_interval = int(config.get("direct_log_interval", 50) or 0)
+        target_check_interval = int(config.get("direct_target_check_interval", log_interval) or 0)
+        obj_dual_pg_target = config.get("direct_obj_dual_pg_target")
+        obj_dual_pg_target = None if obj_dual_pg_target is None else float(obj_dual_pg_target)
+        wd = config.get("adam_weight_decay", self.pg_cost_c_pg_adam_weight_decay)
+        wd = 0.0 if wd is None else float(wd)
+
+        sample_features = [
+            torch.tensor(self._extract_features(i), dtype=torch.float32, device=self.device)
+            for i in range(self.n_samples)
+        ]
+        targets = [
+            torch.tensor(self._c_pg_direct_target_for_sample(i), dtype=torch.float32, device=self.device)
+            for i in range(self.n_samples)
+        ]
+        full_features_tensor = torch.stack(sample_features, dim=0)
+        full_target_tensor = torch.stack(targets, dim=0)
+        target_scale = config.get("direct_target_scale")
+        if target_scale is None:
+            target_scale_tensor = torch.clamp(torch.mean(torch.abs(full_target_tensor)), min=1.0)
+        else:
+            target_scale_tensor = torch.as_tensor(
+                max(float(target_scale), 1e-6), dtype=torch.float32, device=self.device,
+            )
+        print(
+            f"[Unit-{self.unit_id}][direct-c_pg] direct_loss={loss_kind}, "
+            f"target_scale={float(target_scale_tensor.detach().cpu().item()):.6f}",
+            flush=True,
+        )
+
+        def direct_target_obj_dual_pg() -> float:
+            with torch.no_grad():
+                out = self._gate_pg_cost_tensor(
+                    self.surrogate_net.forward_pg_cost(full_features_tensor)[:, : self.T]
+                )
+                return float(torch.sum(torch.abs(out - full_target_tensor)).detach().cpu().item())
+
+        optimizer = optim.AdamW(self._pg_network_parameters(), lr=lr, weight_decay=wd)
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=max(epochs, 1), eta_min=lr * max(eta_min_ratio, 0.0),
+        )
+        self.surrogate_net.train()
+        self._set_c_pg_training_mode(True)
+        last_avg = None
+        try:
+            for epoch in range(epochs):
+                epoch_loss = 0.0
+                optimizer.zero_grad()
+                sample_indices = np.arange(self.n_samples, dtype=int)
+                if shuffle and self.n_samples > 1:
+                    np.random.shuffle(sample_indices)
+                for sample_pos, _sample_id in enumerate(sample_indices):
+                    batch_start = (sample_pos // batch_size) * batch_size
+                    is_batch_end = ((sample_pos + 1) % batch_size == 0) or sample_pos == self.n_samples - 1
+                    if not is_batch_end:
+                        continue
+                    batch_ids = sample_indices[batch_start: sample_pos + 1]
+                    features_tensor = torch.stack([sample_features[int(i)] for i in batch_ids], dim=0)
+                    if feature_noise_std > 0:
+                        features_tensor = features_tensor + torch.randn_like(features_tensor) * feature_noise_std
+                    target = torch.stack([targets[int(i)] for i in batch_ids], dim=0)
+                    out = self._gate_pg_cost_tensor(
+                        self.surrogate_net.forward_pg_cost(features_tensor)[:, : self.T]
+                    )
+                    if loss_kind in ("mse", "l2"):
+                        err = (out - target) / target_scale_tensor
+                        loss = torch.sum(err * err)
+                    else:
+                        loss = F.smooth_l1_loss(out, target, beta=beta, reduction="sum")
+                    if self.pg_cost_softbound_weight > 0 and self.pg_cost_scale > 0:
+                        scale = torch.as_tensor(float(self.pg_cost_scale), dtype=out.dtype, device=out.device)
+                        excess = self._smooth_relu(torch.abs(out) - scale, eps=self.pg_cost_smooth_abs_eps)
+                        loss = loss + float(self.pg_cost_softbound_weight) * torch.sum(excess * excess)
+                    (loss / max(1, len(batch_ids))).backward()
+                    epoch_loss += float(loss.detach().cpu().item())
+                    torch.nn.utils.clip_grad_norm_(self._pg_network_parameters(), max_norm=grad_clip)
+                    optimizer.step()
+                    optimizer.zero_grad()
+                scheduler.step()
+                last_avg = epoch_loss / max(self.n_samples, 1)
+                do_log = epoch == 0 or epoch == epochs - 1 or (log_interval > 0 and (epoch + 1) % log_interval == 0)
+                do_target_check = (
+                    obj_dual_pg_target is not None
+                    and (do_log or epoch == epochs - 1 or (target_check_interval > 0 and (epoch + 1) % target_check_interval == 0))
+                )
+                metric_obj_dual_pg = direct_target_obj_dual_pg() if (do_log or do_target_check) else None
+                if do_log:
+                    print(
+                        f"  [Unit-{self.unit_id}][direct-c_pg] epoch {epoch+1:>4}/{epochs}, "
+                        f"avg_target_loss={last_avg:.6f}, lr={optimizer.param_groups[0]['lr']:.2e}, "
+                        f"fast_obj_dual_pg={metric_obj_dual_pg:.6f}",
+                        flush=True,
+                    )
+        finally:
+            self._set_c_pg_training_mode(False)
+        self._refresh_cached_surrogate_outputs()
+        return {
+            "avg_target_loss": None if last_avg is None else float(last_avg),
+            "fast_obj_dual_pg": direct_target_obj_dual_pg(),
+        }
 
     def _resolve_nn_batch_config(
         self,
@@ -5088,19 +5773,11 @@ class SubproblemSurrogateTrainer:
         这里只训练 alpha/beta/gamma/delta/c_x，显式剥离 c_pg 对应的驻点项。
         c_pg 使用独立训练器和独立 loss。
         """
-        g = self.unit_id
-        
-        # 从BCD迭代得到的变量
-        x_val   = torch.tensor(self.x[sample_id],   dtype=torch.float32, device=device)  # (T,)
-        mu_vals = torch.tensor(self.mu[sample_id],  dtype=torch.float32, device=device)  # (num_coupling_constraints,)
-        mu_abs_vals = torch.abs(mu_vals)
-        lambda_val = torch.tensor(self.lambda_vals[sample_id], dtype=torch.float32, device=device)
-        lam_inh = self.lambda_inherent[sample_id]  # dict or None
-        direction_signs = torch.tensor(
-            self._get_surrogate_direction_signs(len(alphas_tensor)),
-            dtype=torch.float32,
-            device=device,
-        )
+        cache, metadata = self._loss_cached_sample(sample_id, device=device)
+        n_constraints = int(metadata['n_constraints'])
+        mu_vals = cache['mu'][sample_id][:n_constraints]
+        mu_abs_vals = cache['mu_abs'][sample_id][:n_constraints]
+        direction_signs = cache['direction_signs'][:len(alphas_tensor)]
         signed_alphas = alphas_tensor * direction_signs
         signed_betas = betas_tensor * direction_signs
         signed_gammas = gammas_tensor * direction_signs
@@ -5108,40 +5785,27 @@ class SubproblemSurrogateTrainer:
         
         # ========== 计算obj_primal ==========
         # V3三时段约束违反量（按 sensitive_timesteps 索引）
-        obj_primal = torch.tensor(0.0, device=device, requires_grad=True)
-        sensitive_t = self.sensitive_timesteps[sample_id]
-        constraint_offsets = self._constraint_offsets_for_sample(sample_id)
-        for k, t in enumerate(sensitive_t):
-            coupling_lhs = build_surrogate_constraint_expression(
-                x_val,
-                t,
-                constraint_offsets[k],
-                signed_alphas[k],
-                signed_betas[k],
-                signed_gammas[k],
-                self.T,
+        x_alpha = metadata['x_alpha']
+        x_beta = metadata['x_beta']
+        x_gamma = metadata['x_gamma']
+        if n_constraints > 0:
+            coupling_lhs = (
+                signed_alphas[:n_constraints] * x_alpha
+                + signed_betas[:n_constraints] * x_beta
+                + signed_gammas[:n_constraints] * x_gamma
             )
-            coupling_viol = self._smooth_relu(coupling_lhs - signed_deltas[k])
-            obj_primal = obj_primal + coupling_viol
+            coupling_residual = coupling_lhs - signed_deltas[:n_constraints]
+            obj_primal = torch.sum(self._smooth_relu(coupling_residual))
+            obj_opt = torch.sum(
+                self._smooth_abs(coupling_residual, self.nn_smooth_abs_eps)
+                * mu_abs_vals
+            )
+        else:
+            obj_primal = torch.zeros((), dtype=alphas_tensor.dtype, device=device)
+            obj_opt = torch.zeros((), dtype=alphas_tensor.dtype, device=device)
 
         # ========== 计算obj_opt ==========
         # V3互补松弛（按 sensitive_timesteps 索引）
-        obj_opt = torch.tensor(0.0, device=device, requires_grad=True)
-        for k, t in enumerate(sensitive_t):
-            coupling_lhs = build_surrogate_constraint_expression(
-                x_val,
-                t,
-                constraint_offsets[k],
-                signed_alphas[k],
-                signed_betas[k],
-                signed_gammas[k],
-                self.T,
-            )
-            coupling_abs = self._smooth_abs(
-                coupling_lhs - signed_deltas[k],
-                self.nn_smooth_abs_eps,
-            )
-            obj_opt = obj_opt + coupling_abs * mu_abs_vals[k]
         
         # ========== 计算obj_dual_x ==========
         # x[t]驻点：b + Pmin*lam_pg_lower[t] - Pmax*lam_pg_upper[t]
@@ -5150,88 +5814,27 @@ class SubproblemSurrogateTrainer:
         #
         # 固有项（常数，来自dual block存储的lambda_inherent）
         # 代理耦合项（含alpha,beta,gamma张量，提供NN梯度）
-        g = self.unit_id
-        b_val   = float(self.gencost[g, -1] / self.T_delta)
-        Pmin_v  = float(self.gen[g, PMIN])
-        Pmax_v  = float(self.gen[g, PMAX])
-        Ru_v    = float(self.Ru_all[g])
-        Rd_v    = float(self.Rd_all[g])
-        Ru_co_v = float(self.Ru_co_all[g])
-        Rd_co_v = float(self.Rd_co_all[g])
-        start_c = 0.0 if self.ignore_startup_shutdown_costs else float(self.gencost[g, 1])
-        shut_c  = 0.0 if self.ignore_startup_shutdown_costs else float(self.gencost[g, 2])
-        Ton_l   = min(4, self.T)
-        Toff_l  = min(4, self.T)
-        obj_dual_x = torch.tensor(0.0, device=device, requires_grad=True)
-        for t in range(self.T):
-            # 固有约束贡献（常数部分）
-            inherent_const = b_val
-            if lam_inh is not None:
-                lam_pgl = float(lam_inh['lambda_pg_lower'][t])
-                lam_pgu = float(lam_inh['lambda_pg_upper'][t])
-                inherent_const += Pmin_v * lam_pgl - Pmax_v * lam_pgu
-
-                lam_ru = lam_inh['lambda_ramp_up']    # (T-1,)
-                lam_rd = lam_inh['lambda_ramp_down']  # (T-1,)
-                if t < self.T - 1:
-                    inherent_const += (Ru_co_v - Ru_v) * float(lam_ru[t])
-                if t > 0:
-                    inherent_const += (Rd_co_v - Rd_v) * float(lam_rd[t - 1])
-
-                lam_mon  = lam_inh['lambda_min_on']   # ragged: list indexed [tau_idx][t1]
-                lam_moff = lam_inh['lambda_min_off']
-                for tau in range(1, Ton_l + 1):
-                    tau_row = lam_mon[tau - 1]  # (T-tau,)
-                    for t1 in range(self.T - tau):
-                        k = float(tau_row[t1])
-                        if t == t1 + 1:
-                            inherent_const += k
-                        if t == t1:
-                            inherent_const -= k
-                        if t == t1 + tau:
-                            inherent_const -= k
-                for tau in range(1, Toff_l + 1):
-                    tau_row = lam_moff[tau - 1]
-                    for t1 in range(self.T - tau):
-                        k = float(tau_row[t1])
-                        if t == t1 + 1:
-                            inherent_const -= k
-                        if t == t1:
-                            inherent_const += k
-                        if t == t1 + tau:
-                            inherent_const += k
-
-                lam_sc  = lam_inh['lambda_start_cost']  # (T-1,)
-                lam_shc = lam_inh['lambda_shut_cost']   # (T-1,)
-                if t > 0:
-                    inherent_const += start_c * float(lam_sc[t - 1])
-                    inherent_const -= shut_c  * float(lam_shc[t - 1])
-                if t < self.T - 1:
-                    inherent_const -= start_c * float(lam_sc[t])
-                    inherent_const += shut_c  * float(lam_shc[t])
-
-                lam_xu = lam_inh['lambda_x_upper']  # (T,)
-                lam_xl = lam_inh['lambda_x_lower']  # (T,)
-                inherent_const += float(lam_xu[t]) - float(lam_xl[t])
-
-            # 代理耦合约束贡献（含NN参数，可微分；按 sensitive_timesteps 索引）
-            dual_expr = torch.tensor(inherent_const, dtype=torch.float32, device=device) + costs_tensor[t]
-            for k, ts in enumerate(sensitive_t):
-                for time_idx, coeff in iterate_surrogate_constraint_terms(
-                    ts,
-                    constraint_offsets[k],
-                    alphas_tensor[k],
-                    betas_tensor[k],
-                    gammas_tensor[k],
-                    self.T,
-                ):
-                    if time_idx == t:
-                        dual_expr = dual_expr + coeff * mu_vals[k]
-
-            obj_dual_x = obj_dual_x + self._smooth_abs(
-                dual_expr,
-                self.nn_smooth_abs_eps,
+        inherent_const = cache['x_stationarity_const'][sample_id]
+        dual_coupling = torch.zeros(self.T, dtype=costs_tensor.dtype, device=device)
+        term_times = metadata['term_times']
+        if term_times.numel() > 0:
+            term_k = metadata['term_k']
+            term_kind = metadata['term_kind']
+            alpha_terms = alphas_tensor[term_k]
+            beta_terms = betas_tensor[term_k]
+            gamma_terms = gammas_tensor[term_k]
+            coeff_terms = torch.where(
+                term_kind == 0,
+                alpha_terms,
+                torch.where(term_kind == 1, beta_terms, gamma_terms),
             )
+            dual_coupling = dual_coupling.scatter_add(
+                0,
+                term_times,
+                coeff_terms * mu_vals[term_k],
+            )
+        dual_expr = inherent_const + costs_tensor[:self.T] + dual_coupling
+        obj_dual_x = torch.sum(self._smooth_abs(dual_expr, self.nn_smooth_abs_eps))
 
         # 死区正则：限制幅值失控，但不给模板附近/小范围波动施加默认回拉。
         reg_loss = self.reg_weight * (
@@ -5241,11 +5844,7 @@ class SubproblemSurrogateTrainer:
             + self._deadband_quadratic(costs_tensor, self.aux_cost_reg_deadband)
         )
         if self._uses_template_rhs_bases():
-            delta_base_tensor = torch.tensor(
-                self.template_rhs_base_vector[:deltas_tensor.shape[0]],
-                dtype=deltas_tensor.dtype,
-                device=deltas_tensor.device,
-            )
+            delta_base_tensor = cache['template_rhs_base'][:deltas_tensor.shape[0]].to(dtype=deltas_tensor.dtype)
             reg_loss = reg_loss + self.reg_weight * self._deadband_quadratic(
                 deltas_tensor,
                 self.template_rhs_reg_deadband,
@@ -5258,33 +5857,14 @@ class SubproblemSurrogateTrainer:
             )
 
         # 迭代间差异正则：抑制相邻 BCD 轮次 NN 输出跳变（可通过 iter_delta_reg_weight 控制）
-        if self.iter_delta_reg_weight > 0 and self._prev_alpha_values is not None:
+        prev_cache = cache.get('prev', {})
+        if self.iter_delta_reg_weight > 0 and 'alpha' in prev_cache:
             nc = int(self.num_coupling_constraints)
-            prev_alphas = torch.tensor(
-                self._prev_alpha_values[sample_id][:nc],
-                dtype=alphas_tensor.dtype,
-                device=alphas_tensor.device,
-            )
-            prev_betas = torch.tensor(
-                self._prev_beta_values[sample_id][:nc],
-                dtype=betas_tensor.dtype,
-                device=betas_tensor.device,
-            )
-            prev_gammas = torch.tensor(
-                self._prev_gamma_values[sample_id][:nc],
-                dtype=gammas_tensor.dtype,
-                device=gammas_tensor.device,
-            )
-            prev_deltas = torch.tensor(
-                self._prev_delta_values[sample_id][:nc],
-                dtype=deltas_tensor.dtype,
-                device=deltas_tensor.device,
-            )
-            prev_costs = torch.tensor(
-                self._prev_cost_values[sample_id][: self.T],
-                dtype=costs_tensor.dtype,
-                device=costs_tensor.device,
-            )
+            prev_alphas = prev_cache['alpha'][sample_id][:nc].to(dtype=alphas_tensor.dtype)
+            prev_betas = prev_cache['beta'][sample_id][:nc].to(dtype=betas_tensor.dtype)
+            prev_gammas = prev_cache['gamma'][sample_id][:nc].to(dtype=gammas_tensor.dtype)
+            prev_deltas = prev_cache['delta'][sample_id][:nc].to(dtype=deltas_tensor.dtype)
+            prev_costs = prev_cache['cost'][sample_id][: self.T].to(dtype=costs_tensor.dtype)
             iter_delta = (
                 self._iter_delta_regularization(alphas_tensor, prev_alphas, self.iter_delta_reg_deadband)
                 + self._iter_delta_regularization(betas_tensor, prev_betas, self.iter_delta_reg_deadband)
@@ -5332,45 +5912,20 @@ class SubproblemSurrogateTrainer:
         return_components: bool = False,
     ) -> torch.Tensor:
         """c_pg 单独 loss，只优化 pg 驻点项和 c_pg 自身正则。"""
-        g = self.unit_id
-        lambda_val = torch.tensor(
-            self.lambda_vals[sample_id],
-            dtype=torch.float32,
-            device=device,
-        )
-        lam_inh = self.lambda_inherent[sample_id]
-        obj_dual_pg = torch.tensor(0.0, device=device, requires_grad=True)
-        a_val = float(self.gencost[g, -2] / self.T_delta)
-
-        if lam_inh is not None:
-            lam_ru = lam_inh['lambda_ramp_up']
-            lam_rd = lam_inh['lambda_ramp_down']
-            for t in range(self.T):
-                pg_const = a_val - float(lambda_val[t])
-                pg_const -= float(lam_inh['lambda_pg_lower'][t])
-                pg_const += float(lam_inh['lambda_pg_upper'][t])
-                if t > 0:
-                    pg_const += float(lam_ru[t - 1])
-                    pg_const -= float(lam_rd[t - 1])
-                if t < self.T - 1:
-                    pg_const -= float(lam_ru[t])
-                    pg_const += float(lam_rd[t])
-                residual = torch.tensor(pg_const, dtype=torch.float32, device=device) + pg_costs_tensor[t]
-                obj_dual_pg = obj_dual_pg + self._smooth_abs(
-                    residual,
-                    self.pg_cost_smooth_abs_eps,
-                )
+        cache, _ = self._loss_cached_sample(sample_id, device=device)
+        if cache['lambda_inherent'][sample_id] is None:
+            obj_dual_pg = torch.zeros((), dtype=pg_costs_tensor.dtype, device=device)
+        else:
+            residual = cache['pg_stationarity_const'][sample_id] + pg_costs_tensor[:self.T]
+            obj_dual_pg = torch.sum(self._smooth_abs(residual, self.pg_cost_smooth_abs_eps))
 
         reg_loss = self.reg_weight * self._deadband_quadratic(
             pg_costs_tensor,
             self.pg_cost_reg_deadband,
         )
-        if self.iter_delta_reg_weight > 0 and self._prev_pg_cost_values is not None:
-            prev_pg_costs = torch.tensor(
-                self._prev_pg_cost_values[sample_id][: self.T],
-                dtype=pg_costs_tensor.dtype,
-                device=pg_costs_tensor.device,
-            )
+        prev_cache = cache.get('prev', {})
+        if self.iter_delta_reg_weight > 0 and 'pg_cost' in prev_cache:
+            prev_pg_costs = prev_cache['pg_cost'][sample_id][: self.T].to(dtype=pg_costs_tensor.dtype)
             reg_loss = reg_loss + self.iter_delta_reg_weight * self._iter_delta_regularization(
                 pg_costs_tensor,
                 prev_pg_costs,
@@ -6134,6 +6689,7 @@ class SubproblemSurrogateTrainer:
                     self.x[sample_id] = np.where(np.abs(self.x[sample_id] - 1) < EPS, 1, self.x[sample_id])
                     self.coc[sample_id] = np.where(np.abs(coc_sol) < EPS, 0, coc_sol)
                     self.cpower[sample_id] = np.where(np.abs(cpower_sol) < EPS, 0, cpower_sol)
+            self._invalidate_loss_tensor_cache()
             
             # 2. 对偶块迭代（V3：联合更新固有约束对偶变量和代理耦合对偶变量）
             lb_mu = self._current_mu_lower_bound_value()
@@ -6167,6 +6723,7 @@ class SubproblemSurrogateTrainer:
                         lb_mu,
                         direction_signs=direction_signs,
                     )
+            self._invalidate_loss_tensor_cache()
             
             _z = lambda v: v if abs(v) >= 1e-12 else 0.0
             nn_metrics_pre = self.cal_nn_logging_components()
@@ -6188,6 +6745,8 @@ class SubproblemSurrogateTrainer:
             self._prev_delta_values = self.delta_values.copy()
             self._prev_cost_values = self.cost_values.copy()
             self._prev_pg_cost_values = self.pg_cost_values.copy()
+            self._invalidate_loss_tensor_cache()
+            self.iter_with_main_direct_targets()
             self.iter_with_surrogate_nn(
                 num_epochs=nn_epochs,
                 batch_size=nn_batch_size,
@@ -6196,6 +6755,7 @@ class SubproblemSurrogateTrainer:
                 learning_rate=nn_learning_rate,
                 cost_learning_rate=cost_learning_rate,
             )
+            self.iter_with_c_pg_direct_targets()
             self.iter_with_c_pg_nn(
                 num_epochs=resolved_pg_cost_nn_epochs,
                 batch_size=(self.pg_cost_batch_size if self.pg_cost_batch_size is not None else nn_batch_size),
@@ -6557,13 +7117,10 @@ class SubproblemSurrogateTrainer:
         try:
             for sample_id in range(self.n_samples):
                 features = np.asarray(self._extract_features(sample_id), dtype=np.float64).reshape(-1)
-                lam = np.asarray(self.lambda_vals[sample_id], dtype=np.float64).reshape(-1)
                 li = self.lambda_inherent[sample_id]
                 li_cpg = None
-                pg_const_t: list[float] = []
+                pg_const_t = self._pg_stationarity_const_np(sample_id).astype(float).tolist()
                 if li is not None:
-                    lam_ru = li["lambda_ramp_up"]
-                    lam_rd = li["lambda_ramp_down"]
                     li_cpg = {
                         "lambda_pg_lower": np.asarray(
                             li["lambda_pg_lower"], dtype=float
@@ -6578,17 +7135,6 @@ class SubproblemSurrogateTrainer:
                             li["lambda_ramp_down"], dtype=float
                         ).reshape(-1).tolist(),
                     }
-                    for t in range(self.T):
-                        pg_const = a_val - float(lam[t])
-                        pg_const -= float(li["lambda_pg_lower"][t])
-                        pg_const += float(li["lambda_pg_upper"][t])
-                        if t > 0:
-                            pg_const += float(lam_ru[t - 1])
-                            pg_const -= float(lam_rd[t - 1])
-                        if t < self.T - 1:
-                            pg_const -= float(lam_ru[t])
-                            pg_const += float(lam_rd[t])
-                        pg_const_t.append(float(pg_const))
                 features_tensor = torch.tensor(
                     features, dtype=torch.float32, device=self.device
                 ).unsqueeze(0)

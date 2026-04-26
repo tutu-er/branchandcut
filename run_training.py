@@ -282,6 +282,52 @@ SUBPROBLEM_PG_COST_SAMPLE_WEIGHT_CLIP: float = 10.0
 SUBPROBLEM_PG_COST_SINGLE_SAMPLE_REG_SCALE: float | None = None
 SUBPROBLEM_PG_COST_C_PG_ADAM_WD: float | None = None
 
+# NN_subproblem 新训练策略：先用解析/KKT proxy 直接目标预训练，再进入原可微 KKT loss 微调。
+# epochs=0 可关闭对应 direct-target 阶段。
+SUBPROBLEM_MAIN_DIRECT_EPOCHS: int = 120
+SUBPROBLEM_MAIN_DIRECT_LR: float = 2e-3
+SUBPROBLEM_MAIN_DIRECT_COST_LR: float = 8e-4
+SUBPROBLEM_MAIN_DIRECT_ETA_MIN_RATIO: float = 0.20
+SUBPROBLEM_MAIN_DIRECT_BATCH_STRATEGY: str = "mini-batch"
+SUBPROBLEM_MAIN_DIRECT_BATCH_SIZE: int = 16
+SUBPROBLEM_MAIN_DIRECT_SHUFFLE: bool = True
+SUBPROBLEM_MAIN_DIRECT_LOSS: str = "mse"
+SUBPROBLEM_MAIN_DIRECT_GRAD_CLIP: float = 3.0
+SUBPROBLEM_MAIN_DIRECT_LOG_INTERVAL: int = 10
+SUBPROBLEM_MAIN_DIRECT_TARGET_CHECK_INTERVAL: int = 5
+SUBPROBLEM_MAIN_DIRECT_MAE_TARGET: float | None = 0.076
+SUBPROBLEM_MAIN_DIRECT_FEATURE_NOISE_STD: float = 0.005
+SUBPROBLEM_MAIN_DIRECT_ADAM_WD: float = 1e-5
+SUBPROBLEM_MAIN_DIRECT_TARGET_BLEND: float = 0.75
+SUBPROBLEM_MAIN_DIRECT_DUAL_EQ_WEIGHT: float = 1.0
+SUBPROBLEM_MAIN_DIRECT_ACTIVE_OPT_WEIGHT: float = 0.8
+SUBPROBLEM_MAIN_DIRECT_INACTIVE_MARGIN_WEIGHT: float = 0.08
+SUBPROBLEM_MAIN_DIRECT_INACTIVE_MARGIN: float = 0.15
+SUBPROBLEM_MAIN_DIRECT_ANCHOR_WEIGHT: float = 0.18
+SUBPROBLEM_MAIN_DIRECT_COEFF_ANCHOR_WEIGHT: float = 0.22
+SUBPROBLEM_MAIN_DIRECT_DELTA_ANCHOR_WEIGHT: float = 0.12
+SUBPROBLEM_MAIN_DIRECT_COST_ANCHOR_WEIGHT: float = 0.10
+SUBPROBLEM_MAIN_DIRECT_MU_ACTIVE_THRESHOLD: float = 1e-7
+SUBPROBLEM_MAIN_DIRECT_COEFF_LOSS_WEIGHT: float = 1.0
+SUBPROBLEM_MAIN_DIRECT_DELTA_LOSS_WEIGHT: float = 0.65
+SUBPROBLEM_MAIN_DIRECT_COST_LOSS_WEIGHT: float = 0.85
+SUBPROBLEM_MAIN_DIRECT_PROXY_KKT_LOSS_WEIGHT: float = 0.008
+
+SUBPROBLEM_C_PG_DIRECT_EPOCHS: int = 420
+SUBPROBLEM_C_PG_DIRECT_LR: float = 6e-3
+SUBPROBLEM_C_PG_DIRECT_ETA_MIN_RATIO: float = 0.25
+SUBPROBLEM_C_PG_DIRECT_BATCH_STRATEGY: str = "mini-batch"
+SUBPROBLEM_C_PG_DIRECT_BATCH_SIZE: int = 16
+SUBPROBLEM_C_PG_DIRECT_SHUFFLE: bool = True
+SUBPROBLEM_C_PG_DIRECT_LOSS: str = "mse"
+SUBPROBLEM_C_PG_DIRECT_OBJ_DUAL_PG_TARGET: float | None = 45.0
+SUBPROBLEM_C_PG_DIRECT_BETA: float = 1.0
+SUBPROBLEM_C_PG_DIRECT_GRAD_CLIP: float = 5.0
+SUBPROBLEM_C_PG_DIRECT_LOG_INTERVAL: int = 25
+SUBPROBLEM_C_PG_DIRECT_TARGET_CHECK_INTERVAL: int = 25
+SUBPROBLEM_C_PG_DIRECT_FEATURE_NOISE_STD: float = 0.005
+SUBPROBLEM_C_PG_DIRECT_ADAM_WD: float = 1e-5
+
 # 迭代间输出差异正则：温和抑制相邻 BCD 轮次输出跳变；可按算例继续调节
 BCD_ITER_DELTA_REG_WEIGHT = 1e-4
 BCD_ITER_DELTA_REG_DEADBAND = 0.05
@@ -403,6 +449,58 @@ def normalize_nn_size_option(size_option: str, label: str) -> str:
 def resolve_nn_hidden_dims(size_option: str, dim_options: dict[str, list[int]], label: str) -> tuple[str, list[int]]:
     resolved_size = normalize_nn_size_option(size_option, label)
     return resolved_size, list(dim_options[resolved_size])
+
+
+def build_subproblem_main_direct_train_config() -> dict:
+    return {
+        "direct_epochs": SUBPROBLEM_MAIN_DIRECT_EPOCHS,
+        "direct_lr": SUBPROBLEM_MAIN_DIRECT_LR,
+        "direct_cost_lr": SUBPROBLEM_MAIN_DIRECT_COST_LR,
+        "direct_eta_min_ratio": SUBPROBLEM_MAIN_DIRECT_ETA_MIN_RATIO,
+        "direct_batch_strategy": SUBPROBLEM_MAIN_DIRECT_BATCH_STRATEGY,
+        "direct_batch_size": SUBPROBLEM_MAIN_DIRECT_BATCH_SIZE,
+        "direct_shuffle": SUBPROBLEM_MAIN_DIRECT_SHUFFLE,
+        "direct_loss": SUBPROBLEM_MAIN_DIRECT_LOSS,
+        "direct_grad_clip": SUBPROBLEM_MAIN_DIRECT_GRAD_CLIP,
+        "direct_log_interval": SUBPROBLEM_MAIN_DIRECT_LOG_INTERVAL,
+        "direct_target_check_interval": SUBPROBLEM_MAIN_DIRECT_TARGET_CHECK_INTERVAL,
+        "direct_mae_target": SUBPROBLEM_MAIN_DIRECT_MAE_TARGET,
+        "feature_noise_std": SUBPROBLEM_MAIN_DIRECT_FEATURE_NOISE_STD,
+        "adam_weight_decay": SUBPROBLEM_MAIN_DIRECT_ADAM_WD,
+        "target_blend": SUBPROBLEM_MAIN_DIRECT_TARGET_BLEND,
+        "dual_eq_weight": SUBPROBLEM_MAIN_DIRECT_DUAL_EQ_WEIGHT,
+        "active_opt_weight": SUBPROBLEM_MAIN_DIRECT_ACTIVE_OPT_WEIGHT,
+        "inactive_margin_weight": SUBPROBLEM_MAIN_DIRECT_INACTIVE_MARGIN_WEIGHT,
+        "inactive_margin": SUBPROBLEM_MAIN_DIRECT_INACTIVE_MARGIN,
+        "anchor_weight": SUBPROBLEM_MAIN_DIRECT_ANCHOR_WEIGHT,
+        "coeff_anchor_weight": SUBPROBLEM_MAIN_DIRECT_COEFF_ANCHOR_WEIGHT,
+        "delta_anchor_weight": SUBPROBLEM_MAIN_DIRECT_DELTA_ANCHOR_WEIGHT,
+        "cost_anchor_weight": SUBPROBLEM_MAIN_DIRECT_COST_ANCHOR_WEIGHT,
+        "mu_active_threshold": SUBPROBLEM_MAIN_DIRECT_MU_ACTIVE_THRESHOLD,
+        "coeff_loss_weight": SUBPROBLEM_MAIN_DIRECT_COEFF_LOSS_WEIGHT,
+        "delta_loss_weight": SUBPROBLEM_MAIN_DIRECT_DELTA_LOSS_WEIGHT,
+        "cost_loss_weight": SUBPROBLEM_MAIN_DIRECT_COST_LOSS_WEIGHT,
+        "proxy_kkt_loss_weight": SUBPROBLEM_MAIN_DIRECT_PROXY_KKT_LOSS_WEIGHT,
+    }
+
+
+def build_subproblem_c_pg_direct_train_config() -> dict:
+    return {
+        "direct_epochs": SUBPROBLEM_C_PG_DIRECT_EPOCHS,
+        "direct_lr": SUBPROBLEM_C_PG_DIRECT_LR,
+        "direct_eta_min_ratio": SUBPROBLEM_C_PG_DIRECT_ETA_MIN_RATIO,
+        "direct_batch_strategy": SUBPROBLEM_C_PG_DIRECT_BATCH_STRATEGY,
+        "direct_batch_size": SUBPROBLEM_C_PG_DIRECT_BATCH_SIZE,
+        "direct_shuffle": SUBPROBLEM_C_PG_DIRECT_SHUFFLE,
+        "direct_loss": SUBPROBLEM_C_PG_DIRECT_LOSS,
+        "direct_obj_dual_pg_target": SUBPROBLEM_C_PG_DIRECT_OBJ_DUAL_PG_TARGET,
+        "direct_beta": SUBPROBLEM_C_PG_DIRECT_BETA,
+        "direct_grad_clip": SUBPROBLEM_C_PG_DIRECT_GRAD_CLIP,
+        "direct_log_interval": SUBPROBLEM_C_PG_DIRECT_LOG_INTERVAL,
+        "direct_target_check_interval": SUBPROBLEM_C_PG_DIRECT_TARGET_CHECK_INTERVAL,
+        "feature_noise_std": SUBPROBLEM_C_PG_DIRECT_FEATURE_NOISE_STD,
+        "adam_weight_decay": SUBPROBLEM_C_PG_DIRECT_ADAM_WD,
+    }
 
 
 def load_json_data(data_file: Path) -> list:
@@ -615,6 +713,8 @@ def create_subproblem_trainer(ppc, all_samples, T_DELTA, unit_id: int, *,
                   pg_cost_sample_weight_clip: float = 10.0,
                   pg_cost_single_sample_reg_scale: float | None = None,
                   pg_cost_c_pg_adam_weight_decay: float | None = None,
+                  main_direct_train_config: dict | None = None,
+                  c_pg_direct_train_config: dict | None = None,
                   pg_block_prox_weight: float = SUBPROBLEM_PG_BLOCK_PROX_WEIGHT,
                               dual_block_prox_weight: float = SUBPROBLEM_DUAL_BLOCK_PROX_WEIGHT,
                               iter_delta_reg_weight: float = SUBPROBLEM_ITER_DELTA_REG_WEIGHT,
@@ -673,6 +773,8 @@ def create_subproblem_trainer(ppc, all_samples, T_DELTA, unit_id: int, *,
         pg_cost_sample_weight_clip=pg_cost_sample_weight_clip,
         pg_cost_single_sample_reg_scale=pg_cost_single_sample_reg_scale,
         pg_cost_c_pg_adam_weight_decay=pg_cost_c_pg_adam_weight_decay,
+        main_direct_train_config=main_direct_train_config,
+        c_pg_direct_train_config=c_pg_direct_train_config,
         pg_block_prox_weight=pg_block_prox_weight,
         dual_block_prox_weight=dual_block_prox_weight,
         iter_delta_reg_weight=iter_delta_reg_weight,
@@ -747,6 +849,8 @@ def run_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS,
                   pg_cost_sample_weight_clip: float = 10.0,
                   pg_cost_single_sample_reg_scale: float | None = None,
                   pg_cost_c_pg_adam_weight_decay: float | None = None,
+                  main_direct_train_config: dict | None = None,
+                  c_pg_direct_train_config: dict | None = None,
                   pg_block_prox_weight: float = SUBPROBLEM_PG_BLOCK_PROX_WEIGHT,
                   dual_block_prox_weight: float = SUBPROBLEM_DUAL_BLOCK_PROX_WEIGHT,
                   iter_delta_reg_weight: float = SUBPROBLEM_ITER_DELTA_REG_WEIGHT,
@@ -858,7 +962,9 @@ def run_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS,
         f"c_pg_batch={pg_cost_batch_strategy or '(inherit subproblem_nn)'}/"
         f"{pg_cost_batch_size or '(inherit)'}, c_pg_shuffle={pg_cost_shuffle}, "
         f"c_pg_sample_w={pg_cost_use_sample_weights}, "
-        f"c_pg_sw_power={pg_cost_sample_weight_power}, c_pg_sw_clip={pg_cost_sample_weight_clip}"
+        f"c_pg_sw_power={pg_cost_sample_weight_power}, c_pg_sw_clip={pg_cost_sample_weight_clip}, "
+        f"main_direct_epochs={int((main_direct_train_config or {}).get('direct_epochs', 0) or 0)}, "
+        f"c_pg_direct_epochs={int((c_pg_direct_train_config or {}).get('direct_epochs', 0) or 0)}"
     )
     log(
         f"iter_delta_reg: subproblem_weight={iter_delta_reg_weight}, "
@@ -1150,6 +1256,8 @@ def run_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS,
             pg_cost_sample_weight_clip=pg_cost_sample_weight_clip,
             pg_cost_single_sample_reg_scale=pg_cost_single_sample_reg_scale,
             pg_cost_c_pg_adam_weight_decay=pg_cost_c_pg_adam_weight_decay,
+            main_direct_train_config=main_direct_train_config,
+            c_pg_direct_train_config=c_pg_direct_train_config,
             pg_block_prox_weight=pg_block_prox_weight,
             dual_block_prox_weight=dual_block_prox_weight,
             save_dir=save_dir,
@@ -1234,6 +1342,8 @@ def run_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS,
                 pg_cost_sample_weight_clip=pg_cost_sample_weight_clip,
                 pg_cost_single_sample_reg_scale=pg_cost_single_sample_reg_scale,
                 pg_cost_c_pg_adam_weight_decay=pg_cost_c_pg_adam_weight_decay,
+                main_direct_train_config=main_direct_train_config,
+                c_pg_direct_train_config=c_pg_direct_train_config,
                 pg_block_prox_weight=pg_block_prox_weight,
                 dual_block_prox_weight=dual_block_prox_weight,
                 iter_delta_reg_weight=iter_delta_reg_weight,
@@ -1296,6 +1406,8 @@ def run_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS,
                 pg_cost_sample_weight_clip=pg_cost_sample_weight_clip,
                 pg_cost_single_sample_reg_scale=pg_cost_single_sample_reg_scale,
                 pg_cost_c_pg_adam_weight_decay=pg_cost_c_pg_adam_weight_decay,
+                main_direct_train_config=main_direct_train_config,
+                c_pg_direct_train_config=c_pg_direct_train_config,
                 pg_block_prox_weight=pg_block_prox_weight,
                 dual_block_prox_weight=dual_block_prox_weight,
                 iter_delta_reg_weight=iter_delta_reg_weight,
@@ -2025,6 +2137,8 @@ def main():
     SUBPROBLEM_PG_COST_SAMPLE_WEIGHT_CLIP_VALUE = SUBPROBLEM_PG_COST_SAMPLE_WEIGHT_CLIP
     SUBPROBLEM_PG_COST_SINGLE_SAMPLE_REG_SCALE_VALUE = SUBPROBLEM_PG_COST_SINGLE_SAMPLE_REG_SCALE
     SUBPROBLEM_PG_COST_C_PG_ADAM_WD_VALUE = SUBPROBLEM_PG_COST_C_PG_ADAM_WD
+    SUBPROBLEM_MAIN_DIRECT_TRAIN_CONFIG_VALUE = build_subproblem_main_direct_train_config()
+    SUBPROBLEM_C_PG_DIRECT_TRAIN_CONFIG_VALUE = build_subproblem_c_pg_direct_train_config()
     SUBPROBLEM_PG_BLOCK_PROX_WEIGHT_VALUE = SUBPROBLEM_PG_BLOCK_PROX_WEIGHT
     SUBPROBLEM_DUAL_BLOCK_PROX_WEIGHT_VALUE = SUBPROBLEM_DUAL_BLOCK_PROX_WEIGHT
 
@@ -2275,6 +2389,8 @@ def main():
                     pg_cost_sample_weight_clip=SUBPROBLEM_PG_COST_SAMPLE_WEIGHT_CLIP_VALUE,
                     pg_cost_single_sample_reg_scale=SUBPROBLEM_PG_COST_SINGLE_SAMPLE_REG_SCALE_VALUE,
                     pg_cost_c_pg_adam_weight_decay=SUBPROBLEM_PG_COST_C_PG_ADAM_WD_VALUE,
+                    main_direct_train_config=SUBPROBLEM_MAIN_DIRECT_TRAIN_CONFIG_VALUE,
+                    c_pg_direct_train_config=SUBPROBLEM_C_PG_DIRECT_TRAIN_CONFIG_VALUE,
                     pg_block_prox_weight=SUBPROBLEM_PG_BLOCK_PROX_WEIGHT_VALUE,
                     dual_block_prox_weight=SUBPROBLEM_DUAL_BLOCK_PROX_WEIGHT_VALUE,
                     iter_delta_reg_weight=SUBPROBLEM_ITER_DELTA_REG_WEIGHT,
@@ -2628,6 +2744,8 @@ def main():
                     pg_cost_sample_weight_clip=SUBPROBLEM_PG_COST_SAMPLE_WEIGHT_CLIP_VALUE,
                     pg_cost_single_sample_reg_scale=SUBPROBLEM_PG_COST_SINGLE_SAMPLE_REG_SCALE_VALUE,
                     pg_cost_c_pg_adam_weight_decay=SUBPROBLEM_PG_COST_C_PG_ADAM_WD_VALUE,
+                    main_direct_train_config=SUBPROBLEM_MAIN_DIRECT_TRAIN_CONFIG_VALUE,
+                    c_pg_direct_train_config=SUBPROBLEM_C_PG_DIRECT_TRAIN_CONFIG_VALUE,
                     pg_block_prox_weight=SUBPROBLEM_PG_BLOCK_PROX_WEIGHT_VALUE,
                     dual_block_prox_weight=SUBPROBLEM_DUAL_BLOCK_PROX_WEIGHT_VALUE,
                     iter_delta_reg_weight=SUBPROBLEM_ITER_DELTA_REG_WEIGHT,

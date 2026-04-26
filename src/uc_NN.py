@@ -1693,9 +1693,22 @@ class Agent_NN:
     # 可微分Loss函数
     # --------------------------------------------------------------------------
     def loss_function_differentiable(self, sample_id, theta_tensor, zeta_tensor, union_analysis=None, device=None):
-        """可微分的loss函数"""
+        """可微分的loss函数。
+
+        性能训练入口应优先使用 ``src.uc_NN_BCD.Agent_NN``，该路径已经维护
+        per-iteration tensor cache 和 union-analysis cache。这里保留旧实现作为
+        兼容入口，避免维护两套主问题缓存逻辑。
+        """
         if not TORCH_AVAILABLE:
             raise RuntimeError("PyTorch未安装，无法使用可微分loss函数")
+        if not getattr(self, "_warned_legacy_loss_path", False):
+            warnings.warn(
+                "src.uc_NN.Agent_NN.loss_function_differentiable is the legacy "
+                "uncached path; use src.uc_NN_BCD.Agent_NN for performance-critical training.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            self._warned_legacy_loss_path = True
         
         if device is None:
             device = self.device if hasattr(self, 'device') else torch.device('cpu')

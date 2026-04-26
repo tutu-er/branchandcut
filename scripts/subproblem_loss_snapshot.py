@@ -85,10 +85,16 @@ TEST_MAIN_LAST_PTH: str = "result/subproblem_loss_snapshots/main_test_after_main
 TEST_MAIN_RESULT_JSON: str = "result/subproblem_loss_snapshots/main_test_trials_unit0_n10_pre40_iter41.json"
 TEST_MAIN_FULL_BASELINE_METRICS: bool = False
 TEST_MAIN_FULL_FINAL_METRICS: bool = False
+# NN-main main_test: balance speed vs quality. Heuristics (see logs):
+# - direct MSE fit plateaus in ~80–120 epochs; 360+ is mostly margin.
+# - loss_function_differentiable (proxy KKT) is the main per-step cost;
+#   keep a small non-zero weight for quality, not 0.02 on every sample every epoch.
+# - direct_mae_target is diagnostic only; direct training always runs all configured epochs.
+# - For final polish, duplicate this trial with direct_epochs=200, direct_mae_target=0.075, proxy=0.01.
 TEST_MAIN_TRIALS: list[dict] = [
     {
-        "name": "direct_kkt_proxy_balanced",
-        "direct_epochs": 360,
+        "name": "direct_kkt_proxy_fast_ok",
+        "direct_epochs": 120,
         "direct_lr": 2e-3,
         "direct_cost_lr": 8e-4,
         "direct_eta_min_ratio": 0.20,
@@ -97,9 +103,9 @@ TEST_MAIN_TRIALS: list[dict] = [
         "direct_shuffle": True,
         "direct_loss": "mse",
         "direct_grad_clip": 3.0,
-        "direct_log_interval": 25,
-        "direct_target_check_interval": 25,
-        "direct_mae_target": 0.075,
+        "direct_log_interval": 10,
+        "direct_target_check_interval": 5,
+        "direct_mae_target": 0.076,
         "feature_noise_std": 0.005,
         "adam_weight_decay": 1e-5,
         "target_blend": 0.75,
@@ -115,7 +121,7 @@ TEST_MAIN_TRIALS: list[dict] = [
         "coeff_loss_weight": 1.0,
         "delta_loss_weight": 0.65,
         "cost_loss_weight": 0.85,
-        "proxy_kkt_loss_weight": 0.02,
+        "proxy_kkt_loss_weight": 0.008,
         "fine_epochs": 0,
         "fine_lr": 5e-5,
         "fine_cost_lr": 5e-6,
@@ -683,17 +689,6 @@ def _train_cpg_direct_targets(trainer, trial: dict) -> float | None:
                     f"fast_obj_dual_pg={metric_obj_dual_pg:.6f}",
                     flush=True,
                 )
-            if (
-                obj_dual_pg_target is not None
-                and metric_obj_dual_pg is not None
-                and metric_obj_dual_pg <= obj_dual_pg_target
-            ):
-                print(
-                    f"  [Unit-{trainer.unit_id}][direct-c_pg:{phase_name}] early stop: "
-                    f"obj_dual_pg={metric_obj_dual_pg:.6f} <= target={obj_dual_pg_target:.6f}",
-                    flush=True,
-                )
-                return phase_last_avg
         return phase_last_avg
 
     trainer.surrogate_net.train()
@@ -1146,17 +1141,6 @@ def _train_main_direct_targets(trainer, trial: dict) -> dict | None:
                     f"fast_obj_dual_x={last_fast['obj_dual_x']:.6f}",
                     flush=True,
                 )
-            if (
-                direct_mae_target is not None
-                and last_fast is not None
-                and last_fast["direct_mae"] <= direct_mae_target
-            ):
-                print(
-                    f"  [Unit-{trainer.unit_id}][direct-NN-main] early stop: "
-                    f"direct_mae={last_fast['direct_mae']:.6f} <= target={direct_mae_target:.6f}",
-                    flush=True,
-                )
-                break
     finally:
         _set_main_training_mode(trainer, False)
     trainer._refresh_cached_surrogate_outputs()
