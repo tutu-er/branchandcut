@@ -28,6 +28,14 @@ _CVXPY_HIGHS_INSTALLED_CACHE = None
 _CVXPY_HIGHS_STATUS_CACHE = None
 
 
+def _trainer_subproblem_ton_toff(trainer) -> tuple[int, int]:
+    """τ 上界：与 ``SubproblemSurrogateTrainer.subproblem_Ton/Toff`` 一致；缺省时退回 ``min(4,T)``。"""
+    fb = min(4, int(trainer.T))
+    ton = int(getattr(trainer, "subproblem_Ton", fb))
+    toff = int(getattr(trainer, "subproblem_Toff", fb))
+    return ton, toff
+
+
 def normalize_lp_backend(lp_backend: str | None) -> str:
     resolved = LP_BACKEND_GUROBI if lp_backend is None else str(lp_backend).strip().lower()
     if resolved not in SUPPORTED_LP_BACKENDS:
@@ -317,6 +325,14 @@ def _cvxpy_pi_to_gurobi_pi(constraint, sense: str) -> float:
 
 def _nonnegative_pi(constraint, sense: str) -> float:
     return max(0.0, _cvxpy_pi_to_gurobi_pi(constraint, sense))
+
+
+def _equality_stationarity_contribution(constraint) -> float:
+    """Signed contribution of an equality dual to the x-stationarity residual."""
+    dual_val = constraint.dual_value
+    if dual_val is None:
+        return 0.0
+    return float(np.asarray(dual_val, dtype=float).reshape(-1)[0])
 
 
 def _abs_distance(expr, reference_value: float, scale: float):
@@ -881,14 +897,16 @@ def solve_init_lp(trainer, sample_id: int):
     即 init LP 中 **x 被钉在 0/1**，与 JSON 标签一致，再在连续变量 **pg, coc, cpower** 上求可行最小成本。返回的
     ``x_true`` 为上述 ``x_init`` 的拷贝，供 ``x_true``/敏感时段等后续使用。
 
-    **init LP 包含的约束（与 Gurobi 初值路径语义对齐）**
+    **init LP 包含的约束（与 Gurobi 初值路径、BCD 中 primal/dual 块语义对齐）**
     - ``0 <= x <= 1``，随后被每时段的 ``x>=1`` 或 ``x<=0`` **收紧为 MILP 标签对应的 0/1**；
     - 发电上下界：``pg[t] >= Pmin*x[t]``, ``pg[t] <= Pmax*x[t]``；
     - 爬坡：``t>=1`` 的 ramp up / ramp down（含 Ru_co, Rd_co 项）；
-    - 最小开/关时间：``Ton=Toff=min(4,T)`` 下的 min_on / min_off 线性化；
-    - 启停成本：``coc`` 的 start/shut 线性不等式（``ignore_startup_shutdown_costs`` 时 sc=shc=0）；
+    - 最小开/关时间：``Ton``/``Toff`` 取自 ``trainer.subproblem_Ton/Toff``（case118 与 MTI 数据对齐；
+      其余算例为 ``min(4,T)``）下的 min_on / min_off 线性化；
+    - 启停辅助变量：始终保留 ``coc``；``ignore_startup_shutdown_costs=True`` 时 **与迭代中相同**：
+      ``sc=shc=0``，start/shut 线性约束退化为 ``coc[t-1] >= 0``，不再施加启停货币成本系数；
     - 电力成本定义：``cpower[t] == a*pg[t] + b*x[t]``（``a,b`` 来自 gencost / T_delta）；
-    - 目标：``min sum(cpower)+sum(coc) - lambda_vals·pg``（与节点电价 ``lambda`` 一致）。
+    - 目标：``min sum(cpower)+sum(coc) - lambda_vals·pg``（``lambda_vals`` 与构造 trainer 时一致：预测或 JSON/ED）。
 
     **成功条件**  
     仅当 HiGHS 使 ``problem.status`` 为 ``OPTIMAL`` 或 ``OPTIMAL_INACCURATE`` 时成功；否则抛出 ``RuntimeError``，**不**在调用方用假对偶回退。
@@ -906,8 +924,7 @@ def solve_init_lp(trainer, sample_id: int):
     b = trainer.gencost[g, -1] / trainer.T_delta
     sc = 0.0 if trainer.ignore_startup_shutdown_costs else trainer.gencost[g, 1]
     shc = 0.0 if trainer.ignore_startup_shutdown_costs else trainer.gencost[g, 2]
-    Ton = min(4, trainer.T)
-    Toff = min(4, trainer.T)
+    Ton, Toff = _trainer_subproblem_ton_toff(trainer)
 
     lambda_val = np.asarray(trainer.lambda_vals[sample_id], dtype=float)
     x_init = _recover_unit_x_from_sample(trainer, sample_id)
@@ -967,16 +984,12 @@ def solve_init_lp(trainer, sample_id: int):
 
     # 真值边界：与 MILP 标签一致，用于提取 μ₂（single-time 耦合对偶）初值的影子价格
     x_true_eps = 0.5
-    x_true_fix_meta = []
+    x_target = np.asarray(x_init >= x_true_eps, dtype=float)
+    x_fix_cons = []
     for t in range(trainer.T):
-        if float(x_init[t]) >= x_true_eps:
-            cons = x[t] >= 1.0
-            constraints.append(cons)
-            x_true_fix_meta.append(("ge", cons))
-        else:
-            cons = x[t] <= 0.0
-            constraints.append(cons)
-            x_true_fix_meta.append(("le", cons))
+        cons = x[t] == float(x_target[t])
+        constraints.append(cons)
+        x_fix_cons.append(cons)
 
     objective = cp.sum(cpower) + cp.sum(coc) - lambda_val @ pg
     problem = cp.Problem(cp.Minimize(objective), constraints)
@@ -1017,8 +1030,8 @@ def solve_init_lp(trainer, sample_id: int):
         "lambda_x_lower": np.zeros(trainer.T, dtype=float),
     }
 
-    mu2_coupling_dual = np.array(
-        [_nonnegative_pi(cons, sense) for sense, cons in x_true_fix_meta],
+    x_fix_dual_contrib = np.array(
+        [_equality_stationarity_contribution(cons) for cons in x_fix_cons],
         dtype=float,
     )
 
@@ -1027,9 +1040,10 @@ def solve_init_lp(trainer, sample_id: int):
         "x_sol": np.asarray(x.value, dtype=float),
         "coc_sol": np.asarray(coc.value, dtype=float) if trainer.T > 1 else np.zeros(0, dtype=float),
         "cpower_sol": np.asarray(cpower.value, dtype=float),
-        "x_true": x_init.copy(),
+        "x_true": x_target.copy(),
         "lambda_inherent": lambda_inherent,
-        "mu2_coupling_dual": mu2_coupling_dual,
+        "x_fix_dual_contrib": x_fix_dual_contrib,
+        "mu2_coupling_dual": np.abs(x_fix_dual_contrib),
     }
 
 
@@ -1107,8 +1121,7 @@ def solve_primal_block(
     Rd_co = float(trainer.Rd_co_all[g])
     sc = 0.0 if trainer.ignore_startup_shutdown_costs else trainer.gencost[g, 1]
     shc = 0.0 if trainer.ignore_startup_shutdown_costs else trainer.gencost[g, 2]
-    Ton = min(4, trainer.T)
-    Toff = min(4, trainer.T)
+    Ton, Toff = _trainer_subproblem_ton_toff(trainer)
 
     pg = cp.Variable(trainer.T, nonneg=True)
     x = cp.Variable(trainer.T)
@@ -1313,8 +1326,7 @@ def solve_dual_block(
     Rd_co = float(trainer.Rd_co_all[g])
     start_cost = 0.0 if trainer.ignore_startup_shutdown_costs else trainer.gencost[g, 1]
     shut_cost = 0.0 if trainer.ignore_startup_shutdown_costs else trainer.gencost[g, 2]
-    Ton = min(4, trainer.T)
-    Toff = min(4, trainer.T)
+    Ton, Toff = _trainer_subproblem_ton_toff(trainer)
 
     phase = trainer._get_mu_lower_bound_phase()
     lb = trainer._current_mu_lower_bound_value()

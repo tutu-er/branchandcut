@@ -1,4 +1,4 @@
-"""
+﻿"""
 uc_NN_subproblem_parallel.py
 ================================
 并行版 subproblem_v3 训练，分两个并行层级：
@@ -108,6 +108,7 @@ class ParallelSubproblemSurrogateTrainer(SubproblemSurrogateTrainer):
         rho_dual_x_init: float | None = None,
         rho_dual_coc_init: float | None = None,
         rho_binary_init: float = 1.0,
+        rho_binary_max: float = 1e4,
         rho_opt_init: float = 1e-3,
         gamma_base: float = 1e-3,
         mu_lower_bound_init: float = 0.1,
@@ -133,6 +134,12 @@ class ParallelSubproblemSurrogateTrainer(SubproblemSurrogateTrainer):
         pg_cost_softbound_weight: float = 1.0,
         nn_smooth_abs_eps: float = 1e-6,
         pg_cost_smooth_abs_eps: float = 1e-6,
+        pg_cost_batch_strategy: str | None = None,
+        pg_cost_batch_size: int | None = None,
+        pg_cost_shuffle: bool | None = None,
+        pg_cost_use_sample_weights: bool = True,
+        pg_cost_sample_weight_power: float = 1.0,
+        pg_cost_sample_weight_clip: float = 10.0,
         iter_delta_reg_weight: float = 5e-5,
         iter_delta_reg_deadband: float = 0.10,
         loss_ratio_primal: float = 1.0,
@@ -146,12 +153,26 @@ class ParallelSubproblemSurrogateTrainer(SubproblemSurrogateTrainer):
         ignore_startup_shutdown_costs: bool = False,
         unit_predictor=None,
         use_unit_predictor: bool = False,
+        predictor_warmup_rounds: int = 0,
+        sign4_curriculum_rounds: int = 0,
+        sign4_initial_scale: float = 1.0,
+        sign4_final_scale: float = 1.0,
         unit_predictor_finetune_lr: float = 1e-5,
         unit_predictor_weight_decay: float = 1e-4,
         pg_cost_single_sample_reg_scale: float | None = None,
         pg_cost_c_pg_adam_weight_decay: float | None = None,
         main_direct_train_config: dict | None = None,
         c_pg_direct_train_config: dict | None = None,
+        nn_main_eta_min_ratio: float = 0.08,
+        nn_main_lr_late_scale: float = 0.42,
+        nn_main_adam_weight_decay: float = 1e-4,
+        nn_main_grad_clip: float = 0.85,
+        nn_main_kkt_lr_scale: float = 1.0,
+        case_name: str | None = None,
+        enable_surrogate_delta_reference_lift: bool | None = None,
+        surrogate_delta_reference_eps: float = 1e-6,
+        surrogate_delta_reference_scope: str = "sign4_only",
+        surrogate_delta_reference_min_abs_factor: float = 1e-9,
         device=None,
         n_workers: int = 4,
     ):
@@ -167,6 +188,7 @@ class ParallelSubproblemSurrogateTrainer(SubproblemSurrogateTrainer):
             rho_dual_x_init=rho_dual_x_init,
             rho_dual_coc_init=rho_dual_coc_init,
             rho_binary_init=rho_binary_init,
+            rho_binary_max=rho_binary_max,
             rho_opt_init=rho_opt_init,
             gamma_base=gamma_base,
             mu_lower_bound_init=mu_lower_bound_init,
@@ -192,6 +214,12 @@ class ParallelSubproblemSurrogateTrainer(SubproblemSurrogateTrainer):
             pg_cost_softbound_weight=pg_cost_softbound_weight,
             nn_smooth_abs_eps=nn_smooth_abs_eps,
             pg_cost_smooth_abs_eps=pg_cost_smooth_abs_eps,
+            pg_cost_batch_strategy=pg_cost_batch_strategy,
+            pg_cost_batch_size=pg_cost_batch_size,
+            pg_cost_shuffle=pg_cost_shuffle,
+            pg_cost_use_sample_weights=pg_cost_use_sample_weights,
+            pg_cost_sample_weight_power=pg_cost_sample_weight_power,
+            pg_cost_sample_weight_clip=pg_cost_sample_weight_clip,
             iter_delta_reg_weight=iter_delta_reg_weight,
             iter_delta_reg_deadband=iter_delta_reg_deadband,
             loss_ratio_primal=loss_ratio_primal,
@@ -205,12 +233,26 @@ class ParallelSubproblemSurrogateTrainer(SubproblemSurrogateTrainer):
             ignore_startup_shutdown_costs=ignore_startup_shutdown_costs,
             unit_predictor=unit_predictor,
             use_unit_predictor=use_unit_predictor,
+            predictor_warmup_rounds=predictor_warmup_rounds,
+            sign4_curriculum_rounds=sign4_curriculum_rounds,
+            sign4_initial_scale=sign4_initial_scale,
+            sign4_final_scale=sign4_final_scale,
             unit_predictor_finetune_lr=unit_predictor_finetune_lr,
             unit_predictor_weight_decay=unit_predictor_weight_decay,
             pg_cost_single_sample_reg_scale=pg_cost_single_sample_reg_scale,
             pg_cost_c_pg_adam_weight_decay=pg_cost_c_pg_adam_weight_decay,
             main_direct_train_config=main_direct_train_config,
             c_pg_direct_train_config=c_pg_direct_train_config,
+            nn_main_eta_min_ratio=nn_main_eta_min_ratio,
+            nn_main_lr_late_scale=nn_main_lr_late_scale,
+            nn_main_adam_weight_decay=nn_main_adam_weight_decay,
+            nn_main_grad_clip=nn_main_grad_clip,
+            nn_main_kkt_lr_scale=nn_main_kkt_lr_scale,
+            case_name=case_name,
+            enable_surrogate_delta_reference_lift=enable_surrogate_delta_reference_lift,
+            surrogate_delta_reference_eps=surrogate_delta_reference_eps,
+            surrogate_delta_reference_scope=surrogate_delta_reference_scope,
+            surrogate_delta_reference_min_abs_factor=surrogate_delta_reference_min_abs_factor,
             device=device,
         )
         self.n_workers = min(n_workers, self.n_samples)
@@ -242,6 +284,10 @@ class ParallelSubproblemSurrogateTrainer(SubproblemSurrogateTrainer):
             'dual_block_prox_weight': float(self.dual_block_prox_weight),
             'num_coupling_constraints': int(self.num_coupling_constraints),
             'all_mode_group_size': int(self.all_mode_group_size),
+            'constraint_generation_strategy': str(self.constraint_generation_strategy),
+            'sign4_curriculum_rounds': int(self.sign4_curriculum_rounds),
+            'sign4_initial_scale': float(self.sign4_initial_scale),
+            'sign4_final_scale': float(self.sign4_final_scale),
             'mu_lower_bound': float(self.mu_lower_bound),
             'mu_individual_lower_bound_round': int(self.mu_individual_lower_bound_round),
             'mu_group_lower_bound_round': int(self.mu_group_lower_bound_round),
@@ -259,6 +305,8 @@ class ParallelSubproblemSurrogateTrainer(SubproblemSurrogateTrainer):
             'sensitive_timesteps': [list(self.sensitive_timesteps[sample_id])],
             'surrogate_constraint_offsets': [copy.deepcopy(self.surrogate_constraint_offsets[sample_id])],
             'active_set_data': [{'x_true': copy.deepcopy(self.active_set_data[sample_id].get('x_true'))}],
+            'subproblem_Ton': int(self.subproblem_Ton),
+            'subproblem_Toff': int(self.subproblem_Toff),
         }
 
     def _run_cvxpy_highs_sample_pool(self, block: str, block_args: list[tuple], prefix: str) -> Dict[int, tuple]:
@@ -326,13 +374,17 @@ class ParallelSubproblemSurrogateTrainer(SubproblemSurrogateTrainer):
             flush=True,
         )
 
+        self._surrogate_bcd_max_iter = max(int(max_iter), 1)
         EPS = 1e-10
         gamma = self.gamma_base / (self.n_samples * max(max_iter, 1))
         gamma_dual = gamma * self.gamma_dual_component_scale
         self.gamma = gamma
-        resolved_pg_cost_nn_epochs = (
-            self.pg_cost_nn_epochs if pg_cost_nn_epochs is None else max(int(pg_cost_nn_epochs), 1)
-        )
+        if pg_cost_nn_epochs is not None:
+            resolved_pg_cost_nn_epochs = max(int(pg_cost_nn_epochs), 0)
+        elif self.pg_cost_nn_epochs is not None:
+            resolved_pg_cost_nn_epochs = max(int(self.pg_cost_nn_epochs), 0)
+        else:
+            resolved_pg_cost_nn_epochs = 10
 
         for i in range(max_iter):
             print(f"{prefix} 🔄 迭代 {i+1}/{max_iter}", flush=True)
@@ -464,12 +516,16 @@ class ParallelSubproblemSurrogateTrainer(SubproblemSurrogateTrainer):
             )
 
             # ── 3. NN block（串行，批次化训练） ──────────────────────
+            # 与非并行版一致：每轮 BCD 内先 direct-target 预训练，再可微 KKT 微调；
+            # c_pg 同理（direct 在 pg_cost_start_round 之后才会真正更新，见 iter_with_c_pg_direct_targets）。
             self._prev_alpha_values = self.alpha_values.copy()
             self._prev_beta_values = self.beta_values.copy()
             self._prev_gamma_values = self.gamma_values.copy()
             self._prev_delta_values = self.delta_values.copy()
             self._prev_cost_values = self.cost_values.copy()
             self._prev_pg_cost_values = self.pg_cost_values.copy()
+            self._invalidate_loss_tensor_cache()
+            self.iter_with_main_direct_targets()
             self.iter_with_surrogate_nn(
                 num_epochs=nn_epochs,
                 batch_size=nn_batch_size,
@@ -478,11 +534,24 @@ class ParallelSubproblemSurrogateTrainer(SubproblemSurrogateTrainer):
                 learning_rate=nn_learning_rate,
                 cost_learning_rate=cost_learning_rate,
             )
+            self.iter_with_c_pg_direct_targets()
             self.iter_with_c_pg_nn(
                 num_epochs=resolved_pg_cost_nn_epochs,
-                batch_size=nn_batch_size,
-                batch_strategy=nn_batch_strategy,
-                shuffle=nn_shuffle,
+                batch_size=(
+                    self.pg_cost_batch_size
+                    if self.pg_cost_batch_size is not None
+                    else nn_batch_size
+                ),
+                batch_strategy=(
+                    self.pg_cost_batch_strategy
+                    if self.pg_cost_batch_strategy is not None
+                    else nn_batch_strategy
+                ),
+                shuffle=(
+                    self.pg_cost_shuffle
+                    if self.pg_cost_shuffle is not None
+                    else nn_shuffle
+                ),
                 learning_rate=pg_cost_surr_learning_rate,
             )
             self._refresh_cached_surrogate_outputs()
@@ -531,13 +600,14 @@ class ParallelSubproblemSurrogateTrainer(SubproblemSurrogateTrainer):
                 self.rho_dual_x = min(self.rho_dual_x + gamma_dual * obj_dual_x, self.rho_max)
                 self.rho_dual_coc = min(self.rho_dual_coc + gamma_dual * obj_dual_coc, self.rho_max)
                 self._sync_rho_dual_summary()
-                self.rho_binary = min(self.rho_binary + gamma * obj_binary, self.rho_max)
+                self.rho_binary = min(self.rho_binary + gamma * obj_binary, self.rho_binary_max)
                 self.rho_opt    = min(self.rho_opt    + gamma * obj_opt,    self.rho_max)
 
             print(
                 f"{prefix}   ρ_primal={self.rho_primal:.4f}, ρ_dual_pg={self.rho_dual_pg:.4f}, "
                 f"ρ_dual_x={self.rho_dual_x:.4f}, ρ_dual_coc={self.rho_dual_coc:.4f}, "
-                f"ρ_dual={self.rho_dual:.4f}, ρ_opt={self.rho_opt:.4f}",
+                f"ρ_dual={self.rho_dual:.4f}, ρ_binary={self.rho_binary:.4f} "
+                f"(≤{self.rho_binary_max:.4g}), ρ_opt={self.rho_opt:.4f}",
                 flush=True,
             )
             # 与非并行版一致；带机组前缀便于机组级多进程 stdout 交错时辨认
@@ -557,6 +627,25 @@ class _SampleWorkerTrainerProxy(SimpleNamespace):
             return signs.copy()
         return signs[: int(size)].copy()
 
+    def _current_sign4_curriculum_scale(self) -> float:
+        rounds = max(int(getattr(self, 'sign4_curriculum_rounds', 0) or 0), 0)
+        initial = max(float(getattr(self, 'sign4_initial_scale', 1.0) or 0.0), 0.0)
+        final = max(float(getattr(self, 'sign4_final_scale', 1.0) or 0.0), 0.0)
+        if rounds <= 0:
+            return final
+        progress = min(max(float(getattr(self, 'iter_number', 0)), 0.0) / float(rounds), 1.0)
+        return initial + (final - initial) * progress
+
+    def _sign4_curriculum_factors(self, size: int) -> np.ndarray:
+        factors = np.ones(int(size), dtype=float)
+        strategy = str(getattr(self, 'constraint_generation_strategy', '') or '')
+        if strategy not in {'all_templates_sign4', 'all_templates_sign4_plus_single'}:
+            return factors
+        n_sign4 = min(int(size), int(self.all_mode_group_size) * max(int(self.T) - 2, 0))
+        if n_sign4 > 0:
+            factors[:n_sign4] = self._current_sign4_curriculum_scale()
+        return factors
+
     def _apply_surrogate_direction_to_params(
         self,
         alphas: np.ndarray,
@@ -565,11 +654,12 @@ class _SampleWorkerTrainerProxy(SimpleNamespace):
         deltas: np.ndarray,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         signs = self._get_surrogate_direction_signs(len(alphas))
+        factors = signs * self._sign4_curriculum_factors(len(alphas))
         return (
-            np.asarray(alphas, dtype=float) * signs,
-            np.asarray(betas, dtype=float) * signs,
-            np.asarray(gammas, dtype=float) * signs,
-            np.asarray(deltas, dtype=float) * signs,
+            np.asarray(alphas, dtype=float) * factors,
+            np.asarray(betas, dtype=float) * factors,
+            np.asarray(gammas, dtype=float) * factors,
+            np.asarray(deltas, dtype=float) * factors,
         )
 
     def _constraint_offsets_for_sample(self, sample_id: int) -> list[tuple[int, ...]]:
@@ -678,6 +768,7 @@ def _train_unit_worker(args: dict) -> dict:
     rho_dual_x_init     = args.get('rho_dual_x_init')
     rho_dual_coc_init   = args.get('rho_dual_coc_init')
     rho_binary_init     = args.get('rho_binary_init', 1.0)
+    rho_binary_max      = float(args.get('rho_binary_max', 1e4))
     rho_opt_init        = args.get('rho_opt_init', 1e-3)
     gamma_base          = args.get('gamma_base', 1e-3)
     mu_lower_bound_init = args.get('mu_lower_bound_init', 0.1)
@@ -694,6 +785,11 @@ def _train_unit_worker(args: dict) -> dict:
     nn_batch_size       = args.get('nn_batch_size', 4)
     nn_shuffle          = args.get('nn_shuffle', True)
     nn_smooth_abs_eps   = args.get('nn_smooth_abs_eps', 1e-6)
+    nn_main_eta_min_ratio = float(args.get('nn_main_eta_min_ratio', 0.08))
+    nn_main_lr_late_scale = float(args.get('nn_main_lr_late_scale', 0.42))
+    nn_main_adam_weight_decay = float(args.get('nn_main_adam_weight_decay', 1e-4))
+    nn_main_grad_clip = float(args.get('nn_main_grad_clip', 0.85))
+    nn_main_kkt_lr_scale = float(args.get('nn_main_kkt_lr_scale', 1.0))
     loss_ratio_primal   = args.get('loss_ratio_primal', 1.0)
     loss_ratio_dual_pg  = args.get('loss_ratio_dual_pg', 1.0)
     loss_ratio_dual_x   = args.get('loss_ratio_dual_x', 1.0)
@@ -727,8 +823,24 @@ def _train_unit_worker(args: dict) -> dict:
     save_dir            = args.get('save_dir')
     unit_predictor_path = args.get('unit_predictor_path')
     use_unit_predictor_flag = bool(args.get('use_unit_predictor', False))
+    predictor_warmup_rounds = args.get('predictor_warmup_rounds', 0)
+    sign4_curriculum_rounds = args.get('sign4_curriculum_rounds', 0)
+    sign4_initial_scale = args.get('sign4_initial_scale', 1.0)
+    sign4_final_scale = args.get('sign4_final_scale', 1.0)
+    enable_surrogate_delta_reference_lift = args.get('enable_surrogate_delta_reference_lift', None)
+    surrogate_delta_reference_eps = args.get('surrogate_delta_reference_eps', 1e-6)
+    surrogate_delta_reference_scope = args.get('surrogate_delta_reference_scope', "sign4_only")
+    surrogate_delta_reference_min_abs_factor = args.get('surrogate_delta_reference_min_abs_factor', 1e-9)
     unit_predictor_finetune_lr = args.get('unit_predictor_finetune_lr', 1e-5)
     unit_predictor_weight_decay = args.get('unit_predictor_weight_decay', 1e-4)
+    unit_predictor_hidden_dims = args.get('unit_predictor_hidden_dims')
+    unit_predictor_net_variant = args.get('unit_predictor_net_variant', 'mlp')
+    unit_predictor_tcn_channels = args.get('unit_predictor_tcn_channels', 64)
+    unit_predictor_tcn_depth = args.get('unit_predictor_tcn_depth', 6)
+    unit_predictor_tconv_channels = args.get('unit_predictor_tconv_channels', 64)
+    unit_predictor_tconv_depth = args.get('unit_predictor_tconv_depth', 3)
+    unit_predictor_dropout = args.get('unit_predictor_dropout', 0.1)
+    case_name = args.get('case_name')
     # 机组级 ProcessPool 多进程时，各子进程若均默认选用 CUDA，常在 NN 首次 forward
     # （_refresh_cached_surrogate_outputs）处互斥/死锁或长时间无输出；默认强制 NN 用 CPU。
     force_nn_cpu_for_multiprocess = bool(args.get('force_nn_cpu_for_multiprocess', False))
@@ -763,10 +875,21 @@ def _train_unit_worker(args: dict) -> dict:
             unit_predictor_obj = SingleUnitBinaryPredictorTrainer(
                 ppc, active_set_data, T_delta,
                 unit_ids=[unit_id],
+                hidden_dims=unit_predictor_hidden_dims,
+                net_variant=unit_predictor_net_variant,
+                tcn_channels=unit_predictor_tcn_channels,
+                tcn_depth=unit_predictor_tcn_depth,
+                tconv_channels=unit_predictor_tconv_channels,
+                tconv_depth=unit_predictor_tconv_depth,
+                dropout=unit_predictor_dropout,
                 weight_decay=unit_predictor_weight_decay,
                 device=nn_device,
             )
-            unit_predictor_obj.load(unit_predictor_path)
+            loaded_ok = bool(unit_predictor_obj.load(unit_predictor_path))
+            if not loaded_ok:
+                raise RuntimeError(
+                    f"unit_predictor checkpoint incompatible or empty: {unit_predictor_path}"
+                )
             print(
                 f"{prefix} 已在子进程加载 unit_predictor: {unit_predictor_path}",
                 flush=True,
@@ -777,6 +900,7 @@ def _train_unit_worker(args: dict) -> dict:
                 flush=True,
             )
             unit_predictor_obj = None
+            raise
     effective_use_unit_predictor = unit_predictor_obj is not None
 
     # 构建 trainer
@@ -794,6 +918,7 @@ def _train_unit_worker(args: dict) -> dict:
             rho_dual_x_init=rho_dual_x_init,
             rho_dual_coc_init=rho_dual_coc_init,
             rho_binary_init=rho_binary_init,
+            rho_binary_max=rho_binary_max,
             rho_opt_init=rho_opt_init,
             gamma_base=gamma_base,
             mu_lower_bound_init=mu_lower_bound_init,
@@ -810,6 +935,11 @@ def _train_unit_worker(args: dict) -> dict:
             nn_batch_size=nn_batch_size,
             nn_shuffle=nn_shuffle,
             nn_smooth_abs_eps=nn_smooth_abs_eps,
+            nn_main_eta_min_ratio=nn_main_eta_min_ratio,
+            nn_main_lr_late_scale=nn_main_lr_late_scale,
+            nn_main_adam_weight_decay=nn_main_adam_weight_decay,
+            nn_main_grad_clip=nn_main_grad_clip,
+            nn_main_kkt_lr_scale=nn_main_kkt_lr_scale,
             loss_ratio_primal=loss_ratio_primal,
             loss_ratio_dual_pg=loss_ratio_dual_pg,
             loss_ratio_dual_x=loss_ratio_dual_x,
@@ -838,8 +968,17 @@ def _train_unit_worker(args: dict) -> dict:
             dual_block_prox_weight=dual_block_prox_weight,
             unit_predictor=unit_predictor_obj,
             use_unit_predictor=effective_use_unit_predictor,
+            predictor_warmup_rounds=predictor_warmup_rounds,
+            sign4_curriculum_rounds=sign4_curriculum_rounds,
+            sign4_initial_scale=sign4_initial_scale,
+            sign4_final_scale=sign4_final_scale,
+            enable_surrogate_delta_reference_lift=enable_surrogate_delta_reference_lift,
+            surrogate_delta_reference_eps=surrogate_delta_reference_eps,
+            surrogate_delta_reference_scope=surrogate_delta_reference_scope,
+            surrogate_delta_reference_min_abs_factor=surrogate_delta_reference_min_abs_factor,
             unit_predictor_finetune_lr=unit_predictor_finetune_lr,
             unit_predictor_weight_decay=unit_predictor_weight_decay,
+            case_name=case_name,
             device=nn_device,
             n_workers=sample_n_workers,
         )
@@ -855,6 +994,7 @@ def _train_unit_worker(args: dict) -> dict:
             rho_dual_x_init=rho_dual_x_init,
             rho_dual_coc_init=rho_dual_coc_init,
             rho_binary_init=rho_binary_init,
+            rho_binary_max=rho_binary_max,
             rho_opt_init=rho_opt_init,
             gamma_base=gamma_base,
             mu_lower_bound_init=mu_lower_bound_init,
@@ -871,6 +1011,11 @@ def _train_unit_worker(args: dict) -> dict:
             nn_batch_size=nn_batch_size,
             nn_shuffle=nn_shuffle,
             nn_smooth_abs_eps=nn_smooth_abs_eps,
+            nn_main_eta_min_ratio=nn_main_eta_min_ratio,
+            nn_main_lr_late_scale=nn_main_lr_late_scale,
+            nn_main_adam_weight_decay=nn_main_adam_weight_decay,
+            nn_main_grad_clip=nn_main_grad_clip,
+            nn_main_kkt_lr_scale=nn_main_kkt_lr_scale,
             loss_ratio_primal=loss_ratio_primal,
             loss_ratio_dual_pg=loss_ratio_dual_pg,
             loss_ratio_dual_x=loss_ratio_dual_x,
@@ -899,8 +1044,17 @@ def _train_unit_worker(args: dict) -> dict:
             dual_block_prox_weight=dual_block_prox_weight,
             unit_predictor=unit_predictor_obj,
             use_unit_predictor=effective_use_unit_predictor,
+            predictor_warmup_rounds=predictor_warmup_rounds,
+            sign4_curriculum_rounds=sign4_curriculum_rounds,
+            sign4_initial_scale=sign4_initial_scale,
+            sign4_final_scale=sign4_final_scale,
+            enable_surrogate_delta_reference_lift=enable_surrogate_delta_reference_lift,
+            surrogate_delta_reference_eps=surrogate_delta_reference_eps,
+            surrogate_delta_reference_scope=surrogate_delta_reference_scope,
+            surrogate_delta_reference_min_abs_factor=surrogate_delta_reference_min_abs_factor,
             unit_predictor_finetune_lr=unit_predictor_finetune_lr,
             unit_predictor_weight_decay=unit_predictor_weight_decay,
+            case_name=case_name,
             device=nn_device,
         )
 
@@ -1068,6 +1222,7 @@ def train_all_surrogates_parallel(
     rho_dual_x_init: float | None = None,
     rho_dual_coc_init: float | None = None,
     rho_binary_init: float = 1.0,
+    rho_binary_max: float = 1e4,
     rho_opt_init: float = 1e-3,
     gamma_base: float = 1e-3,
     mu_lower_bound_init: float = 0.1,
@@ -1084,6 +1239,11 @@ def train_all_surrogates_parallel(
     nn_batch_size: int = 4,
     nn_shuffle: bool = True,
     nn_smooth_abs_eps: float = 1e-6,
+    nn_main_eta_min_ratio: float = 0.08,
+    nn_main_lr_late_scale: float = 0.42,
+    nn_main_adam_weight_decay: float = 1e-4,
+    nn_main_grad_clip: float = 0.85,
+    nn_main_kkt_lr_scale: float = 1.0,
     loss_ratio_primal: float = 1.0,
     loss_ratio_dual_pg: float = 1.0,
     loss_ratio_dual_x: float = 1.0,
@@ -1118,8 +1278,24 @@ def train_all_surrogates_parallel(
     use_sample_parallel: bool = True,
     unit_predictor_path: Optional[str] = None,
     use_unit_predictor: bool = False,
+    predictor_warmup_rounds: int = 0,
+    sign4_curriculum_rounds: int = 0,
+    sign4_initial_scale: float = 1.0,
+    sign4_final_scale: float = 1.0,
+    enable_surrogate_delta_reference_lift: bool | None = None,
+    surrogate_delta_reference_eps: float = 1e-6,
+    surrogate_delta_reference_scope: str = "sign4_only",
+    surrogate_delta_reference_min_abs_factor: float = 1e-9,
     unit_predictor_finetune_lr: float = 1e-5,
     unit_predictor_weight_decay: float = 1e-4,
+    unit_predictor_hidden_dims: Optional[List[int]] = None,
+    unit_predictor_net_variant: str = "mlp",
+    unit_predictor_tcn_channels: int = 64,
+    unit_predictor_tcn_depth: int = 6,
+    unit_predictor_tconv_channels: int = 64,
+    unit_predictor_tconv_depth: int = 3,
+    unit_predictor_dropout: float = 0.1,
+    case_name: str | None = None,
 ) -> Dict[int, dict]:
     """并行训练所有机组的子问题代理约束（Level 1：机组级进程并行）。
 
@@ -1210,6 +1386,7 @@ def train_all_surrogates_parallel(
             'rho_dual_x_init':    rho_dual_x_init,
             'rho_dual_coc_init':  rho_dual_coc_init,
             'rho_binary_init':    rho_binary_init,
+            'rho_binary_max':     rho_binary_max,
             'rho_opt_init':       rho_opt_init,
             'gamma_base':         gamma_base,
             'mu_lower_bound_init': mu_lower_bound_init,
@@ -1226,6 +1403,11 @@ def train_all_surrogates_parallel(
             'nn_batch_size':      nn_batch_size,
             'nn_shuffle':         nn_shuffle,
             'nn_smooth_abs_eps':  nn_smooth_abs_eps,
+            'nn_main_eta_min_ratio': nn_main_eta_min_ratio,
+            'nn_main_lr_late_scale': nn_main_lr_late_scale,
+            'nn_main_adam_weight_decay': nn_main_adam_weight_decay,
+            'nn_main_grad_clip': nn_main_grad_clip,
+            'nn_main_kkt_lr_scale': nn_main_kkt_lr_scale,
             'loss_ratio_primal':  loss_ratio_primal,
             'loss_ratio_dual_pg': loss_ratio_dual_pg,
             'loss_ratio_dual_x':  loss_ratio_dual_x,
@@ -1262,13 +1444,30 @@ def train_all_surrogates_parallel(
             # 单机组 0/1 预测器（通过磁盘路径 lazy 加载，避免跨进程 pickle 模型）
             'unit_predictor_path': unit_predictor_path,
             'use_unit_predictor':  bool(use_unit_predictor and unit_predictor_path),
+            'predictor_warmup_rounds': predictor_warmup_rounds,
+            'sign4_curriculum_rounds': sign4_curriculum_rounds,
+            'sign4_initial_scale': sign4_initial_scale,
+            'sign4_final_scale': sign4_final_scale,
+            'enable_surrogate_delta_reference_lift': enable_surrogate_delta_reference_lift,
+            'surrogate_delta_reference_eps': surrogate_delta_reference_eps,
+            'surrogate_delta_reference_scope': surrogate_delta_reference_scope,
+            'surrogate_delta_reference_min_abs_factor': surrogate_delta_reference_min_abs_factor,
             'unit_predictor_finetune_lr': unit_predictor_finetune_lr,
             'unit_predictor_weight_decay': unit_predictor_weight_decay,
+            'unit_predictor_hidden_dims': unit_predictor_hidden_dims,
+            'unit_predictor_net_variant': unit_predictor_net_variant,
+            'unit_predictor_tcn_channels': unit_predictor_tcn_channels,
+            'unit_predictor_tcn_depth': unit_predictor_tcn_depth,
+            'unit_predictor_tconv_channels': unit_predictor_tconv_channels,
+            'unit_predictor_tconv_depth': unit_predictor_tconv_depth,
+            'unit_predictor_dropout': unit_predictor_dropout,
+            'case_name': case_name,
         }
         for g in unit_ids
     ]
 
     results: Dict[int, dict] = {}
+    failures: Dict[int, Exception] = {}
 
     executor = ProcessPoolExecutor(max_workers=n_workers)
     wait_on_close = True
@@ -1288,6 +1487,7 @@ def train_all_surrogates_parallel(
                 print(f"✗ 机组 {uid} 训练失败: {exc}", flush=True)
                 import traceback
                 traceback.print_exc()
+                failures[uid] = exc
     except KeyboardInterrupt:
         print(
             "\n收到 KeyboardInterrupt：正在以 wait=False 关闭进程池；"
@@ -1300,6 +1500,13 @@ def train_all_surrogates_parallel(
     finally:
         # 避免仅用 with：中断时默认 shutdown(wait=True) 会长时间卡在 join 子进程上
         executor.shutdown(wait=wait_on_close, cancel_futures=cancel_pending)
+    if failures or len(results) != len(unit_ids):
+        missing_units = set(int(u) for u in unit_ids) - set(results.keys())
+        failed_units = sorted(set(failures.keys()) | missing_units)
+        raise RuntimeError(
+            f"parallel subproblem training incomplete: {len(results)}/{len(unit_ids)} succeeded; "
+            f"failed_units={failed_units}"
+        )
 
     print(f"\n✓ 所有机组并行训练完成 ({len(results)}/{len(unit_ids)})", flush=True)
     return results

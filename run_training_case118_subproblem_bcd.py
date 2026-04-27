@@ -59,6 +59,18 @@ def _parse_args() -> argparse.Namespace:
             "设为 0 可禁用 predictor 热身（Plan B 实现后生效）"
         ),
     )
+    p.add_argument(
+        "--delta-reference-lift",
+        choices=("auto", "on", "off"),
+        default="auto",
+        help="surrogate delta reference lift: auto enables it for sign4 strategies",
+    )
+    p.add_argument(
+        "--delta-reference-scope",
+        choices=("sign4_only", "all_coupling"),
+        default="sign4_only",
+        help="scope for surrogate delta reference lift",
+    )
     return p.parse_args()
 
 
@@ -73,6 +85,13 @@ def main() -> None:
         case118_cfg.SUBPROBLEM_LIGHT_MAX_ITER = max(1, int(args.max_iter))
     if args.warmup_rounds is not None:
         case118_cfg.SUBPROBLEM_LIGHT_PREDICTOR_WARMUP_ROUNDS = max(0, int(args.warmup_rounds))
+    if args.delta_reference_lift == "auto":
+        case118_cfg.CASE118_SUBPROBLEM_SURROGATE_DELTA_REFERENCE_LIFT = None
+    else:
+        case118_cfg.CASE118_SUBPROBLEM_SURROGATE_DELTA_REFERENCE_LIFT = (
+            args.delta_reference_lift == "on"
+        )
+    case118_cfg.CASE118_SUBPROBLEM_SURROGATE_DELTA_REFERENCE_SCOPE = args.delta_reference_scope
     case118_cfg.main()
 
 

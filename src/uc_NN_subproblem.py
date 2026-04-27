@@ -1,4 +1,4 @@
-import numpy as np
+﻿import numpy as np
 try:
     import gurobipy as gp
     from gurobipy import GRB
@@ -435,6 +435,39 @@ def _get_ramp_limits_from_ppc(ppc_raw, gen: np.ndarray, T_delta: float) -> Tuple
     Ru_co = np.maximum(Ru, gen[:, PMIN])
     Rd_co = np.maximum(Rd, gen[:, PMIN])
     return Ru, Rd, Ru_co, Rd_co
+
+
+def _compute_subproblem_min_up_down_tau_max(
+    case_name: Optional[str],
+    ppc_raw,
+    gen: np.ndarray,
+    T: int,
+    T_delta: float,
+    unit_id: int,
+) -> Tuple[int, int]:
+    """子问题中最小开/关时间约束的 τ 上界（与 ``uc_gurobipy._get_min_up_down_time_steps`` 一致）。
+
+    - ``case118``：使用 ``ppc['uc_min_up_time_h']`` / ``uc_min_down_time_h`` 按 ``T_delta`` 换算
+      （``ceil``，至少 1），与全模型 UC 对齐。
+    - 其余算例（含 ``case3``、``case30``、``None`` 等）：保持原 ``min(4, T)`` 紧凑建模。
+    """
+    if str(case_name).strip().lower() == "case118":
+        min_up_h = _get_custom_generator_array_from_ppc(
+            ppc_raw, gen.shape[0], "uc_min_up_time_h"
+        )
+        min_down_h = _get_custom_generator_array_from_ppc(
+            ppc_raw, gen.shape[0], "uc_min_down_time_h"
+        )
+        if min_up_h is None or min_down_h is None:
+            raise ValueError(
+                "case118 子问题需要 ppc 上包含 uc_min_up_time_h 与 uc_min_down_time_h "
+                "（与 load_case118_ppc_with_mti_limits 一致）。"
+            )
+        ton = int(np.maximum(np.ceil(float(min_up_h[unit_id]) / float(T_delta)), 1))
+        toff = int(np.maximum(np.ceil(float(min_down_h[unit_id]) / float(T_delta)), 1))
+        return ton, toff
+    cap = min(max(int(4 * float(T_delta)), 1), int(T))
+    return cap, cap
 
 
 def _combine_pg_duals(
@@ -1451,6 +1484,8 @@ class SingleUnitBinaryPredictorTrainer:
     - 预训练阶段：BCEWithLogitsLoss 以 ``unit_commitment_matrix`` 作为监督标签。
     - BCD 阶段：被 ``SubproblemSurrogateTrainer`` 以小学习率做端到端微调。
     - 存储：按 ``unit_id`` 懒初始化（避免为未训练机组浪费显存）。
+    - 输入特征仅为 ``scenario_utils.get_feature_vector_from_sample``（负荷/可再生或净负荷），
+      与主 surrogate 网络的 ``[场景, λ, unit_params]`` 拼接向量分离；BCD 内不得混入 λ 与机组静态后缀。
     """
 
     def __init__(
@@ -1553,7 +1588,6 @@ class SingleUnitBinaryPredictorTrainer:
             f"pos_rate={pos_rate:.3f}, device={self.device}",
             flush=True,
         )
-
     def _ensure_network(self, unit_id: int) -> None:
         if not TORCH_AVAILABLE:
             return
@@ -2045,6 +2079,13 @@ class SingleUnitBinaryPredictorTrainer:
                 'unit_ids': list(self.unit_ids),
                 'learning_rate': self.learning_rate,
                 'net_variant': self.net_variant,
+                'resmlp_width': self.resmlp_width,
+                'resmlp_depth': self.resmlp_depth,
+                'tconv_channels': self.tconv_channels,
+                'tconv_depth': self.tconv_depth,
+                'tcn_channels': self.tcn_channels,
+                'tcn_depth': self.tcn_depth,
+                'dropout': self.dropout,
             },
         }
         if self.net_variant == "tcn_shared_film":
@@ -2056,15 +2097,23 @@ class SingleUnitBinaryPredictorTrainer:
         torch.save(payload, filepath)
         print(f"✓ 单机组 0/1 预测器已保存: {filepath}", flush=True)
 
-    def load(self, filepath: str) -> None:
+    def load(self, filepath: str) -> bool:
         if not TORCH_AVAILABLE:
-            return
+            return False
         state = torch.load(filepath, map_location=self.device)
         meta = state.get('metadata', {}) or {}
         loaded_variant = str(meta.get('net_variant', self.net_variant) or self.net_variant).strip().lower()
+        want_variant = str(self.net_variant).strip().lower()
+        if loaded_variant != want_variant:
+            print(
+                f"! [UnitPredictor] checkpoint net_variant={loaded_variant!r} 与当前 {want_variant!r} 不一致，跳过加载: {filepath}",
+                flush=True,
+            )
+            return False
         # 允许从 checkpoint 恢复共享网络（仅当当前也配置为共享网络）
         if loaded_variant == "tcn_shared_film" and self.net_variant == "tcn_shared_film":
             shared = state.get('shared', {}) or {}
+            loaded_any = False
             # 确保 shared 组件存在
             for g in (meta.get('unit_ids') or self.unit_ids):
                 self._ensure_network(int(g))
@@ -2091,23 +2140,28 @@ class SingleUnitBinaryPredictorTrainer:
                             continue
                         filtered_sd[k] = v
 
-                    # 只加载完全匹配的参数，避免 shape mismatch 直接报错
-                    if len(filtered_sd) == 0:
+                    # 只加载完全匹配的参数，避免 shape mismatch 直接报错。
+                    # 部分加载会使骨干大量随机初始化，效果比「完全从头训」更差，故低匹配率时整网放弃加载。
+                    _min_shared_key_ratio = 0.85
+                    n_total = len(current_sd)
+                    n_loaded = len(filtered_sd)
+                    n_skipped = len(skipped)
+                    if n_loaded == 0 or (n_total > 0 and n_loaded < _min_shared_key_ratio * n_total):
                         print(
-                            "! [UnitPredictor] checkpoint 与当前 SharedTCNFiLMNet 结构不兼容（无可用参数），跳过加载并从头训练。"
-                            f" ckpt={filepath}",
+                            "! [UnitPredictor] checkpoint 与当前 SharedTCNFiLMNet 不匹配或匹配键过少 "
+                            f"({n_loaded}/{n_total} < {_min_shared_key_ratio:.0%})，跳过加载并从头训练。"
+                            f" 请使用同 net_variant / 同 input_dim·T·channels·depth 训练得到的 unit_predictor.pth，"
+                            f"或设 UNIT_PREDICTOR_LOAD_PATH=None。ckpt={filepath}",
                             flush=True,
                         )
                     else:
                         missing, unexpected = self.shared_model.load_state_dict(filtered_sd, strict=False)
-                        n_total = len(current_sd)
-                        n_loaded = len(filtered_sd)
-                        n_skipped = len(skipped)
                         print(
                             f"✓ 单机组 0/1 预测器已加载(共享骨干, 兼容模式): {filepath} "
                             f"(loaded={n_loaded}/{n_total}, skipped={n_skipped}, missing={len(missing)}, unexpected={len(unexpected)})",
                             flush=True,
                         )
+                        loaded_any = True
                         if n_skipped > 0:
                             preview = ", ".join([f"{k}({reason})" for k, reason in skipped[:6]])
                             more = "" if n_skipped <= 6 else f", ...(+{n_skipped-6})"
@@ -2118,20 +2172,29 @@ class SingleUnitBinaryPredictorTrainer:
             # 注：上面兼容加载已经打印过一次更详细的统计；这里保留兜底提示以兼容旧日志习惯
             if shared.get('shared_model') is None:
                 print(f"✓ 单机组 0/1 预测器已加载(共享骨干): {filepath}", flush=True)
-            return
+            self.shared_model.eval()
+            return loaded_any
 
         state_dicts = state.get('state_dicts', {}) or {}
+        if not state_dicts:
+            print(f"! [UnitPredictor] checkpoint has no state_dicts; no weights loaded: {filepath}", flush=True)
+            return False
+        loaded_count = 0
         for g, sd in state_dicts.items():
             g_int = int(g)
             if g_int not in self.unit_ids:
                 self.unit_ids.append(g_int)
             self._ensure_network(g_int)
             self.networks[g_int].load_state_dict(sd)
+            loaded_count += 1
         print(
             f"✓ 单机组 0/1 预测器已加载: {filepath} "
             f"（已恢复机组: {sorted(self.networks.keys())}）",
             flush=True,
         )
+        for net in self.networks.values():
+            net.eval()
+        return loaded_count > 0
 
 
 # ========================== 第二部分：子问题代理约束训练（BCD方式） ==========================
@@ -2582,6 +2645,7 @@ class SubproblemSurrogateTrainer:
                  rho_dual_x_init: float | None = None,
                  rho_dual_coc_init: float | None = None,
                  rho_binary_init: float = 1.0,
+                 rho_binary_max: float = 1e4,
                  rho_opt_init: float = 1e-3,
                  gamma_base: float = 1e-3,
                  mu_lower_bound_init: float = 0.1,
@@ -2626,12 +2690,26 @@ class SubproblemSurrogateTrainer:
                  ignore_startup_shutdown_costs: bool = False,
                  unit_predictor: 'SingleUnitBinaryPredictorTrainer | None' = None,
                  use_unit_predictor: bool = False,
+                 predictor_warmup_rounds: int = 0,
+                 sign4_curriculum_rounds: int = 0,
+                 sign4_initial_scale: float = 1.0,
+                 sign4_final_scale: float = 1.0,
                  unit_predictor_finetune_lr: float = 1e-5,
                  unit_predictor_weight_decay: float = 1e-4,
                  pg_cost_single_sample_reg_scale: float | None = None,
                  pg_cost_c_pg_adam_weight_decay: float | None = None,
                  main_direct_train_config: dict | None = None,
                  c_pg_direct_train_config: dict | None = None,
+                 nn_main_eta_min_ratio: float = 0.08,
+                 nn_main_lr_late_scale: float = 0.42,
+                 nn_main_adam_weight_decay: float = 1e-4,
+                 nn_main_grad_clip: float = 0.85,
+                 nn_main_kkt_lr_scale: float = 1.0,
+                 case_name: str | None = None,
+                 enable_surrogate_delta_reference_lift: bool | None = None,
+                 surrogate_delta_reference_eps: float = 1e-6,
+                 surrogate_delta_reference_scope: str = "sign4_only",
+                 surrogate_delta_reference_min_abs_factor: float = 1e-9,
                  device=None):
         """
         初始化单机组子问题代理约束训练器 - V3三时段版本
@@ -2643,6 +2721,7 @@ class SubproblemSurrogateTrainer:
             unit_id: 机组索引
             lambda_predictor: 已训练的对偶变量预测器（可选）
             max_constraints: 最大约束数量（敏感时段）
+            case_name: 算例名；``case118`` 时最小开停机与 MTI 数据对齐，否则沿用 ``min(4,T)``。
             device: 计算设备
         """
         self.ppc = ppc
@@ -2697,7 +2776,17 @@ class SubproblemSurrogateTrainer:
             self.T = active_set_data[0]['pd_data'].shape[1]
         else:
             self.T = active_set_data['pd_data'].shape[1]
-            
+
+        self.case_name = case_name
+        self.subproblem_Ton, self.subproblem_Toff = _compute_subproblem_min_up_down_tau_max(
+            case_name,
+            self.ppc_raw,
+            self.gen,
+            self.T,
+            float(self.T_delta),
+            int(unit_id),
+        )
+
         self.ng = self.gen.shape[0]
         self.nb = self.bus.shape[0]
         if self.constraint_generation_strategy == CONSTRAINT_STRATEGY_ALL_TEMPLATES_SIGN4:
@@ -2742,6 +2831,7 @@ class SubproblemSurrogateTrainer:
         self.gamma = self.gamma_base
         self.gamma_dual_component_scale = 3.0
         self.rho_max = 10.0
+        self.rho_binary_max = max(float(rho_binary_max), self.rho_binary)
         self.reg_weight = 1e-4   # alpha/beta/gamma L2 正则化权重
         self.iter_delta_reg_weight = float(iter_delta_reg_weight)
         self.iter_delta_reg_deadband = max(float(iter_delta_reg_deadband), 0.0)
@@ -2775,7 +2865,8 @@ class SubproblemSurrogateTrainer:
         self.nn_batch_strategy = normalize_nn_batch_strategy(nn_batch_strategy)
         self.nn_batch_size = max(int(nn_batch_size), 1)
         self.nn_shuffle = bool(nn_shuffle)
-        self.pg_cost_nn_epochs = None if pg_cost_nn_epochs is None else max(int(pg_cost_nn_epochs), 1)
+        # 0 表示 BCD 内跳过 NN-c_pg（可微 KKT loss），仅依赖 direct-c_pg 与缓存刷新
+        self.pg_cost_nn_epochs = None if pg_cost_nn_epochs is None else max(int(pg_cost_nn_epochs), 0)
         self.loss_ratio_primal = float(loss_ratio_primal)
         self.loss_ratio_dual_pg = float(loss_ratio_dual_pg)
         self.loss_ratio_dual_x = float(loss_ratio_dual_x)
@@ -2801,6 +2892,24 @@ class SubproblemSurrogateTrainer:
         # 单机组 0/1 预测器（可选代理约束生成方式）
         self.unit_predictor = unit_predictor
         self.use_unit_predictor = bool(use_unit_predictor)
+        self.predictor_warmup_rounds = max(int(predictor_warmup_rounds), 0)
+        self.sign4_curriculum_rounds = max(int(sign4_curriculum_rounds), 0)
+        self.sign4_initial_scale = max(float(sign4_initial_scale), 0.0)
+        self.sign4_final_scale = max(float(sign4_final_scale), 0.0)
+        if enable_surrogate_delta_reference_lift is None:
+            self.enable_surrogate_delta_reference_lift = self.constraint_generation_strategy in (
+                CONSTRAINT_STRATEGY_ALL_TEMPLATES_SIGN4,
+                CONSTRAINT_STRATEGY_ALL_TEMPLATES_SIGN4_PLUS_SINGLE,
+            )
+        else:
+            self.enable_surrogate_delta_reference_lift = bool(enable_surrogate_delta_reference_lift)
+        self.surrogate_delta_reference_eps = max(float(surrogate_delta_reference_eps), 0.0)
+        self.surrogate_delta_reference_scope = self._normalize_surrogate_delta_reference_scope(
+            surrogate_delta_reference_scope
+        )
+        self.surrogate_delta_reference_min_abs_factor = max(
+            float(surrogate_delta_reference_min_abs_factor), 1e-15
+        )
         self.unit_predictor_finetune_lr = max(float(unit_predictor_finetune_lr), 1e-10)
         self.unit_predictor_weight_decay = max(float(unit_predictor_weight_decay), 0.0)
         self._unit_predictor_optimizer = None  # 在 iter_with_surrogate_nn 中按需构造
@@ -2817,6 +2926,15 @@ class SubproblemSurrogateTrainer:
             self.pg_cost_c_pg_adam_weight_decay = 0.0 if self.n_samples == 1 else 1e-4
         self.main_direct_train_config = dict(main_direct_train_config or {})
         self.c_pg_direct_train_config = dict(c_pg_direct_train_config or {})
+        # NN-main（可微 KKT）：与 direct-NN-main 一致用每轮 BCD 内 CosineAnnealingLR；
+        # nn_main_lr_late_scale 随外循环减小基准步长，类比 subproblem_lp_solver 中 rho 增大后的精细收敛。
+        self.nn_main_eta_min_ratio = max(float(nn_main_eta_min_ratio), 0.0)
+        self.nn_main_lr_late_scale = min(max(float(nn_main_lr_late_scale), 1e-3), 1.0)
+        self.nn_main_adam_weight_decay = max(float(nn_main_adam_weight_decay), 0.0)
+        self.nn_main_grad_clip = max(float(nn_main_grad_clip), 1e-6)
+        # 仅作用于 iter_with_surrogate_nn（KKT），不作用于 direct-NN-main；<1 可抑制大 rho 下 loss 尖峰
+        self.nn_main_kkt_lr_scale = max(float(nn_main_kkt_lr_scale), 1e-6)
+        self._surrogate_bcd_max_iter = 1
         
         # 初始化原始变量和对偶变量存储
         self.pg = np.zeros((self.n_samples, self.T))
@@ -2839,6 +2957,11 @@ class SubproblemSurrogateTrainer:
         # 存储每个样本的敏感时段索引
         self.sensitive_timesteps = [[] for _ in range(self.n_samples)]
         self.surrogate_constraint_offsets = [[] for _ in range(self.n_samples)]
+
+        # 场景特征维度（与 _extract_features 中 pd_flat 前缀一致）；unit_predictor 仅消费此段
+        self._scenario_feature_dim = len(
+            get_feature_vector_from_sample(dict(self.active_set_data[0]))
+        )
         
         # 获取对偶变量λ
         self.lambda_vals = self._get_lambda_values()
@@ -2866,6 +2989,9 @@ class SubproblemSurrogateTrainer:
         
         # 初始化求解
         self._initialize_solve()
+        if self.enable_surrogate_delta_reference_lift:
+            self._sync_surrogate_direction_strategy_state()
+            self._lift_surrogate_delta_for_reference_x()
 
         # ----- Persistent Gurobi model cache -----
         # 每个样本只建一次模型，后续迭代通过 setObjective / chgCoeff 更新
@@ -3020,6 +3146,23 @@ class SubproblemSurrogateTrainer:
             flush=True,
         )
         print(f"  - nn_dual_term_interval={self.nn_dual_term_interval}", flush=True)
+        print(
+            f"  - nn_main(refine): eta_min_ratio={self.nn_main_eta_min_ratio:.3g}, "
+            f"lr_late_scale={self.nn_main_lr_late_scale:.3g}, "
+            f"adam_wd={self.nn_main_adam_weight_decay:.1e}, grad_clip={self.nn_main_grad_clip:.3g}, "
+            f"kkt_lr_scale={self.nn_main_kkt_lr_scale:.3g}",
+            flush=True,
+        )
+
+    def _nn_main_bcd_lr_scale(self) -> float:
+        """BCD 外循环越靠后，NN-main 基准学习率越小（与 LP 块 penalty 随轮次加重后更偏局部细化一致）。"""
+        late = float(self.nn_main_lr_late_scale)
+        T = max(int(getattr(self, "_surrogate_bcd_max_iter", 1)), 1)
+        t = min(max(int(self.iter_number), 0), T - 1)
+        if T <= 1:
+            return 1.0
+        w = t / (T - 1)
+        return (1.0 - w) + late * w
 
     def _cost_network_parameters(self) -> list:
         return list(self.surrogate_net.cost_net.parameters())
@@ -3052,7 +3195,9 @@ class SubproblemSurrogateTrainer:
             tuple(tuple(int(o) for o in offsets) for offsets in sample_offsets)
             for sample_offsets in self.surrogate_constraint_offsets
         )
-        direction_key = tuple(np.asarray(self._get_surrogate_direction_signs(), dtype=float).reshape(-1).tolist())
+        _dir_signs_arr = np.asarray(self._get_surrogate_direction_signs(), dtype=float)
+        _curr_factors_arr = self._sign4_curriculum_factors(self.num_coupling_constraints)
+        direction_key = tuple((_dir_signs_arr * _curr_factors_arr).reshape(-1).tolist())
         return (
             str(device),
             id(self.x),
@@ -3097,8 +3242,8 @@ class SubproblemSurrogateTrainer:
         rd_co_v = float(self.Rd_co_all[g])
         start_c = 0.0 if self.ignore_startup_shutdown_costs else float(self.gencost[g, 1])
         shut_c = 0.0 if self.ignore_startup_shutdown_costs else float(self.gencost[g, 2])
-        ton_l = min(4, self.T)
-        toff_l = min(4, self.T)
+        ton_l = int(self.subproblem_Ton)
+        toff_l = int(self.subproblem_Toff)
         for t in range(self.T):
             val = b_val
             if lam_inh is not None:
@@ -3228,7 +3373,9 @@ class SubproblemSurrogateTrainer:
             'mu_abs': torch.abs(torch.as_tensor(self.mu, dtype=torch.float32, device=device)),
             'lambda_vals': torch.as_tensor(self.lambda_vals, dtype=torch.float32, device=device),
             'direction_signs': torch.as_tensor(
-                self._get_surrogate_direction_signs(),
+                self._get_surrogate_direction_signs() * self._sign4_curriculum_factors(
+                    self.num_coupling_constraints
+                ),
                 dtype=torch.float32,
                 device=device,
             ),
@@ -3299,6 +3446,12 @@ class SubproblemSurrogateTrainer:
             CONSTRAINT_STRATEGY_ALL_TEMPLATES_SIGN4_PLUS_SINGLE,
         )
 
+    def _unit_predictor_finetune_active(self) -> bool:
+        """Warmup gates predictor finetuning, not predictor-defined single constraints."""
+        if not self._unit_predictor_active():
+            return False
+        return int(getattr(self, 'iter_number', 0)) >= int(getattr(self, 'predictor_warmup_rounds', 0))
+
     def _unit_predictor_slice(self) -> tuple[int, int]:
         """返回 single-time 段在约束向量中的 [start, end) 范围；不启用时返回 (0, 0)。"""
         if not self._unit_predictor_active():
@@ -3327,6 +3480,10 @@ class SubproblemSurrogateTrainer:
             return (start, end)
         return (0, 0)
 
+    def _single_time_k_for_t(self, slice_start: int, t: int) -> int:
+        """single-time 段内第 t 个槽位对应的全局耦合约束下标 k（与 μ 向量切片对齐）。"""
+        return int(slice_start) + int(t)
+
     def _apply_mu2_coupling_dual_init(
         self, sample_id: int, mu2_per_t: np.ndarray | None
     ) -> None:
@@ -3346,41 +3503,93 @@ class SubproblemSurrogateTrainer:
         out[:take] = np.maximum(seg, float(self.mu_lower_bound))
         self.mu[sample_id, st:en] = out
 
+    def _apply_x_fix_dual_init(
+        self,
+        sample_id: int,
+        x_ref: np.ndarray,
+        x_fix_dual_contrib: np.ndarray | None,
+    ) -> None:
+        """Split signed x-fix duals into natural x bounds or single-time surrogate duals.
+
+        The signed value is interpreted in the same stationarity convention used by
+        cal_viol_components: positive contributes like x<=., negative like x>=.
+        """
+        if x_fix_dual_contrib is None:
+            return
+        if not (0 <= int(sample_id) < len(self.lambda_inherent)):
+            return
+        lam_inh = self.lambda_inherent[sample_id]
+        if lam_inh is None:
+            return
+
+        contrib = np.asarray(x_fix_dual_contrib, dtype=float).reshape(-1)
+        x_arr = np.asarray(x_ref, dtype=float).reshape(-1)
+        if contrib.size == 0 or x_arr.size == 0:
+            return
+
+        st, en = self._single_time_coupling_slice()
+        single_width = max(int(en) - int(st), 0)
+        single_mu = np.zeros(single_width, dtype=float)
+
+        n = min(self.T, contrib.size, x_arr.size)
+        for t in range(n):
+            d = float(contrib[t])
+            if abs(d) <= 1e-10:
+                continue
+            is_on = float(x_arr[t]) >= 0.5
+            if not is_on:
+                if d < 0.0:
+                    lam_inh['lambda_x_lower'][t] += -d
+                elif t < single_width:
+                    single_mu[t] = max(single_mu[t], d)
+            else:
+                if d > 0.0:
+                    lam_inh['lambda_x_upper'][t] += d
+                elif t < single_width:
+                    single_mu[t] = max(single_mu[t], -d)
+
+        if single_width > 0:
+            self.mu[sample_id, st:en] = single_mu
+
     def _unit_predictor_parameters(self) -> list:
         if not self._unit_predictor_active():
             return []
         return list(self.unit_predictor.get_network(self.unit_id).parameters())
 
     def _compute_single_time_alpha_delta_tensor(
-        self, features_tensor: torch.Tensor
+        self, features_tensor: torch.Tensor, train_predictor: bool = False
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """用 predictor 可微前向得到 (alpha, delta)，形状与 forward_logits 输出一致。
+
+        仅传入 ``get_feature_vector_from_sample`` 维度的场景向量（与训练一致），
+        不得使用主 surrogate 的 ``[场景, λ, unit_params]`` 全向量。
 
         mapping:
             x_hat   = sigmoid(logits)
             alpha_t = 1 - 2 * x_hat
             delta_t = x_hat * (1 - 2 * x_hat)        # 等价 alpha_t * x_hat
         """
-        expected_in = None
-        try:
-            net = (
-                self.unit_predictor.get_network(self.unit_id)
-                if getattr(self, "unit_predictor", None) is not None
-                else None
-            )
-            if net is not None:
-                first_linear = next((m for m in net.network if isinstance(m, nn.Linear)), None)
-                expected_in = None if first_linear is None else int(first_linear.in_features)
-        except Exception:
-            expected_in = None
-
-        # The unit predictor is trained on scenario features only (no lambda/unit_params).
-        # Align feature dimension to predictor input_dim to avoid shape mismatch.
-        if expected_in is not None and features_tensor.ndim >= 1:
-            got = int(features_tensor.shape[-1])
-            if got > expected_in:
-                features_tensor = features_tensor[..., :expected_in]
-        logits = self.unit_predictor.forward_logits(self.unit_id, features_tensor)
+        dim = int(getattr(self, "_scenario_feature_dim", 0) or 0)
+        if dim <= 0:
+            dim = len(get_feature_vector_from_sample(dict(self.active_set_data[0])))
+            self._scenario_feature_dim = dim
+        scenario = features_tensor[..., :dim]
+        if getattr(self, "unit_predictor", None) is not None:
+            exp_in = int(self.unit_predictor.input_dim)
+            if int(scenario.shape[-1]) != exp_in:
+                raise ValueError(
+                    f"UnitPredictor expects input_dim={exp_in}, got scenario width={int(scenario.shape[-1])}"
+                )
+        if train_predictor:
+            logits = self.unit_predictor.forward_logits(self.unit_id, scenario)
+        else:
+            net = self.unit_predictor.get_network(self.unit_id)
+            was_training = bool(net.training)
+            net.eval()
+            with torch.no_grad():
+                logits = self.unit_predictor.forward_logits(self.unit_id, scenario)
+            if was_training:
+                net.train()
         x_hat = torch.sigmoid(logits)
         alpha = 1.0 - 2.0 * x_hat
         delta = x_hat * alpha
@@ -3393,6 +3602,7 @@ class SubproblemSurrogateTrainer:
         gammas_tensor: torch.Tensor,
         deltas_tensor: torch.Tensor,
         features_tensor: torch.Tensor,
+        train_predictor: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """把 single-time 段的 (alpha, beta, gamma, delta) 替换为 predictor 派生值。
 
@@ -3405,7 +3615,9 @@ class SubproblemSurrogateTrainer:
         if end <= start:
             return alphas_tensor, betas_tensor, gammas_tensor, deltas_tensor
 
-        alpha_pred, delta_pred = self._compute_single_time_alpha_delta_tensor(features_tensor)
+        alpha_pred, delta_pred = self._compute_single_time_alpha_delta_tensor(
+            features_tensor, train_predictor=train_predictor,
+        )
         # alpha_pred / delta_pred 形状: (B, T) 或 (T,)；需要按张量 ndim 对齐
         target_len = end - start
         if alphas_tensor.ndim == 1:
@@ -3446,7 +3658,7 @@ class SubproblemSurrogateTrainer:
 
     def _ensure_unit_predictor_optimizer(self, learning_rate: float | None = None) -> None:
         """按 finetune LR 为 predictor 对应机组的网络构造优化器（重复调用安全）。"""
-        if not self._unit_predictor_active():
+        if not self._unit_predictor_finetune_active():
             self._unit_predictor_optimizer = None
             self._unit_predictor_scheduler = None
             return
@@ -3809,6 +4021,7 @@ class SubproblemSurrogateTrainer:
             inherent = self._x_stationarity_inherent_np(sample_id)
             offsets_by_k = self._constraint_offsets_for_sample(sample_id)
             signs = self._get_surrogate_direction_signs(nc)
+            curriculum_factors = self._sign4_curriculum_factors(nc)
 
             for t in range(self.T):
                 row = np.zeros(n_vars, dtype=np.float64)
@@ -3819,7 +4032,7 @@ class SubproblemSurrogateTrainer:
                     ):
                         if int(time_idx) != t:
                             continue
-                        row[int(kind) * nc + k] += float(mu_val[k])
+                        row[int(kind) * nc + k] += float(signs[k]) * float(curriculum_factors[k]) * float(mu_val[k])
                 rows.append(row)
                 rhs.append(-float(inherent[t]))
                 weights.append(max(dual_w, 0.0))
@@ -4029,14 +4242,20 @@ class SubproblemSurrogateTrainer:
                 scheduler_main.step()
                 scheduler_cost.step()
                 last_avg = epoch_loss / max(self.n_samples, 1)
-                do_log = epoch == 0 or epoch == epochs - 1 or (log_interval > 0 and (epoch + 1) % log_interval == 0)
+                do_print = epoch == 0 or epoch == epochs - 1
                 do_target_check = (
                     direct_mae_target is not None
-                    and (do_log or epoch == epochs - 1 or (target_check_interval > 0 and (epoch + 1) % target_check_interval == 0))
+                    and (
+                        epoch == epochs - 1
+                        or (
+                            target_check_interval > 0
+                            and (epoch + 1) % target_check_interval == 0
+                        )
+                    )
                 )
-                if do_log or do_target_check:
+                if do_print or do_target_check:
                     last_fast = self._main_direct_fast_metrics(sample_features, targets, target_scales)
-                if do_log:
+                if do_print:
                     print(
                         f"  [Unit-{self.unit_id}][direct-NN-main] epoch {epoch+1:>4}/{epochs}, "
                         f"avg_target_loss={last_avg:.6f}, lr={optimizer_main.param_groups[0]['lr']:.2e}, "
@@ -4153,13 +4372,21 @@ class SubproblemSurrogateTrainer:
                     optimizer.zero_grad()
                 scheduler.step()
                 last_avg = epoch_loss / max(self.n_samples, 1)
-                do_log = epoch == 0 or epoch == epochs - 1 or (log_interval > 0 and (epoch + 1) % log_interval == 0)
+                do_print = epoch == 0 or epoch == epochs - 1
                 do_target_check = (
                     obj_dual_pg_target is not None
-                    and (do_log or epoch == epochs - 1 or (target_check_interval > 0 and (epoch + 1) % target_check_interval == 0))
+                    and (
+                        epoch == epochs - 1
+                        or (
+                            target_check_interval > 0
+                            and (epoch + 1) % target_check_interval == 0
+                        )
+                    )
                 )
-                metric_obj_dual_pg = direct_target_obj_dual_pg() if (do_log or do_target_check) else None
-                if do_log:
+                metric_obj_dual_pg = (
+                    direct_target_obj_dual_pg() if (do_print or do_target_check) else None
+                )
+                if do_print:
                     print(
                         f"  [Unit-{self.unit_id}][direct-c_pg] epoch {epoch+1:>4}/{epochs}, "
                         f"avg_target_loss={last_avg:.6f}, lr={optimizer.param_groups[0]['lr']:.2e}, "
@@ -4304,6 +4531,10 @@ class SubproblemSurrogateTrainer:
     def _is_mu_sign_relaxation_round(self) -> bool:
         interval = int(getattr(self, 'mu_signed_round_interval', 0) or 0)
         lb = float(self._current_mu_lower_bound_value())
+        # 仅在前半段 BCD 启用：对偶块符号松弛 + 由 μ 更新 surrogate_direction_signs
+        cutoff = int(getattr(self, '_mu_sign_relaxation_last_iter', 10**9))
+        if int(getattr(self, 'iter_number', 0)) >= cutoff:
+            return False
         return (
             interval > 0
             and lb > 0.0
@@ -4391,6 +4622,27 @@ class SubproblemSurrogateTrainer:
         self.surrogate_direction_pending_counts = pending_counts
         return resolved
 
+    def _current_sign4_curriculum_scale(self) -> float:
+        rounds = max(int(getattr(self, 'sign4_curriculum_rounds', 0) or 0), 0)
+        initial = max(float(getattr(self, 'sign4_initial_scale', 1.0) or 0.0), 0.0)
+        final = max(float(getattr(self, 'sign4_final_scale', 1.0) or 0.0), 0.0)
+        if rounds <= 0:
+            return final
+        progress = min(max(float(getattr(self, 'iter_number', 0)), 0.0) / float(rounds), 1.0)
+        return initial + (final - initial) * progress
+
+    def _sign4_curriculum_factors(self, size: int) -> np.ndarray:
+        factors = np.ones(int(size), dtype=float)
+        if self.constraint_generation_strategy not in (
+            CONSTRAINT_STRATEGY_ALL_TEMPLATES_SIGN4,
+            CONSTRAINT_STRATEGY_ALL_TEMPLATES_SIGN4_PLUS_SINGLE,
+        ):
+            return factors
+        n_sign4 = min(int(size), self.all_mode_group_size * max(int(self.T) - 2, 0))
+        if n_sign4 > 0:
+            factors[:n_sign4] = self._current_sign4_curriculum_scale()
+        return factors
+
     def _apply_surrogate_direction_to_params(
         self,
         alphas: np.ndarray,
@@ -4399,12 +4651,100 @@ class SubproblemSurrogateTrainer:
         deltas: np.ndarray,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         signs = self._get_surrogate_direction_signs(len(alphas))
+        factors = signs * self._sign4_curriculum_factors(len(alphas))
         return (
-            np.asarray(alphas, dtype=float) * signs,
-            np.asarray(betas, dtype=float) * signs,
-            np.asarray(gammas, dtype=float) * signs,
-            np.asarray(deltas, dtype=float) * signs,
+            np.asarray(alphas, dtype=float) * factors,
+            np.asarray(betas, dtype=float) * factors,
+            np.asarray(gammas, dtype=float) * factors,
+            np.asarray(deltas, dtype=float) * factors,
         )
+
+    @staticmethod
+    def _normalize_surrogate_delta_reference_scope(scope: str | None) -> str:
+        s = (scope or "sign4_only").strip().lower().replace("-", "_")
+        if s in ("all", "all_coupling", "full"):
+            return "all_coupling"
+        return "sign4_only"
+
+    def _lift_surrogate_delta_for_reference_x(self) -> None:
+        """初始化一次性：按各样本 ``x_true`` 调整原始 ``δ``，使有效不等式在参考点上满足 ``lhs_eff ≤ δ_eff − ε``（消除代理耦合的 primal 违反项）。
+
+        使用与 primal block 相同的 ``f_k = sign_k × curriculum_k`` 缩放；仅改 ``delta_values``，不改动网络权重。
+        """
+        if not self.enable_surrogate_delta_reference_lift:
+            return
+        eps = float(self.surrogate_delta_reference_eps)
+        min_f = float(self.surrogate_delta_reference_min_abs_factor)
+        scope = self.surrogate_delta_reference_scope
+        signs = np.asarray(self._get_surrogate_direction_signs(), dtype=float)
+        factors_full = np.asarray(
+            self._sign4_curriculum_factors(self.num_coupling_constraints), dtype=float
+        )
+        f_arr = signs * factors_full
+        n_adj = 0
+        max_viol = 0.0
+        for sample_id in range(self.n_samples):
+            x_true = self.active_set_data[sample_id].get("x_true")
+            if x_true is None:
+                x_ref = np.asarray(self.x[sample_id], dtype=float)
+            else:
+                x_ref = np.asarray(x_true, dtype=float)
+            sensitive = self.sensitive_timesteps[sample_id]
+            offsets_list = self._constraint_offsets_for_sample(sample_id)
+            n_active = min(len(sensitive), len(offsets_list))
+            if n_active <= 0:
+                continue
+            if scope == "all_coupling":
+                ks = range(n_active)
+            else:
+                if self.constraint_generation_strategy not in (
+                    CONSTRAINT_STRATEGY_ALL_TEMPLATES_SIGN4,
+                    CONSTRAINT_STRATEGY_ALL_TEMPLATES_SIGN4_PLUS_SINGLE,
+                ):
+                    ks = range(0)
+                else:
+                    n_sign4 = min(
+                        self.all_mode_group_size * max(int(self.T) - 2, 0),
+                        n_active,
+                    )
+                    ks = range(n_sign4)
+            dv = np.asarray(self.delta_values[sample_id], dtype=float).copy()
+            av = np.asarray(self.alpha_values[sample_id], dtype=float)
+            bv = np.asarray(self.beta_values[sample_id], dtype=float)
+            gv = np.asarray(self.gamma_values[sample_id], dtype=float)
+            for k in ks:
+                if k < 0 or k >= int(self.num_coupling_constraints):
+                    continue
+                f_k = float(f_arr[k])
+                if abs(f_k) < min_f:
+                    continue
+                lhs_raw = float(
+                    build_surrogate_constraint_expression(
+                        x_ref,
+                        int(sensitive[k]),
+                        offsets_list[k],
+                        float(av[k]),
+                        float(bv[k]),
+                        float(gv[k]),
+                        int(self.T),
+                    )
+                )
+                lhs_eff = f_k * lhs_raw
+                delta_eff = f_k * float(dv[k])
+                viol = lhs_eff - delta_eff
+                if viol <= 1e-14:
+                    continue
+                max_viol = max(max_viol, viol)
+                delta_eff_new = lhs_eff + eps
+                dv[k] = delta_eff_new / f_k
+                n_adj += 1
+            self.delta_values[sample_id] = dv
+        if n_adj > 0:
+            print(
+                f"  [Unit-{self.unit_id}] surrogate δ 参考锚定: 调整 {n_adj} 项, "
+                f"max(lhs_eff−δ_eff)≈{max_viol:.6g}（scope={scope}, ε={eps:g}）",
+                flush=True,
+            )
 
     def _constraint_offsets_for_sample(self, sample_id: int) -> list[tuple[int, ...]]:
         return resolve_constraint_offsets_from_trainer(
@@ -4473,8 +4813,8 @@ class SubproblemSurrogateTrainer:
         b     = self.gencost[g, -1] / self.T_delta
         sc    = 0.0 if self.ignore_startup_shutdown_costs else self.gencost[g, 1]
         shc   = 0.0 if self.ignore_startup_shutdown_costs else self.gencost[g, 2]
-        Ton   = min(4, self.T)
-        Toff  = min(4, self.T)
+        Ton   = int(self.subproblem_Ton)
+        Toff  = int(self.subproblem_Toff)
 
         print(
             f"  [Unit-{self.unit_id}] 开始初始化求解（{self.n_samples} 个样本，backend={self._lp_backend}）…",
@@ -4487,6 +4827,22 @@ class SubproblemSurrogateTrainer:
                 return max(0.0, m.getConstrByName(name).Pi)
             except Exception:
                 return 0.0
+
+        def _get_x_fix_stationarity_contribution(m, name):
+            try:
+                return -float(m.getConstrByName(name).Pi)
+            except Exception:
+                return 0.0
+
+        def _gurobi_status_name(st: int) -> str:
+            m = {
+                int(GRB.LOADED): "LOADED",
+                int(GRB.OPTIMAL): "OPTIMAL",
+                int(GRB.INFEASIBLE): "INFEASIBLE",
+                int(GRB.INF_OR_UNBD): "INF_OR_UNBD",
+                int(GRB.UNBOUNDED): "UNBOUNDED",
+            }
+            return m.get(int(st), f"status_{st}")
 
         if self._lp_backend == LP_BACKEND_CVXPY_HIGHS:
             assert_lp_backend_available(self._lp_backend)
@@ -4522,8 +4878,10 @@ class SubproblemSurrogateTrainer:
                 self.coc[sample_id] = result['coc_sol']
                 self.cpower[sample_id] = result['cpower_sol']
                 self.lambda_inherent[sample_id] = result['lambda_inherent']
-                self._apply_mu2_coupling_dual_init(
-                    sample_id, result.get("mu2_coupling_dual")
+                self._apply_x_fix_dual_init(
+                    sample_id,
+                    result.get("x_true", x_lp),
+                    result.get("x_fix_dual_contrib"),
                 )
             print(
                 f"  [Unit-{self.unit_id}] 初始化求解完成（{self.n_samples} 个样本，"
@@ -4566,126 +4924,143 @@ class SubproblemSurrogateTrainer:
                 print(f"  ⚠ 样本 {sample_id} 机组 {g}: 数据中既无 active_set 也无 "
                       f"unit_commitment_matrix，x_init 使用全零默认值", flush=True)
 
-            # 求解单机组LP松弛，目标: cost - λᵀpg
-            model = gp.Model('init_subproblem_LP')
-            model.Params.OutputFlag = 0
+            # 求解单机组 LP 松弛，目标: cost - λᵀpg。若「全约束」不可行（真值 x 与最小开/停等冲突），
+            # 则自动重试：省略最小开/停线性化，λ_min_on/off 取 0（与 subproblem_lp_solver 文档语义一致）。
+            x_target = np.asarray(x_init >= 0.5, dtype=float)
+            init_solved = False
+            last_status: int | None = None
+            for include_mud in (True, False):
+                model = gp.Model('init_subproblem_LP' + ('' if include_mud else '_no_mud'))
+                model.Params.OutputFlag = 0
 
-            pg     = model.addVars(self.T,   lb=0,       name='pg')
-            x      = model.addVars(self.T,   lb=0, ub=1, name='x')   # LP 松弛（连续）
-            coc    = model.addVars(self.T-1, lb=0,       name='coc')
-            cpower = model.addVars(self.T,   lb=0,       name='cpower')
+                pg     = model.addVars(self.T,   lb=0,       name='pg')
+                x      = model.addVars(self.T,   lb=0, ub=1, name='x')   # LP 松弛（连续）
+                coc    = model.addVars(self.T-1, lb=0,       name='coc')
+                cpower = model.addVars(self.T,   lb=0,       name='cpower')
 
-            # 发电上下限（x 为松弛变量）
-            for t in range(self.T):
-                model.addConstr(pg[t] >= Pmin * x[t], name=f'pg_lower_{t}')
-                model.addConstr(pg[t] <= Pmax * x[t], name=f'pg_upper_{t}')
-
-            # 爬坡约束（与 dual block 一致：Ru_co=0.3*Pmax）
-            for t in range(1, self.T):
-                model.addConstr(
-                    pg[t] - pg[t-1] <= Ru * x[t-1] + Ru_co * (1 - x[t-1]),
-                    name=f'ramp_up_{t}')
-                model.addConstr(
-                    pg[t-1] - pg[t] <= Rd * x[t] + Rd_co * (1 - x[t]),
-                    name=f'ramp_down_{t}')
-
-            # 最小开机时间（LP 松弛形式）
-            for tau in range(1, Ton + 1):
-                for t1 in range(self.T - tau):
-                    model.addConstr(
-                        x[t1+1] - x[t1] <= x[t1+tau],
-                        name=f'min_on_{tau}_{t1}')
-            # 最小关机时间（LP 松弛形式）
-            for tau in range(1, Toff + 1):
-                for t1 in range(self.T - tau):
-                    model.addConstr(
-                        -x[t1+1] + x[t1] <= 1 - x[t1+tau],
-                        name=f'min_off_{tau}_{t1}')
-
-            # 启停成本
-            for t in range(1, self.T):
-                model.addConstr(coc[t-1] >= sc  * (x[t] - x[t-1]), name=f'start_cost_{t}')
-                model.addConstr(coc[t-1] >= shc * (x[t-1] - x[t]), name=f'shut_cost_{t}')
-
-            # 发电成本（等式约束，与 dual block 假设 lambda_cpower=1 一致）
-            for t in range(self.T):
-                model.addConstr(cpower[t] == a * pg[t] + b * x[t], name=f'cpower_{t}')
-
-            # 真值边界（μ₂ 初值影子价格）；x_init 与 active_set / unit_commitment_matrix 一致
-            for t in range(self.T):
-                if float(x_init[t]) >= 0.5:
-                    model.addConstr(x[t] >= 1.0, name=f'mu2_xfix_ge_{t}')
-                else:
-                    model.addConstr(x[t] <= 0.0, name=f'mu2_xfix_le_{t}')
-
-            # 目标: min cost - λᵀpg（用于提取有意义的对偶变量）
-            obj = (gp.quicksum(cpower[t] for t in range(self.T)) +
-                   gp.quicksum(coc[t]    for t in range(self.T-1)) -
-                   gp.quicksum(lambda_val[t] * pg[t] for t in range(self.T)))
-            model.setObjective(obj, GRB.MINIMIZE)
-            model.optimize()
-
-            if model.status == GRB.OPTIMAL:
-                x_lp = np.array([x[t].X for t in range(self.T)])    # LP 松弛解（连续）
-                self.pg[sample_id]     = np.array([pg[t].X     for t in range(self.T)])
-                self.x[sample_id]      = x_lp                        # ← 连续松弛解
-                # 将 JSON 整数解存入 sample，作为 iter_with_primal_block 的持久锚点
-                # （不随 BCD 迭代更新，确保 x_true 始终指向原始 MILP 最优解）
-                self.active_set_data[sample_id]['x_true'] = x_init.copy()
-
-                # 识别敏感时段（分数解 → 优先覆盖；全整数 → 按距0.5升序补齐）
-                (
-                    self.sensitive_timesteps[sample_id],
-                    self.surrogate_constraint_offsets[sample_id],
-                ) = select_constraint_layout(
-                    x_lp,
-                    strategy=self.constraint_generation_strategy,
-                    threshold_low=0.1, threshold_high=0.9,
-                    max_constraints=self.max_constraints
-                )
-                self.coc[sample_id]    = np.array([coc[t].X    for t in range(self.T-1)])
-                self.cpower[sample_id] = np.array([cpower[t].X for t in range(self.T)])
-
-                # 提取约束对偶变量作为 lambda_inherent 初始值
-                self.lambda_inherent[sample_id] = {
-                    'lambda_pg_lower':   np.array([_get_pi(model, f'pg_lower_{t}')
-                                                   for t in range(self.T)]),
-                    'lambda_pg_upper':   np.array([_get_pi(model, f'pg_upper_{t}')
-                                                   for t in range(self.T)]),
-                    'lambda_ramp_up':    np.array([_get_pi(model, f'ramp_up_{t}')
-                                                   for t in range(1, self.T)]),
-                    'lambda_ramp_down':  np.array([_get_pi(model, f'ramp_down_{t}')
-                                                   for t in range(1, self.T)]),
-                    'lambda_min_on':     np.array([[_get_pi(model, f'min_on_{tau}_{t1}')
-                                                    for t1 in range(self.T - tau)]
-                                                   for tau in range(1, Ton+1)],  dtype=object),
-                    'lambda_min_off':    np.array([[_get_pi(model, f'min_off_{tau}_{t1}')
-                                                    for t1 in range(self.T - tau)]
-                                                   for tau in range(1, Toff+1)], dtype=object),
-                    'lambda_start_cost': np.array([_get_pi(model, f'start_cost_{t}')
-                                                   for t in range(1, self.T)]),
-                    'lambda_shut_cost':  np.array([_get_pi(model, f'shut_cost_{t}')
-                                                   for t in range(1, self.T)]),
-                    'lambda_coc_nonneg': np.zeros(self.T - 1),
-                    'lambda_x_upper':    np.zeros(self.T),
-                    'lambda_x_lower':    np.zeros(self.T),
-                }
-                mu2_per_t = np.zeros(self.T, dtype=float)
+                # 发电上下限（x 为松弛变量）
                 for t in range(self.T):
-                    if float(x_init[t]) >= 0.5:
-                        mu2_per_t[t] = _get_pi(model, f'mu2_xfix_ge_{t}')
-                    else:
-                        mu2_per_t[t] = _get_pi(model, f'mu2_xfix_le_{t}')
-                self._apply_mu2_coupling_dual_init(sample_id, mu2_per_t)
-            else:
-                raise RuntimeError(
-                    f"init LP（Gurobi）未最优: unit_id={g}, sample_id={sample_id}, status={model.status}"
-                )
+                    model.addConstr(pg[t] >= Pmin * x[t], name=f'pg_lower_{t}')
+                    model.addConstr(pg[t] <= Pmax * x[t], name=f'pg_upper_{t}')
 
-            try:
-                model.dispose()
-            except Exception:
-                pass
+                # 爬坡约束（与 dual block 一致：Ru_co=0.3*Pmax）
+                for t in range(1, self.T):
+                    model.addConstr(
+                        pg[t] - pg[t-1] <= Ru * x[t-1] + Ru_co * (1 - x[t-1]),
+                        name=f'ramp_up_{t}')
+                    model.addConstr(
+                        pg[t-1] - pg[t] <= Rd * x[t] + Rd_co * (1 - x[t]),
+                        name=f'ramp_down_{t}')
+
+                if include_mud:
+                    # 最小开机时间（LP 松弛形式）
+                    for tau in range(1, Ton + 1):
+                        for t1 in range(self.T - tau):
+                            model.addConstr(
+                                x[t1+1] - x[t1] <= x[t1+tau],
+                                name=f'min_on_{tau}_{t1}')
+                    # 最小关机时间（LP 松弛形式）
+                    for tau in range(1, Toff + 1):
+                        for t1 in range(self.T - tau):
+                            model.addConstr(
+                                -x[t1+1] + x[t1] <= 1 - x[t1+tau],
+                                name=f'min_off_{tau}_{t1}')
+
+                # 启停成本
+                for t in range(1, self.T):
+                    model.addConstr(coc[t-1] >= sc  * (x[t] - x[t-1]), name=f'start_cost_{t}')
+                    model.addConstr(coc[t-1] >= shc * (x[t-1] - x[t]), name=f'shut_cost_{t}')
+
+                # 发电成本（等式约束，与 dual block 假设 lambda_cpower=1 一致）
+                for t in range(self.T):
+                    model.addConstr(cpower[t] == a * pg[t] + b * x[t], name=f'cpower_{t}')
+
+                # 真值边界（μ₂ 初值影子价格）；x_init 与 active_set / unit_commitment_matrix 一致
+                for t in range(self.T):
+                    model.addConstr(x[t] == float(x_target[t]), name=f'x_fix_{t}')
+
+                # 目标: min cost - λᵀpg（用于提取有意义的对偶变量）
+                obj = (gp.quicksum(cpower[t] for t in range(self.T)) +
+                       gp.quicksum(coc[t]    for t in range(self.T-1)) -
+                       gp.quicksum(lambda_val[t] * pg[t] for t in range(self.T)))
+                model.setObjective(obj, GRB.MINIMIZE)
+                model.optimize()
+                last_status = int(model.status)
+                if last_status != int(GRB.OPTIMAL):
+                    model.Params.NumericFocus = 2
+                    model.Params.DualReductions = 0
+                    model.optimize()
+                    last_status = int(model.status)
+                if last_status == int(GRB.OPTIMAL):
+                    if not include_mud:
+                        print(
+                            f"  ⚠ 样本 {sample_id} 机组 {g}: 全约束 init LP 不可行/未证最优，"
+                            f"已使用**省略最小开/停**的 init LP 继续（min_on/min_off 对偶初值按 0）",
+                            flush=True,
+                        )
+                    x_lp = np.array([x[t].X for t in range(self.T)])    # LP 松弛解（连续）
+                    self.pg[sample_id]     = np.array([pg[t].X     for t in range(self.T)])
+                    self.x[sample_id]      = x_lp                        # ← 连续松弛解
+                    # 将 JSON 整数解存入 sample，作为 iter_with_primal_block 的持久锚点
+                    # （不随 BCD 迭代更新，确保 x_true 始终指向原始 MILP 最优解）
+                    self.active_set_data[sample_id]['x_true'] = x_target.copy()
+
+                    # 识别敏感时段（分数解 → 优先覆盖；全整数 → 按距0.5升序补齐）
+                    (
+                        self.sensitive_timesteps[sample_id],
+                        self.surrogate_constraint_offsets[sample_id],
+                    ) = select_constraint_layout(
+                        x_lp,
+                        strategy=self.constraint_generation_strategy,
+                        threshold_low=0.1, threshold_high=0.9,
+                        max_constraints=self.max_constraints
+                    )
+                    self.coc[sample_id]    = np.array([coc[t].X    for t in range(self.T-1)])
+                    self.cpower[sample_id] = np.array([cpower[t].X for t in range(self.T)])
+
+                    # 提取约束对偶变量作为 lambda_inherent 初始值
+                    self.lambda_inherent[sample_id] = {
+                        'lambda_pg_lower':   np.array([_get_pi(model, f'pg_lower_{t}')
+                                                       for t in range(self.T)]),
+                        'lambda_pg_upper':   np.array([_get_pi(model, f'pg_upper_{t}')
+                                                       for t in range(self.T)]),
+                        'lambda_ramp_up':    np.array([_get_pi(model, f'ramp_up_{t}')
+                                                       for t in range(1, self.T)]),
+                        'lambda_ramp_down':  np.array([_get_pi(model, f'ramp_down_{t}')
+                                                       for t in range(1, self.T)]),
+                        'lambda_min_on':     np.array([[_get_pi(model, f'min_on_{tau}_{t1}')
+                                                        for t1 in range(self.T - tau)]
+                                                       for tau in range(1, Ton+1)],  dtype=object),
+                        'lambda_min_off':    np.array([[_get_pi(model, f'min_off_{tau}_{t1}')
+                                                        for t1 in range(self.T - tau)]
+                                                       for tau in range(1, Toff+1)], dtype=object),
+                        'lambda_start_cost': np.array([_get_pi(model, f'start_cost_{t}')
+                                                       for t in range(1, self.T)]),
+                        'lambda_shut_cost':  np.array([_get_pi(model, f'shut_cost_{t}')
+                                                       for t in range(1, self.T)]),
+                        'lambda_coc_nonneg': np.zeros(self.T - 1),
+                        'lambda_x_upper':    np.zeros(self.T),
+                        'lambda_x_lower':    np.zeros(self.T),
+                    }
+                    x_fix_dual_contrib = np.zeros(self.T, dtype=float)
+                    for t in range(self.T):
+                        x_fix_dual_contrib[t] = _get_x_fix_stationarity_contribution(
+                            model, f'x_fix_{t}'
+                        )
+                    self._apply_x_fix_dual_init(sample_id, x_target, x_fix_dual_contrib)
+                    init_solved = True
+                try:
+                    model.dispose()
+                except Exception:
+                    pass
+                if init_solved:
+                    break
+
+            if not init_solved:
+                raise RuntimeError(
+                    f"init LP（Gurobi）未最优: unit_id={g}, sample_id={sample_id}, "
+                    f"status={last_status} ({_gurobi_status_name(last_status) if last_status is not None else '?'})"
+                )
 
         print(
             f"  [Unit-{self.unit_id}] 初始化求解完成（Gurobi init_lp，{self.n_samples} 个样本，"
@@ -4711,7 +5086,8 @@ class SubproblemSurrogateTrainer:
         Ru_co= float(self.Ru_co_all[g]); Rd_co= float(self.Rd_co_all[g])
         sc   = 0.0 if self.ignore_startup_shutdown_costs else self.gencost[g, 1]
         shc  = 0.0 if self.ignore_startup_shutdown_costs else self.gencost[g, 2]
-        Ton  = min(4, self.T); Toff = min(4, self.T)
+        Ton  = int(self.subproblem_Ton)
+        Toff = int(self.subproblem_Toff)
 
         model = gp.Model('primal_block')
         model.Params.OutputFlag = 0
@@ -4923,6 +5299,9 @@ class SubproblemSurrogateTrainer:
         # 3. Prox
         obj_prox = self._build_primal_block_prox_obj(model, sample_id, pg, x, coc)
 
+        vars_dict['obj_opt'] = obj_opt
+        vars_dict['obj_prox'] = obj_prox
+
         model.setObjective(
             self.rho_primal  * vars_dict['obj_primal']
             + self.rho_opt   * obj_opt
@@ -4998,11 +5377,17 @@ class SubproblemSurrogateTrainer:
             coc = vars_dict['coc']
             cp  = vars_dict['cpower']
             if sample_id <= 2:
+                obj_o = vars_dict.get('obj_opt')
+                obj_px = vars_dict.get('obj_prox')
+                obj_o_s = f"{obj_o.getValue():.4f}" if obj_o is not None else "n/a"
+                obj_px_s = f"{obj_px.getValue():.4f}" if obj_px is not None else "n/a"
                 self._emit_subproblem_block_log(
                     sample_id,
                     f"[Unit-{self.unit_id}] primal_block, sample_id: {sample_id}, "
                     f"obj_primal: {vars_dict['obj_primal'].getValue():.4f}, "
-                    f"obj_binary: {vars_dict['obj_binary'].getValue():.4f}",
+                    f"obj_opt: {obj_o_s}, "
+                    f"obj_binary: {vars_dict['obj_binary'].getValue():.4f}, "
+                    f"obj_prox: {obj_px_s}",
                 )
             pg_sol     = np.array([pg[t].X  for t in range(self.T)])
             x_sol      = np.array([x[t].X   for t in range(self.T)])
@@ -5035,7 +5420,8 @@ class SubproblemSurrogateTrainer:
         Ru_co= float(self.Ru_co_all[g]); Rd_co= float(self.Rd_co_all[g])
         start_cost = 0.0 if self.ignore_startup_shutdown_costs else self.gencost[g, 1]
         shut_cost  = 0.0 if self.ignore_startup_shutdown_costs else self.gencost[g, 2]
-        Ton  = min(4, self.T); Toff = min(4, self.T)
+        Ton  = int(self.subproblem_Ton)
+        Toff = int(self.subproblem_Toff)
         lambda_val = self.lambda_vals[sample_id]
 
         model = gp.Model('dual_sub_block')
@@ -5087,6 +5473,7 @@ class SubproblemSurrogateTrainer:
         obj_dual_coc = gp.LinExpr()
 
         # pg 驻点（完全静态系数）
+        dual_pg_abs_constrs = []  # list of (c_pos, c_neg) per time step t
         for t in range(self.T):
             expr = a + (float(pg_costs[t]) if pg_costs is not None else 0.0) - float(lambda_val[t])
             expr -= lam_pg_lower[t]
@@ -5098,14 +5485,16 @@ class SubproblemSurrogateTrainer:
                 expr -= lam_ramp_up[t]
                 expr += lam_ramp_down[t]
             abs_v = model.addVar(lb=0, name=f'abs_pg_{t}')
-            model.addConstr(abs_v >= expr,  name=f'abs_pg_pos_{t}')
-            model.addConstr(abs_v >= -expr, name=f'abs_pg_neg_{t}')
+            c_pg_pos = model.addConstr(abs_v >= expr,  name=f'abs_pg_pos_{t}')
+            c_pg_neg = model.addConstr(abs_v >= -expr, name=f'abs_pg_neg_{t}')
+            dual_pg_abs_constrs.append((c_pg_pos, c_pg_neg))
             obj_dual_pg += abs_v
 
         # x 驻点（mu 的 alpha/beta/gamma 系数以初始值建立）
         sensitive_t        = self.sensitive_timesteps[sample_id]
         constraint_offsets = self._constraint_offsets_for_sample(sample_id)
         dual_x_mu_terms    = {}  # t -> [(c_pos, c_neg, mu[k], k, coeff_key)]
+        dual_x_abs_constrs = []  # list of (c_pos, c_neg) per time step t, for RHS updates
         for t in range(self.T):
             expr = b + (float(costs[t]) if costs is not None else 0.0)
             expr += Pmin * lam_pg_lower[t]
@@ -5147,6 +5536,7 @@ class SubproblemSurrogateTrainer:
             abs_v = model.addVar(lb=0, name=f'abs_x_{t}')
             c_pos = model.addConstr(abs_v >= expr,  name=f'abs_x_pos_{t}')
             c_neg = model.addConstr(abs_v >= -expr, name=f'abs_x_neg_{t}')
+            dual_x_abs_constrs.append((c_pos, c_neg))
             obj_dual_x += abs_v
 
             # 记录各 mu 项（用于后续 chgCoeff）
@@ -5183,6 +5573,11 @@ class SubproblemSurrogateTrainer:
             'dual_x_mu_terms': dual_x_mu_terms,
             'sensitive_t': sensitive_t,
             'constraint_offsets': constraint_offsets,
+            # RHS update support: constraint refs + last-used constant terms
+            'dual_x_abs_constrs': dual_x_abs_constrs,
+            'last_costs': np.array(costs, dtype=float) if costs is not None else None,
+            'dual_pg_abs_constrs': dual_pg_abs_constrs,
+            'last_pg_costs': np.array(pg_costs, dtype=float) if pg_costs is not None else None,
         }
         return model, vars_dict
 
@@ -5214,6 +5609,36 @@ class SubproblemSurrogateTrainer:
         # 1. 更新 x 驻点约束中 mu 的系数
         self._apply_dual_sub_mu_chgcoeff(model, vars_dict, alphas, betas, gammas)
 
+        # 2. 更新 x 驻点约束的常数项 RHS（c_x 随 NN 更新而变化）
+        #    约束形式: abs_v >= b + c_x[t] + lambda_terms  →  c_pos.RHS = b + c_x[t]
+        #              abs_v >= -(b + c_x[t] + lambda_terms) →  c_neg.RHS = -(b + c_x[t])
+        if costs is not None and 'dual_x_abs_constrs' in vars_dict:
+            old_costs = vars_dict.get('last_costs')
+            if old_costs is not None:
+                dual_x_abs_constrs = vars_dict['dual_x_abs_constrs']
+                for t in range(self.T):
+                    delta = float(costs[t]) - float(old_costs[t])
+                    if abs(delta) > 1e-12:
+                        c_pos, c_neg = dual_x_abs_constrs[t]
+                        c_pos.RHS += delta
+                        c_neg.RHS -= delta
+            vars_dict['last_costs'] = np.array(costs, dtype=float)
+
+        # 3. 更新 pg 驻点约束的常数项 RHS（c_pg 随 NN 更新而变化）
+        #    约束形式: abs_v >= a + c_pg[t] - lambda[t] + lambda_terms
+        #              →  c_pg_pos.RHS = a + c_pg[t] - lambda[t]
+        if pg_costs is not None and 'dual_pg_abs_constrs' in vars_dict:
+            old_pg_costs = vars_dict.get('last_pg_costs')
+            if old_pg_costs is not None:
+                dual_pg_abs_constrs = vars_dict['dual_pg_abs_constrs']
+                for t in range(self.T):
+                    delta = float(pg_costs[t]) - float(old_pg_costs[t])
+                    if abs(delta) > 1e-12:
+                        c_pg_pos, c_pg_neg = dual_pg_abs_constrs[t]
+                        c_pg_pos.RHS += delta
+                        c_pg_neg.RHS -= delta
+            vars_dict['last_pg_costs'] = np.array(pg_costs, dtype=float)
+
         g = self.unit_id
         pg_val  = self.pg[sample_id]
         x_val   = self.x[sample_id]
@@ -5234,7 +5659,7 @@ class SubproblemSurrogateTrainer:
         lam_mon   = vars_dict['lam_min_on'];   lam_moff= vars_dict['lam_min_off']
         mu        = vars_dict['mu']; mu_abs = vars_dict['mu_abs']
 
-        # 2. 重建 obj_opt（动态标量系数）
+        # 4. 重建 obj_opt（动态标量系数）
         obj_opt = gp.LinExpr()
         for t in range(self.T):
             pgl_v = abs(pg_val[t] - Pmin * x_val[t])
@@ -5276,7 +5701,7 @@ class SubproblemSurrogateTrainer:
             if viol > 1e-10:
                 obj_opt += viol * mu_abs[k_idx]
 
-        # 3. Prox
+        # 5. Prox
         obj_dual_prox = self._build_dual_block_prox_obj(
             model, sample_id,
             lam_pgl, lam_pgu, lam_ru, lam_rd, lam_sc, lam_shc, lam_coc,
@@ -5426,7 +5851,8 @@ class SubproblemSurrogateTrainer:
         Ru_co= float(self.Ru_co_all[g]); Rd_co= float(self.Rd_co_all[g])
         start_cost = 0.0 if self.ignore_startup_shutdown_costs else self.gencost[g, 1]
         shut_cost  = 0.0 if self.ignore_startup_shutdown_costs else self.gencost[g, 2]
-        Ton  = min(4, self.T); Toff = min(4, self.T)
+        Ton  = int(self.subproblem_Ton)
+        Toff = int(self.subproblem_Toff)
         phase            = self._get_mu_lower_bound_phase()
         lb               = self._current_mu_lower_bound_value()
         sign_relax_round = self._is_mu_sign_relaxation_round()
@@ -5820,9 +6246,9 @@ class SubproblemSurrogateTrainer:
         if term_times.numel() > 0:
             term_k = metadata['term_k']
             term_kind = metadata['term_kind']
-            alpha_terms = alphas_tensor[term_k]
-            beta_terms = betas_tensor[term_k]
-            gamma_terms = gammas_tensor[term_k]
+            alpha_terms = signed_alphas[term_k]
+            beta_terms = signed_betas[term_k]
+            gamma_terms = signed_gammas[term_k]
             coeff_terms = torch.where(
                 term_kind == 0,
                 alpha_terms,
@@ -6016,8 +6442,13 @@ class SubproblemSurrogateTrainer:
         cost_learning_rate: float | None = None,
     ):
         """
-        BCD迭代：主代理网络训练。
-        这里只更新 alpha/beta/gamma/delta/c_x，不包含 c_pg。
+        BCD 迭代：主代理网络的可微 KKT 微调（NN-main）。
+
+        与 ``iter_with_main_direct_targets`` 分工：direct 阶段用大步长拟合解析/锚定目标；
+        本阶段用小步长在当前 BCD 状态下细化驻点残差。调度上对齐 ``direct-NN-main`` 的
+        ``CosineAnnealingLR``（每轮外循环内余弦降到 ``eta_min``），并随外循环推进减小
+        基准学习率（参见 ``_nn_main_bcd_lr_scale``，类比 ``subproblem_lp_solver`` 中
+        penalty 权重随迭代累积后的局部精炼）。
         """
         if not TORCH_AVAILABLE:
             return
@@ -6040,39 +6471,62 @@ class SubproblemSurrogateTrainer:
                 f"cost_learning_rate must be positive, got {resolved_cost_learning_rate}"
             )
 
-        # 前N轮BCD重建optimizer（适应剧烈变化），之后保持动量
+        bcd_lr_scale = self._nn_main_bcd_lr_scale()
+        kkt_lr_scale = float(self.nn_main_kkt_lr_scale)
+        lr0 = float(resolved_learning_rate) * bcd_lr_scale * kkt_lr_scale
+        cost_lr0 = float(resolved_cost_learning_rate) * bcd_lr_scale * kkt_lr_scale
+        eta_min_ratio = max(float(self.nn_main_eta_min_ratio), 0.0)
+        nn_wd = float(self.nn_main_adam_weight_decay)
+        grad_clip_nn = float(self.nn_main_grad_clip)
+        T_ep = max(int(num_epochs), 1)
+
+        # 前 N 轮 BCD 重建优化器（适应剧烈变化），之后保持动量；是否重建仅看名义超参是否变化，
+        # 不用当前 param_group['lr']（scheduler 会把它降到 eta_min，否则会每轮误判重建）。
         optimizer_persist_after = 5
         rebuild = (self.iter_number < optimizer_persist_after)
-        current_main_lr = None
-        if hasattr(self, '_surr_optimizer') and self._surr_optimizer is not None:
-            current_main_lr = self._surr_optimizer.param_groups[0].get('lr')
-        current_cost_lr = None
-        if hasattr(self, '_surr_cost_optimizer') and self._surr_cost_optimizer is not None:
-            current_cost_lr = self._surr_cost_optimizer.param_groups[0].get('lr')
+        stored_nominal_main = getattr(self, '_surr_nn_nominal_main_lr', None)
+        stored_nominal_cost = getattr(self, '_surr_nn_nominal_cost_lr', None)
+        stored_wd = getattr(self, '_surr_nn_adam_wd', None)
         if (
             rebuild
             or not hasattr(self, '_surr_optimizer')
             or self._surr_optimizer is None
             or not hasattr(self, '_surr_cost_optimizer')
             or self._surr_cost_optimizer is None
-            or current_main_lr != resolved_learning_rate
-            or current_cost_lr != resolved_cost_learning_rate
+            or stored_nominal_main != resolved_learning_rate
+            or stored_nominal_cost != resolved_cost_learning_rate
+            or stored_wd != nn_wd
         ):
-            # 分离 x/pg 辅助成本头参数，主优化器不管理这些低学习率头
             main_params = self._main_network_parameters()
             self._surr_optimizer = optim.Adam(
-                main_params, lr=resolved_learning_rate, weight_decay=1e-4)
+                main_params, lr=lr0, weight_decay=nn_wd,
+            )
             self._surr_cost_optimizer = optim.Adam(
                 self._cost_network_parameters(),
-                lr=resolved_cost_learning_rate,
-                weight_decay=1e-4,
+                lr=cost_lr0,
+                weight_decay=nn_wd,
             )
-            self._surr_scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
-                self._surr_optimizer, T_0=max(num_epochs, 1), T_mult=1)
+            self._surr_nn_nominal_main_lr = resolved_learning_rate
+            self._surr_nn_nominal_cost_lr = resolved_cost_learning_rate
+            self._surr_nn_adam_wd = nn_wd
+        else:
+            for pg in self._surr_optimizer.param_groups:
+                pg['lr'] = lr0
+            for pg in self._surr_cost_optimizer.param_groups:
+                pg['lr'] = cost_lr0
+
+        # 每轮 BCD 内独立余弦周期（无 WarmRestarts 跨外循环拉回高峰学习率）
+        self._surr_scheduler = optim.lr_scheduler.CosineAnnealingLR(
+            self._surr_optimizer, T_max=T_ep, eta_min=lr0 * eta_min_ratio,
+        )
+        self._surr_cost_scheduler = optim.lr_scheduler.CosineAnnealingLR(
+            self._surr_cost_optimizer, T_max=T_ep, eta_min=cost_lr0 * eta_min_ratio,
+        )
 
         # 单机组预测器微调优化器（仅在 _unit_predictor_active 时生效）
-        predictor_active = self._unit_predictor_active()
-        if predictor_active:
+        predictor_override_active = self._unit_predictor_active()
+        predictor_train_active = self._unit_predictor_finetune_active()
+        if predictor_train_active:
             self._ensure_unit_predictor_optimizer()
             self.unit_predictor.get_network(self.unit_id).train()
 
@@ -6080,9 +6534,10 @@ class SubproblemSurrogateTrainer:
 
         for epoch in range(num_epochs):
             epoch_loss = 0.0
+            epoch_p = epoch_dx = epoch_o = epoch_r = 0.0
             self._surr_optimizer.zero_grad()
             self._surr_cost_optimizer.zero_grad()
-            if predictor_active and self._unit_predictor_optimizer is not None:
+            if predictor_train_active and self._unit_predictor_optimizer is not None:
                 self._unit_predictor_optimizer.zero_grad()
             batch_count = 0
             sample_indices = np.arange(self.n_samples, dtype=int)
@@ -6110,7 +6565,7 @@ class SubproblemSurrogateTrainer:
                 costs_tensor = costs_out.squeeze(0)[:self.T]  # (T,)
 
                 # 可选：用 0/1 预测器覆盖 single-time 段的 (alpha, beta, gamma, delta)
-                if predictor_active:
+                if predictor_override_active:
                     alphas_tensor, betas_tensor, gammas_tensor, deltas_tensor = (
                         self._apply_unit_predictor_override(
                             alphas_tensor,
@@ -6118,41 +6573,52 @@ class SubproblemSurrogateTrainer:
                             gammas_tensor,
                             deltas_tensor,
                             features_tensor,
+                            train_predictor=predictor_train_active,
                         )
                     )
 
-                # 主 loss 不再包含 c_pg 对应项
-                loss = self.loss_function_differentiable(
+                # 主 loss 不再包含 c_pg 对应项（标量已为 ρ 加权后的 KKT 目标，与 direct MSE 不可比）
+                loss, _lc = self.loss_function_differentiable(
                     sample_id, alphas_tensor, betas_tensor, gammas_tensor, deltas_tensor,
-                    costs_tensor, self.device
+                    costs_tensor, self.device, return_components=True,
                 )
                 (loss / actual_batch_size).backward()
-                epoch_loss += loss.detach().cpu().item()
+                epoch_loss += float(loss.detach().cpu().item())
+                epoch_p += float(_lc["primal_term"].detach().cpu().item())
+                epoch_dx += float(_lc["dual_x_term"].detach().cpu().item())
+                epoch_o += float(_lc["opt_term"].detach().cpu().item())
+                epoch_r += float(_lc["reg_term"].detach().cpu().item())
                 batch_count += 1
 
                 # batch 满或 epoch 结束：clip + step
                 if batch_count == resolved_batch_size or sample_pos == self.n_samples - 1:
-                    torch.nn.utils.clip_grad_norm_(self.surrogate_net.parameters(), max_norm=1.0)
-                    if predictor_active and self._unit_predictor_optimizer is not None:
+                    torch.nn.utils.clip_grad_norm_(
+                        self.surrogate_net.parameters(), max_norm=grad_clip_nn,
+                    )
+                    if predictor_train_active and self._unit_predictor_optimizer is not None:
                         torch.nn.utils.clip_grad_norm_(
                             self._unit_predictor_parameters(), max_norm=1.0,
                         )
                     self._surr_optimizer.step()
                     self._surr_cost_optimizer.step()
-                    if predictor_active and self._unit_predictor_optimizer is not None:
+                    if predictor_train_active and self._unit_predictor_optimizer is not None:
                         self._unit_predictor_optimizer.step()
                     self._surr_optimizer.zero_grad()
                     self._surr_cost_optimizer.zero_grad()
-                    if predictor_active and self._unit_predictor_optimizer is not None:
+                    if predictor_train_active and self._unit_predictor_optimizer is not None:
                         self._unit_predictor_optimizer.zero_grad()
                     batch_count = 0
 
             self._surr_scheduler.step()
+            self._surr_cost_scheduler.step()
 
             if epoch == 0 or epoch == num_epochs - 1:
+                inv_n = 1.0 / max(self.n_samples, 1)
                 print(
                     f"  [Unit-{self.unit_id}][NN-main] epoch {epoch+1}/{num_epochs}, "
-                    f"avg_loss = {epoch_loss/self.n_samples:.6f}",
+                    f"avg_kkt_loss={epoch_loss * inv_n:.6f} "
+                    f"(ρ加权: primal={epoch_p * inv_n:.4g}, dual_x={epoch_dx * inv_n:.4g}, "
+                    f"opt={epoch_o * inv_n:.4g}, reg={epoch_r * inv_n:.4g})",
                     flush=True,
                 )
 
@@ -6176,14 +6642,19 @@ class SubproblemSurrogateTrainer:
         仅更新 pg_cost_net，并使用独立 loss。
 
         Args:
-            log_interval: 若 ``None``，仅在第 1 与最后一轮打印 ``avg_loss``；
-            若为正整数 ``k``，则每 ``k`` 轮打印一次，且始终包含第 1 轮与最后一轮。
+            log_interval: 保留兼容；**不再影响** stdout，仅第 1 轮与最后一轮打印。
             log_metrics: 为 True 时在每次打印时额外 ``cal_nn_logging_components`` 输出
             ``obj_dual_pg`` / ``reg_pg``（略增开销）。
         """
         if not TORCH_AVAILABLE or not self._pg_costs_active():
             self._last_pg_cost_nn_loss = None
             return
+
+        resolved_epochs = 10 if num_epochs is None else int(num_epochs)
+        if resolved_epochs <= 0:
+            self._last_pg_cost_nn_loss = None
+            return
+        num_epochs = resolved_epochs
 
         _, resolved_batch_size, resolved_shuffle = self._resolve_nn_batch_config(
             batch_size=batch_size,
@@ -6278,15 +6749,7 @@ class SubproblemSurrogateTrainer:
 
                 avg = epoch_loss / max(self.n_samples, 1)
                 lr_cur = float(self._surr_pg_cost_optimizer.param_groups[0].get("lr", 0.0))
-                if log_interval is None or int(log_interval) <= 0:
-                    do_log = epoch == 0 or epoch == num_epochs - 1
-                else:
-                    k = int(log_interval)
-                    do_log = (
-                        epoch == 0
-                        or epoch == num_epochs - 1
-                        or (epoch + 1) % k == 0
-                    )
+                do_log = epoch == 0 or epoch == num_epochs - 1
                 if do_log:
                     line = (
                         f"  [Unit-{self.unit_id}][NN-c_pg] epoch {epoch+1:>4}/{num_epochs}, "
@@ -6357,8 +6820,8 @@ class SubproblemSurrogateTrainer:
             Rd_co_v = float(self.Rd_co_all[g])
             sc_v    = 0.0 if self.ignore_startup_shutdown_costs else self.gencost[g, 1]
             shc_v   = 0.0 if self.ignore_startup_shutdown_costs else self.gencost[g, 2]
-            Ton_v   = min(4, self.T)
-            Toff_v  = min(4, self.T)
+            Ton_v   = int(self.subproblem_Ton)
+            Toff_v  = int(self.subproblem_Toff)
 
             # ================================================================
             # obj_primal：所有原始可行性违反
@@ -6571,8 +7034,8 @@ class SubproblemSurrogateTrainer:
             Rd_co_v = float(self.Rd_co_all[g])
             sc_v = 0.0 if self.ignore_startup_shutdown_costs else self.gencost[g, 1]
             shc_v = 0.0 if self.ignore_startup_shutdown_costs else self.gencost[g, 2]
-            Ton_v = min(4, self.T)
-            Toff_v = min(4, self.T)
+            Ton_v = int(self.subproblem_Ton)
+            Toff_v = int(self.subproblem_Toff)
 
             sensitive_t = self.sensitive_timesteps[sample_id]
             constraint_offsets = self._constraint_offsets_for_sample(sample_id)
@@ -6655,12 +7118,18 @@ class SubproblemSurrogateTrainer:
         if not hasattr(self, 'logger'):
             self.logger = None
         print(f"开始BCD迭代训练 (机组{self.unit_id}, V3三时段耦合约束)...", flush=True)
+        self._surrogate_bcd_max_iter = max(int(max_iter), 1)
+        # 与本次 BCD 对齐：约在前 max_iter/2 轮允许 μ 符号松弛与代理方向翻转，之后固定方向
+        self._mu_sign_relaxation_last_iter = max(int(max_iter) // 2, 0)
         gamma = self.gamma_base / (self.n_samples * max(max_iter, 1))
         gamma_dual = gamma * self.gamma_dual_component_scale
         self.gamma = gamma
-        resolved_pg_cost_nn_epochs = (
-            self.pg_cost_nn_epochs if pg_cost_nn_epochs is None else max(int(pg_cost_nn_epochs), 1)
-        )
+        if pg_cost_nn_epochs is not None:
+            resolved_pg_cost_nn_epochs = max(int(pg_cost_nn_epochs), 0)
+        elif self.pg_cost_nn_epochs is not None:
+            resolved_pg_cost_nn_epochs = max(int(self.pg_cost_nn_epochs), 0)
+        else:
+            resolved_pg_cost_nn_epochs = 10
         log_u = f"[Unit-{self.unit_id}]"
 
         for i in range(max_iter):
@@ -6789,13 +7258,14 @@ class SubproblemSurrogateTrainer:
                 self.rho_dual_x = min(self.rho_dual_x + gamma_dual * obj_dual_x, self.rho_max)
                 self.rho_dual_coc = min(self.rho_dual_coc + gamma_dual * obj_dual_coc, self.rho_max)
                 self._sync_rho_dual_summary()
-                self.rho_binary = min(self.rho_binary + gamma * obj_binary, self.rho_max)
+                self.rho_binary = min(self.rho_binary + gamma * obj_binary, self.rho_binary_max)
                 self.rho_opt    = min(self.rho_opt    + gamma * obj_opt,    self.rho_max)
 
             print(
                 f"{log_u}   ρ_primal={self.rho_primal:.4f}, ρ_dual_pg={self.rho_dual_pg:.4f}, "
                 f"ρ_dual_x={self.rho_dual_x:.4f}, ρ_dual_coc={self.rho_dual_coc:.4f}, "
-                f"ρ_dual={self.rho_dual:.4f}, ρ_opt={self.rho_opt:.4f}",
+                f"ρ_dual={self.rho_dual:.4f}, ρ_binary={self.rho_binary:.4f} "
+                f"(≤{self.rho_binary_max:.4g}), ρ_opt={self.rho_opt:.4f}",
                 flush=True,
             )
             print(f"{log_u} " + "-" * 40, flush=True)
@@ -7021,14 +7491,20 @@ class SubproblemSurrogateTrainer:
                 'rho_dual_x': self.rho_dual_x,
                 'rho_dual_coc': self.rho_dual_coc,
                 'rho_binary': self.rho_binary,
+                'rho_binary_max': self.rho_binary_max,
                 'rho_opt': self.rho_opt,
                 'gamma_dual_component_scale': self.gamma_dual_component_scale,
+                'iter_number': self.iter_number,
                 'num_coupling_constraints': self.num_coupling_constraints,
                 'max_constraints': self.max_constraints,
                 'requested_max_constraints': self.requested_max_constraints,
                 'constraint_generation_strategy': self.constraint_generation_strategy,
                 'lp_backend': self._lp_backend,
                 'ignore_startup_shutdown_costs': self.ignore_startup_shutdown_costs,
+                'predictor_warmup_rounds': self.predictor_warmup_rounds,
+                'sign4_curriculum_rounds': self.sign4_curriculum_rounds,
+                'sign4_initial_scale': self.sign4_initial_scale,
+                'sign4_final_scale': self.sign4_final_scale,
                 'mu_individual_lower_bound_round': self.mu_individual_lower_bound_round,
                 'mu_group_lower_bound_round': self.mu_group_lower_bound_round,
                 'mu_signed_round_interval': self.mu_signed_round_interval,
@@ -7038,6 +7514,11 @@ class SubproblemSurrogateTrainer:
                 'pg_cost_start_round': self.pg_cost_start_round,
                 'pg_cost_scale_multiplier': self.pg_cost_scale_multiplier,
                 'nn_learning_rate': self.nn_learning_rate,
+                'nn_main_eta_min_ratio': self.nn_main_eta_min_ratio,
+                'nn_main_lr_late_scale': self.nn_main_lr_late_scale,
+                'nn_main_adam_weight_decay': self.nn_main_adam_weight_decay,
+                'nn_main_grad_clip': self.nn_main_grad_clip,
+                'nn_main_kkt_lr_scale': self.nn_main_kkt_lr_scale,
                 'nn_hidden_dims': self.nn_hidden_dims,
                 'pg_cost_hidden_dims': self.pg_cost_hidden_dims,
                 'cost_learning_rate': self.cost_learning_rate,
@@ -7064,6 +7545,7 @@ class SubproblemSurrogateTrainer:
                 'coeff_reg_deadband': self.coeff_reg_deadband,
                 'aux_cost_reg_deadband': self.aux_cost_reg_deadband,
                 'lambda_inherent': self.lambda_inherent,
+                'scenario_feature_dim': int(getattr(self, '_scenario_feature_dim', 0) or 0),
             }
             
             dirpath = os.path.dirname(os.path.abspath(filepath))
@@ -7218,6 +7700,9 @@ class SubproblemSurrogateTrainer:
             self.pg_cost_values = state.get('pg_cost_values', np.zeros((self.n_samples, self.T)))
             self.x_cost_scale = state.get('x_cost_scale', self.x_cost_scale)
             self.pg_cost_scale = state.get('pg_cost_scale', self.pg_cost_scale)
+            _sfd = state.get('scenario_feature_dim')
+            if _sfd is not None and int(_sfd) > 0:
+                self._scenario_feature_dim = int(_sfd)
             self.mu = state['mu']
             loaded_direction_signs = state.get('surrogate_direction_signs')
             if loaded_direction_signs is None:
@@ -7240,6 +7725,11 @@ class SubproblemSurrogateTrainer:
             self.rho_dual_coc = state.get('rho_dual_coc', state.get('rho_dual', self.rho_dual_coc))
             self._sync_rho_dual_summary()
             self.rho_binary = state.get('rho_binary', self.rho_binary)
+            if 'rho_binary_max' in state:
+                self.rho_binary_max = max(float(state['rho_binary_max']), self.rho_binary)
+            else:
+                self.rho_binary_max = max(self.rho_binary_max, self.rho_binary)
+            self.rho_binary = min(self.rho_binary, self.rho_binary_max)
             self.rho_opt = state['rho_opt']
             self.gamma_dual_component_scale = state.get(
                 'gamma_dual_component_scale',
@@ -7251,9 +7741,36 @@ class SubproblemSurrogateTrainer:
             self.ignore_startup_shutdown_costs = bool(
                 state.get('ignore_startup_shutdown_costs', self.ignore_startup_shutdown_costs)
             )
+            self.predictor_warmup_rounds = max(
+                int(state.get('predictor_warmup_rounds', self.predictor_warmup_rounds)),
+                0,
+            )
+            self.sign4_curriculum_rounds = max(
+                int(state.get('sign4_curriculum_rounds', self.sign4_curriculum_rounds)),
+                0,
+            )
+            self.sign4_initial_scale = max(
+                float(state.get('sign4_initial_scale', self.sign4_initial_scale)),
+                0.0,
+            )
+            self.sign4_final_scale = max(
+                float(state.get('sign4_final_scale', self.sign4_final_scale)),
+                0.0,
+            )
+            self.iter_number = int(state.get(
+                'iter_number',
+                max(
+                    int(getattr(self, 'iter_number', 0)),
+                    self.predictor_warmup_rounds,
+                    self.sign4_curriculum_rounds,
+                ),
+            ))
             self.all_mode_group_size = (
                 4
-                if self.constraint_generation_strategy == CONSTRAINT_STRATEGY_ALL_TEMPLATES_SIGN4
+                if self.constraint_generation_strategy in (
+                    CONSTRAINT_STRATEGY_ALL_TEMPLATES_SIGN4,
+                    CONSTRAINT_STRATEGY_ALL_TEMPLATES_SIGN4_PLUS_SINGLE,
+                )
                 else 1
             )
             self.mu_individual_lower_bound_round = state.get(
@@ -7286,6 +7803,26 @@ class SubproblemSurrogateTrainer:
                 self.pg_cost_scale_multiplier,
             )
             self.nn_learning_rate = state.get('nn_learning_rate', self.nn_learning_rate)
+            self.nn_main_eta_min_ratio = max(
+                float(state.get('nn_main_eta_min_ratio', self.nn_main_eta_min_ratio)),
+                0.0,
+            )
+            self.nn_main_lr_late_scale = min(
+                max(float(state.get('nn_main_lr_late_scale', self.nn_main_lr_late_scale)), 1e-3),
+                1.0,
+            )
+            self.nn_main_adam_weight_decay = max(
+                float(state.get('nn_main_adam_weight_decay', self.nn_main_adam_weight_decay)),
+                0.0,
+            )
+            self.nn_main_grad_clip = max(
+                float(state.get('nn_main_grad_clip', self.nn_main_grad_clip)),
+                1e-6,
+            )
+            self.nn_main_kkt_lr_scale = max(
+                float(state.get('nn_main_kkt_lr_scale', self.nn_main_kkt_lr_scale)),
+                1e-6,
+            )
             self.nn_hidden_dims = normalize_nn_hidden_dims(
                 state.get('nn_hidden_dims'),
                 self.nn_hidden_dims,
@@ -7299,7 +7836,7 @@ class SubproblemSurrogateTrainer:
             self.pg_cost_surr_lr = state.get('pg_cost_surr_lr', self.pg_cost_surr_lr)
             loaded_pg_cost_nn_epochs = state.get('pg_cost_nn_epochs', self.pg_cost_nn_epochs)
             self.pg_cost_nn_epochs = (
-                None if loaded_pg_cost_nn_epochs is None else max(int(loaded_pg_cost_nn_epochs), 1)
+                None if loaded_pg_cost_nn_epochs is None else max(int(loaded_pg_cost_nn_epochs), 0)
             )
             self.nn_batch_strategy = normalize_nn_batch_strategy(
                 state.get('nn_batch_strategy', self.nn_batch_strategy)
@@ -7393,6 +7930,10 @@ def _load_surrogate_model_metadata(filepath: str, device=None) -> dict:
         'mu_signed_round_interval': state.get('mu_signed_round_interval'),
         'mu_sign_hysteresis_rounds': state.get('mu_sign_hysteresis_rounds'),
         'mu_sign_flip_min_share': state.get('mu_sign_flip_min_share'),
+        'predictor_warmup_rounds': state.get('predictor_warmup_rounds'),
+        'sign4_curriculum_rounds': state.get('sign4_curriculum_rounds'),
+        'sign4_initial_scale': state.get('sign4_initial_scale'),
+        'sign4_final_scale': state.get('sign4_final_scale'),
         'surrogate_direction_signs': state.get('surrogate_direction_signs'),
         'nn_hidden_dims': state.get('nn_hidden_dims'),
         'pg_cost_hidden_dims': state.get('pg_cost_hidden_dims', state.get('nn_hidden_dims')),
@@ -7592,32 +8133,45 @@ def train_unit_predictor_from_data(
         device=device,
     )
 
+    loaded_from_checkpoint = False
     if load_path is not None and os.path.exists(load_path):
-        predictor.load(load_path)
+        loaded_from_checkpoint = bool(predictor.load(load_path))
+        if not loaded_from_checkpoint and int(num_epochs) <= 0:
+            raise RuntimeError(
+                f"unit_predictor checkpoint was requested but no compatible weights were loaded: {load_path}"
+            )
+        if not loaded_from_checkpoint:
+            print(
+                f"! [UnitPredictor] load failed or incompatible; training from scratch for {int(num_epochs)} epochs",
+                flush=True,
+            )
 
-    predictor.train_all(
-        num_epochs=num_epochs,
-        batch_size=batch_size,
-        batch_strategy=batch_strategy,
-        shuffle=shuffle,
-        learning_rate=learning_rate,
-        enable_scheduler=enable_scheduler,
-        scheduler_patience=scheduler_patience,
-        scheduler_factor=scheduler_factor,
-        scheduler_min_lr=scheduler_min_lr,
-        enable_pos_weight=enable_pos_weight,
-        pos_weight_clip=pos_weight_clip,
-        loss_weight_bce=loss_weight_bce,
-        loss_weight_mse=loss_weight_mse,
-        loss_weight_l1=loss_weight_l1,
-        loss_weight_tv=loss_weight_tv,
-        loss_weight_transition=loss_weight_transition,
-        loss_weight_binarize=loss_weight_binarize,
-        loss_weight_std_floor=loss_weight_std_floor,
-        std_floor_scale=std_floor_scale,
-        loss_weight_tv_floor=loss_weight_tv_floor,
-        tv_floor_scale=tv_floor_scale,
-    )
+    if int(num_epochs) > 0:
+        predictor.train_all(
+            num_epochs=num_epochs,
+            batch_size=batch_size,
+            batch_strategy=batch_strategy,
+            shuffle=shuffle,
+            learning_rate=learning_rate,
+            enable_scheduler=enable_scheduler,
+            scheduler_patience=scheduler_patience,
+            scheduler_factor=scheduler_factor,
+            scheduler_min_lr=scheduler_min_lr,
+            enable_pos_weight=enable_pos_weight,
+            pos_weight_clip=pos_weight_clip,
+            loss_weight_bce=loss_weight_bce,
+            loss_weight_mse=loss_weight_mse,
+            loss_weight_l1=loss_weight_l1,
+            loss_weight_tv=loss_weight_tv,
+            loss_weight_transition=loss_weight_transition,
+            loss_weight_binarize=loss_weight_binarize,
+            loss_weight_std_floor=loss_weight_std_floor,
+            std_floor_scale=std_floor_scale,
+            loss_weight_tv_floor=loss_weight_tv_floor,
+            tv_floor_scale=tv_floor_scale,
+        )
+    elif loaded_from_checkpoint:
+        print("[UnitPredictor] checkpoint loaded; skip extra pretraining (epochs=0)", flush=True)
 
     if save_path:
         predictor.save(save_path)
@@ -7950,6 +8504,20 @@ def load_trained_models(ppc, active_set_data: List[Dict], T_delta: float,
                          lp_backend: str | None = None,
                          constraint_generation_strategy: str | None = None,
                          ignore_startup_shutdown_costs: bool | None = None,
+                         case_name: str | None = None,
+                         unit_predictor_path: str | None = None,
+                         use_unit_predictor: bool = False,
+                         unit_predictor_hidden_dims: List[int] | None = None,
+                         unit_predictor_net_variant: str = "mlp",
+                         unit_predictor_resmlp_width: int = 512,
+                         unit_predictor_resmlp_depth: int = 4,
+                         unit_predictor_tcn_channels: int = 64,
+                         unit_predictor_tcn_depth: int = 6,
+                         unit_predictor_tconv_channels: int = 64,
+                         unit_predictor_tconv_depth: int = 4,
+                         unit_predictor_dropout: float = 0.1,
+                         unit_predictor_finetune_lr: float = 1e-5,
+                         unit_predictor_weight_decay: float = 1e-4,
                          device=None):
     """
     加载已训练的模型
@@ -8001,10 +8569,45 @@ def load_trained_models(ppc, active_set_data: List[Dict], T_delta: float,
     
     # 加载代理约束模型
     trainers = {}
+    unit_predictor_obj = None
+    if bool(use_unit_predictor):
+        resolved_unit_predictor_path = unit_predictor_path or os.path.join(load_dir, 'unit_predictor.pth')
+        if os.path.exists(resolved_unit_predictor_path):
+            unit_predictor_obj = SingleUnitBinaryPredictorTrainer(
+                ppc,
+                active_set_data,
+                T_delta,
+                unit_ids=[int(g) for g in unit_ids],
+                hidden_dims=unit_predictor_hidden_dims,
+                net_variant=unit_predictor_net_variant,
+                resmlp_width=unit_predictor_resmlp_width,
+                resmlp_depth=unit_predictor_resmlp_depth,
+                tcn_channels=unit_predictor_tcn_channels,
+                tcn_depth=unit_predictor_tcn_depth,
+                tconv_channels=unit_predictor_tconv_channels,
+                tconv_depth=unit_predictor_tconv_depth,
+                dropout=unit_predictor_dropout,
+                weight_decay=unit_predictor_weight_decay,
+                device=device,
+            )
+            loaded_ok = bool(unit_predictor_obj.load(resolved_unit_predictor_path))
+            if not loaded_ok:
+                raise RuntimeError(
+                    f"unit_predictor checkpoint incompatible or empty: {resolved_unit_predictor_path}"
+                )
+        else:
+            print(
+                f"Warning: use_unit_predictor=True but unit_predictor checkpoint is missing: "
+                f"{resolved_unit_predictor_path}",
+                flush=True,
+            )
+
+    missing_surrogate_units = []
     for g in unit_ids:
         surrogate_path = os.path.join(load_dir, f'surrogate_unit_{g}.pth')
         if not os.path.exists(surrogate_path):
             print(f"警告: 未找到机组{g}代理约束模型 {surrogate_path}", flush=True)
+            missing_surrogate_units.append(int(g))
             continue
 
         metadata = _load_surrogate_model_metadata(surrogate_path, device=device)
@@ -8066,10 +8669,21 @@ def load_trained_models(ppc, active_set_data: List[Dict], T_delta: float,
             ignore_startup_shutdown_costs=requested_ignore_startup_shutdown_costs,
             nn_hidden_dims=metadata.get('nn_hidden_dims'),
             pg_cost_hidden_dims=metadata.get('pg_cost_hidden_dims'),
+            case_name=case_name,
+            unit_predictor=unit_predictor_obj,
+            use_unit_predictor=(unit_predictor_obj is not None),
+            unit_predictor_finetune_lr=unit_predictor_finetune_lr,
+            unit_predictor_weight_decay=unit_predictor_weight_decay,
             device=device,
         )
         trainer.load(surrogate_path)
         trainers[g] = trainer
+
+    if missing_surrogate_units:
+        print(
+            f"Warning: missing surrogate model files for requested units: {missing_surrogate_units}",
+            flush=True,
+        )
     
     print(f"✓ 模型加载完成", flush=True)
     return dual_predictor, trainers
@@ -8409,8 +9023,8 @@ def solve_subproblem_LP_simple(trainer: SubproblemSurrogateTrainer, sample_id: i
         model.addConstr(pg[t-1] - pg[t] <= Rd * x[t] + trainer.gen[g, PMAX] * (1 - x[t]))
     
     # 最小开关机时间约束
-    Ton = min(4, T)
-    Toff = min(4, T)
+    Ton = int(getattr(trainer, "subproblem_Ton", min(4, T)))
+    Toff = int(getattr(trainer, "subproblem_Toff", min(4, T)))
     for tau in range(1, Ton+1):
         for t1 in range(T - tau):
             model.addConstr(x[t1+1] - x[t1] <= x[t1+tau])

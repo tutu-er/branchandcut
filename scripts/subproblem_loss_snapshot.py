@@ -293,6 +293,7 @@ def _make_trainer(ppc, all_samples: list, dual_predictor):
         rho_dual_x_init=rt.SUBPROBLEM_RHO_DUAL_X_INIT,
         rho_dual_coc_init=rt.SUBPROBLEM_RHO_DUAL_COC_INIT,
         rho_binary_init=rt.SUBPROBLEM_RHO_BINARY_INIT,
+        rho_binary_max=rt.SUBPROBLEM_RHO_BINARY_MAX,
         rho_opt_init=rt.SUBPROBLEM_RHO_OPT_INIT,
         loss_ratio_primal=rt.SUBPROBLEM_LOSS_RATIO_PRIMAL,
         loss_ratio_dual_pg=rt.SUBPROBLEM_LOSS_RATIO_DUAL_PG,
@@ -341,6 +342,7 @@ def _make_trainer(ppc, all_samples: list, dual_predictor):
         use_unit_predictor=False,
         unit_predictor_finetune_lr=rt.UNIT_PREDICTOR_FINETUNE_LR,
         unit_predictor_weight_decay=rt.UNIT_PREDICTOR_WEIGHT_DECAY,
+        case_name=str(CASE),
     )
 
 
@@ -1225,6 +1227,7 @@ def run_main_test() -> None:
         lp_backend=str(LP_BACKEND).strip().lower(),
         constraint_generation_strategy=CONSTRAINT_STRATEGY,
         ignore_startup_shutdown_costs=bool(IGNORE_STARTUP_SHUTDOWN),
+        case_name=str(CASE),
     )
     trainer = trainers[int(UNIT_ID)]
     if TEST_FULL_BASELINE_METRICS or TEST_MAIN_FULL_BASELINE_METRICS:
@@ -1460,6 +1463,7 @@ def run_test() -> None:
         lp_backend=str(LP_BACKEND).strip().lower(),
         constraint_generation_strategy=CONSTRAINT_STRATEGY,
         ignore_startup_shutdown_costs=bool(IGNORE_STARTUP_SHUTDOWN),
+        case_name=str(CASE),
     )
     trainer = trainers[int(UNIT_ID)]
     _apply_cpg_snapshot(trainer, snap, strict=bool(TEST_STRICT_HPARAMS))

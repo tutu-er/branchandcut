@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 训练脚本（多模式）
@@ -237,6 +237,7 @@ SUBPROBLEM_RHO_DUAL_PG_INIT = 1e-1
 SUBPROBLEM_RHO_DUAL_X_INIT = 1e-1
 SUBPROBLEM_RHO_DUAL_COC_INIT = 1e1
 SUBPROBLEM_RHO_BINARY_INIT = 1.0
+SUBPROBLEM_RHO_BINARY_MAX = 1e4
 SUBPROBLEM_RHO_OPT_INIT = 1e-1
 SUBPROBLEM_LOSS_RATIO_PRIMAL = 1.0
 SUBPROBLEM_LOSS_RATIO_DUAL_PG = 1.0
@@ -252,9 +253,16 @@ SUBPROBLEM_MU_DUAL_FLOOR_DECAY_ROUND = round(SUBPROBLEM_MAX_ITER/2)
 # predictor override 热身轮数：前 N 轮禁用 single-time 段覆写，让 surrogate_net 独立 bootstrap mu
 # 设为 0 保持原有行为（Plan B 实现前该参数由训练流程读取但尚未透传给 trainer）
 SUBPROBLEM_PREDICTOR_WARMUP_ROUNDS = round(SUBPROBLEM_MAX_ITER * 0.10)
-SUBPROBLEM_MU_SIGNED_ROUND_INTERVAL = 10
-SUBPROBLEM_MU_SIGN_HYSTERESIS_ROUNDS = 2
-SUBPROBLEM_MU_SIGN_FLIP_MIN_SHARE = 0.67
+SUBPROBLEM_SIGN4_CURRICULUM_ROUNDS = 0
+SUBPROBLEM_SIGN4_INITIAL_SCALE = 1.0
+SUBPROBLEM_SIGN4_FINAL_SCALE = 1.0
+SUBPROBLEM_SURROGATE_DELTA_REFERENCE_LIFT = None  # None=auto: enable for sign4 strategies
+SUBPROBLEM_SURROGATE_DELTA_REFERENCE_EPS = 1e-6
+SUBPROBLEM_SURROGATE_DELTA_REFERENCE_SCOPE = "sign4_only"
+SUBPROBLEM_SURROGATE_DELTA_REFERENCE_MIN_ABS_FACTOR = 1e-9
+SUBPROBLEM_MU_SIGNED_ROUND_INTERVAL = 20
+SUBPROBLEM_MU_SIGN_HYSTERESIS_ROUNDS = 3
+SUBPROBLEM_MU_SIGN_FLIP_MIN_SHARE = 0.72
 SUBPROBLEM_X_BOUND_DUAL_ZERO_ROUNDS = 0
 SUBPROBLEM_NN_BATCH_STRATEGY = 'full-batch'   # 'full-batch' / 'mini-batch'
 SUBPROBLEM_NN_SIZE = 'medium'   # 'small' / 'medium' / 'large'
@@ -262,10 +270,18 @@ SUBPROBLEM_C_PG_NN_SIZE = 'medium'   # 'small' / 'medium' / 'large'
 SUBPROBLEM_NN_BATCH_SIZE = 4
 SUBPROBLEM_NN_SHUFFLE = True
 SUBPROBLEM_NN_LR = 5e-4
+# NN-main（可微 KKT）细化：与 direct-NN-main 相同每轮 BCD 内 CosineAnnealingLR；外循环基准 lr 按
+# nn_main_lr_late_scale 递减，类比子问题 LP 中 rho 累积后的局部精炼（见 subproblem_lp_solver 加权目标）。
+SUBPROBLEM_NN_MAIN_ETA_MIN_RATIO = 0.08
+SUBPROBLEM_NN_MAIN_LR_LATE_SCALE = 0.42
+SUBPROBLEM_NN_MAIN_ADAM_WEIGHT_DECAY = 1e-4
+SUBPROBLEM_NN_MAIN_GRAD_CLIP = 0.85
+# 仅缩小 NN-main（KKT）步长，direct-NN-main 仍用 SUBPROBLEM_NN_LR
+SUBPROBLEM_NN_MAIN_KKT_LR_SCALE = 1.0
 SUBPROBLEM_IGNORE_STARTUP_SHUTDOWN_COSTS = True
 SUBPROBLEM_X_COST_NN_LR = 1e-5
 SUBPROBLEM_PG_COST_NN_EPOCHS = 64
-SUBPROBLEM_PG_COST_START_ROUND = round(SUBPROBLEM_MAX_ITER/2)
+SUBPROBLEM_PG_COST_START_ROUND = max(0, SUBPROBLEM_MAX_ITER // 4)
 SUBPROBLEM_PG_COST_SCALE_MULTIPLIER = 2
 SUBPROBLEM_PG_COST_LR = 1e-4
 SUBPROBLEM_PG_COST_SURR_LR = 2e-4
@@ -673,6 +689,7 @@ def create_subproblem_trainer(ppc, all_samples, T_DELTA, unit_id: int, *,
                               rho_dual_x_init: float | None = None,
                               rho_dual_coc_init: float | None = None,
                               rho_binary_init: float = 1.0,
+                              rho_binary_max: float = SUBPROBLEM_RHO_BINARY_MAX,
                               rho_opt_init: float = 1e-3,
                               loss_ratio_primal: float = 1.0,
                               loss_ratio_dual_pg: float = 1.0,
@@ -694,6 +711,11 @@ def create_subproblem_trainer(ppc, all_samples, T_DELTA, unit_id: int, *,
                               subproblem_nn_batch_size: int = 4,
                               subproblem_nn_shuffle: bool = True,
                               subproblem_nn_learning_rate: float = 1e-4,
+                              subproblem_nn_main_eta_min_ratio: float = SUBPROBLEM_NN_MAIN_ETA_MIN_RATIO,
+                              subproblem_nn_main_lr_late_scale: float = SUBPROBLEM_NN_MAIN_LR_LATE_SCALE,
+                              subproblem_nn_main_adam_weight_decay: float = SUBPROBLEM_NN_MAIN_ADAM_WEIGHT_DECAY,
+                              subproblem_nn_main_grad_clip: float = SUBPROBLEM_NN_MAIN_GRAD_CLIP,
+                              subproblem_nn_main_kkt_lr_scale: float = SUBPROBLEM_NN_MAIN_KKT_LR_SCALE,
                               ignore_startup_shutdown_costs: bool = False,
                               subproblem_cost_learning_rate: float = 1e-5,
                               subproblem_nn_smooth_abs_eps: float = SUBPROBLEM_NN_SMOOTH_ABS_EPS,
@@ -721,8 +743,17 @@ def create_subproblem_trainer(ppc, all_samples, T_DELTA, unit_id: int, *,
                               iter_delta_reg_deadband: float = SUBPROBLEM_ITER_DELTA_REG_DEADBAND,
                               unit_predictor: 'SingleUnitBinaryPredictorTrainer | None' = None,
                               use_unit_predictor: bool = False,
+                              predictor_warmup_rounds: int = 0,
+                              sign4_curriculum_rounds: int = 0,
+                              sign4_initial_scale: float = 1.0,
+                              sign4_final_scale: float = 1.0,
+                              enable_surrogate_delta_reference_lift: bool | None = None,
+                              surrogate_delta_reference_eps: float = 1e-6,
+                              surrogate_delta_reference_scope: str = "sign4_only",
+                              surrogate_delta_reference_min_abs_factor: float = 1e-9,
                               unit_predictor_finetune_lr: float = 1e-5,
-                              unit_predictor_weight_decay: float = 1e-4):
+                              unit_predictor_weight_decay: float = 1e-4,
+                              case_name: str | None = None):
     trainer_kwargs = dict(
         lambda_predictor=lambda_predictor,
         lp_backend=lp_backend,
@@ -733,6 +764,7 @@ def create_subproblem_trainer(ppc, all_samples, T_DELTA, unit_id: int, *,
         rho_dual_x_init=rho_dual_x_init,
         rho_dual_coc_init=rho_dual_coc_init,
         rho_binary_init=rho_binary_init,
+        rho_binary_max=rho_binary_max,
         rho_opt_init=rho_opt_init,
         loss_ratio_primal=loss_ratio_primal,
         loss_ratio_dual_pg=loss_ratio_dual_pg,
@@ -754,6 +786,11 @@ def create_subproblem_trainer(ppc, all_samples, T_DELTA, unit_id: int, *,
         nn_batch_size=subproblem_nn_batch_size,
         nn_shuffle=subproblem_nn_shuffle,
         nn_learning_rate=subproblem_nn_learning_rate,
+        nn_main_eta_min_ratio=subproblem_nn_main_eta_min_ratio,
+        nn_main_lr_late_scale=subproblem_nn_main_lr_late_scale,
+        nn_main_adam_weight_decay=subproblem_nn_main_adam_weight_decay,
+        nn_main_grad_clip=subproblem_nn_main_grad_clip,
+        nn_main_kkt_lr_scale=subproblem_nn_main_kkt_lr_scale,
         ignore_startup_shutdown_costs=ignore_startup_shutdown_costs,
         cost_learning_rate=subproblem_cost_learning_rate,
         nn_smooth_abs_eps=subproblem_nn_smooth_abs_eps,
@@ -781,8 +818,17 @@ def create_subproblem_trainer(ppc, all_samples, T_DELTA, unit_id: int, *,
         iter_delta_reg_deadband=iter_delta_reg_deadband,
         unit_predictor=unit_predictor,
         use_unit_predictor=use_unit_predictor,
+        predictor_warmup_rounds=predictor_warmup_rounds,
+        sign4_curriculum_rounds=sign4_curriculum_rounds,
+        sign4_initial_scale=sign4_initial_scale,
+        sign4_final_scale=sign4_final_scale,
+        enable_surrogate_delta_reference_lift=enable_surrogate_delta_reference_lift,
+        surrogate_delta_reference_eps=surrogate_delta_reference_eps,
+        surrogate_delta_reference_scope=surrogate_delta_reference_scope,
+        surrogate_delta_reference_min_abs_factor=surrogate_delta_reference_min_abs_factor,
         unit_predictor_finetune_lr=unit_predictor_finetune_lr,
         unit_predictor_weight_decay=unit_predictor_weight_decay,
+        case_name=case_name,
     )
     if n_workers <= 1:
         return SubproblemSurrogateTrainer(ppc, all_samples, T_DELTA, unit_id, **trainer_kwargs)
@@ -811,6 +857,7 @@ def run_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS,
                   rho_dual_x_init: float | None = None,
                   rho_dual_coc_init: float | None = None,
                   rho_binary_init: float = 1.0,
+                  rho_binary_max: float = SUBPROBLEM_RHO_BINARY_MAX,
                   rho_opt_init: float = 1e-3,
                   loss_ratio_primal: float = 1.0,
                   loss_ratio_dual_pg: float = 1.0,
@@ -830,6 +877,11 @@ def run_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS,
                   subproblem_nn_batch_size: int = 4,
                   subproblem_nn_shuffle: bool = True,
                   subproblem_nn_learning_rate: float = 1e-4,
+                  subproblem_nn_main_eta_min_ratio: float = SUBPROBLEM_NN_MAIN_ETA_MIN_RATIO,
+                  subproblem_nn_main_lr_late_scale: float = SUBPROBLEM_NN_MAIN_LR_LATE_SCALE,
+                  subproblem_nn_main_adam_weight_decay: float = SUBPROBLEM_NN_MAIN_ADAM_WEIGHT_DECAY,
+                  subproblem_nn_main_grad_clip: float = SUBPROBLEM_NN_MAIN_GRAD_CLIP,
+                  subproblem_nn_main_kkt_lr_scale: float = SUBPROBLEM_NN_MAIN_KKT_LR_SCALE,
                   ignore_startup_shutdown_costs: bool = False,
                   subproblem_cost_learning_rate: float = 1e-5,
                   subproblem_nn_smooth_abs_eps: float = SUBPROBLEM_NN_SMOOTH_ABS_EPS,
@@ -892,8 +944,17 @@ def run_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS,
                   unit_predictor_auto_extra_tv_epochs: int = 160,
                   unit_predictor_auto_extra_tv_tv_threshold: float = 0.02,
                   unit_predictor_auto_extra_tv_weight: float = 0.02,
+                  predictor_warmup_rounds: int = 0,
+                  sign4_curriculum_rounds: int = 0,
+                  sign4_initial_scale: float = 1.0,
+                  sign4_final_scale: float = 1.0,
+                  enable_surrogate_delta_reference_lift: bool | None = None,
+                  surrogate_delta_reference_eps: float = 1e-6,
+                  surrogate_delta_reference_scope: str = "sign4_only",
+                  surrogate_delta_reference_min_abs_factor: float = 1e-9,
                   unit_predictor_finetune_lr: float = 1e-5,
-                  unit_predictor_weight_decay: float = 1e-4):
+                  unit_predictor_weight_decay: float = 1e-4,
+                  case_name: str | None = None):
     """V3 代理约束训练（样本级并行），返回 (dual_predictor, trainers)。"""
     import os
     from pypower.ext2int import ext2int
@@ -955,6 +1016,11 @@ def run_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS,
         f"c_pg_size={subproblem_c_pg_nn_size}, c_pg_hidden_dims={subproblem_c_pg_nn_hidden_dims}, "
         f"ignore_startup_shutdown_costs={ignore_startup_shutdown_costs}, "
         f"main_lr={subproblem_nn_learning_rate}, x_cost_lr={subproblem_cost_learning_rate}, "
+        f"nn_main_eta_min={subproblem_nn_main_eta_min_ratio}, "
+        f"nn_main_lr_late_scale={subproblem_nn_main_lr_late_scale}, "
+        f"nn_main_adam_wd={subproblem_nn_main_adam_weight_decay}, "
+        f"nn_main_grad_clip={subproblem_nn_main_grad_clip}, "
+        f"nn_main_kkt_lr_scale={subproblem_nn_main_kkt_lr_scale}, "
         f"nn_smooth_eps={subproblem_nn_smooth_abs_eps}, "
         f"c_pg_epochs={pg_cost_nn_epochs}, c_pg_surr_lr={pg_cost_surr_lr}, "
         f"c_pg_softbound_w={pg_cost_softbound_weight}, "
@@ -964,7 +1030,9 @@ def run_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS,
         f"c_pg_sample_w={pg_cost_use_sample_weights}, "
         f"c_pg_sw_power={pg_cost_sample_weight_power}, c_pg_sw_clip={pg_cost_sample_weight_clip}, "
         f"main_direct_epochs={int((main_direct_train_config or {}).get('direct_epochs', 0) or 0)}, "
-        f"c_pg_direct_epochs={int((c_pg_direct_train_config or {}).get('direct_epochs', 0) or 0)}"
+        f"c_pg_direct_epochs={int((c_pg_direct_train_config or {}).get('direct_epochs', 0) or 0)}, "
+        f"predictor_warmup={predictor_warmup_rounds}, "
+        f"sign4_curriculum={sign4_initial_scale}->{sign4_final_scale}/{sign4_curriculum_rounds}"
     )
     log(
         f"iter_delta_reg: subproblem_weight={iter_delta_reg_weight}, "
@@ -990,6 +1058,10 @@ def run_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS,
         f"subproblem_loss_ratio: primal={loss_ratio_primal}, dual_pg={loss_ratio_dual_pg}, "
         f"dual_x={loss_ratio_dual_x}, opt={loss_ratio_opt}, reg={loss_ratio_reg}"
     )
+    log(
+        f"subproblem_rho_binary: init={rho_binary_init}, max={rho_binary_max} "
+        f"(cap independent of rho_max=10 for primal/dual/opt)"
+    )
     print("=" * 70)
 
     if save_dir:
@@ -1010,6 +1082,7 @@ def run_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS,
             lp_backend=lp_backend,
             constraint_generation_strategy=constraint_generation_strategy,
             ignore_startup_shutdown_costs=ignore_startup_shutdown_costs,
+            case_name=case_name,
         )[0]
         dual_predictor.train(
             num_epochs=DUAL_EPOCHS,
@@ -1055,6 +1128,10 @@ def run_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS,
                 os.path.join(save_dir, 'unit_predictor.pth') if save_dir else None
             )
             resolved_external = _resolve_unit_predictor_load_path(unit_predictor_load_path)
+            if unit_predictor_load_path and not resolved_external:
+                raise FileNotFoundError(
+                    f"UNIT_PREDICTOR_LOAD_PATH was set but no checkpoint was found: {unit_predictor_load_path}"
+                )
             unit_predictor_load_path = resolved_external or (
                 str(load_path / 'unit_predictor.pth')
                 if load_path and (load_path / 'unit_predictor.pth').exists()
@@ -1067,8 +1144,11 @@ def run_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS,
                 f"lr={unit_predictor_lr}, hidden_dims={unit_predictor_hidden_dims}, "
                 f"finetune_lr={unit_predictor_finetune_lr}"
             )
-            # 若指定了外部 load_path，则默认不再额外预训练（避免覆盖外部模型）
-            effective_epochs = 0 if unit_predictor_load_path else int(unit_predictor_epochs)
+            # Explicit external checkpoints are used as-is; auto-discovered checkpoints
+            # from load_dir are treated as warm starts and may continue training.  If an
+            # explicit checkpoint is incompatible, train_unit_predictor_from_data raises
+            # instead of silently running with random weights.
+            effective_epochs = 0 if resolved_external else int(unit_predictor_epochs)
             unit_predictor = train_unit_predictor_from_data(
                 ppc,
                 all_samples,
@@ -1203,6 +1283,11 @@ def run_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS,
     if N_WORKERS_UNIT > 1:
         from uc_NN_subproblem_parallel import train_all_surrogates_parallel
 
+        if unit_predictor is not None and not unit_predictor_save_path:
+            raise RuntimeError(
+                "unit_predictor is enabled with unit-level multiprocessing, but no save_dir/path "
+                "is available for child workers to load the predictor checkpoint"
+            )
         log(
             f"  启用机组级并行: unit_workers={N_WORKERS_UNIT}, sample_workers={N_WORKERS_SAMPLE}"
         )
@@ -1222,6 +1307,7 @@ def run_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS,
             rho_dual_x_init=rho_dual_x_init,
             rho_dual_coc_init=rho_dual_coc_init,
             rho_binary_init=rho_binary_init,
+            rho_binary_max=rho_binary_max,
             rho_opt_init=rho_opt_init,
             gamma_base=subproblem_gamma_base,
             mu_lower_bound_init=mu_lower_bound_init,
@@ -1238,6 +1324,11 @@ def run_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS,
             nn_batch_size=subproblem_nn_batch_size,
             nn_shuffle=subproblem_nn_shuffle,
             nn_smooth_abs_eps=subproblem_nn_smooth_abs_eps,
+            nn_main_eta_min_ratio=subproblem_nn_main_eta_min_ratio,
+            nn_main_lr_late_scale=subproblem_nn_main_lr_late_scale,
+            nn_main_adam_weight_decay=subproblem_nn_main_adam_weight_decay,
+            nn_main_grad_clip=subproblem_nn_main_grad_clip,
+            nn_main_kkt_lr_scale=subproblem_nn_main_kkt_lr_scale,
             loss_ratio_primal=loss_ratio_primal,
             loss_ratio_dual_pg=loss_ratio_dual_pg,
             loss_ratio_dual_x=loss_ratio_dual_x,
@@ -1266,8 +1357,24 @@ def run_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS,
             use_sample_parallel=(N_WORKERS_SAMPLE > 1),
             unit_predictor_path=unit_predictor_save_path,
             use_unit_predictor=(unit_predictor is not None),
+            predictor_warmup_rounds=predictor_warmup_rounds,
+            sign4_curriculum_rounds=sign4_curriculum_rounds,
+            sign4_initial_scale=sign4_initial_scale,
+            sign4_final_scale=sign4_final_scale,
+            enable_surrogate_delta_reference_lift=enable_surrogate_delta_reference_lift,
+            surrogate_delta_reference_eps=surrogate_delta_reference_eps,
+            surrogate_delta_reference_scope=surrogate_delta_reference_scope,
+            surrogate_delta_reference_min_abs_factor=surrogate_delta_reference_min_abs_factor,
             unit_predictor_finetune_lr=unit_predictor_finetune_lr,
             unit_predictor_weight_decay=unit_predictor_weight_decay,
+            unit_predictor_hidden_dims=unit_predictor_hidden_dims,
+            unit_predictor_net_variant=unit_predictor_net_variant,
+            unit_predictor_tcn_channels=unit_predictor_tcn_channels,
+            unit_predictor_tcn_depth=unit_predictor_tcn_depth,
+            unit_predictor_tconv_channels=unit_predictor_tconv_channels,
+            unit_predictor_tconv_depth=unit_predictor_tconv_depth,
+            unit_predictor_dropout=unit_predictor_dropout,
+            case_name=case_name,
         )
 
         # train_all_surrogates_parallel 返回的是 state_dict；为了保持 run_surrogate 的返回形态
@@ -1281,10 +1388,15 @@ def run_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS,
             lp_backend=lp_backend,
             constraint_generation_strategy=constraint_generation_strategy,
             ignore_startup_shutdown_costs=ignore_startup_shutdown_costs,
+            case_name=case_name,
         )
         if logger is not None:
             for trainer in trainers.values():
                 trainer.logger = logger
+        if unit_predictor is not None:
+            for trainer in trainers.values():
+                trainer.unit_predictor = unit_predictor
+                trainer.use_unit_predictor = True
         return dual_predictor_loaded, trainers
 
     trainers = {}
@@ -1302,6 +1414,7 @@ def run_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS,
         rho_dual_x_init=rho_dual_x_init,
         rho_dual_coc_init=rho_dual_coc_init,
         rho_binary_init=rho_binary_init,
+        rho_binary_max=rho_binary_max,
         rho_opt_init=rho_opt_init,
                 loss_ratio_primal=loss_ratio_primal,
                 loss_ratio_dual_pg=loss_ratio_dual_pg,
@@ -1323,7 +1436,12 @@ def run_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS,
                 nn_batch_size=subproblem_nn_batch_size,
                 nn_shuffle=subproblem_nn_shuffle,
                 nn_learning_rate=subproblem_nn_learning_rate,
-                ignore_startup_shutdown_costs=ignore_startup_shutdown_costs,
+                nn_main_eta_min_ratio=subproblem_nn_main_eta_min_ratio,
+                nn_main_lr_late_scale=subproblem_nn_main_lr_late_scale,
+                nn_main_adam_weight_decay=subproblem_nn_main_adam_weight_decay,
+        nn_main_grad_clip=subproblem_nn_main_grad_clip,
+        nn_main_kkt_lr_scale=subproblem_nn_main_kkt_lr_scale,
+        ignore_startup_shutdown_costs=ignore_startup_shutdown_costs,
                 cost_learning_rate=subproblem_cost_learning_rate,
                 nn_smooth_abs_eps=subproblem_nn_smooth_abs_eps,
                 pg_cost_start_round=pg_cost_start_round,
@@ -1350,8 +1468,17 @@ def run_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS,
                 iter_delta_reg_deadband=iter_delta_reg_deadband,
                 unit_predictor=unit_predictor,
                 use_unit_predictor=(unit_predictor is not None),
+                predictor_warmup_rounds=predictor_warmup_rounds,
+                sign4_curriculum_rounds=sign4_curriculum_rounds,
+                sign4_initial_scale=sign4_initial_scale,
+                sign4_final_scale=sign4_final_scale,
+                enable_surrogate_delta_reference_lift=enable_surrogate_delta_reference_lift,
+                surrogate_delta_reference_eps=surrogate_delta_reference_eps,
+                surrogate_delta_reference_scope=surrogate_delta_reference_scope,
+                surrogate_delta_reference_min_abs_factor=surrogate_delta_reference_min_abs_factor,
                 unit_predictor_finetune_lr=unit_predictor_finetune_lr,
                 unit_predictor_weight_decay=unit_predictor_weight_decay,
+                case_name=case_name,
             )
         else:
             log(f"  机组 {g} ({i+1}/{len(unit_ids)}) — 样本级并行 n_workers={n_workers}")
@@ -1366,6 +1493,7 @@ def run_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS,
                 rho_dual_x_init=rho_dual_x_init,
                 rho_dual_coc_init=rho_dual_coc_init,
                 rho_binary_init=rho_binary_init,
+                rho_binary_max=rho_binary_max,
                 rho_opt_init=rho_opt_init,
                 loss_ratio_primal=loss_ratio_primal,
                 loss_ratio_dual_pg=loss_ratio_dual_pg,
@@ -1387,7 +1515,12 @@ def run_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS,
                 nn_batch_size=subproblem_nn_batch_size,
                 nn_shuffle=subproblem_nn_shuffle,
                 nn_learning_rate=subproblem_nn_learning_rate,
-                ignore_startup_shutdown_costs=ignore_startup_shutdown_costs,
+                nn_main_eta_min_ratio=subproblem_nn_main_eta_min_ratio,
+                nn_main_lr_late_scale=subproblem_nn_main_lr_late_scale,
+                nn_main_adam_weight_decay=subproblem_nn_main_adam_weight_decay,
+        nn_main_grad_clip=subproblem_nn_main_grad_clip,
+        nn_main_kkt_lr_scale=subproblem_nn_main_kkt_lr_scale,
+        ignore_startup_shutdown_costs=ignore_startup_shutdown_costs,
                 cost_learning_rate=subproblem_cost_learning_rate,
                 nn_smooth_abs_eps=subproblem_nn_smooth_abs_eps,
                 pg_cost_start_round=pg_cost_start_round,
@@ -1414,8 +1547,17 @@ def run_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS,
                 iter_delta_reg_deadband=iter_delta_reg_deadband,
                 unit_predictor=unit_predictor,
                 use_unit_predictor=(unit_predictor is not None),
+                predictor_warmup_rounds=predictor_warmup_rounds,
+                sign4_curriculum_rounds=sign4_curriculum_rounds,
+                sign4_initial_scale=sign4_initial_scale,
+                sign4_final_scale=sign4_final_scale,
+                enable_surrogate_delta_reference_lift=enable_surrogate_delta_reference_lift,
+                surrogate_delta_reference_eps=surrogate_delta_reference_eps,
+                surrogate_delta_reference_scope=surrogate_delta_reference_scope,
+                surrogate_delta_reference_min_abs_factor=surrogate_delta_reference_min_abs_factor,
                 unit_predictor_finetune_lr=unit_predictor_finetune_lr,
                 unit_predictor_weight_decay=unit_predictor_weight_decay,
+                case_name=case_name,
                 n_workers=n_workers,
             )
         if load_path is not None:
@@ -1447,7 +1589,8 @@ def load_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS, load_dir,
                    logger: 'TrainingLogger | None' = None,
                    lp_backend: str | None = None,
                    constraint_generation_strategy: str | None = None,
-                   ignore_startup_shutdown_costs: bool | None = None):
+                   ignore_startup_shutdown_costs: bool | None = None,
+                   case_name: str | None = None):
     """加载已有 dual_predictor 和 subproblem surrogate 模型。"""
     load_path = Path(load_dir)
     if not load_path.is_absolute():
@@ -1456,6 +1599,33 @@ def load_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS, load_dir,
         raise FileNotFoundError(f"surrogate 模型目录不存在: {load_path}")
 
     log(f"从已有目录加载 subproblem 模型，跳过 subproblem 训练: {load_path}")
+    predictor_strategy = normalize_constraint_generation_strategy(
+        constraint_generation_strategy or SURROGATE_CONSTRAINT_STRATEGY
+    )
+    load_unit_predictor = bool(USE_UNIT_PREDICTOR) and predictor_strategy in {
+        'all_single_time',
+        'all_templates_sign4_plus_single',
+    }
+    unit_predictor_checkpoint = None
+    if load_unit_predictor:
+        raw_predictor_path = UNIT_PREDICTOR_LOAD_PATH
+        if raw_predictor_path:
+            p = Path(raw_predictor_path)
+            if not p.is_absolute():
+                p = Path(__file__).parent / p
+            if p.is_dir():
+                latest = p / 'LATEST.txt'
+                if latest.is_file():
+                    target = Path(latest.read_text(encoding='utf-8').strip())
+                    p = target if target.is_absolute() else p / target
+                else:
+                    p = p / 'unit_predictor.pth'
+            if not p.exists():
+                raise FileNotFoundError(f"UNIT_PREDICTOR_LOAD_PATH was set but no checkpoint was found: {p}")
+            unit_predictor_checkpoint = str(p)
+        else:
+            unit_predictor_checkpoint = str(load_path / 'unit_predictor.pth')
+
     dual_predictor, trainers = load_trained_models(
         ppc,
         all_samples,
@@ -1465,6 +1635,18 @@ def load_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS, load_dir,
         lp_backend=lp_backend,
         constraint_generation_strategy=constraint_generation_strategy,
         ignore_startup_shutdown_costs=ignore_startup_shutdown_costs,
+        case_name=case_name,
+        unit_predictor_path=unit_predictor_checkpoint,
+        use_unit_predictor=load_unit_predictor,
+        unit_predictor_hidden_dims=UNIT_PREDICTOR_HIDDEN_DIMS,
+        unit_predictor_net_variant=UNIT_PREDICTOR_NET_VARIANT,
+        unit_predictor_tcn_channels=UNIT_PREDICTOR_TCN_CHANNELS,
+        unit_predictor_tcn_depth=UNIT_PREDICTOR_TCN_DEPTH,
+        unit_predictor_tconv_channels=UNIT_PREDICTOR_TCONV_CHANNELS,
+        unit_predictor_tconv_depth=UNIT_PREDICTOR_TCONV_DEPTH,
+        unit_predictor_dropout=UNIT_PREDICTOR_DROPOUT,
+        unit_predictor_finetune_lr=UNIT_PREDICTOR_FINETUNE_LR,
+        unit_predictor_weight_decay=UNIT_PREDICTOR_WEIGHT_DECAY,
     )
     if logger is not None:
         for trainer in trainers.values():
@@ -2089,6 +2271,7 @@ def main():
     SUBPROBLEM_RHO_DUAL_X_INIT_VALUE = SUBPROBLEM_RHO_DUAL_X_INIT
     SUBPROBLEM_RHO_DUAL_COC_INIT_VALUE = SUBPROBLEM_RHO_DUAL_COC_INIT
     SUBPROBLEM_RHO_BINARY_INIT_VALUE = SUBPROBLEM_RHO_BINARY_INIT
+    SUBPROBLEM_RHO_BINARY_MAX_VALUE = SUBPROBLEM_RHO_BINARY_MAX
     SUBPROBLEM_RHO_OPT_INIT_VALUE = SUBPROBLEM_RHO_OPT_INIT
     SUBPROBLEM_LOSS_RATIO_PRIMAL_VALUE = SUBPROBLEM_LOSS_RATIO_PRIMAL
     SUBPROBLEM_LOSS_RATIO_DUAL_PG_VALUE = SUBPROBLEM_LOSS_RATIO_DUAL_PG
@@ -2101,6 +2284,14 @@ def main():
     SUBPROBLEM_MU_DUAL_FLOOR_INIT_VALUE = SUBPROBLEM_MU_DUAL_FLOOR_INIT
     SUBPROBLEM_MU_DUAL_FLOOR_INDIVIDUAL_ROUND_VALUE = SUBPROBLEM_MU_DUAL_FLOOR_INDIVIDUAL_ROUND
     SUBPROBLEM_MU_DUAL_FLOOR_DECAY_ROUND_VALUE = SUBPROBLEM_MU_DUAL_FLOOR_DECAY_ROUND
+    SUBPROBLEM_PREDICTOR_WARMUP_ROUNDS_VALUE = SUBPROBLEM_PREDICTOR_WARMUP_ROUNDS
+    SUBPROBLEM_SIGN4_CURRICULUM_ROUNDS_VALUE = SUBPROBLEM_SIGN4_CURRICULUM_ROUNDS
+    SUBPROBLEM_SIGN4_INITIAL_SCALE_VALUE = SUBPROBLEM_SIGN4_INITIAL_SCALE
+    SUBPROBLEM_SIGN4_FINAL_SCALE_VALUE = SUBPROBLEM_SIGN4_FINAL_SCALE
+    SUBPROBLEM_SURROGATE_DELTA_REFERENCE_LIFT_VALUE = SUBPROBLEM_SURROGATE_DELTA_REFERENCE_LIFT
+    SUBPROBLEM_SURROGATE_DELTA_REFERENCE_EPS_VALUE = SUBPROBLEM_SURROGATE_DELTA_REFERENCE_EPS
+    SUBPROBLEM_SURROGATE_DELTA_REFERENCE_SCOPE_VALUE = SUBPROBLEM_SURROGATE_DELTA_REFERENCE_SCOPE
+    SUBPROBLEM_SURROGATE_DELTA_REFERENCE_MIN_ABS_FACTOR_VALUE = SUBPROBLEM_SURROGATE_DELTA_REFERENCE_MIN_ABS_FACTOR
     SUBPROBLEM_MU_SIGNED_ROUND_INTERVAL_VALUE = SUBPROBLEM_MU_SIGNED_ROUND_INTERVAL
     SUBPROBLEM_MU_SIGN_HYSTERESIS_ROUNDS_VALUE = SUBPROBLEM_MU_SIGN_HYSTERESIS_ROUNDS
     SUBPROBLEM_MU_SIGN_FLIP_MIN_SHARE_VALUE = SUBPROBLEM_MU_SIGN_FLIP_MIN_SHARE
@@ -2109,6 +2300,11 @@ def main():
     SUBPROBLEM_NN_BATCH_SIZE_VALUE = SUBPROBLEM_NN_BATCH_SIZE
     SUBPROBLEM_NN_SHUFFLE_VALUE = SUBPROBLEM_NN_SHUFFLE
     SUBPROBLEM_NN_LR_VALUE = SUBPROBLEM_NN_LR
+    SUBPROBLEM_NN_MAIN_ETA_MIN_RATIO_VALUE = SUBPROBLEM_NN_MAIN_ETA_MIN_RATIO
+    SUBPROBLEM_NN_MAIN_LR_LATE_SCALE_VALUE = SUBPROBLEM_NN_MAIN_LR_LATE_SCALE
+    SUBPROBLEM_NN_MAIN_ADAM_WEIGHT_DECAY_VALUE = SUBPROBLEM_NN_MAIN_ADAM_WEIGHT_DECAY
+    SUBPROBLEM_NN_MAIN_GRAD_CLIP_VALUE = SUBPROBLEM_NN_MAIN_GRAD_CLIP
+    SUBPROBLEM_NN_MAIN_KKT_LR_SCALE_VALUE = SUBPROBLEM_NN_MAIN_KKT_LR_SCALE
     SUBPROBLEM_IGNORE_STARTUP_SHUTDOWN_COSTS_VALUE = SUBPROBLEM_IGNORE_STARTUP_SHUTDOWN_COSTS
     SUBPROBLEM_NN_SIZE_VALUE, SUBPROBLEM_NN_HIDDEN_DIMS_VALUE = resolve_nn_hidden_dims(
         SUBPROBLEM_NN_SIZE,
@@ -2329,6 +2525,7 @@ def main():
                     lp_backend=SUBPROBLEM_LP_BACKEND,
                     constraint_generation_strategy=CONSTRAINT_GENERATION_STRATEGY,
                     ignore_startup_shutdown_costs=SUBPROBLEM_IGNORE_STARTUP_SHUTDOWN_COSTS_VALUE,
+                    case_name=CASE_NAME,
                 )
             else:
                 dual_predictor, trainers = run_surrogate(
@@ -2347,6 +2544,7 @@ def main():
                     rho_dual_x_init=SUBPROBLEM_RHO_DUAL_X_INIT_VALUE,
                     rho_dual_coc_init=SUBPROBLEM_RHO_DUAL_COC_INIT_VALUE,
                     rho_binary_init=SUBPROBLEM_RHO_BINARY_INIT_VALUE,
+                    rho_binary_max=SUBPROBLEM_RHO_BINARY_MAX_VALUE,
                     rho_opt_init=SUBPROBLEM_RHO_OPT_INIT_VALUE,
                     loss_ratio_primal=SUBPROBLEM_LOSS_RATIO_PRIMAL_VALUE,
                     loss_ratio_dual_pg=SUBPROBLEM_LOSS_RATIO_DUAL_PG_VALUE,
@@ -2370,6 +2568,11 @@ def main():
                     subproblem_nn_batch_size=SUBPROBLEM_NN_BATCH_SIZE_VALUE,
                     subproblem_nn_shuffle=SUBPROBLEM_NN_SHUFFLE_VALUE,
                     subproblem_nn_learning_rate=SUBPROBLEM_NN_LR_VALUE,
+                    subproblem_nn_main_eta_min_ratio=SUBPROBLEM_NN_MAIN_ETA_MIN_RATIO_VALUE,
+                    subproblem_nn_main_lr_late_scale=SUBPROBLEM_NN_MAIN_LR_LATE_SCALE_VALUE,
+                    subproblem_nn_main_adam_weight_decay=SUBPROBLEM_NN_MAIN_ADAM_WEIGHT_DECAY_VALUE,
+                    subproblem_nn_main_grad_clip=SUBPROBLEM_NN_MAIN_GRAD_CLIP_VALUE,
+                    subproblem_nn_main_kkt_lr_scale=SUBPROBLEM_NN_MAIN_KKT_LR_SCALE_VALUE,
                     ignore_startup_shutdown_costs=SUBPROBLEM_IGNORE_STARTUP_SHUTDOWN_COSTS_VALUE,
                     subproblem_cost_learning_rate=SUBPROBLEM_X_COST_NN_LR_VALUE,
                     subproblem_nn_smooth_abs_eps=SUBPROBLEM_NN_SMOOTH_ABS_EPS_VALUE,
@@ -2432,8 +2635,17 @@ def main():
                     unit_predictor_auto_extra_tv_epochs=UNIT_PREDICTOR_AUTO_EXTRA_TV_EPOCHS_VALUE,
                     unit_predictor_auto_extra_tv_tv_threshold=UNIT_PREDICTOR_AUTO_EXTRA_TV_TV_THRESHOLD_VALUE,
                     unit_predictor_auto_extra_tv_weight=UNIT_PREDICTOR_AUTO_EXTRA_TV_WEIGHT_VALUE,
+                    predictor_warmup_rounds=SUBPROBLEM_PREDICTOR_WARMUP_ROUNDS_VALUE,
+                    sign4_curriculum_rounds=SUBPROBLEM_SIGN4_CURRICULUM_ROUNDS_VALUE,
+                    sign4_initial_scale=SUBPROBLEM_SIGN4_INITIAL_SCALE_VALUE,
+                    sign4_final_scale=SUBPROBLEM_SIGN4_FINAL_SCALE_VALUE,
+                    enable_surrogate_delta_reference_lift=SUBPROBLEM_SURROGATE_DELTA_REFERENCE_LIFT_VALUE,
+                    surrogate_delta_reference_eps=SUBPROBLEM_SURROGATE_DELTA_REFERENCE_EPS_VALUE,
+                    surrogate_delta_reference_scope=SUBPROBLEM_SURROGATE_DELTA_REFERENCE_SCOPE_VALUE,
+                    surrogate_delta_reference_min_abs_factor=SUBPROBLEM_SURROGATE_DELTA_REFERENCE_MIN_ABS_FACTOR_VALUE,
                     unit_predictor_finetune_lr=UNIT_PREDICTOR_FINETUNE_LR_VALUE,
                     unit_predictor_weight_decay=UNIT_PREDICTOR_WEIGHT_DECAY_VALUE,
+                    case_name=CASE_NAME,
                 )
             if trainers:
                 print_surrogate_results(trainers, all_samples)
@@ -2684,6 +2896,7 @@ def main():
                     lp_backend=SUBPROBLEM_LP_BACKEND,
                     constraint_generation_strategy=CONSTRAINT_GENERATION_STRATEGY,
                     ignore_startup_shutdown_costs=SUBPROBLEM_IGNORE_STARTUP_SHUTDOWN_COSTS_VALUE,
+                    case_name=CASE_NAME,
                 )
             else:
                 dual_predictor, trainers = run_surrogate(
@@ -2702,6 +2915,7 @@ def main():
                     rho_dual_x_init=SUBPROBLEM_RHO_DUAL_X_INIT_VALUE,
                     rho_dual_coc_init=SUBPROBLEM_RHO_DUAL_COC_INIT_VALUE,
                     rho_binary_init=SUBPROBLEM_RHO_BINARY_INIT_VALUE,
+                    rho_binary_max=SUBPROBLEM_RHO_BINARY_MAX_VALUE,
                     rho_opt_init=SUBPROBLEM_RHO_OPT_INIT_VALUE,
                     loss_ratio_primal=SUBPROBLEM_LOSS_RATIO_PRIMAL_VALUE,
                     loss_ratio_dual_pg=SUBPROBLEM_LOSS_RATIO_DUAL_PG_VALUE,
@@ -2725,6 +2939,11 @@ def main():
                     subproblem_nn_batch_size=SUBPROBLEM_NN_BATCH_SIZE_VALUE,
                     subproblem_nn_shuffle=SUBPROBLEM_NN_SHUFFLE_VALUE,
                     subproblem_nn_learning_rate=SUBPROBLEM_NN_LR_VALUE,
+                    subproblem_nn_main_eta_min_ratio=SUBPROBLEM_NN_MAIN_ETA_MIN_RATIO_VALUE,
+                    subproblem_nn_main_lr_late_scale=SUBPROBLEM_NN_MAIN_LR_LATE_SCALE_VALUE,
+                    subproblem_nn_main_adam_weight_decay=SUBPROBLEM_NN_MAIN_ADAM_WEIGHT_DECAY_VALUE,
+                    subproblem_nn_main_grad_clip=SUBPROBLEM_NN_MAIN_GRAD_CLIP_VALUE,
+                    subproblem_nn_main_kkt_lr_scale=SUBPROBLEM_NN_MAIN_KKT_LR_SCALE_VALUE,
                     ignore_startup_shutdown_costs=SUBPROBLEM_IGNORE_STARTUP_SHUTDOWN_COSTS_VALUE,
                     subproblem_cost_learning_rate=SUBPROBLEM_X_COST_NN_LR_VALUE,
                     subproblem_nn_smooth_abs_eps=SUBPROBLEM_NN_SMOOTH_ABS_EPS_VALUE,
@@ -2787,8 +3006,17 @@ def main():
                     unit_predictor_auto_extra_tv_epochs=UNIT_PREDICTOR_AUTO_EXTRA_TV_EPOCHS_VALUE,
                     unit_predictor_auto_extra_tv_tv_threshold=UNIT_PREDICTOR_AUTO_EXTRA_TV_TV_THRESHOLD_VALUE,
                     unit_predictor_auto_extra_tv_weight=UNIT_PREDICTOR_AUTO_EXTRA_TV_WEIGHT_VALUE,
+                    predictor_warmup_rounds=SUBPROBLEM_PREDICTOR_WARMUP_ROUNDS_VALUE,
+                    sign4_curriculum_rounds=SUBPROBLEM_SIGN4_CURRICULUM_ROUNDS_VALUE,
+                    sign4_initial_scale=SUBPROBLEM_SIGN4_INITIAL_SCALE_VALUE,
+                    sign4_final_scale=SUBPROBLEM_SIGN4_FINAL_SCALE_VALUE,
+                    enable_surrogate_delta_reference_lift=SUBPROBLEM_SURROGATE_DELTA_REFERENCE_LIFT_VALUE,
+                    surrogate_delta_reference_eps=SUBPROBLEM_SURROGATE_DELTA_REFERENCE_EPS_VALUE,
+                    surrogate_delta_reference_scope=SUBPROBLEM_SURROGATE_DELTA_REFERENCE_SCOPE_VALUE,
+                    surrogate_delta_reference_min_abs_factor=SUBPROBLEM_SURROGATE_DELTA_REFERENCE_MIN_ABS_FACTOR_VALUE,
                     unit_predictor_finetune_lr=UNIT_PREDICTOR_FINETUNE_LR_VALUE,
                     unit_predictor_weight_decay=UNIT_PREDICTOR_WEIGHT_DECAY_VALUE,
+                    case_name=CASE_NAME,
                 )
             print_surrogate_results(trainers, all_samples)
 
