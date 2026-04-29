@@ -1382,7 +1382,12 @@ class SingleUnitBinaryPredictorTCNNet(nn.Module):
 
 
 class _SharedTCNBackbone(nn.Module):
-    """共享 TCN 骨干：输出 (B, ch, T) 的时序特征。"""
+    """共享 TCN 骨干：输出 (B, ch, T) 的时序特征。
+
+    - 标准：``input_dim = 2 * nb * T``（负荷 + 可再生拼接），每步 ``per_t = 2*nb`` 为偶数。
+    - 兼容：``input_dim = nb * T`` 仅负荷/净负荷展平（无独立可再生）时 ``per_t = nb`` 可能为奇数
+      （例如 case3lite 三母线）：在 ``forward`` 内与全零「可再生」槽拼接，卷积输入通道数 ``2*nb``。
+    """
 
     def __init__(self, *, input_dim: int, T: int, channels: int = 64, depth: int = 6, dropout: float = 0.1):
         super().__init__()
@@ -1391,10 +1396,14 @@ class _SharedTCNBackbone(nn.Module):
         if self.T <= 0 or self.input_dim <= 0 or (self.input_dim % self.T) != 0:
             raise ValueError(f"SharedTCN expects input_dim % T == 0, got input_dim={input_dim}, T={T}")
         per_t = self.input_dim // self.T
-        if per_t % 2 != 0:
-            raise ValueError(f"SharedTCN expects per-time features even (2*nb), got per_t={per_t}")
-        self.nb = per_t // 2
-        self.in_channels = per_t
+        if per_t % 2 == 0:
+            self.nb = per_t // 2
+            self._net_load_only = False
+            self.in_channels = per_t
+        else:
+            self.nb = per_t
+            self._net_load_only = True
+            self.in_channels = 2 * per_t
 
         ch = int(max(8, channels))
         d = int(max(1, depth))
@@ -1421,8 +1430,12 @@ class _SharedTCNBackbone(nn.Module):
         B = x.shape[0]
         nb = self.nb
         T = self.T
-        load = x[:, : nb * T].reshape(B, nb, T).permute(0, 2, 1)
-        ren = x[:, nb * T : 2 * nb * T].reshape(B, nb, T).permute(0, 2, 1)
+        if getattr(self, "_net_load_only", False):
+            load = x.reshape(B, nb, T).permute(0, 2, 1)
+            ren = torch.zeros_like(load)
+        else:
+            load = x[:, : nb * T].reshape(B, nb, T).permute(0, 2, 1)
+            ren = x[:, nb * T : 2 * nb * T].reshape(B, nb, T).permute(0, 2, 1)
         feat = torch.cat([load, ren], dim=2).permute(0, 2, 1).contiguous()  # (B, 2*nb, T)
         y = self.in_proj(feat)
         y = self.blocks(y)
@@ -2694,6 +2707,7 @@ class SubproblemSurrogateTrainer:
                  sign4_curriculum_rounds: int = 0,
                  sign4_initial_scale: float = 1.0,
                  sign4_final_scale: float = 1.0,
+                 sign4_delay_rounds: int = 0,
                  unit_predictor_finetune_lr: float = 1e-5,
                  unit_predictor_weight_decay: float = 1e-4,
                  pg_cost_single_sample_reg_scale: float | None = None,
@@ -2896,6 +2910,7 @@ class SubproblemSurrogateTrainer:
         self.sign4_curriculum_rounds = max(int(sign4_curriculum_rounds), 0)
         self.sign4_initial_scale = max(float(sign4_initial_scale), 0.0)
         self.sign4_final_scale = max(float(sign4_final_scale), 0.0)
+        self.sign4_delay_rounds = max(int(sign4_delay_rounds), 0)
         if enable_surrogate_delta_reference_lift is None:
             self.enable_surrogate_delta_reference_lift = self.constraint_generation_strategy in (
                 CONSTRAINT_STRATEGY_ALL_TEMPLATES_SIGN4,
@@ -4626,9 +4641,14 @@ class SubproblemSurrogateTrainer:
         rounds = max(int(getattr(self, 'sign4_curriculum_rounds', 0) or 0), 0)
         initial = max(float(getattr(self, 'sign4_initial_scale', 1.0) or 0.0), 0.0)
         final = max(float(getattr(self, 'sign4_final_scale', 1.0) or 0.0), 0.0)
+        delay = max(int(getattr(self, 'sign4_delay_rounds', 0) or 0), 0)
+        iter_n = float(getattr(self, 'iter_number', 0))
+        if delay > 0 and iter_n < float(delay):
+            return 0.0
+        effective_iter = max(iter_n - float(delay), 0.0)
         if rounds <= 0:
             return final
-        progress = min(max(float(getattr(self, 'iter_number', 0)), 0.0) / float(rounds), 1.0)
+        progress = min(max(effective_iter, 0.0) / float(rounds), 1.0)
         return initial + (final - initial) * progress
 
     def _sign4_curriculum_factors(self, size: int) -> np.ndarray:
@@ -7505,6 +7525,7 @@ class SubproblemSurrogateTrainer:
                 'sign4_curriculum_rounds': self.sign4_curriculum_rounds,
                 'sign4_initial_scale': self.sign4_initial_scale,
                 'sign4_final_scale': self.sign4_final_scale,
+                'sign4_delay_rounds': self.sign4_delay_rounds,
                 'mu_individual_lower_bound_round': self.mu_individual_lower_bound_round,
                 'mu_group_lower_bound_round': self.mu_group_lower_bound_round,
                 'mu_signed_round_interval': self.mu_signed_round_interval,
@@ -7757,6 +7778,10 @@ class SubproblemSurrogateTrainer:
                 float(state.get('sign4_final_scale', self.sign4_final_scale)),
                 0.0,
             )
+            self.sign4_delay_rounds = max(
+                int(state.get('sign4_delay_rounds', getattr(self, 'sign4_delay_rounds', 0))),
+                0,
+            )
             self.iter_number = int(state.get(
                 'iter_number',
                 max(
@@ -7934,6 +7959,7 @@ def _load_surrogate_model_metadata(filepath: str, device=None) -> dict:
         'sign4_curriculum_rounds': state.get('sign4_curriculum_rounds'),
         'sign4_initial_scale': state.get('sign4_initial_scale'),
         'sign4_final_scale': state.get('sign4_final_scale'),
+        'sign4_delay_rounds': state.get('sign4_delay_rounds'),
         'surrogate_direction_signs': state.get('surrogate_direction_signs'),
         'nn_hidden_dims': state.get('nn_hidden_dims'),
         'pg_cost_hidden_dims': state.get('pg_cost_hidden_dims', state.get('nn_hidden_dims')),

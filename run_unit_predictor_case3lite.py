@@ -1,35 +1,37 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Case118 单独训练/评估 UnitPredictor（单机组 0/1 变量预测器）。
+"""Case3lite 单独训练/评估 UnitPredictor（单机组 0/1 变量预测器）。
 
-用途：
-- 独立于 subproblem BCD 训练流程，快速迭代 UnitPredictor 的结构/超参；
-- 支持截断样本数、指定机组列表、配置训练超参，并把模型存到 result/ 下的时间戳目录。
+与 ``run_unit_predictor_case118.py`` 结构相同，仅算例与数据路径针对 **case3lite**（通常 3 台机组）。
 
-默认设定面向「训练集距离（MSE）压到极低」：full-batch、增大 TCN 容量、末阶段纯 MSE 精修；
-脚本结束会对训练集逐机组打印 mse/mae/bce 与分类指标（可选 F1 阈值扫优）。
+数据：默认使用 ``CASE3LITE_ACTIVE_SET_JSON``；若该文件不存在且 ``AUTO_PICK_LATEST_ACTIVE_SET=True``，
+则在 ``result/active_set/`` 下选取 **修改时间最新** 的 ``active_sets_case3lite_*.json``。
 
-架构提示：``net_variant="tcn_shared_film"`` 时全程只有**共享骨干 +  joint 训练**
-（``train_all_shared_joint``），日志均为 ``[UnitPredictor-shared]``，**不会**出现逐机组
-``train_unit``；阶段里「选中机组」仅通过 ``unit_loss_weights`` 加权损失。若需要独立机组
-网络与逐机组训练日志，请改用 ``mlp`` / ``tcn`` / ``tconv`` 等。
+输出：``result/surrogate_models/unit_predictor_case3lite_<timestamp>/unit_predictor.pth`` 及 ``LATEST.txt``。
 
-说明：
-    本脚本不使用命令行参数；请在 `main()` 顶部显式修改配置变量以进行实验对比。
+说明：本脚本不使用命令行参数；请在 ``main()`` 顶部显式修改配置。
 """
 
 from __future__ import annotations
+import sys
 from datetime import datetime
 from pathlib import Path
 
 import numpy as np
 
 import run_training as rt
-import run_training_case118 as case118_cfg
 
 from src.case_registry import get_case_ppc
 from src.uc_NN_subproblem import SingleUnitBinaryPredictorTrainer
 from src.scenario_utils import get_feature_vector_from_sample
+
+
+ROOT = Path(__file__).resolve().parent
+
+# 与 ``run_test.py`` / 仓库惯例一致的占位路径；不存在则依赖 AUTO_PICK_LATEST_ACTIVE_SET
+CASE3LITE_ACTIVE_SET_JSON = "result/active_set/active_sets_case3lite_T24_n1000_20260403_180137.json"
+
+AUTO_PICK_LATEST_ACTIVE_SET = False
 
 
 def _parse_hidden_dims(text: str) -> list[int] | None:
@@ -54,22 +56,14 @@ def _train_val_split(items: list, *, val_ratio: float, seed: int) -> tuple[list,
     return train, val
 
 
-def _sigmoid(x: np.ndarray) -> np.ndarray:
-    x = np.asarray(x, dtype=float)
-    return 1.0 / (1.0 + np.exp(-x))
-
-
 def _bce_from_logits(logits: np.ndarray, y_true: np.ndarray) -> float:
-    """标量 BCE（按元素平均）。"""
     z = np.asarray(logits, dtype=float)
     y = np.asarray(y_true, dtype=float)
-    # stable: log(1+exp(z)) - y*z
     loss = np.logaddexp(0.0, z) - y * z
     return float(loss.mean())
 
 
 def _prepare_eval_xy(predictor, samples: list):
-    """把 samples 堆叠成 (N,D) 特征张量与 (N,ng,T) 标签数组，避免 per-sample forward 的慢路径。"""
     import torch
 
     if not samples:
@@ -84,12 +78,11 @@ def _prepare_eval_xy(predictor, samples: list):
     )
     X_tensor = torch.tensor(X, dtype=torch.float32, device=predictor.device)
 
-    # y：优先从 unit_commitment_matrix 取（形状一般是 (ng, T)）
     if "unit_commitment_matrix" in samples[0]:
         y_mat = np.stack(
             [np.asarray(s["unit_commitment_matrix"], dtype=float) for s in samples],
             axis=0,
-        )  # (N, ng, T)
+        )
     else:
         ng = int(getattr(predictor, "ng", len(getattr(predictor, "unit_ids", [])) or 0))
         T = int(getattr(predictor, "T", 0))
@@ -111,11 +104,11 @@ def _eval_unit_predictor(predictor, samples: list, unit_id: int, threshold: floa
     import torch
 
     X_tensor, y_mat = _prepare_eval_xy(predictor, samples)
-    y_arr = np.asarray(y_mat[:, int(unit_id), :], dtype=float)  # (N, T)
+    y_arr = np.asarray(y_mat[:, int(unit_id), :], dtype=float)
 
     net = predictor.get_network(unit_id)
     with torch.no_grad():
-        logits_t = net(X_tensor)  # (N, T)
+        logits_t = net(X_tensor)
         probs_t = torch.sigmoid(logits_t)
     logits_arr = logits_t.detach().cpu().numpy()
     probs = probs_t.detach().cpu().numpy()
@@ -146,7 +139,6 @@ def _eval_unit_predictor(predictor, samples: list, unit_id: int, threshold: floa
 
 
 def _best_threshold_for_f1(predictor, samples: list, unit_id: int) -> tuple[float, dict]:
-    """在验证集上网格搜索阈值，返回 (best_thr, metrics_at_best_thr)。"""
     best_thr = 0.5
     best_f1 = -1.0
     best_m = {}
@@ -173,7 +165,6 @@ def _pick_low_tv_units(
         m = _eval_unit_predictor(predictor, samples, unit_id=int(g), threshold=0.5)
         y_tv = float(m.get("y_tv", 0.0))
         p_tv = float(m.get("tv", 0.0))
-        # 仅在真值确实存在启停变化时才要求预测也有变化，否则允许常数（比如永远开/关的机组）
         if y_tv >= float(tv_threshold) and p_tv < float(tv_floor_scale) * y_tv:
             picked.append(int(g))
     return picked
@@ -189,7 +180,6 @@ def _pick_high_mse_units(predictor, samples: list, unit_ids: list[int], *, mse_t
 
 
 def _make_unit_loss_weights_from_val_mse(predictor, val_samples: list, unit_ids: list[int], *, power: float = 1.0):
-    """根据 val MSE 生成 (ng,) 的权重向量：越差的机组权重越大。mean=1 归一化。"""
     ng = int(getattr(predictor, "ng", len(unit_ids)))
     w = np.ones(int(ng), dtype=float)
     if not val_samples:
@@ -208,7 +198,6 @@ def _make_unit_loss_weights_from_val_mse(predictor, val_samples: list, unit_ids:
 
 
 def _make_unit_loss_weights_from_selected(predictor, selected_units: list[int], *, boost: float = 3.0):
-    """给 selected_units 更大权重，用于 shared joint 训练时等效“补足 epoch”。"""
     ng = int(getattr(predictor, "ng", max(selected_units) + 1 if selected_units else 0))
     w = np.ones(int(ng), dtype=float)
     for g in selected_units:
@@ -219,7 +208,6 @@ def _make_unit_loss_weights_from_selected(predictor, selected_units: list[int], 
 
 
 def _reset_unit_network(predictor, unit_id: int) -> None:
-    """删除指定机组的网络/优化器，让 trainer 在下次训练时重建（用于跳出局部最优）。"""
     try:
         g = int(unit_id)
     except Exception:
@@ -232,6 +220,31 @@ def _reset_unit_network(predictor, unit_id: int) -> None:
         predictor._ensure_network(g)
 
 
+def _resolve_case3lite_data_file() -> Path:
+    """返回 active set JSON 的绝对路径。"""
+    if CASE3LITE_ACTIVE_SET_JSON:
+        p = Path(CASE3LITE_ACTIVE_SET_JSON)
+        if not p.is_absolute():
+            p = ROOT / p
+        if p.is_file():
+            return p.resolve()
+    if AUTO_PICK_LATEST_ACTIVE_SET:
+        d = ROOT / "result" / "active_set"
+        if d.is_dir():
+            cands = sorted(
+                d.glob("active_sets_case3lite_*.json"),
+                key=lambda x: x.stat().st_mtime,
+                reverse=True,
+            )
+            if cands:
+                print(f"[run_unit_predictor_case3lite] 使用最新 active set: {cands[0]}", flush=True)
+                return cands[0].resolve()
+    raise FileNotFoundError(
+        "未找到 case3lite active set JSON。请在 main 顶部设置 CASE3LITE_ACTIVE_SET_JSON，"
+        "或将 ``active_sets_case3lite_*.json`` 放入 result/active_set/。"
+    )
+
+
 def _run_train_set_per_unit_report(
     predictor,
     train_samples: list,
@@ -239,14 +252,13 @@ def _run_train_set_per_unit_report(
     unit_ids: list[int],
     do_threshold_sweep: bool = True,
 ) -> None:
-    """在训练集上对每个机组输出距离指标与（可选）F1 最优阈值。"""
     if not train_samples or not unit_ids:
         print("[train_eval] empty train_samples or unit_ids", flush=True)
         return
 
     print("=" * 72, flush=True)
     suffix = "；含 F1 阈值扫优" if do_threshold_sweep else ""
-    print(f"训练集效果汇总（各机组）| mse/mae/bce 与 thr=0.5 分类指标{suffix}", flush=True)
+    print(f"训练集效果汇总（case3lite 各机组）| mse/mae/bce 与 thr=0.5 分类指标{suffix}", flush=True)
     print("=" * 72, flush=True)
 
     rows = []
@@ -296,45 +308,33 @@ def _run_train_set_per_unit_report(
 
 
 def main() -> None:
-    # ── 实验配置（请在这里显式修改；不使用命令行参数）────────────────────
-    # 目标：全量训练数据上把训练集 MSE 压到极低；full-batch + 末段纯 MSE（Stage F）长跑精修。
-    # 数据截断：None=不截断；正整数=只取前 N 个样本
-    max_samples: int | None = None
-    # 是否使用“全部样本作为训练集”（不切分验证集）
-    use_all_samples_as_train = True
-    # 训练哪些机组：None=训练全部机组（推荐，便于统一评估）
+    max_samples: int | None = 250
+    use_all_samples_as_train = 200
     unit_ids: list[int] | None = None
-    # 继续训练：指向已有 checkpoint；None=从头训练
     load_path: str | None = None
 
-    # 训练超参（用于 staged training 的每阶段默认 lr 等）
     lr = 1e-3
     weight_decay = 8e-5
     batch_strategy = "full-batch"
-    batch_size = 64  # mini-batch 时生效；full-batch 下有效 batch=n_samples
+    batch_size = 64
     shuffle = True
 
-    # LR scheduler：末段纯 MSE 需持续减小 lr
     enable_scheduler = True
     scheduler_patience = 15
     scheduler_factor = 0.5
     min_lr = 1e-7
 
-    # 网络结构：略增容量、略降 dropout，利于训练集拟合
-    # tcn_shared_film：全体机组共享一套参数，train_all 内部只跑 shared joint（无逐机组 train_unit）
-    net_variant = "tcn_shared_film"  # "mlp" | "resmlp" | "tconv" | "tcn" | "tcn_shared_film"
-    hidden_dims = _parse_hidden_dims("256,128")  # 仅对 mlp 生效
+    net_variant = "tcn_shared_film"
+    hidden_dims = _parse_hidden_dims("256,128")
     resmlp_width = 512
     resmlp_depth = 4
     tconv_channels = 64
     tconv_depth = 4
-    tcn_channels = 160
-    tcn_depth = 9
+    # case3lite 仅 3 台机，可适当减小容量以加快实验；需与下游 run_training 中 UNIT_PREDICTOR_* 对齐
+    tcn_channels = 128
+    tcn_depth = 8
     dropout = 0.02
 
-    # staged training：
-    # A–E：课程学习 + 难点机组加权；E 在无 val 时用当前训练误差生成 unit 权重（见主循环）。
-    # F：几乎纯 MSE（极小 transition），去掉 floor/binarize，压低训练集距离损失。
     stages = [
         {
             "name": "A_align_mse",
@@ -453,26 +453,29 @@ def main() -> None:
     ]
     pos_weight_clip = 20.0
 
-    # 评估：train/val 切分
     seed = 42
-    val_ratio = 0.2  # 0=不做验证
+    val_ratio = 0.2
     print_all_validation = False
-    validation_top_k = 12
+    validation_top_k = 4
     target_mse = 0.05
     train_eval_threshold_sweep = True
 
-    # 输出目录：None=使用默认时间戳目录
     out_dir_override: str | None = None
 
-    # 使用 case118 的 active set 配置（与主入口一致）
-    rt.CASE_NAME = "case118"
-    rt.ACTIVE_SETS_FILE = case118_cfg.CASE118_ACTIVE_SET_JSON
+    try:
+        data_file = _resolve_case3lite_data_file()
+    except FileNotFoundError as e:
+        print(str(e), file=sys.stderr)
+        sys.exit(1)
+
+    rt.CASE_NAME = "case3lite"
+    try:
+        rt.ACTIVE_SETS_FILE = str(data_file.relative_to(ROOT)).replace("\\", "/")
+    except ValueError:
+        rt.ACTIVE_SETS_FILE = str(data_file)
     rt.MAX_SAMPLES = None
 
     rt.ensure_bcd_modules_imported()
-    data_file = Path(rt.ACTIVE_SETS_FILE)
-    if not data_file.is_absolute():
-        data_file = Path(__file__).resolve().parent / data_file
     all_samples = rt.load_active_set_from_json(str(data_file))
 
     if max_samples is not None and int(max_samples) > 0 and len(all_samples) > int(max_samples):
@@ -488,16 +491,12 @@ def main() -> None:
     out_dir = (
         Path(out_dir_override)
         if out_dir_override is not None
-        else Path("result") / "surrogate_models" / f"unit_predictor_case118_{timestamp}"
+        else Path("result") / "surrogate_models" / f"unit_predictor_case3lite_{timestamp}"
     )
     out_dir.mkdir(parents=True, exist_ok=True)
     save_path = out_dir / "unit_predictor.pth"
 
-    if unit_ids is None:
-        # 不指定则训练所有机组
-        unit_ids = None
-
-    ppc = get_case_ppc("case118")
+    ppc = get_case_ppc("case3lite")
     predictor = SingleUnitBinaryPredictorTrainer(
         ppc,
         train_samples,
@@ -526,17 +525,7 @@ def main() -> None:
     if _nv == "tcn_shared_film":
         print("-" * 60, flush=True)
         print(
-            "[架构] tcn_shared_film：单一共享模型，forward 输出 shape (B, ng, T)；"
-            "训练仅调用 train_all → train_all_shared_joint，故日志只有 [UnitPredictor-shared]。",
-            flush=True,
-        )
-        print(
-            "      阶段 B/C/D 选中部分机组时：仍是一次 joint 更新，仅通过 unit_loss_weights "
-            "提高选中机组在损失里的权重（不是 train_unit 单独优化子网）。",
-            flush=True,
-        )
-        print(
-            "      需要逐机组 train_unit 与独立日志时：将 net_variant 改为 mlp / tcn / tconv。",
+            "[架构] tcn_shared_film：日志为 [UnitPredictor-shared]，无逐机组 train_unit。",
             flush=True,
         )
         print("-" * 60, flush=True)
@@ -606,7 +595,6 @@ def main() -> None:
                 **extra_kwargs,
             )
         else:
-            # 共享模型不能逐机组训练，否则会反复覆盖共享骨干导致变差
             if str(net_variant).strip().lower() == "tcn_shared_film":
                 extra_kwargs = {}
                 boost = float(stage.get("selected_unit_boost", 3.0))
@@ -683,19 +671,17 @@ def main() -> None:
 
     predictor.save(str(save_path))
 
-    # 额外写一个“最新”指针文件，方便其它脚本引用
     latest_path = out_dir / "LATEST.txt"
     latest_path.write_text(str(save_path).replace("\\", "/"), encoding="utf-8")
 
-    print(f"✓ UnitPredictor 已保存: {save_path}", flush=True)
+    print(f"✓ UnitPredictor (case3lite) 已保存: {save_path}", flush=True)
     if predictor is not None:
+        print(f"  data_file={data_file}", flush=True)
         print(f"  out_dir={out_dir}", flush=True)
         print(f"  unit_ids={unit_ids!r}", flush=True)
         print(
             f"  train/val={len(train_samples)}/{len(val_samples)} seed={seed} "
-            f"net={net_variant} hidden_dims={hidden_dims} resmlp=({resmlp_width},{resmlp_depth}) "
-            f"tconv=({tconv_channels},{tconv_depth}) tcn=({tcn_channels},{tcn_depth}) "
-            f"dropout={dropout}",
+            f"net={net_variant} tcn=({tcn_channels},{tcn_depth}) dropout={dropout}",
             flush=True,
         )
 
@@ -712,7 +698,7 @@ def main() -> None:
             rows_sorted = sorted(rows, key=lambda r: float(r[1].get("mse", 1e9)), reverse=True)
             head_rows = rows_sorted if print_all_validation else rows_sorted[: int(max(1, validation_top_k))]
             if not print_all_validation:
-                print(f"  (showing worst-{len(head_rows)} by val MSE; set print_all_validation=True to show all)", flush=True)
+                print(f"  (showing worst-{len(head_rows)} by val MSE)", flush=True)
 
             bad_cnt = sum(1 for _, m in rows_sorted if float(m.get("mse", 0.0)) > float(target_mse))
             print(f"  summary: {bad_cnt}/{len(rows_sorted)} units have val_mse>{target_mse:.3f}", flush=True)
@@ -738,4 +724,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

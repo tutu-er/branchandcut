@@ -11,9 +11,14 @@
 在 ``_configure_subproblem_bcd`` 内已与 Case118 的 full-batch、学习率等对齐（见 ``CASE118_SUBPROBLEM_MAIN_DIRECT_EPOCHS``、
 ``CASE118_SUBPROBLEM_C_PG_DIRECT_EPOCHS`` 及紧随其后的 ``rt.SUBPROBLEM_*_DIRECT_*`` 赋值）；本轻量脚本不单独关闭该路径。
 
+Unit predictor（独立脚本 ``run_unit_predictor_case118.py`` 产出的 ``unit_predictor.pth``）由 ``run_training_case118``
+``CASE118_UNIT_PREDICTOR_*`` / ``_resolve_case118_unit_predictor_load_path`` 注入 ``run_training``（默认选用最新的
+``result/surrogate_models/unit_predictor_case118_*``）；可用环境变量 ``CASE118_UNIT_PREDICTOR_LOAD_PATH`` 覆盖。
+
 外循环轮次默认由 preset 决定（与 ``run_training_case118.CASE118_SUBPROBLEM_MAX_ITER_*`` 一致）；
 ``--preset`` 默认为 ``desktop``（与 ``run_training_case118.py`` 顶部一致）；predictor warmup 默认为 MaxIter 的 10%。
 可通过 ``--max-iter`` / ``--warmup-rounds`` 在命令行覆盖。
+``--sign4-delay-rounds`` 可在 ``all_templates_sign4_plus_single`` 下延期启用 sign4（详见 ``run_training_case118_subproblem_bcd.py`` 说明）。
 
 示例::
 
@@ -22,6 +27,7 @@
     python run_training_case118_subproblem_bcd_light.py --preset server --max-samples 32
     python run_training_case118_subproblem_bcd_light.py --units 0,1,2
     python run_training_case118_subproblem_bcd_light.py --max-iter 60 --warmup-rounds 6
+    python run_training_case118_subproblem_bcd_light.py --sign4-delay-rounds 5
 
 中等规模（服务器默认 64 样本 / server）::
 
@@ -92,6 +98,16 @@ def _parse_args() -> argparse.Namespace:
         ),
     )
     p.add_argument(
+        "--sign4-delay-rounds",
+        type=int,
+        default=None,
+        metavar="K",
+        help=(
+            "覆盖 SUBPROBLEM_SIGN4_DELAY_ROUNDS（sign4+single：前 K 轮 sign4 权重为 0）；"
+            "None 沿用 Case118 默认或 --max-iter 按比例重算"
+        ),
+    )
+    p.add_argument(
         "--delta-reference-lift",
         choices=("auto", "on", "off"),
         default="auto",
@@ -120,6 +136,8 @@ def main() -> None:
         case118_cfg.SUBPROBLEM_LIGHT_MAX_ITER = max(1, int(args.max_iter))
     if args.warmup_rounds is not None:
         case118_cfg.SUBPROBLEM_LIGHT_PREDICTOR_WARMUP_ROUNDS = max(0, int(args.warmup_rounds))
+    if args.sign4_delay_rounds is not None:
+        case118_cfg.SUBPROBLEM_LIGHT_SIGN4_DELAY_ROUNDS = max(0, int(args.sign4_delay_rounds))
     if args.delta_reference_lift == "auto":
         case118_cfg.CASE118_SUBPROBLEM_SURROGATE_DELTA_REFERENCE_LIFT = None
     else:

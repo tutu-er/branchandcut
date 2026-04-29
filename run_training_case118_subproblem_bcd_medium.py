@@ -6,6 +6,8 @@
 默认使用 **server** 预设（``CASE118_SUBPROBLEM_MAX_ITER_SERVER=200``、HiGHS 子问题 LP、较高并行度）、
 **64 个样本**、机组/样本并行度偏大。子问题超参仍全部由 ``run_training_case118.py`` 的 ``CASE118_SUBPROBLEM_*`` 决定。
 
+Unit predictor：与 light 入口相同，由 ``run_training_case118`` 解析 ``unit_predictor.pth``（见该模块文档）。
+
 可在命令行用与 light 相同的参数覆盖（如 ``--max-samples``、``--preset desktop``）。
 
 示例::

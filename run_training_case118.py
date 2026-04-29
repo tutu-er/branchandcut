@@ -13,6 +13,11 @@ Run from repo root::
 
 This wrapper reuses ``run_training.py`` and only overrides the configuration
 needed for the refined case118 dataset.
+
+独立脚本 ``run_unit_predictor_case118.py`` 产出的 ``unit_predictor.pth`` 由
+``CASE118_UNIT_PREDICTOR_*`` / ``_resolve_case118_unit_predictor_load_path`` 注入
+``run_training.UNIT_PREDICTOR_LOAD_PATH``；其它 ``run_training_case118*.py`` 入口均
+import 本模块并调用 ``main()``，无需重复配置。
 """
 
 from __future__ import annotations
@@ -33,6 +38,46 @@ SUBPROBLEM_SOLVE_PRESET = "desktop"  # "desktop" | "server"
 ROOT = Path(__file__).resolve().parent
 
 
+def _latest_standalone_unit_predictor_ckpt(repo_root: Path) -> str | None:
+    """选取 ``result/surrogate_models/unit_predictor_case118_*`` 下修改时间最新的 ``unit_predictor.pth``。"""
+    base = repo_root / "result" / "surrogate_models"
+    if not base.is_dir():
+        return None
+    best: tuple[float, Path] | None = None
+    for d in base.iterdir():
+        if not d.is_dir() or not d.name.startswith("unit_predictor_case118_"):
+            continue
+        ckpt = d / "unit_predictor.pth"
+        if ckpt.is_file():
+            mtime = ckpt.stat().st_mtime
+            if best is None or mtime > best[0]:
+                best = (mtime, ckpt)
+    return str(best[1].resolve()) if best else None
+
+
+def _resolve_case118_unit_predictor_load_path() -> str | None:
+    """解析子问题流程使用的 ``unit_predictor.pth``。
+
+    优先级：
+    1. 环境变量 ``CASE118_UNIT_PREDICTOR_LOAD_PATH``（非空）
+    2. 常量 ``CASE118_UNIT_PREDICTOR_LOAD_PATH``（非空）
+    3. ``CASE118_UNIT_PREDICTOR_AUTO_LATEST_STANDALONE`` 为 True 时：仓库内最新 standalone 产物
+    """
+    env = os.environ.get("CASE118_UNIT_PREDICTOR_LOAD_PATH", "").strip()
+    if env:
+        p = Path(env)
+        return str(p.resolve() if p.is_absolute() else (ROOT / p).resolve())
+    explicit = CASE118_UNIT_PREDICTOR_LOAD_PATH
+    if explicit and str(explicit).strip():
+        p = Path(str(explicit).strip())
+        return str(p.resolve() if p.is_absolute() else (ROOT / p).resolve())
+    if CASE118_UNIT_PREDICTOR_AUTO_LATEST_STANDALONE:
+        got = _latest_standalone_unit_predictor_ckpt(ROOT)
+        if got:
+            return got
+    return None
+
+
 def _round_pct(n: int, p: float) -> int:
     """对最大外循环轮次 ``n`` 按比例 ``p`` 四舍五入取整，且非负（子问题 BCD 常用）。"""
     return max(0, int(round(float(n) * float(p))))
@@ -40,6 +85,7 @@ def _round_pct(n: int, p: float) -> int:
 
 # 相对 ``SUBPROBLEM_MAX_ITER`` 的固定比例；具体整轮次 = ``_round_pct(max_iter, p)``（见下节预设）
 _CASE118_PCT_SUBPROBLEM_WARMUP = 0.10
+_CASE118_PCT_SUBPROBLEM_SIGN4_DELAY = 0.10  # sign4 全关阶段外循环轮数（与 max_iter 比例重算）
 _CASE118_PCT_SUBPROBLEM_MU_INDIVIDUAL = 0.19  # sign4 课程截止与 mu 个体 floor 阶段共用
 _CASE118_PCT_SUBPROBLEM_MU_DECAY = 0.38
 # c_pg 分支从外循环约 75% 轮次起启用（四舍五入）
@@ -77,6 +123,8 @@ SUBPROBLEM_LIGHT_N_WORKERS_SAMPLE: int | None = None
 # 可选：从命令行覆盖外循环轮次与 predictor warmup（None = 使用 preset 默认值）
 SUBPROBLEM_LIGHT_MAX_ITER: int | None = None
 SUBPROBLEM_LIGHT_PREDICTOR_WARMUP_ROUNDS: int | None = None
+# 覆盖 sign4 延期轮次（None=不覆盖；若与 --max-iter 同用，在本文件覆盖逻辑中优先于按比例重算）
+SUBPROBLEM_LIGHT_SIGN4_DELAY_ROUNDS: int | None = None
 # 仅训练部分机组时设为列表（如 [0, 1, 5]）；None 表示全部机组（case118 为 39 台，与 run_training.UNIT_IDS 一致）
 CASE118_SUBPROBLEM_UNIT_IDS: list[int] | None = None
 
@@ -137,9 +185,10 @@ CASE118_UNIT_PREDICTOR_FINETUNE_LR = 1e-5
 CASE118_UNIT_PREDICTOR_WEIGHT_DECAY = 1e-4
 # UnitPredictor（距离最小化）结构与损失配置
 CASE118_UNIT_PREDICTOR_NET_VARIANT = "tcn_shared_film"
-CASE118_UNIT_PREDICTOR_TCN_CHANNELS = 64
-CASE118_UNIT_PREDICTOR_TCN_DEPTH = 6
-CASE118_UNIT_PREDICTOR_DROPOUT = 0.1
+# 与 ``run_unit_predictor_case118.py`` 默认结构一致（加载 ckpt 时必须一致）
+CASE118_UNIT_PREDICTOR_TCN_CHANNELS = 160
+CASE118_UNIT_PREDICTOR_TCN_DEPTH = 9
+CASE118_UNIT_PREDICTOR_DROPOUT = 0.02
 # 预训练阶段：用纯 MSE 对齐 x_hat（避免拉长 epoch 导致 unit0/2 过拟合）
 CASE118_UNIT_PREDICTOR_LOSS_WEIGHT_BCE = 0.0
 CASE118_UNIT_PREDICTOR_LOSS_WEIGHT_MSE = 1.0
@@ -162,7 +211,10 @@ CASE118_UNIT_PREDICTOR_AUTO_EXTRA_TV_WEIGHT = 0.02
 # 若已用独立脚本训练好 unit_predictor，可在此指定目录/文件供主流程直接加载使用。
 # 须与当前 net_variant（见上 tcn_shared_film）及 TCN 宽度等超参一致；旧版 mlp 或不同 channels
 # 的 checkpoint 会几乎无法匹配（仅部分加载≈随机骨干）。默认 None：当次 run 内按 Case118 设定完整训练。
+# 显式指定 ``unit_predictor.pth``（文件或含 LATEST.txt 的目录）；None 则看 AUTO_LATEST / 环境变量
 CASE118_UNIT_PREDICTOR_LOAD_PATH: str | None = None
+# True：若 LOAD_PATH 与环境变量均未设置，自动使用 ``result/surrogate_models/unit_predictor_case118_*`` 中最新的 ckpt
+CASE118_UNIT_PREDICTOR_AUTO_LATEST_STANDALONE = True
 # 为 True 且 LOAD_PATH 非空时：跳过 unit1 extra TV 与 auto extra TV（只加载权重，不额外“预训练”）
 CASE118_UNIT_PREDICTOR_NO_FINETUNE_WHEN_LOADED = True
 
@@ -183,6 +235,8 @@ CASE118_SUBPROBLEM_PREDICTOR_WARMUP_ROUNDS_DESKTOP = _round_pct(
 )  # 10%*50  -> 5
 CASE118_SUBPROBLEM_SIGN4_INITIAL_SCALE = 0.20
 CASE118_SUBPROBLEM_SIGN4_FINAL_SCALE = 1.00
+# 默认 0：前若干外循环轮次 sign4 权重为 0（仅 single-time 生效）；>0 时与课程/CLI 覆盖配合
+CASE118_SUBPROBLEM_SIGN4_DELAY_ROUNDS = 0
 CASE118_SUBPROBLEM_SIGN4_CURRICULUM_ROUNDS_SERVER = _round_pct(
     CASE118_SUBPROBLEM_MAX_ITER_SERVER, _CASE118_PCT_SUBPROBLEM_MU_INDIVIDUAL
 )
@@ -469,6 +523,7 @@ def _configure_subproblem_bcd() -> None:
     rt.SUBPROBLEM_MU_DUAL_FLOOR_INIT = 0.25
     rt.SUBPROBLEM_SIGN4_INITIAL_SCALE = CASE118_SUBPROBLEM_SIGN4_INITIAL_SCALE
     rt.SUBPROBLEM_SIGN4_FINAL_SCALE = CASE118_SUBPROBLEM_SIGN4_FINAL_SCALE
+    rt.SUBPROBLEM_SIGN4_DELAY_ROUNDS = max(0, int(CASE118_SUBPROBLEM_SIGN4_DELAY_ROUNDS))
     rt.SUBPROBLEM_SURROGATE_DELTA_REFERENCE_LIFT = CASE118_SUBPROBLEM_SURROGATE_DELTA_REFERENCE_LIFT
     rt.SUBPROBLEM_SURROGATE_DELTA_REFERENCE_EPS = CASE118_SUBPROBLEM_SURROGATE_DELTA_REFERENCE_EPS
     rt.SUBPROBLEM_SURROGATE_DELTA_REFERENCE_SCOPE = CASE118_SUBPROBLEM_SURROGATE_DELTA_REFERENCE_SCOPE
@@ -547,10 +602,11 @@ def _configure_subproblem_bcd() -> None:
     rt.UNIT_PREDICTOR_AUTO_EXTRA_TV_EPOCHS = CASE118_UNIT_PREDICTOR_AUTO_EXTRA_TV_EPOCHS
     rt.UNIT_PREDICTOR_AUTO_EXTRA_TV_TV_THRESHOLD = CASE118_UNIT_PREDICTOR_AUTO_EXTRA_TV_TV_THRESHOLD
     rt.UNIT_PREDICTOR_AUTO_EXTRA_TV_WEIGHT = CASE118_UNIT_PREDICTOR_AUTO_EXTRA_TV_WEIGHT
-    rt.UNIT_PREDICTOR_LOAD_PATH = CASE118_UNIT_PREDICTOR_LOAD_PATH
+    resolved_up = _resolve_case118_unit_predictor_load_path()
+    rt.UNIT_PREDICTOR_LOAD_PATH = resolved_up
     if (
         CASE118_UNIT_PREDICTOR_NO_FINETUNE_WHEN_LOADED
-        and CASE118_UNIT_PREDICTOR_LOAD_PATH
+        and resolved_up
     ):
         rt.UNIT_PREDICTOR_UNIT1_EXTRA_TV_EPOCHS = 0
         rt.UNIT_PREDICTOR_AUTO_EXTRA_TV = False
@@ -593,9 +649,13 @@ def _apply_subproblem_light_runtime_overrides() -> bool:
         rt.SUBPROBLEM_PG_COST_START_ROUND = _round_pct(
             n, _CASE118_PCT_SUBPROBLEM_PG_COST_START
         )
+        rt.SUBPROBLEM_SIGN4_DELAY_ROUNDS = _round_pct(n, _CASE118_PCT_SUBPROBLEM_SIGN4_DELAY)
         changed = True
     if SUBPROBLEM_LIGHT_PREDICTOR_WARMUP_ROUNDS is not None:
         rt.SUBPROBLEM_PREDICTOR_WARMUP_ROUNDS = max(0, int(SUBPROBLEM_LIGHT_PREDICTOR_WARMUP_ROUNDS))
+        changed = True
+    if SUBPROBLEM_LIGHT_SIGN4_DELAY_ROUNDS is not None:
+        rt.SUBPROBLEM_SIGN4_DELAY_ROUNDS = max(0, int(SUBPROBLEM_LIGHT_SIGN4_DELAY_ROUNDS))
         changed = True
     return changed
 
@@ -651,7 +711,7 @@ def main() -> None:
             f"constraint_strategy={rt.SURROGATE_CONSTRAINT_STRATEGY}, "
             f"predictor_warmup_rounds={rt.SUBPROBLEM_PREDICTOR_WARMUP_ROUNDS}, "
             f"sign4_scale={rt.SUBPROBLEM_SIGN4_INITIAL_SCALE}->{rt.SUBPROBLEM_SIGN4_FINAL_SCALE}/"
-            f"{rt.SUBPROBLEM_SIGN4_CURRICULUM_ROUNDS}, "
+            f"{rt.SUBPROBLEM_SIGN4_CURRICULUM_ROUNDS}, sign4_delay={rt.SUBPROBLEM_SIGN4_DELAY_ROUNDS}, "
             f"delta_ref_lift={rt.SUBPROBLEM_SURROGATE_DELTA_REFERENCE_LIFT}/"
             f"{rt.SUBPROBLEM_SURROGATE_DELTA_REFERENCE_SCOPE}, "
             f"mu_individual_round={rt.SUBPROBLEM_MU_DUAL_FLOOR_INDIVIDUAL_ROUND}, "
@@ -705,6 +765,15 @@ def main() -> None:
             f"adam_wd={rt.SUBPROBLEM_NN_MAIN_ADAM_WEIGHT_DECAY}, "
             f"grad_clip={rt.SUBPROBLEM_NN_MAIN_GRAD_CLIP}, "
             f"kkt_lr_scale={rt.SUBPROBLEM_NN_MAIN_KKT_LR_SCALE}",
+            flush=True,
+        )
+        print(
+            "case118_unit_predictor: "
+            f"use={rt.USE_UNIT_PREDICTOR}, load_path={rt.UNIT_PREDICTOR_LOAD_PATH!r}, "
+            f"net={CASE118_UNIT_PREDICTOR_NET_VARIANT}, "
+            f"tcn_ch={CASE118_UNIT_PREDICTOR_TCN_CHANNELS}, depth={CASE118_UNIT_PREDICTOR_TCN_DEPTH}, "
+            f"dropout={CASE118_UNIT_PREDICTOR_DROPOUT}, "
+            f"auto_latest_standalone={CASE118_UNIT_PREDICTOR_AUTO_LATEST_STANDALONE}",
             flush=True,
         )
         if light_overrides:

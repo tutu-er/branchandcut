@@ -6,8 +6,15 @@
 仅训练部分机组：``--units 0,1,2`` 或在本仓库 ``run_training_case118.py`` 中设置
 ``CASE118_SUBPROBLEM_UNIT_IDS = [0, 1, 2]``。
 
+Unit predictor：由 ``run_training_case118`` 注入 standalone ``unit_predictor.pth``（默认最新 ``unit_predictor_case118_*``；
+环境变量 ``CASE118_UNIT_PREDICTOR_LOAD_PATH`` 可覆盖）。
+
 外循环轮次默认由 preset 决定（server=160，desktop=120）；predictor warmup 默认为 MaxIter 的 10%。
 可通过 ``--max-iter`` / ``--warmup-rounds`` 在命令行覆盖。
+
+在 ``all_templates_sign4_plus_single`` 策略下，``--sign4-delay-rounds K`` 表示前 ``K`` 个外循环轮次
+sign4 段权重强制为 0（仅训练 single-time 段）；仅靠将 ``sign4_initial_scale`` 设为 0 时，从第 1 轮起
+仍会按课程爬升，不能得到「前 K 轮完全无 sign4」的 plateau。
 
 示例::
 
@@ -15,6 +22,7 @@
     python run_training_case118_subproblem_bcd.py --units 0,1,2
     python run_training_case118_subproblem_bcd.py --preset desktop --max-iter 80
     python run_training_case118_subproblem_bcd.py --max-iter 200 --warmup-rounds 20
+    python run_training_case118_subproblem_bcd.py --sign4-delay-rounds 20
 """
 
 from __future__ import annotations
@@ -60,6 +68,16 @@ def _parse_args() -> argparse.Namespace:
         ),
     )
     p.add_argument(
+        "--sign4-delay-rounds",
+        type=int,
+        default=None,
+        metavar="K",
+        help=(
+            "覆盖 SUBPROBLEM_SIGN4_DELAY_ROUNDS：sign4+single 策略下前 K 轮 sign4 不参与（权重为 0）；"
+            "None 表示沿用 run_training_case118 默认值或 --max-iter 按比例重算"
+        ),
+    )
+    p.add_argument(
         "--delta-reference-lift",
         choices=("auto", "on", "off"),
         default="auto",
@@ -85,6 +103,8 @@ def main() -> None:
         case118_cfg.SUBPROBLEM_LIGHT_MAX_ITER = max(1, int(args.max_iter))
     if args.warmup_rounds is not None:
         case118_cfg.SUBPROBLEM_LIGHT_PREDICTOR_WARMUP_ROUNDS = max(0, int(args.warmup_rounds))
+    if args.sign4_delay_rounds is not None:
+        case118_cfg.SUBPROBLEM_LIGHT_SIGN4_DELAY_ROUNDS = max(0, int(args.sign4_delay_rounds))
     if args.delta_reference_lift == "auto":
         case118_cfg.CASE118_SUBPROBLEM_SURROGATE_DELTA_REFERENCE_LIFT = None
     else:

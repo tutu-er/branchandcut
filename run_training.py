@@ -152,6 +152,13 @@ UNIT_PREDICTOR_TV_FLOOR_SCALE = 0.8
 # - dir: 读取 <dir>/LATEST.txt 或 <dir>/unit_predictor.pth
 # - LATEST.txt: 读取其中指向的模型路径
 UNIT_PREDICTOR_LOAD_PATH = None
+# 当 UNIT_PREDICTOR_LOAD_PATH 为空时，自动查找
+# result/surrogate_models/unit_predictor_<CASE_NAME>_*/unit_predictor.pth。
+# 对 case3lite，这可直接复用 run_unit_predictor_case3lite.py 的 standalone 输出。
+UNIT_PREDICTOR_AUTO_LATEST_STANDALONE = True
+# 若加载的 unit_predictor checkpoint 含 metadata，则用其中的 net_variant / TCN 宽度等
+# 覆盖当前配置，避免用默认 MLP 去加载 tcn_shared_film checkpoint。
+UNIT_PREDICTOR_LOAD_METADATA_CONFIG = True
 # 可选：仅对 unit=1 追加 TV 微调（在预训练后对单个机组继续训练，避免拖累其它机组）
 UNIT_PREDICTOR_UNIT1_EXTRA_TV_EPOCHS = 0
 UNIT_PREDICTOR_UNIT1_EXTRA_TV_WEIGHT = 0.02
@@ -256,6 +263,7 @@ SUBPROBLEM_PREDICTOR_WARMUP_ROUNDS = round(SUBPROBLEM_MAX_ITER * 0.10)
 SUBPROBLEM_SIGN4_CURRICULUM_ROUNDS = 0
 SUBPROBLEM_SIGN4_INITIAL_SCALE = 1.0
 SUBPROBLEM_SIGN4_FINAL_SCALE = 1.0
+SUBPROBLEM_SIGN4_DELAY_ROUNDS = 0
 SUBPROBLEM_SURROGATE_DELTA_REFERENCE_LIFT = None  # None=auto: enable for sign4 strategies
 SUBPROBLEM_SURROGATE_DELTA_REFERENCE_EPS = 1e-6
 SUBPROBLEM_SURROGATE_DELTA_REFERENCE_SCOPE = "sign4_only"
@@ -747,6 +755,7 @@ def create_subproblem_trainer(ppc, all_samples, T_DELTA, unit_id: int, *,
                               sign4_curriculum_rounds: int = 0,
                               sign4_initial_scale: float = 1.0,
                               sign4_final_scale: float = 1.0,
+                              sign4_delay_rounds: int = 0,
                               enable_surrogate_delta_reference_lift: bool | None = None,
                               surrogate_delta_reference_eps: float = 1e-6,
                               surrogate_delta_reference_scope: str = "sign4_only",
@@ -822,6 +831,7 @@ def create_subproblem_trainer(ppc, all_samples, T_DELTA, unit_id: int, *,
         sign4_curriculum_rounds=sign4_curriculum_rounds,
         sign4_initial_scale=sign4_initial_scale,
         sign4_final_scale=sign4_final_scale,
+        sign4_delay_rounds=sign4_delay_rounds,
         enable_surrogate_delta_reference_lift=enable_surrogate_delta_reference_lift,
         surrogate_delta_reference_eps=surrogate_delta_reference_eps,
         surrogate_delta_reference_scope=surrogate_delta_reference_scope,
@@ -948,6 +958,7 @@ def run_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS,
                   sign4_curriculum_rounds: int = 0,
                   sign4_initial_scale: float = 1.0,
                   sign4_final_scale: float = 1.0,
+                  sign4_delay_rounds: int = 0,
                   enable_surrogate_delta_reference_lift: bool | None = None,
                   surrogate_delta_reference_eps: float = 1e-6,
                   surrogate_delta_reference_scope: str = "sign4_only",
@@ -1032,7 +1043,8 @@ def run_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS,
         f"main_direct_epochs={int((main_direct_train_config or {}).get('direct_epochs', 0) or 0)}, "
         f"c_pg_direct_epochs={int((c_pg_direct_train_config or {}).get('direct_epochs', 0) or 0)}, "
         f"predictor_warmup={predictor_warmup_rounds}, "
-        f"sign4_curriculum={sign4_initial_scale}->{sign4_final_scale}/{sign4_curriculum_rounds}"
+        f"sign4_curriculum={sign4_initial_scale}->{sign4_final_scale}/"
+        f"{sign4_curriculum_rounds}, sign4_delay={sign4_delay_rounds}"
     )
     log(
         f"iter_delta_reg: subproblem_weight={iter_delta_reg_weight}, "
@@ -1361,6 +1373,7 @@ def run_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS,
             sign4_curriculum_rounds=sign4_curriculum_rounds,
             sign4_initial_scale=sign4_initial_scale,
             sign4_final_scale=sign4_final_scale,
+            sign4_delay_rounds=sign4_delay_rounds,
             enable_surrogate_delta_reference_lift=enable_surrogate_delta_reference_lift,
             surrogate_delta_reference_eps=surrogate_delta_reference_eps,
             surrogate_delta_reference_scope=surrogate_delta_reference_scope,
@@ -1472,6 +1485,7 @@ def run_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS,
                 sign4_curriculum_rounds=sign4_curriculum_rounds,
                 sign4_initial_scale=sign4_initial_scale,
                 sign4_final_scale=sign4_final_scale,
+                sign4_delay_rounds=sign4_delay_rounds,
                 enable_surrogate_delta_reference_lift=enable_surrogate_delta_reference_lift,
                 surrogate_delta_reference_eps=surrogate_delta_reference_eps,
                 surrogate_delta_reference_scope=surrogate_delta_reference_scope,
@@ -1551,6 +1565,7 @@ def run_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS,
                 sign4_curriculum_rounds=sign4_curriculum_rounds,
                 sign4_initial_scale=sign4_initial_scale,
                 sign4_final_scale=sign4_final_scale,
+                sign4_delay_rounds=sign4_delay_rounds,
                 enable_surrogate_delta_reference_lift=enable_surrogate_delta_reference_lift,
                 surrogate_delta_reference_eps=surrogate_delta_reference_eps,
                 surrogate_delta_reference_scope=surrogate_delta_reference_scope,
@@ -2170,10 +2185,168 @@ def run_feasibility_pump_test(ppc, all_samples, dual_predictor, trainers,
     return results
 
 
+def _case_env_prefix(case_name: str) -> str:
+    return re.sub(r"[^A-Za-z0-9]+", "_", str(case_name).upper())
+
+
+def _resolve_unit_predictor_checkpoint_path(raw_path: str | os.PathLike | None) -> Path | None:
+    """Resolve file/dir/LATEST.txt forms used by standalone UnitPredictor scripts."""
+    if raw_path is None:
+        return None
+    text = str(raw_path).strip()
+    if not text:
+        return None
+
+    root = Path(__file__).parent
+    p = Path(text)
+    if not p.is_absolute():
+        p = root / p
+
+    if p.is_dir():
+        latest = p / "LATEST.txt"
+        if latest.is_file():
+            target = latest.read_text(encoding="utf-8").strip()
+            if target:
+                t = Path(target)
+                if t.is_absolute():
+                    return t.resolve()
+                cand = (p / t).resolve()
+                if cand.exists():
+                    return cand
+                return (root / t).resolve()
+        return (p / "unit_predictor.pth").resolve()
+
+    if p.is_file() and p.name.lower() == "latest.txt":
+        target = p.read_text(encoding="utf-8").strip()
+        if not target:
+            return None
+        t = Path(target)
+        if t.is_absolute():
+            return t.resolve()
+        cand = (p.parent / t).resolve()
+        if cand.exists():
+            return cand
+        return (root / t).resolve()
+
+    return p.resolve()
+
+
+def _latest_standalone_unit_predictor_ckpt(case_name: str) -> Path | None:
+    base = Path(__file__).parent / "result" / "surrogate_models"
+    if not base.is_dir():
+        return None
+    prefix = f"unit_predictor_{case_name}_"
+    best: tuple[float, Path] | None = None
+    for d in base.iterdir():
+        if not d.is_dir() or not d.name.startswith(prefix):
+            continue
+        ckpt = d / "unit_predictor.pth"
+        if not ckpt.is_file():
+            continue
+        mtime = ckpt.stat().st_mtime
+        if best is None or mtime > best[0]:
+            best = (mtime, ckpt)
+    return best[1].resolve() if best else None
+
+
+def _read_unit_predictor_metadata(checkpoint_path: Path) -> dict:
+    try:
+        import torch
+
+        state = torch.load(str(checkpoint_path), map_location="cpu")
+        meta = state.get("metadata", {}) if isinstance(state, dict) else {}
+        return dict(meta or {})
+    except Exception as exc:
+        log(f"[unit_predictor] 无法读取 checkpoint metadata（将沿用当前配置）: {checkpoint_path} ({exc})")
+        return {}
+
+
+def _apply_unit_predictor_metadata_config(metadata: dict) -> bool:
+    if not metadata:
+        return False
+    global UNIT_PREDICTOR_HIDDEN_DIMS
+    global UNIT_PREDICTOR_NET_VARIANT
+    global UNIT_PREDICTOR_TCN_CHANNELS
+    global UNIT_PREDICTOR_TCN_DEPTH
+    global UNIT_PREDICTOR_TCONV_CHANNELS
+    global UNIT_PREDICTOR_TCONV_DEPTH
+    global UNIT_PREDICTOR_DROPOUT
+
+    changed = False
+    if metadata.get("hidden_dims") is not None:
+        UNIT_PREDICTOR_HIDDEN_DIMS = list(metadata["hidden_dims"])
+        changed = True
+    if metadata.get("net_variant") is not None:
+        UNIT_PREDICTOR_NET_VARIANT = str(metadata["net_variant"])
+        changed = True
+    if metadata.get("tcn_channels") is not None:
+        UNIT_PREDICTOR_TCN_CHANNELS = int(metadata["tcn_channels"])
+        changed = True
+    if metadata.get("tcn_depth") is not None:
+        UNIT_PREDICTOR_TCN_DEPTH = int(metadata["tcn_depth"])
+        changed = True
+    if metadata.get("tconv_channels") is not None:
+        UNIT_PREDICTOR_TCONV_CHANNELS = int(metadata["tconv_channels"])
+        changed = True
+    if metadata.get("tconv_depth") is not None:
+        UNIT_PREDICTOR_TCONV_DEPTH = int(metadata["tconv_depth"])
+        changed = True
+    if metadata.get("dropout") is not None:
+        UNIT_PREDICTOR_DROPOUT = float(metadata["dropout"])
+        changed = True
+    return changed
+
+
+def _configure_unit_predictor_load_path_from_runtime() -> None:
+    """Apply case/env/standalone UnitPredictor runtime defaults before config snapshot."""
+    global UNIT_PREDICTOR_LOAD_PATH
+
+    if not bool(USE_UNIT_PREDICTOR):
+        return
+
+    case_prefix = _case_env_prefix(CASE_NAME)
+    env_specific = os.environ.get(f"{case_prefix}_UNIT_PREDICTOR_LOAD_PATH", "").strip()
+    env_generic = os.environ.get("UNIT_PREDICTOR_LOAD_PATH", "").strip()
+
+    configured = UNIT_PREDICTOR_LOAD_PATH
+    source = "configured"
+    if env_specific:
+        configured = env_specific
+        source = f"env:{case_prefix}_UNIT_PREDICTOR_LOAD_PATH"
+    elif env_generic:
+        configured = env_generic
+        source = "env:UNIT_PREDICTOR_LOAD_PATH"
+
+    resolved = _resolve_unit_predictor_checkpoint_path(configured)
+    if resolved is None and bool(UNIT_PREDICTOR_AUTO_LATEST_STANDALONE):
+        resolved = _latest_standalone_unit_predictor_ckpt(CASE_NAME)
+        source = "auto_latest_standalone"
+
+    if resolved is None:
+        return
+
+    UNIT_PREDICTOR_LOAD_PATH = str(resolved)
+    if bool(UNIT_PREDICTOR_LOAD_METADATA_CONFIG) and resolved.is_file():
+        metadata = _read_unit_predictor_metadata(resolved)
+        if _apply_unit_predictor_metadata_config(metadata):
+            log(
+                "[unit_predictor] 已按 checkpoint metadata 对齐配置: "
+                f"source={source}, path={resolved}, "
+                f"net={UNIT_PREDICTOR_NET_VARIANT}, "
+                f"tcn=({UNIT_PREDICTOR_TCN_CHANNELS},{UNIT_PREDICTOR_TCN_DEPTH}), "
+                f"tconv=({UNIT_PREDICTOR_TCONV_CHANNELS},{UNIT_PREDICTOR_TCONV_DEPTH}), "
+                f"dropout={UNIT_PREDICTOR_DROPOUT}"
+            )
+            return
+
+    log(f"[unit_predictor] 使用 standalone checkpoint: source={source}, path={resolved}")
+
+
 # ──────────────────────── 主函数 ────────────────────────
 
 def main():
     _bootstrap_runtime_environment()
+    _configure_unit_predictor_load_path_from_runtime()
     start_time = time.time()
 
     print("=" * 70)
@@ -2288,6 +2461,7 @@ def main():
     SUBPROBLEM_SIGN4_CURRICULUM_ROUNDS_VALUE = SUBPROBLEM_SIGN4_CURRICULUM_ROUNDS
     SUBPROBLEM_SIGN4_INITIAL_SCALE_VALUE = SUBPROBLEM_SIGN4_INITIAL_SCALE
     SUBPROBLEM_SIGN4_FINAL_SCALE_VALUE = SUBPROBLEM_SIGN4_FINAL_SCALE
+    SUBPROBLEM_SIGN4_DELAY_ROUNDS_VALUE = SUBPROBLEM_SIGN4_DELAY_ROUNDS
     SUBPROBLEM_SURROGATE_DELTA_REFERENCE_LIFT_VALUE = SUBPROBLEM_SURROGATE_DELTA_REFERENCE_LIFT
     SUBPROBLEM_SURROGATE_DELTA_REFERENCE_EPS_VALUE = SUBPROBLEM_SURROGATE_DELTA_REFERENCE_EPS
     SUBPROBLEM_SURROGATE_DELTA_REFERENCE_SCOPE_VALUE = SUBPROBLEM_SURROGATE_DELTA_REFERENCE_SCOPE
@@ -2376,6 +2550,16 @@ def main():
     log(
         f"Iteration config: bcd_max_iter={BCD_MAX_ITER_VALUE}, "
         f"subproblem_max_iter={SUBPROBLEM_MAX_ITER_VALUE}, joint_max_iter={JOINT_MAX_ITER}"
+    )
+    log(
+        f"UnitPredictor config: use={USE_UNIT_PREDICTOR_VALUE}, "
+        f"load_path={UNIT_PREDICTOR_LOAD_PATH_VALUE!r}, "
+        f"auto_latest={UNIT_PREDICTOR_AUTO_LATEST_STANDALONE}, "
+        f"net={UNIT_PREDICTOR_NET_VARIANT_VALUE}, "
+        f"tcn=({UNIT_PREDICTOR_TCN_CHANNELS_VALUE},{UNIT_PREDICTOR_TCN_DEPTH_VALUE}), "
+        f"tconv=({UNIT_PREDICTOR_TCONV_CHANNELS_VALUE},{UNIT_PREDICTOR_TCONV_DEPTH_VALUE}), "
+        f"dropout={UNIT_PREDICTOR_DROPOUT_VALUE}, "
+        f"predictor_warmup_rounds={SUBPROBLEM_PREDICTOR_WARMUP_ROUNDS_VALUE}"
     )
 
     # ── 查找数据文件 ─────────────────────────────────────
@@ -2639,6 +2823,7 @@ def main():
                     sign4_curriculum_rounds=SUBPROBLEM_SIGN4_CURRICULUM_ROUNDS_VALUE,
                     sign4_initial_scale=SUBPROBLEM_SIGN4_INITIAL_SCALE_VALUE,
                     sign4_final_scale=SUBPROBLEM_SIGN4_FINAL_SCALE_VALUE,
+                    sign4_delay_rounds=SUBPROBLEM_SIGN4_DELAY_ROUNDS_VALUE,
                     enable_surrogate_delta_reference_lift=SUBPROBLEM_SURROGATE_DELTA_REFERENCE_LIFT_VALUE,
                     surrogate_delta_reference_eps=SUBPROBLEM_SURROGATE_DELTA_REFERENCE_EPS_VALUE,
                     surrogate_delta_reference_scope=SUBPROBLEM_SURROGATE_DELTA_REFERENCE_SCOPE_VALUE,
@@ -3010,6 +3195,7 @@ def main():
                     sign4_curriculum_rounds=SUBPROBLEM_SIGN4_CURRICULUM_ROUNDS_VALUE,
                     sign4_initial_scale=SUBPROBLEM_SIGN4_INITIAL_SCALE_VALUE,
                     sign4_final_scale=SUBPROBLEM_SIGN4_FINAL_SCALE_VALUE,
+                    sign4_delay_rounds=SUBPROBLEM_SIGN4_DELAY_ROUNDS_VALUE,
                     enable_surrogate_delta_reference_lift=SUBPROBLEM_SURROGATE_DELTA_REFERENCE_LIFT_VALUE,
                     surrogate_delta_reference_eps=SUBPROBLEM_SURROGATE_DELTA_REFERENCE_EPS_VALUE,
                     surrogate_delta_reference_scope=SUBPROBLEM_SURROGATE_DELTA_REFERENCE_SCOPE_VALUE,

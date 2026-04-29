@@ -157,6 +157,7 @@ class ParallelSubproblemSurrogateTrainer(SubproblemSurrogateTrainer):
         sign4_curriculum_rounds: int = 0,
         sign4_initial_scale: float = 1.0,
         sign4_final_scale: float = 1.0,
+        sign4_delay_rounds: int = 0,
         unit_predictor_finetune_lr: float = 1e-5,
         unit_predictor_weight_decay: float = 1e-4,
         pg_cost_single_sample_reg_scale: float | None = None,
@@ -237,6 +238,7 @@ class ParallelSubproblemSurrogateTrainer(SubproblemSurrogateTrainer):
             sign4_curriculum_rounds=sign4_curriculum_rounds,
             sign4_initial_scale=sign4_initial_scale,
             sign4_final_scale=sign4_final_scale,
+            sign4_delay_rounds=sign4_delay_rounds,
             unit_predictor_finetune_lr=unit_predictor_finetune_lr,
             unit_predictor_weight_decay=unit_predictor_weight_decay,
             pg_cost_single_sample_reg_scale=pg_cost_single_sample_reg_scale,
@@ -288,6 +290,7 @@ class ParallelSubproblemSurrogateTrainer(SubproblemSurrogateTrainer):
             'sign4_curriculum_rounds': int(self.sign4_curriculum_rounds),
             'sign4_initial_scale': float(self.sign4_initial_scale),
             'sign4_final_scale': float(self.sign4_final_scale),
+            'sign4_delay_rounds': int(getattr(self, 'sign4_delay_rounds', 0)),
             'mu_lower_bound': float(self.mu_lower_bound),
             'mu_individual_lower_bound_round': int(self.mu_individual_lower_bound_round),
             'mu_group_lower_bound_round': int(self.mu_group_lower_bound_round),
@@ -631,9 +634,14 @@ class _SampleWorkerTrainerProxy(SimpleNamespace):
         rounds = max(int(getattr(self, 'sign4_curriculum_rounds', 0) or 0), 0)
         initial = max(float(getattr(self, 'sign4_initial_scale', 1.0) or 0.0), 0.0)
         final = max(float(getattr(self, 'sign4_final_scale', 1.0) or 0.0), 0.0)
+        delay = max(int(getattr(self, 'sign4_delay_rounds', 0) or 0), 0)
+        iter_n = float(getattr(self, 'iter_number', 0))
+        if delay > 0 and iter_n < float(delay):
+            return 0.0
+        effective_iter = max(iter_n - float(delay), 0.0)
         if rounds <= 0:
             return final
-        progress = min(max(float(getattr(self, 'iter_number', 0)), 0.0) / float(rounds), 1.0)
+        progress = min(max(effective_iter, 0.0) / float(rounds), 1.0)
         return initial + (final - initial) * progress
 
     def _sign4_curriculum_factors(self, size: int) -> np.ndarray:
@@ -827,6 +835,7 @@ def _train_unit_worker(args: dict) -> dict:
     sign4_curriculum_rounds = args.get('sign4_curriculum_rounds', 0)
     sign4_initial_scale = args.get('sign4_initial_scale', 1.0)
     sign4_final_scale = args.get('sign4_final_scale', 1.0)
+    sign4_delay_rounds = args.get('sign4_delay_rounds', 0)
     enable_surrogate_delta_reference_lift = args.get('enable_surrogate_delta_reference_lift', None)
     surrogate_delta_reference_eps = args.get('surrogate_delta_reference_eps', 1e-6)
     surrogate_delta_reference_scope = args.get('surrogate_delta_reference_scope', "sign4_only")
@@ -972,6 +981,7 @@ def _train_unit_worker(args: dict) -> dict:
             sign4_curriculum_rounds=sign4_curriculum_rounds,
             sign4_initial_scale=sign4_initial_scale,
             sign4_final_scale=sign4_final_scale,
+            sign4_delay_rounds=sign4_delay_rounds,
             enable_surrogate_delta_reference_lift=enable_surrogate_delta_reference_lift,
             surrogate_delta_reference_eps=surrogate_delta_reference_eps,
             surrogate_delta_reference_scope=surrogate_delta_reference_scope,
@@ -1048,6 +1058,7 @@ def _train_unit_worker(args: dict) -> dict:
             sign4_curriculum_rounds=sign4_curriculum_rounds,
             sign4_initial_scale=sign4_initial_scale,
             sign4_final_scale=sign4_final_scale,
+            sign4_delay_rounds=sign4_delay_rounds,
             enable_surrogate_delta_reference_lift=enable_surrogate_delta_reference_lift,
             surrogate_delta_reference_eps=surrogate_delta_reference_eps,
             surrogate_delta_reference_scope=surrogate_delta_reference_scope,
@@ -1282,6 +1293,7 @@ def train_all_surrogates_parallel(
     sign4_curriculum_rounds: int = 0,
     sign4_initial_scale: float = 1.0,
     sign4_final_scale: float = 1.0,
+    sign4_delay_rounds: int = 0,
     enable_surrogate_delta_reference_lift: bool | None = None,
     surrogate_delta_reference_eps: float = 1e-6,
     surrogate_delta_reference_scope: str = "sign4_only",
@@ -1448,6 +1460,7 @@ def train_all_surrogates_parallel(
             'sign4_curriculum_rounds': sign4_curriculum_rounds,
             'sign4_initial_scale': sign4_initial_scale,
             'sign4_final_scale': sign4_final_scale,
+            'sign4_delay_rounds': sign4_delay_rounds,
             'enable_surrogate_delta_reference_lift': enable_surrogate_delta_reference_lift,
             'surrogate_delta_reference_eps': surrogate_delta_reference_eps,
             'surrogate_delta_reference_scope': surrogate_delta_reference_scope,
