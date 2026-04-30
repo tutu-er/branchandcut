@@ -401,6 +401,7 @@ try:
         ActiveSetReader,
         load_trained_models,
         resolve_constraint_offsets_from_trainer,
+        normalize_constraint_generation_strategy,
     )
     from uc_NN_subproblem_parallel import ParallelSubproblemSurrogateTrainer
     from case_registry import get_case_ppc
