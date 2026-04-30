@@ -43,6 +43,8 @@ for _p in [str(_SRC_DIR), str(_ROOT_DIR)]:
         sys.path.insert(0, _p)
 
 from uc_NN_subproblem import (
+    CONSTRAINT_STRATEGY_ALL_TEMPLATES_SIGN4,
+    CONSTRAINT_STRATEGY_ALL_TEMPLATES_SIGN4_PLUS_SINGLE,
     LP_BACKEND_CVXPY_HIGHS,
     LP_BACKEND_GUROBI,
     SubproblemSurrogateTrainer,
@@ -297,6 +299,9 @@ class ParallelSubproblemSurrogateTrainer(SubproblemSurrogateTrainer):
             'mu_signed_round_interval': int(self.mu_signed_round_interval),
             'x_bound_dual_zero_rounds': int(self.x_bound_dual_zero_rounds),
             'iter_number': int(self.iter_number),
+            '_mu_sign_relaxation_last_iter': int(
+                getattr(self, '_mu_sign_relaxation_last_iter', 10**9)
+            ),
             'use_group_mu_lower_bound': bool(self._uses_group_mu_lower_bound()),
             'surrogate_direction_signs': self._get_surrogate_direction_signs(),
             'pg': [np.asarray(self.pg[sample_id], dtype=float).copy()],
@@ -676,6 +681,22 @@ class _SampleWorkerTrainerProxy(SimpleNamespace):
     def _uses_group_mu_lower_bound(self) -> bool:
         return bool(self.use_group_mu_lower_bound)
 
+    def _mu_floor_schedule_iter(self) -> int:
+        """与 ``SubproblemSurrogateTrainer._mu_floor_schedule_iter`` 一致（worker 仅用标量快照）。"""
+        delay = max(int(getattr(self, 'sign4_delay_rounds', 0) or 0), 0)
+        if delay <= 0:
+            return int(self.iter_number)
+        strategy = str(getattr(self, 'constraint_generation_strategy', '') or '')
+        if strategy not in {
+            CONSTRAINT_STRATEGY_ALL_TEMPLATES_SIGN4,
+            CONSTRAINT_STRATEGY_ALL_TEMPLATES_SIGN4_PLUS_SINGLE,
+        }:
+            return int(self.iter_number)
+        i = int(self.iter_number)
+        if i < delay:
+            return -1
+        return i - delay
+
     def _get_mu_lower_bound_phase(self) -> str:
         t = self._mu_floor_schedule_iter()
         if t < 0:
@@ -690,7 +711,16 @@ class _SampleWorkerTrainerProxy(SimpleNamespace):
         return self.mu_lower_bound if self._get_mu_lower_bound_phase() != "none" else 0.0
 
     def _is_mu_sign_relaxation_round(self) -> bool:
-        return super()._is_mu_sign_relaxation_round()
+        interval = int(getattr(self, 'mu_signed_round_interval', 0) or 0)
+        lb = float(self._current_mu_lower_bound_value())
+        cutoff = int(getattr(self, '_mu_sign_relaxation_last_iter', 10**9))
+        if int(getattr(self, 'iter_number', 0)) >= cutoff:
+            return False
+        return (
+            interval > 0
+            and lb > 0.0
+            and ((int(self.iter_number) + 1) % interval == 0)
+        )
 
     def _force_zero_x_bound_duals(self) -> bool:
         return self.iter_number < self.x_bound_dual_zero_rounds
