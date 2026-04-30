@@ -126,7 +126,7 @@ SUBPROBLEM_LIGHT_PREDICTOR_WARMUP_ROUNDS: int | None = None
 # 覆盖 sign4 延期轮次（None=不覆盖；若与 --max-iter 同用，在本文件覆盖逻辑中优先于按比例重算）
 SUBPROBLEM_LIGHT_SIGN4_DELAY_ROUNDS: int | None = None
 # 仅训练部分机组时设为列表（如 [0, 1, 5]）；None 表示全部机组（case118 为 39 台，与 run_training.UNIT_IDS 一致）
-CASE118_SUBPROBLEM_UNIT_IDS: list[int] | None = None
+CASE118_SUBPROBLEM_UNIT_IDS: list[int] | None = [0]
 
 # ── Case118 子问题 c_pg（发电边际修正头）────────────────────────────────
 # 与 118 节点系统、裁剪电价 λ 的典型量级及较长子问题 BCD 外循环对齐：
@@ -225,6 +225,7 @@ CASE118_BCD_DUAL_SIGN_RELAX_INTERVAL = 10
 # ── 子问题 BCD：max_iter 与「相对外循环总轮次」的百分比取整（与轻量覆盖逻辑共用比例常量）
 # server: 更长的外循环；desktop: 本地缩短。
 # 时序例（200 轮, 四舍五入）: warmup 20(10%) < μ 个体 / sign4 止 38(19%) < μ 衰减 76(38%) < c_pg 150(75%)
+# 使用 Sign4 延期时：上述 μ 阶段阈值从「Sign4 权重非零起始外循环」起算（非从第 0 轮起算）；符号松弛截止轮亦按延期后有效跨度折半。
 CASE118_SUBPROBLEM_MAX_ITER_SERVER = 200
 CASE118_SUBPROBLEM_MAX_ITER_DESKTOP = 50
 CASE118_SUBPROBLEM_PREDICTOR_WARMUP_ROUNDS_SERVER = _round_pct(
@@ -261,6 +262,31 @@ CASE118_SUBPROBLEM_MU_DECAY_ROUND_SERVER = _round_pct(
 CASE118_SUBPROBLEM_MU_DECAY_ROUND_DESKTOP = _round_pct(
     CASE118_SUBPROBLEM_MAX_ITER_DESKTOP, _CASE118_PCT_SUBPROBLEM_MU_DECAY
 )
+
+
+def default_subproblem_entry_sign4_delay_rounds(
+    *,
+    preset: str,
+    max_iter_cli: int | None,
+    sign4_cli: int | None,
+) -> int | None:
+    """供子问题 BCD 入口脚本设置 ``SUBPROBLEM_LIGHT_SIGN4_DELAY_ROUNDS``。
+
+    - 显式 ``sign4_cli``：返回该非负整数值；
+    - 已传 ``max_iter_cli``：返回 ``None``（由 `_apply_subproblem_light_runtime_overrides` 对 n 使用
+      ``_CASE118_PCT_SUBPROBLEM_SIGN4_DELAY`` 计算）；
+    - 否则：按 preset 默认 max_iter 的同一比例（``_round_pct``）。
+    """
+    if sign4_cli is not None:
+        return max(0, int(sign4_cli))
+    if max_iter_cli is not None:
+        return None
+    n = (
+        CASE118_SUBPROBLEM_MAX_ITER_SERVER
+        if preset == "server"
+        else CASE118_SUBPROBLEM_MAX_ITER_DESKTOP
+    )
+    return _round_pct(max(1, int(n)), _CASE118_PCT_SUBPROBLEM_SIGN4_DELAY)
 
 
 def _cpu_count() -> int:
@@ -508,7 +534,7 @@ def _configure_subproblem_bcd() -> None:
     rt.SUBPROBLEM_NN_MAIN_KKT_LR_SCALE = CASE118_SUBPROBLEM_NN_MAIN_KKT_LR_SCALE
 
     # 与 SubproblemSurrogateTrainer.ignore_startup_shutdown_costs 一致：init LP（solve_init_lp /
-    # Gurobi init）、primal_block、CVXPY primal、dual_block 均用 sc=shc=0，仍保留 coc 变量与非负约束。
+    # Gurobi init）、primal_block、CVXPY primal、dual_block 均用 sc=shc=0；**无负荷成本系数 b（gencost[:,-1]/T_delta）亦置零**，仍保留 coc 变量与非负约束。
     rt.SUBPROBLEM_IGNORE_STARTUP_SHUTDOWN_COSTS = True
     rt.SUBPROBLEM_GAMMA_BASE = 1e-3
     rt.SUBPROBLEM_RHO_PRIMAL_INIT = 1e-1

@@ -731,7 +731,7 @@ def _x_stationarity_inherent_terms(trainer, sample_id: int) -> np.ndarray:
     g = int(trainer.unit_id)
     lam_inh = trainer.lambda_inherent[sample_id]
     out = np.zeros(int(trainer.T), dtype=np.float64)
-    b_val = float(trainer.gencost[g, -1] / trainer.T_delta)
+    b_val = float(trainer.subproblem_generation_no_load_coeff(g))
     pmin_v = float(trainer.gen[g, PMIN])
     pmax_v = float(trainer.gen[g, PMAX])
     ru_v = float(trainer.Ru_all[g])

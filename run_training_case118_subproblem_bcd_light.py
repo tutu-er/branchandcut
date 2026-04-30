@@ -18,7 +18,8 @@ Unit predictor（独立脚本 ``run_unit_predictor_case118.py`` 产出的 ``unit
 外循环轮次默认由 preset 决定（与 ``run_training_case118.CASE118_SUBPROBLEM_MAX_ITER_*`` 一致）；
 ``--preset`` 默认为 ``desktop``（与 ``run_training_case118.py`` 顶部一致）；predictor warmup 默认为 MaxIter 的 10%。
 可通过 ``--max-iter`` / ``--warmup-rounds`` 在命令行覆盖。
-``--sign4-delay-rounds`` 可在 ``all_templates_sign4_plus_single`` 下延期启用 sign4（详见 ``run_training_case118_subproblem_bcd.py`` 说明）。
+默认 **Sign4 延期** 为当前 ``max_iter`` 的 10%（四舍五入）；未传 ``--max-iter`` 时按 preset 默认轮次计算。
+可用 ``--sign4-delay-rounds K`` 显式覆盖（详见 ``run_training_case118_subproblem_bcd.py`` 说明）。
 
 示例::
 
@@ -104,7 +105,7 @@ def _parse_args() -> argparse.Namespace:
         metavar="K",
         help=(
             "覆盖 SUBPROBLEM_SIGN4_DELAY_ROUNDS（sign4+single：前 K 轮 sign4 权重为 0）；"
-            "None 沿用 Case118 默认或 --max-iter 按比例重算"
+            "默认按当前 max_iter 的 10%%（未传 --max-iter 时用 preset 默认 max_iter）"
         ),
     )
     p.add_argument(
@@ -136,8 +137,13 @@ def main() -> None:
         case118_cfg.SUBPROBLEM_LIGHT_MAX_ITER = max(1, int(args.max_iter))
     if args.warmup_rounds is not None:
         case118_cfg.SUBPROBLEM_LIGHT_PREDICTOR_WARMUP_ROUNDS = max(0, int(args.warmup_rounds))
-    if args.sign4_delay_rounds is not None:
-        case118_cfg.SUBPROBLEM_LIGHT_SIGN4_DELAY_ROUNDS = max(0, int(args.sign4_delay_rounds))
+    delay_resolved = case118_cfg.default_subproblem_entry_sign4_delay_rounds(
+        preset=args.preset,
+        max_iter_cli=args.max_iter,
+        sign4_cli=args.sign4_delay_rounds,
+    )
+    if delay_resolved is not None:
+        case118_cfg.SUBPROBLEM_LIGHT_SIGN4_DELAY_ROUNDS = int(delay_resolved)
     if args.delta_reference_lift == "auto":
         case118_cfg.CASE118_SUBPROBLEM_SURROGATE_DELTA_REFERENCE_LIFT = None
     else:

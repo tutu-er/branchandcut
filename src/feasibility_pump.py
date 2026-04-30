@@ -1667,10 +1667,10 @@ def _solve_unit_surrogate_model(
             for t1 in range(T - tau):
                 model.addConstr(-x[t1+1] + x[t1] <= 1 - x[t1+tau])
 
+        b_nl = trainer.subproblem_generation_no_load_coeff(g)
         for t in range(T):
             model.addConstr(
-                cpower[t] >= trainer.gencost[g, -2] / trainer.T_delta * pg[t]
-                           + trainer.gencost[g, -1] / trainer.T_delta * x[t]
+                cpower[t] >= trainer.gencost[g, -2] / trainer.T_delta * pg[t] + b_nl * x[t]
             )
 
         surrogate_slacks = []
@@ -2309,9 +2309,13 @@ def solve_global_LP_relaxation(
                 )
 
             for t in range(T):
+                b_nl = (
+                    trainers[g].subproblem_generation_no_load_coeff(g)
+                    if g in trainers
+                    else float(gencost[g, -1]) / T_delta
+                )
                 model.addConstr(
-                    cpower[g, t] >= gencost[g, -2] / T_delta * pg[g, t]
-                                   + gencost[g, -1] / T_delta * x[g, t]
+                    cpower[g, t] >= gencost[g, -2] / T_delta * pg[g, t] + b_nl * x[g, t]
                 )
 
             if g in trainers:

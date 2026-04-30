@@ -9,6 +9,8 @@
 Unit predictor：与 light 入口相同，由 ``run_training_case118`` 解析 ``unit_predictor.pth``（见该模块文档）。
 
 可在命令行用与 light 相同的参数覆盖（如 ``--max-samples``、``--preset desktop``）。
+默认 **Sign4 延期** 为当前 ``max_iter`` 的 10%；未传 ``--max-iter`` 时按 preset 默认轮次计算；
+``--sign4-delay-rounds`` 可显式覆盖。
 
 示例::
 
@@ -87,6 +89,15 @@ def _parse_args() -> argparse.Namespace:
         ),
     )
     p.add_argument(
+        "--sign4-delay-rounds",
+        type=int,
+        default=None,
+        metavar="K",
+        help=(
+            "覆盖 SUBPROBLEM_SIGN4_DELAY_ROUNDS；默认 max_iter 的 10%%（未传 --max-iter 时用 preset 默认）"
+        ),
+    )
+    p.add_argument(
         "--delta-reference-lift",
         choices=("auto", "on", "off"),
         default="auto",
@@ -115,6 +126,13 @@ def main() -> None:
         case118_cfg.SUBPROBLEM_LIGHT_MAX_ITER = max(1, int(args.max_iter))
     if args.warmup_rounds is not None:
         case118_cfg.SUBPROBLEM_LIGHT_PREDICTOR_WARMUP_ROUNDS = max(0, int(args.warmup_rounds))
+    delay_resolved = case118_cfg.default_subproblem_entry_sign4_delay_rounds(
+        preset=args.preset,
+        max_iter_cli=args.max_iter,
+        sign4_cli=args.sign4_delay_rounds,
+    )
+    if delay_resolved is not None:
+        case118_cfg.SUBPROBLEM_LIGHT_SIGN4_DELAY_ROUNDS = int(delay_resolved)
     if args.delta_reference_lift == "auto":
         case118_cfg.CASE118_SUBPROBLEM_SURROGATE_DELTA_REFERENCE_LIFT = None
     else:

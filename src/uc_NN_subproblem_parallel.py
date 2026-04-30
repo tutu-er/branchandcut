@@ -377,7 +377,7 @@ class ParallelSubproblemSurrogateTrainer(SubproblemSurrogateTrainer):
             flush=True,
         )
 
-        self._surrogate_bcd_max_iter = max(int(max_iter), 1)
+        self._configure_surrogate_bcd_run(max_iter)
         EPS = 1e-10
         gamma = self.gamma_base / (self.n_samples * max(max_iter, 1))
         gamma_dual = gamma * self.gamma_dual_component_scale
@@ -677,9 +677,12 @@ class _SampleWorkerTrainerProxy(SimpleNamespace):
         return bool(self.use_group_mu_lower_bound)
 
     def _get_mu_lower_bound_phase(self) -> str:
-        if self.iter_number < self.mu_individual_lower_bound_round:
+        t = self._mu_floor_schedule_iter()
+        if t < 0:
             return "individual"
-        if self.iter_number < self.mu_group_lower_bound_round:
+        if t < self.mu_individual_lower_bound_round:
+            return "individual"
+        if t < self.mu_group_lower_bound_round:
             return "group" if self._uses_group_mu_lower_bound() else "individual"
         return "none"
 
@@ -687,9 +690,7 @@ class _SampleWorkerTrainerProxy(SimpleNamespace):
         return self.mu_lower_bound if self._get_mu_lower_bound_phase() != "none" else 0.0
 
     def _is_mu_sign_relaxation_round(self) -> bool:
-        interval = int(getattr(self, 'mu_signed_round_interval', 0) or 0)
-        lb = float(self._current_mu_lower_bound_value())
-        return interval > 0 and lb > 0.0 and ((self.iter_number + 1) % interval == 0)
+        return super()._is_mu_sign_relaxation_round()
 
     def _force_zero_x_bound_duals(self) -> bool:
         return self.iter_number < self.x_bound_dual_zero_rounds
@@ -1166,6 +1167,7 @@ def _precompute_lambda_vals(
     T_delta: float,
     lambda_predictor=None,
     lp_backend: str = LP_BACKEND_GUROBI,
+    ignore_fixed_generation_cost: bool = False,
 ) -> List[object]:
     """Precompute per-unit electricity-price matrices for all samples."""
     n_samples = len(active_set_data)
@@ -1213,6 +1215,7 @@ def _precompute_lambda_vals(
             renewable_data=sample.get('renewable_data'),
             verbose=False,
             lp_backend=lp_backend,
+            ignore_fixed_generation_cost=ignore_fixed_generation_cost,
         )
         price_vals.append(payload['lambda_pg_electricity_price'])
     return price_vals
@@ -1381,6 +1384,7 @@ def train_all_surrogates_parallel(
         T_delta,
         lambda_predictor=lambda_predictor,
         lp_backend=lp_backend,
+        ignore_fixed_generation_cost=bool(ignore_startup_shutdown_costs),
     )
 
     worker_args = [

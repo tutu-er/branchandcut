@@ -737,6 +737,7 @@ def _solve_pg_electricity_price_from_ed(
     renewable_data: np.ndarray | None = None,
     verbose: bool = False,
     lp_backend: str = LP_BACKEND_GUROBI,
+    ignore_fixed_generation_cost: bool = False,
 ) -> Dict[str, np.ndarray]:
     return solve_ed_electricity_price(
         ppc,
@@ -746,6 +747,7 @@ def _solve_pg_electricity_price_from_ed(
         renewable_data=renewable_data,
         verbose=verbose,
         lp_backend=lp_backend,
+        ignore_fixed_generation_cost=ignore_fixed_generation_cost,
     )
 
 
@@ -3199,6 +3201,16 @@ class SubproblemSurrogateTrainer:
     def _pg_costs_active(self) -> bool:
         return self.iter_number >= self.pg_cost_start_round
 
+    def subproblem_generation_no_load_coeff(self, g: int | None = None) -> float:
+        """无负荷（开机固定）发电成本系数 b，满足 cpower = a*pg + b*x。
+
+        ``ignore_startup_shutdown_costs=True`` 时，除启停费外 **b 也置零**，与子问题 LP 块一致。
+        """
+        gi = int(self.unit_id if g is None else g)
+        if self.ignore_startup_shutdown_costs:
+            return 0.0
+        return float(self.gencost[gi, -1]) / float(self.T_delta)
+
     def _invalidate_loss_tensor_cache(self) -> None:
         """Mark cached loss tensors stale after BCD state or restored state changes."""
         self._loss_tensor_cache_dirty = True
@@ -3248,7 +3260,7 @@ class SubproblemSurrogateTrainer:
         g = self.unit_id
         lam_inh = self.lambda_inherent[sample_id]
         out = np.zeros(self.T, dtype=np.float32)
-        b_val = float(self.gencost[g, -1] / self.T_delta)
+        b_val = float(self.subproblem_generation_no_load_coeff(g))
         pmin_v = float(self.gen[g, PMIN])
         pmax_v = float(self.gen[g, PMAX])
         ru_v = float(self.Ru_all[g])
@@ -4527,6 +4539,45 @@ class SubproblemSurrogateTrainer:
             CONSTRAINT_STRATEGY_ALL_TEMPLATES_SIGN4_PLUS_SINGLE,
         ) and self.all_mode_group_size > 1
 
+    def _mu_floor_schedule_iter(self) -> int:
+        """μ 下界阶段切换用的有效外循环轮次。
+
+        在 Sign4 延期（``sign4_delay_rounds > 0`` 且策略含 sign4 模板）时：
+        延期内 ``iter_number < delay`` 返回 ``-1``（视为 Sign4 加入前，保持 individual 相）；
+        自 ``iter_number == delay`` 起记 ``t = 0, 1, …``（与 Sign4 权重可非零的起始轮对齐）。
+        无延期或非 sign4 模板策略时等价于 ``iter_number``。
+        """
+        delay = max(int(getattr(self, "sign4_delay_rounds", 0) or 0), 0)
+        if delay <= 0:
+            return int(self.iter_number)
+        if self.constraint_generation_strategy not in (
+            CONSTRAINT_STRATEGY_ALL_TEMPLATES_SIGN4,
+            CONSTRAINT_STRATEGY_ALL_TEMPLATES_SIGN4_PLUS_SINGLE,
+        ):
+            return int(self.iter_number)
+        i = int(self.iter_number)
+        if i < delay:
+            return -1
+        return i - delay
+
+    def _configure_surrogate_bcd_run(self, max_iter: int) -> None:
+        """与外循环 ``max_iter`` 对齐的 BCD 辅助量（μ 符号松弛截止轮等）。"""
+        max_i = max(int(max_iter), 1)
+        self._surrogate_bcd_max_iter = max_i
+        delay_mu = max(int(getattr(self, "sign4_delay_rounds", 0) or 0), 0)
+        if (
+            delay_mu > 0
+            and self.constraint_generation_strategy
+            in (
+                CONSTRAINT_STRATEGY_ALL_TEMPLATES_SIGN4,
+                CONSTRAINT_STRATEGY_ALL_TEMPLATES_SIGN4_PLUS_SINGLE,
+            )
+        ):
+            active_span = max(max_i - delay_mu, 1)
+            self._mu_sign_relaxation_last_iter = delay_mu + max(active_span // 2, 0)
+        else:
+            self._mu_sign_relaxation_last_iter = max(max_i // 2, 0)
+
     def _sync_surrogate_direction_strategy_state(self) -> None:
         self.surrogate_direction_signs = self._get_surrogate_direction_signs()
 
@@ -4774,9 +4825,12 @@ class SubproblemSurrogateTrainer:
         )
 
     def _get_mu_lower_bound_phase(self) -> str:
-        if self.iter_number < self.mu_individual_lower_bound_round:
+        t = self._mu_floor_schedule_iter()
+        if t < 0:
             return "individual"
-        if self.iter_number < self.mu_group_lower_bound_round:
+        if t < self.mu_individual_lower_bound_round:
+            return "individual"
+        if t < self.mu_group_lower_bound_round:
             return "group" if self._uses_group_mu_lower_bound() else "individual"
         return "none"
 
@@ -4830,7 +4884,7 @@ class SubproblemSurrogateTrainer:
         Ru_co = float(self.Ru_co_all[g])
         Rd_co = float(self.Rd_co_all[g])
         a     = self.gencost[g, -2] / self.T_delta
-        b     = self.gencost[g, -1] / self.T_delta
+        b     = self.subproblem_generation_no_load_coeff(g)
         sc    = 0.0 if self.ignore_startup_shutdown_costs else self.gencost[g, 1]
         shc   = 0.0 if self.ignore_startup_shutdown_costs else self.gencost[g, 2]
         Ton   = int(self.subproblem_Ton)
@@ -5101,7 +5155,7 @@ class SubproblemSurrogateTrainer:
         Pmin = self.gen[g, PMIN]
         Pmax = self.gen[g, PMAX]
         a    = self.gencost[g, -2] / self.T_delta
-        b    = self.gencost[g, -1] / self.T_delta
+        b    = self.subproblem_generation_no_load_coeff(g)
         Ru   = float(self.Ru_all[g]); Rd   = float(self.Rd_all[g])
         Ru_co= float(self.Ru_co_all[g]); Rd_co= float(self.Rd_co_all[g])
         sc   = 0.0 if self.ignore_startup_shutdown_costs else self.gencost[g, 1]
@@ -5434,7 +5488,7 @@ class SubproblemSurrogateTrainer:
         """
         g = self.unit_id
         a    = self.gencost[g, -2] / self.T_delta
-        b    = self.gencost[g, -1] / self.T_delta
+        b    = self.subproblem_generation_no_load_coeff(g)
         Pmin = self.gen[g, PMIN]; Pmax = self.gen[g, PMAX]
         Ru   = float(self.Ru_all[g]); Rd   = float(self.Rd_all[g])
         Ru_co= float(self.Ru_co_all[g]); Rd_co= float(self.Rd_co_all[g])
@@ -5865,7 +5919,7 @@ class SubproblemSurrogateTrainer:
         coc_val = self.coc[sample_id]
         lambda_val = self.lambda_vals[sample_id]
         a    = self.gencost[g, -2] / self.T_delta
-        b    = self.gencost[g, -1] / self.T_delta
+        b    = self.subproblem_generation_no_load_coeff(g)
         Pmin = self.gen[g, PMIN]; Pmax = self.gen[g, PMAX]
         Ru   = float(self.Ru_all[g]); Rd   = float(self.Rd_all[g])
         Ru_co= float(self.Ru_co_all[g]); Rd_co= float(self.Rd_co_all[g])
@@ -6200,7 +6254,7 @@ class SubproblemSurrogateTrainer:
         unit_params = np.array([
             self.gen[g, PMIN] / (Pmax + 1e-8),                    # Pmin/Pmax ratio
             self.gencost[g, -2] / self.T_delta,                    # 边际成本 a
-            self.gencost[g, -1] / self.T_delta / (Pmax + 1e-8),   # 归一化无负荷成本 b
+            self.subproblem_generation_no_load_coeff(g) / (Pmax + 1e-8),   # 归一化无负荷成本 b
             float(self.Ru_all[g]) / (Pmax + 1e-8),                # 归一化爬坡率 Ru
             0.0 if self.ignore_startup_shutdown_costs else self.gencost[g, 1] / (Pmax + 1e-8),
             0.0 if self.ignore_startup_shutdown_costs else self.gencost[g, 2] / (Pmax + 1e-8),
@@ -6831,7 +6885,7 @@ class SubproblemSurrogateTrainer:
             lambda_val = self.lambda_vals[sample_id]   # 电价对偶变量
 
             a_v     = self.gencost[g, -2] / self.T_delta   # 线性发电成本系数
-            b_v     = self.gencost[g, -1] / self.T_delta   # 无负荷成本系数
+            b_v     = self.subproblem_generation_no_load_coeff(g)   # 无负荷成本系数
             Pmin_v  = float(self.gen[g, PMIN])
             Pmax_v  = float(self.gen[g, PMAX])
             Ru_v    = float(self.Ru_all[g])
@@ -7138,9 +7192,7 @@ class SubproblemSurrogateTrainer:
         if not hasattr(self, 'logger'):
             self.logger = None
         print(f"开始BCD迭代训练 (机组{self.unit_id}, V3三时段耦合约束)...", flush=True)
-        self._surrogate_bcd_max_iter = max(int(max_iter), 1)
-        # 与本次 BCD 对齐：约在前 max_iter/2 轮允许 μ 符号松弛与代理方向翻转，之后固定方向
-        self._mu_sign_relaxation_last_iter = max(int(max_iter) // 2, 0)
+        self._configure_surrogate_bcd_run(max_iter)
         gamma = self.gamma_base / (self.n_samples * max(max_iter, 1))
         gamma_dual = gamma * self.gamma_dual_component_scale
         self.gamma = gamma
@@ -7363,7 +7415,7 @@ class SubproblemSurrogateTrainer:
         unit_params = np.array([
             self.gen[g, PMIN] / (Pmax + 1e-8),
             self.gencost[g, -2] / self.T_delta,
-            self.gencost[g, -1] / self.T_delta / (Pmax + 1e-8),
+            self.subproblem_generation_no_load_coeff(g) / (Pmax + 1e-8),
             float(self.Ru_all[g]) / (Pmax + 1e-8),
             0.0 if self.ignore_startup_shutdown_costs else self.gencost[g, 1] / (Pmax + 1e-8),
             0.0 if self.ignore_startup_shutdown_costs else self.gencost[g, 2] / (Pmax + 1e-8),
@@ -9059,9 +9111,11 @@ def solve_subproblem_LP_simple(trainer: SubproblemSurrogateTrainer, sample_id: i
             model.addConstr(-x[t1+1] + x[t1] <= 1 - x[t1+tau])
     
     # 发电成本
+    b_nl = trainer.subproblem_generation_no_load_coeff(g)
     for t in range(T):
-        model.addConstr(cpower[t] >= trainer.gencost[g, -2]/trainer.T_delta * pg[t] + 
-                      trainer.gencost[g, -1]/trainer.T_delta * x[t])
+        model.addConstr(
+            cpower[t] >= trainer.gencost[g, -2] / trainer.T_delta * pg[t] + b_nl * x[t]
+        )
     
     # 代理约束
     if alpha is not None and beta is not None:
@@ -10027,6 +10081,7 @@ def _subproblem_solve_for_lambda(self) -> np.ndarray:
                 x_sol,
                 renewable_data=sample.get('renewable_data'),
                 verbose=False,
+                ignore_fixed_generation_cost=bool(self.ignore_startup_shutdown_costs),
             )
             effective = payload['lambda_pg_electricity_price']
             sample['lambda_pg_electricity_price'] = effective.copy()

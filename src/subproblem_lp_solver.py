@@ -483,6 +483,7 @@ def solve_ed_electricity_price(
     renewable_data: np.ndarray | None = None,
     verbose: bool = False,
     lp_backend: str = LP_BACKEND_GUROBI,
+    ignore_fixed_generation_cost: bool = False,
 ) -> dict:
     backend = normalize_lp_backend(lp_backend)
     if backend == LP_BACKEND_GUROBI:
@@ -493,6 +494,7 @@ def solve_ed_electricity_price(
             x_sol,
             renewable_data=renewable_data,
             verbose=verbose,
+            ignore_fixed_generation_cost=ignore_fixed_generation_cost,
         )
     return _solve_ed_electricity_price_cvxpy_highs(
         ppc,
@@ -501,6 +503,7 @@ def solve_ed_electricity_price(
         x_sol,
         renewable_data=renewable_data,
         verbose=verbose,
+        ignore_fixed_generation_cost=ignore_fixed_generation_cost,
     )
 
 
@@ -554,6 +557,7 @@ def _solve_ed_electricity_price_gurobi(
     x_sol: np.ndarray,
     renewable_data: np.ndarray | None = None,
     verbose: bool = False,
+    ignore_fixed_generation_cost: bool = False,
 ) -> dict:
     import gurobipy as gp
     from gurobipy import GRB
@@ -614,9 +618,13 @@ def _solve_ed_electricity_price_gurobi(
         for g in range(ng):
             model.addConstr(pg[g, t] >= float(gen[g, PMIN] * x_sol[g, t]), name=f"pg_lower_{g}_{t}")
             model.addConstr(pg[g, t] <= float(gen[g, PMAX] * x_sol[g, t]), name=f"pg_upper_{g}_{t}")
+            b_fix = (
+                0.0
+                if ignore_fixed_generation_cost
+                else float(gencost[g, -1] / T_delta * x_sol[g, t])
+            )
             model.addConstr(
-                cpower[g, t] >= float(gencost[g, -2] / T_delta) * pg[g, t]
-                + float(gencost[g, -1] / T_delta * x_sol[g, t]),
+                cpower[g, t] >= float(gencost[g, -2] / T_delta) * pg[g, t] + b_fix,
                 name=f"cpower_{g}_{t}",
             )
         for r, bus_idx in enumerate(renewable_bus_ids):
@@ -718,6 +726,7 @@ def _solve_ed_electricity_price_cvxpy_highs(
     x_sol: np.ndarray,
     renewable_data: np.ndarray | None = None,
     verbose: bool = False,
+    ignore_fixed_generation_cost: bool = False,
 ) -> dict:
     assert_lp_backend_available(LP_BACKEND_CVXPY_HIGHS)
 
@@ -785,9 +794,13 @@ def _solve_ed_electricity_price_cvxpy_highs(
             cons = pg[g, t] <= float(gen[g, PMAX] * x_sol[g, t])
             constraints.append(cons)
             pg_upper_cons[g, t] = cons
+            b_fix = (
+                0.0
+                if ignore_fixed_generation_cost
+                else float(gencost[g, -1] / T_delta * x_sol[g, t])
+            )
             constraints.append(
-                cpower[g, t] >= float(gencost[g, -2] / T_delta) * pg[g, t]
-                + float(gencost[g, -1] / T_delta * x_sol[g, t])
+                cpower[g, t] >= float(gencost[g, -2] / T_delta) * pg[g, t] + b_fix
             )
         for r, bus_idx in enumerate(renewable_bus_ids):
             constraints.append(p_ren[r, t] <= float(renewable_arr[bus_idx, t]))
@@ -905,7 +918,9 @@ def solve_init_lp(trainer, sample_id: int):
       其余算例为 ``min(4,T)``）下的 min_on / min_off 线性化；
     - 启停辅助变量：始终保留 ``coc``；``ignore_startup_shutdown_costs=True`` 时 **与迭代中相同**：
       ``sc=shc=0``，start/shut 线性约束退化为 ``coc[t-1] >= 0``，不再施加启停货币成本系数；
-    - 电力成本定义：``cpower[t] == a*pg[t] + b*x[t]``（``a,b`` 来自 gencost / T_delta）；
+    - 无负荷成本：``cpower`` 中 ``b*x`` 的 ``b`` 来自 ``gencost[:,-1]``；当
+      ``ignore_startup_shutdown_costs=True`` 时 **``b=0``**（与 SubproblemSurrogateTrainer 一致）；
+    - 电力成本定义：``cpower[t] == a*pg[t] + b*x[t]``（``a,b`` 来自 gencost / T_delta，``b`` 可按上条置零）；
     - 目标：``min sum(cpower)+sum(coc) - lambda_vals·pg``（``lambda_vals`` 与构造 trainer 时一致：预测或 JSON/ED）。
 
     **成功条件**  
@@ -921,7 +936,11 @@ def solve_init_lp(trainer, sample_id: int):
     Ru_co = float(trainer.Ru_co_all[g])
     Rd_co = float(trainer.Rd_co_all[g])
     a = trainer.gencost[g, -2] / trainer.T_delta
-    b = trainer.gencost[g, -1] / trainer.T_delta
+    b = (
+        0.0
+        if trainer.ignore_startup_shutdown_costs
+        else trainer.gencost[g, -1] / trainer.T_delta
+    )
     sc = 0.0 if trainer.ignore_startup_shutdown_costs else trainer.gencost[g, 1]
     shc = 0.0 if trainer.ignore_startup_shutdown_costs else trainer.gencost[g, 2]
     Ton, Toff = _trainer_subproblem_ton_toff(trainer)
@@ -1114,7 +1133,11 @@ def solve_primal_block(
     Pmin = trainer.gen[g, PMIN]
     Pmax = trainer.gen[g, PMAX]
     a = trainer.gencost[g, -2] / trainer.T_delta
-    b = trainer.gencost[g, -1] / trainer.T_delta
+    b = (
+        0.0
+        if trainer.ignore_startup_shutdown_costs
+        else trainer.gencost[g, -1] / trainer.T_delta
+    )
     Ru = float(trainer.Ru_all[g])
     Rd = float(trainer.Rd_all[g])
     Ru_co = float(trainer.Ru_co_all[g])
@@ -1317,7 +1340,11 @@ def solve_dual_block(
             _require_finite("pg_costs", pg_costs, context=ctx)
 
     a = trainer.gencost[g, -2] / trainer.T_delta
-    b = trainer.gencost[g, -1] / trainer.T_delta
+    b = (
+        0.0
+        if trainer.ignore_startup_shutdown_costs
+        else trainer.gencost[g, -1] / trainer.T_delta
+    )
     Pmin = trainer.gen[g, PMIN]
     Pmax = trainer.gen[g, PMAX]
     Ru = float(trainer.Ru_all[g])
