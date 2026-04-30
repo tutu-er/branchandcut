@@ -96,6 +96,43 @@ DUAL_PREDICTOR_NET_VARIANT = 'temporal_conv'
 DUAL_PREDICTOR_NORMALIZE_TARGETS = True
 DUAL_PREDICTOR_COSINE_LOSS_WEIGHT = 0.12
 DUAL_PREDICTOR_SMOOTH_L1_BETA = 2.0
+# 单机组 0/1 变量预测器（与 run_training.py 对齐；strategy 须含 single-time 段方可生效）
+USE_UNIT_PREDICTOR = True
+UNIT_PREDICTOR_EPOCHS = 200
+UNIT_PREDICTOR_BATCH_STRATEGY = 'full-batch'
+UNIT_PREDICTOR_BATCH_SIZE = 32
+UNIT_PREDICTOR_SHUFFLE = True
+UNIT_PREDICTOR_LR = 1e-3
+UNIT_PREDICTOR_HIDDEN_DIMS = [256, 128]
+UNIT_PREDICTOR_NET_VARIANT = "mlp"
+UNIT_PREDICTOR_TCN_CHANNELS = 64
+UNIT_PREDICTOR_TCN_DEPTH = 6
+UNIT_PREDICTOR_TCONV_CHANNELS = 64
+UNIT_PREDICTOR_TCONV_DEPTH = 4
+UNIT_PREDICTOR_DROPOUT = 0.1
+UNIT_PREDICTOR_ENABLE_POS_WEIGHT = False
+UNIT_PREDICTOR_POS_WEIGHT_CLIP = 20.0
+UNIT_PREDICTOR_LOSS_WEIGHT_BCE = 1.0
+UNIT_PREDICTOR_LOSS_WEIGHT_MSE = 0.0
+UNIT_PREDICTOR_LOSS_WEIGHT_L1 = 0.0
+UNIT_PREDICTOR_LOSS_WEIGHT_TV = 0.0
+UNIT_PREDICTOR_LOSS_WEIGHT_TRANSITION = 0.0
+UNIT_PREDICTOR_LOSS_WEIGHT_BINARIZE = 0.0
+UNIT_PREDICTOR_LOSS_WEIGHT_STD_FLOOR = 0.0
+UNIT_PREDICTOR_STD_FLOOR_SCALE = 0.5
+UNIT_PREDICTOR_LOSS_WEIGHT_TV_FLOOR = 0.0
+UNIT_PREDICTOR_TV_FLOOR_SCALE = 0.8
+UNIT_PREDICTOR_LOAD_PATH = None
+UNIT_PREDICTOR_AUTO_LATEST_STANDALONE = True
+UNIT_PREDICTOR_LOAD_METADATA_CONFIG = True
+UNIT_PREDICTOR_UNIT1_EXTRA_TV_EPOCHS = 0
+UNIT_PREDICTOR_UNIT1_EXTRA_TV_WEIGHT = 0.02
+UNIT_PREDICTOR_AUTO_EXTRA_TV = False
+UNIT_PREDICTOR_AUTO_EXTRA_TV_EPOCHS = 160
+UNIT_PREDICTOR_AUTO_EXTRA_TV_TV_THRESHOLD = 0.02
+UNIT_PREDICTOR_AUTO_EXTRA_TV_WEIGHT = 0.02
+UNIT_PREDICTOR_FINETUNE_LR = 1e-5
+UNIT_PREDICTOR_WEIGHT_DECAY = 1e-4
 MAX_ITER = 300             # backward-compatible shared fallback
 BCD_MAX_ITER = MAX_ITER
 SUBPROBLEM_MAX_ITER = MAX_ITER
@@ -124,6 +161,7 @@ BCD_MODEL_FILE = None
 BCD_CONTINUE_TRAINING = False
 SURROGATE_MODEL_DIR = None
 SURROGATE_CONTINUE_TRAINING = False
+SURROGATE_DUAL_PREDICTOR_ONLY = False
 SPARSE_TOP_K_VARIABLES = 20
 SPARSE_MAX_GROUPS = 5
 SPARSE_GROUP_SIZE = 3
@@ -164,6 +202,7 @@ SUBPROBLEM_RHO_DUAL_PG_INIT = 1e-1
 SUBPROBLEM_RHO_DUAL_X_INIT = 1e-1
 SUBPROBLEM_RHO_DUAL_COC_INIT = 1e1
 SUBPROBLEM_RHO_BINARY_INIT = 1e3
+SUBPROBLEM_RHO_BINARY_MAX = 1e4
 SUBPROBLEM_RHO_OPT_INIT = 1e-1
 SUBPROBLEM_LOSS_RATIO_PRIMAL = 1.0
 SUBPROBLEM_LOSS_RATIO_DUAL_PG = 1.0
@@ -180,6 +219,15 @@ SUBPROBLEM_MU_SIGNED_ROUND_INTERVAL = 10
 SUBPROBLEM_MU_SIGN_HYSTERESIS_ROUNDS = 2
 SUBPROBLEM_MU_SIGN_FLIP_MIN_SHARE = 0.67
 SUBPROBLEM_X_BOUND_DUAL_ZERO_ROUNDS = 0
+SUBPROBLEM_PREDICTOR_WARMUP_ROUNDS = round(SUBPROBLEM_MAX_ITER * 0.10)
+SUBPROBLEM_SIGN4_CURRICULUM_ROUNDS = 0
+SUBPROBLEM_SIGN4_INITIAL_SCALE = 1.0
+SUBPROBLEM_SIGN4_FINAL_SCALE = 1.0
+SUBPROBLEM_SIGN4_DELAY_ROUNDS = 0
+SUBPROBLEM_SURROGATE_DELTA_REFERENCE_LIFT = None  # None=auto for sign4 strategies
+SUBPROBLEM_SURROGATE_DELTA_REFERENCE_EPS = 1e-6
+SUBPROBLEM_SURROGATE_DELTA_REFERENCE_SCOPE = "sign4_only"
+SUBPROBLEM_SURROGATE_DELTA_REFERENCE_MIN_ABS_FACTOR = 1e-9
 SUBPROBLEM_NN_BATCH_STRATEGY = 'full-batch'   # 'full-batch' / 'mini-batch'
 SUBPROBLEM_NN_SIZE = 'medium'   # 'small' / 'medium' / 'large'
 SUBPROBLEM_C_PG_NN_SIZE = 'medium'   # 'small' / 'medium' / 'large'
@@ -250,10 +298,12 @@ try:
     import pypower.case118
     from uc_NN_subproblem import (
         train_dual_predictor_from_data,
+        train_unit_predictor_from_data,
         SubproblemSurrogateTrainer,
         ActiveSetReader,
         load_trained_models,
         resolve_constraint_offsets_from_trainer,
+        normalize_constraint_generation_strategy,
     )
     from uc_NN_subproblem_parallel import ParallelSubproblemSurrogateTrainer
     from case_registry import get_case_ppc
@@ -387,6 +437,162 @@ def resolve_existing_path(path_value: str | None, label: str) -> Path | None:
     if not path.exists():
         raise FileNotFoundError(f"{label} does not exist: {path}")
     return path
+
+
+def _case_env_prefix(case_name: str) -> str:
+    return re.sub(r"[^A-Za-z0-9]+", "_", str(case_name).upper())
+
+
+def _resolve_unit_predictor_checkpoint_path(raw_path: str | os.PathLike | None) -> Path | None:
+    """Resolve file/dir/LATEST.txt forms used by standalone UnitPredictor scripts."""
+    if raw_path is None:
+        return None
+    text = str(raw_path).strip()
+    if not text:
+        return None
+
+    root = Path(__file__).parent
+    p = Path(text)
+    if not p.is_absolute():
+        p = root / p
+
+    if p.is_dir():
+        latest = p / "LATEST.txt"
+        if latest.is_file():
+            target = latest.read_text(encoding="utf-8").strip()
+            if target:
+                t = Path(target)
+                if t.is_absolute():
+                    return t.resolve()
+                cand = (p / t).resolve()
+                if cand.exists():
+                    return cand
+                return (root / t).resolve()
+        cand = (p / "unit_predictor.pth").resolve()
+        return cand if cand.exists() else None
+
+    if p.is_file() and p.name.lower() == "latest.txt":
+        target = p.read_text(encoding="utf-8").strip()
+        if not target:
+            return None
+        t = Path(target)
+        if t.is_absolute():
+            return t.resolve()
+        cand = (p.parent / t).resolve()
+        if cand.exists():
+            return cand
+        return (root / t).resolve()
+
+    p = p.resolve()
+    return p if p.exists() else None
+
+
+def _latest_standalone_unit_predictor_ckpt(case_name: str) -> Path | None:
+    base = Path(__file__).parent / "result" / "surrogate_models"
+    if not base.is_dir():
+        return None
+    prefix = f"unit_predictor_{case_name}_"
+    best: tuple[float, Path] | None = None
+    for d in base.iterdir():
+        if not d.is_dir() or not d.name.startswith(prefix):
+            continue
+        ckpt = d / "unit_predictor.pth"
+        if not ckpt.is_file():
+            continue
+        mtime = ckpt.stat().st_mtime
+        if best is None or mtime > best[0]:
+            best = (mtime, ckpt)
+    return best[1].resolve() if best else None
+
+
+def _read_unit_predictor_metadata(checkpoint_path: Path) -> dict:
+    try:
+        import torch
+
+        state = torch.load(str(checkpoint_path), map_location="cpu")
+        meta = state.get("metadata", {}) if isinstance(state, dict) else {}
+        return dict(meta or {})
+    except Exception as exc:
+        log(f"[unit_predictor] cannot read checkpoint metadata (keep current config): {checkpoint_path} ({exc})")
+        return {}
+
+
+def _apply_unit_predictor_metadata_config(metadata: dict) -> bool:
+    if not metadata:
+        return False
+    global UNIT_PREDICTOR_HIDDEN_DIMS
+    global UNIT_PREDICTOR_NET_VARIANT
+    global UNIT_PREDICTOR_TCN_CHANNELS
+    global UNIT_PREDICTOR_TCN_DEPTH
+    global UNIT_PREDICTOR_TCONV_CHANNELS
+    global UNIT_PREDICTOR_TCONV_DEPTH
+    global UNIT_PREDICTOR_DROPOUT
+
+    changed = False
+    if metadata.get("hidden_dims") is not None:
+        UNIT_PREDICTOR_HIDDEN_DIMS = list(metadata["hidden_dims"])
+        changed = True
+    if metadata.get("net_variant") is not None:
+        UNIT_PREDICTOR_NET_VARIANT = str(metadata["net_variant"])
+        changed = True
+    if metadata.get("tcn_channels") is not None:
+        UNIT_PREDICTOR_TCN_CHANNELS = int(metadata["tcn_channels"])
+        changed = True
+    if metadata.get("tcn_depth") is not None:
+        UNIT_PREDICTOR_TCN_DEPTH = int(metadata["tcn_depth"])
+        changed = True
+    if metadata.get("tconv_channels") is not None:
+        UNIT_PREDICTOR_TCONV_CHANNELS = int(metadata["tconv_channels"])
+        changed = True
+    if metadata.get("tconv_depth") is not None:
+        UNIT_PREDICTOR_TCONV_DEPTH = int(metadata["tconv_depth"])
+        changed = True
+    if metadata.get("dropout") is not None:
+        UNIT_PREDICTOR_DROPOUT = float(metadata["dropout"])
+        changed = True
+    return changed
+
+
+def _configure_unit_predictor_load_path_from_runtime() -> None:
+    """Apply case/env/standalone UnitPredictor runtime defaults before config snapshot."""
+    global UNIT_PREDICTOR_LOAD_PATH
+
+    if not bool(USE_UNIT_PREDICTOR):
+        return
+
+    case_prefix = _case_env_prefix(CASE_NAME)
+    env_specific = os.environ.get(f"{case_prefix}_UNIT_PREDICTOR_LOAD_PATH", "").strip()
+    env_generic = os.environ.get("UNIT_PREDICTOR_LOAD_PATH", "").strip()
+
+    configured = UNIT_PREDICTOR_LOAD_PATH
+    source = "configured"
+    if env_specific:
+        configured = env_specific
+        source = f"env:{case_prefix}_UNIT_PREDICTOR_LOAD_PATH"
+    elif env_generic:
+        configured = env_generic
+        source = "env:UNIT_PREDICTOR_LOAD_PATH"
+
+    resolved = _resolve_unit_predictor_checkpoint_path(configured)
+    if resolved is None and bool(UNIT_PREDICTOR_AUTO_LATEST_STANDALONE):
+        resolved = _latest_standalone_unit_predictor_ckpt(CASE_NAME)
+        source = "auto_latest_standalone"
+
+    if resolved is None:
+        return
+
+    UNIT_PREDICTOR_LOAD_PATH = str(resolved)
+    if bool(UNIT_PREDICTOR_LOAD_METADATA_CONFIG) and Path(resolved).is_file():
+        metadata = _read_unit_predictor_metadata(Path(resolved))
+        if _apply_unit_predictor_metadata_config(metadata):
+            log(
+                "[unit_predictor] aligned config from checkpoint metadata: "
+                f"source={source}, path={resolved}, "
+                f"net={UNIT_PREDICTOR_NET_VARIANT}"
+            )
+            return
+
+    log(f"[unit_predictor] using standalone checkpoint: source={source}, path={resolved}")
 
 
 def create_bcd_agent(ppc, all_samples, T_DELTA, *,
@@ -591,6 +797,7 @@ def run_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS,
                   rho_dual_x_init: float | None = None,
                   rho_dual_coc_init: float | None = None,
                   rho_binary_init: float = 1.0,
+                  rho_binary_max: float = SUBPROBLEM_RHO_BINARY_MAX,
                   rho_opt_init: float = 1e-3,
                   loss_ratio_primal: float = 1.0,
                   loss_ratio_dual_pg: float = 1.0,
@@ -627,10 +834,80 @@ def run_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS,
                   dual_net_variant: str = 'temporal_conv',
                   dual_normalize_targets: bool = True,
                   dual_cosine_loss_weight: float = 0.12,
-                  dual_smooth_l1_beta: float = 2.0):
+                  dual_smooth_l1_beta: float = 2.0,
+                  dual_predictor_only: bool = False,
+                  use_unit_predictor: bool = False,
+                  unit_predictor_epochs: int = 200,
+                  unit_predictor_batch_strategy: str = 'full-batch',
+                  unit_predictor_batch_size: int = 32,
+                  unit_predictor_shuffle: bool = True,
+                  unit_predictor_lr: float = 1e-3,
+                  unit_predictor_hidden_dims: list[int] | None = None,
+                  unit_predictor_net_variant: str = "mlp",
+                  unit_predictor_tcn_channels: int = 64,
+                  unit_predictor_tcn_depth: int = 6,
+                  unit_predictor_tconv_channels: int = 64,
+                  unit_predictor_tconv_depth: int = 4,
+                  unit_predictor_dropout: float = 0.1,
+                  unit_predictor_enable_pos_weight: bool = False,
+                  unit_predictor_pos_weight_clip: float = 20.0,
+                  unit_predictor_loss_weight_bce: float = 1.0,
+                  unit_predictor_loss_weight_mse: float = 0.0,
+                  unit_predictor_loss_weight_l1: float = 0.0,
+                  unit_predictor_loss_weight_tv: float = 0.0,
+                  unit_predictor_loss_weight_transition: float = 0.0,
+                  unit_predictor_loss_weight_binarize: float = 0.0,
+                  unit_predictor_loss_weight_std_floor: float = 0.0,
+                  unit_predictor_std_floor_scale: float = 0.5,
+                  unit_predictor_loss_weight_tv_floor: float = 0.0,
+                  unit_predictor_tv_floor_scale: float = 0.8,
+                  unit_predictor_load_path: str | None = None,
+                  unit_predictor_unit1_extra_tv_epochs: int = 0,
+                  unit_predictor_unit1_extra_tv_weight: float = 0.02,
+                  unit_predictor_auto_extra_tv: bool = False,
+                  unit_predictor_auto_extra_tv_epochs: int = 160,
+                  unit_predictor_auto_extra_tv_tv_threshold: float = 0.02,
+                  unit_predictor_auto_extra_tv_weight: float = 0.02,
+                  predictor_warmup_rounds: int = 0,
+                  sign4_curriculum_rounds: int = 0,
+                  sign4_initial_scale: float = 1.0,
+                  sign4_final_scale: float = 1.0,
+                  sign4_delay_rounds: int = 0,
+                  enable_surrogate_delta_reference_lift: bool | None = None,
+                  surrogate_delta_reference_eps: float = 1e-6,
+                  surrogate_delta_reference_scope: str = "sign4_only",
+                  surrogate_delta_reference_min_abs_factor: float = 1e-9,
+                  unit_predictor_finetune_lr: float = 1e-5,
+                  unit_predictor_weight_decay: float = 1e-4,
+                  case_name: str | None = None):
     """V3 代理约束训练（样本级并行），返回 (dual_predictor, trainers)。"""
     import os
     from pypower.ext2int import ext2int
+
+    def _resolve_unit_predictor_load_path(text: str | None) -> str | None:
+        if text is None:
+            return None
+        p = str(text).strip()
+        if not p:
+            return None
+        if os.path.isdir(p):
+            latest = os.path.join(p, "LATEST.txt")
+            if os.path.exists(latest):
+                try:
+                    target = open(latest, "r", encoding="utf-8").read().strip()
+                    if target:
+                        return target
+                except Exception:
+                    pass
+            cand = os.path.join(p, "unit_predictor.pth")
+            return cand if os.path.exists(cand) else None
+        if os.path.isfile(p) and os.path.basename(p).lower() == "latest.txt":
+            try:
+                target = open(p, "r", encoding="utf-8").read().strip()
+                return target if target else None
+            except Exception:
+                return None
+        return p if os.path.exists(p) else None
 
     ppc_int = ext2int(ppc)
     ng = ppc_int['gen'].shape[0]
@@ -690,6 +967,12 @@ def run_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS,
         f"subproblem_loss_ratio: primal={loss_ratio_primal}, dual_pg={loss_ratio_dual_pg}, "
         f"dual_x={loss_ratio_dual_x}, opt={loss_ratio_opt}, reg={loss_ratio_reg}"
     )
+    log(
+        f"rho_binary: init={rho_binary_init}, max={rho_binary_max}; "
+        f"predictor_warmup={predictor_warmup_rounds}; "
+        f"sign4_curriculum={sign4_initial_scale}->{sign4_final_scale}/{sign4_curriculum_rounds}, "
+        f"sign4_delay={sign4_delay_rounds}"
+    )
     print("=" * 70, flush=True)
 
     # 步骤 1：对偶变量预测器（串行，NN 训练无需并行化）
@@ -707,6 +990,7 @@ def run_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS,
             lp_backend=lp_backend,
             constraint_generation_strategy=constraint_generation_strategy,
             ignore_startup_shutdown_costs=ignore_startup_shutdown_costs,
+            case_name=case_name,
         )[0]
         dual_predictor.train(
             num_epochs=DUAL_EPOCHS,
@@ -732,6 +1016,171 @@ def run_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS,
             dual_smooth_l1_beta=dual_smooth_l1_beta,
         )
 
+    if dual_predictor_only:
+        log("dual_predictor_only=True: skip subproblem surrogate training")
+        return dual_predictor, {}
+
+    # 步骤 1.5：单机组 0/1 预测器预训练（可选）
+    unit_predictor = None
+    unit_predictor_save_path = None
+    if use_unit_predictor:
+        if constraint_generation_strategy not in (
+            'all_single_time', 'all_templates_sign4_plus_single',
+        ):
+            log(
+                f"[unit_predictor] constraint_strategy={constraint_generation_strategy} has no single-time "
+                "segment, skip unit predictor"
+            )
+        else:
+            unit_predictor_save_path = (
+                os.path.join(save_dir, 'unit_predictor.pth') if save_dir else None
+            )
+            resolved_external = _resolve_unit_predictor_load_path(unit_predictor_load_path)
+            if unit_predictor_load_path and not resolved_external:
+                raise FileNotFoundError(
+                    f"UNIT_PREDICTOR_LOAD_PATH set but checkpoint not found: {unit_predictor_load_path}"
+                )
+            unit_predictor_load_resolved = resolved_external or (
+                str(load_path / 'unit_predictor.pth')
+                if load_path and (load_path / 'unit_predictor.pth').exists()
+                else None
+            )
+            log(
+                f"[unit_predictor] train per-unit binary predictor: "
+                f"units={unit_ids}, epochs={unit_predictor_epochs}, "
+                f"batch={unit_predictor_batch_size}/{unit_predictor_batch_strategy}, "
+                f"lr={unit_predictor_lr}, hidden_dims={unit_predictor_hidden_dims}"
+            )
+            effective_epochs = 0 if resolved_external else int(unit_predictor_epochs)
+            unit_predictor = train_unit_predictor_from_data(
+                ppc,
+                all_samples,
+                T_delta=T_DELTA,
+                unit_ids=unit_ids,
+                hidden_dims=unit_predictor_hidden_dims,
+                num_epochs=effective_epochs,
+                batch_size=unit_predictor_batch_size,
+                batch_strategy=unit_predictor_batch_strategy,
+                shuffle=unit_predictor_shuffle,
+                learning_rate=unit_predictor_lr,
+                weight_decay=unit_predictor_weight_decay,
+                net_variant=unit_predictor_net_variant,
+                tcn_channels=unit_predictor_tcn_channels,
+                tcn_depth=unit_predictor_tcn_depth,
+                tconv_channels=unit_predictor_tconv_channels,
+                tconv_depth=unit_predictor_tconv_depth,
+                dropout=unit_predictor_dropout,
+                enable_pos_weight=unit_predictor_enable_pos_weight,
+                pos_weight_clip=unit_predictor_pos_weight_clip,
+                loss_weight_bce=unit_predictor_loss_weight_bce,
+                loss_weight_mse=unit_predictor_loss_weight_mse,
+                loss_weight_l1=unit_predictor_loss_weight_l1,
+                loss_weight_tv=unit_predictor_loss_weight_tv,
+                loss_weight_transition=unit_predictor_loss_weight_transition,
+                loss_weight_binarize=unit_predictor_loss_weight_binarize,
+                loss_weight_std_floor=unit_predictor_loss_weight_std_floor,
+                std_floor_scale=unit_predictor_std_floor_scale,
+                loss_weight_tv_floor=unit_predictor_loss_weight_tv_floor,
+                tv_floor_scale=unit_predictor_tv_floor_scale,
+                save_path=unit_predictor_save_path,
+                load_path=unit_predictor_load_resolved,
+            )
+
+            try:
+                extra_epochs = int(unit_predictor_unit1_extra_tv_epochs)
+            except Exception:
+                extra_epochs = 0
+            if (
+                unit_predictor is not None
+                and extra_epochs > 0
+                and any(int(x) == 1 for x in (unit_ids or []))
+            ):
+                log(
+                    f"[unit_predictor] unit=1 extra TV finetune: epochs={extra_epochs}, "
+                    f"tv_w={float(unit_predictor_unit1_extra_tv_weight)}"
+                )
+                unit_predictor.train_unit(
+                    unit_id=1,
+                    num_epochs=extra_epochs,
+                    batch_size=unit_predictor_batch_size,
+                    batch_strategy=unit_predictor_batch_strategy,
+                    shuffle=unit_predictor_shuffle,
+                    learning_rate=unit_predictor_lr,
+                    enable_scheduler=True,
+                    scheduler_patience=10,
+                    scheduler_factor=0.5,
+                    scheduler_min_lr=1e-5,
+                    enable_pos_weight=False,
+                    pos_weight_clip=unit_predictor_pos_weight_clip,
+                    loss_weight_bce=0.0,
+                    loss_weight_mse=1.0,
+                    loss_weight_l1=0.0,
+                    loss_weight_tv=float(unit_predictor_unit1_extra_tv_weight),
+                    loss_weight_transition=0.25,
+                    loss_weight_binarize=0.05,
+                    loss_weight_std_floor=0.2,
+                    std_floor_scale=unit_predictor_std_floor_scale,
+                    loss_weight_tv_floor=unit_predictor_loss_weight_tv_floor,
+                    tv_floor_scale=unit_predictor_tv_floor_scale,
+                )
+
+            if unit_predictor is not None and bool(unit_predictor_auto_extra_tv):
+                try:
+                    auto_epochs = max(0, int(unit_predictor_auto_extra_tv_epochs))
+                except Exception:
+                    auto_epochs = 0
+                tv_thr = float(unit_predictor_auto_extra_tv_tv_threshold)
+                tv_w = float(unit_predictor_auto_extra_tv_weight)
+                if auto_epochs > 0:
+                    import numpy as _np
+                    import torch as _torch
+
+                    X = _np.array([unit_predictor._extract_features(i) for i in range(unit_predictor.n_samples)])
+                    X_tensor = _torch.tensor(X, dtype=_torch.float32, device=unit_predictor.device)
+                    low_tv_units: list[int] = []
+                    for g in unit_ids:
+                        g_int = int(g)
+                        net = unit_predictor.get_network(g_int)
+                        with _torch.no_grad():
+                            logits = net(X_tensor).detach()
+                            probs = _torch.sigmoid(logits)
+                            tv_val = float(_torch.mean(_torch.abs(probs[:, 1:] - probs[:, :-1])).item())
+                        if tv_val < tv_thr:
+                            low_tv_units.append(g_int)
+                    if low_tv_units:
+                        log(
+                            "[unit_predictor] auto extra TV finetune: "
+                            f"units={low_tv_units}, epochs={auto_epochs}, tv_w={tv_w}, tv_thr={tv_thr}"
+                        )
+                        for g_int in low_tv_units:
+                            unit_predictor.train_unit(
+                                unit_id=g_int,
+                                num_epochs=auto_epochs,
+                                batch_size=unit_predictor_batch_size,
+                                batch_strategy=unit_predictor_batch_strategy,
+                                shuffle=unit_predictor_shuffle,
+                                learning_rate=unit_predictor_lr,
+                                enable_scheduler=False,
+                                scheduler_patience=10,
+                                scheduler_factor=0.5,
+                                scheduler_min_lr=1e-5,
+                                enable_pos_weight=False,
+                                pos_weight_clip=unit_predictor_pos_weight_clip,
+                                loss_weight_bce=0.0,
+                                loss_weight_mse=1.0,
+                                loss_weight_l1=0.0,
+                                loss_weight_tv=tv_w,
+                                loss_weight_transition=unit_predictor_loss_weight_transition,
+                                loss_weight_binarize=unit_predictor_loss_weight_binarize,
+                                loss_weight_std_floor=unit_predictor_loss_weight_std_floor,
+                                std_floor_scale=unit_predictor_std_floor_scale,
+                                loss_weight_tv_floor=max(
+                                    float(unit_predictor_loss_weight_tv_floor),
+                                    float(tv_w),
+                                ),
+                                tv_floor_scale=unit_predictor_tv_floor_scale,
+                            )
+
     # 步骤 2：训练代理约束（支持机组级并行或样本级并行）
     if save_dir:
         os.makedirs(save_dir, exist_ok=True)
@@ -740,6 +1189,11 @@ def run_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS,
     if N_WORKERS_UNIT > 1:
         from uc_NN_subproblem_parallel import train_all_surrogates_parallel
 
+        if unit_predictor is not None and not unit_predictor_save_path:
+            raise RuntimeError(
+                "unit_predictor is enabled with unit-level multiprocessing, but no save_dir/path "
+                "is available for child workers to load the predictor checkpoint"
+            )
         log(
             f"  启用机组级并行: unit_workers={N_WORKERS_UNIT}, sample_workers={N_WORKERS_SAMPLE}"
         )
@@ -759,17 +1213,63 @@ def run_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS,
             rho_dual_x_init=rho_dual_x_init,
             rho_dual_coc_init=rho_dual_coc_init,
             rho_binary_init=rho_binary_init,
+            rho_binary_max=rho_binary_max,
             rho_opt_init=rho_opt_init,
             gamma_base=subproblem_gamma_base,
+            mu_lower_bound_init=mu_lower_bound_init,
             mu_individual_lower_bound_round=mu_individual_lower_bound_round,
             mu_group_lower_bound_round=mu_group_lower_bound_round,
             mu_signed_round_interval=mu_signed_round_interval,
             mu_sign_hysteresis_rounds=mu_sign_hysteresis_rounds,
             mu_sign_flip_min_share=mu_sign_flip_min_share,
+            x_bound_dual_zero_rounds=x_bound_dual_zero_rounds,
+            ignore_startup_shutdown_costs=ignore_startup_shutdown_costs,
+            nn_learning_rate=subproblem_nn_learning_rate,
+            cost_learning_rate=subproblem_cost_learning_rate,
+            nn_batch_strategy=subproblem_nn_batch_strategy,
+            nn_batch_size=subproblem_nn_batch_size,
+            nn_shuffle=subproblem_nn_shuffle,
+            nn_smooth_abs_eps=subproblem_nn_smooth_abs_eps,
+            loss_ratio_primal=loss_ratio_primal,
+            loss_ratio_dual_pg=loss_ratio_dual_pg,
+            loss_ratio_dual_x=loss_ratio_dual_x,
+            nn_dual_term_interval=nn_dual_term_interval,
+            loss_ratio_opt=loss_ratio_opt,
+            loss_ratio_reg=loss_ratio_reg,
+            pg_cost_nn_epochs=pg_cost_nn_epochs,
+            pg_cost_start_round=pg_cost_start_round,
+            pg_cost_lr=pg_cost_lr,
+            pg_cost_surr_lr=pg_cost_surr_lr,
+            pg_cost_reg_deadband=pg_cost_reg_deadband,
+            pg_block_prox_weight=pg_block_prox_weight,
+            dual_block_prox_weight=dual_block_prox_weight,
+            iter_delta_reg_weight=iter_delta_reg_weight,
+            iter_delta_reg_deadband=iter_delta_reg_deadband,
             save_dir=save_dir,
             n_workers=N_WORKERS_UNIT,
             sample_n_workers=N_WORKERS_SAMPLE,
             use_sample_parallel=(N_WORKERS_SAMPLE > 1),
+            unit_predictor_path=unit_predictor_save_path,
+            use_unit_predictor=(unit_predictor is not None),
+            predictor_warmup_rounds=predictor_warmup_rounds,
+            sign4_curriculum_rounds=sign4_curriculum_rounds,
+            sign4_initial_scale=sign4_initial_scale,
+            sign4_final_scale=sign4_final_scale,
+            sign4_delay_rounds=sign4_delay_rounds,
+            enable_surrogate_delta_reference_lift=enable_surrogate_delta_reference_lift,
+            surrogate_delta_reference_eps=surrogate_delta_reference_eps,
+            surrogate_delta_reference_scope=surrogate_delta_reference_scope,
+            surrogate_delta_reference_min_abs_factor=surrogate_delta_reference_min_abs_factor,
+            unit_predictor_finetune_lr=unit_predictor_finetune_lr,
+            unit_predictor_weight_decay=unit_predictor_weight_decay,
+            unit_predictor_hidden_dims=unit_predictor_hidden_dims,
+            unit_predictor_net_variant=unit_predictor_net_variant,
+            unit_predictor_tcn_channels=unit_predictor_tcn_channels,
+            unit_predictor_tcn_depth=unit_predictor_tcn_depth,
+            unit_predictor_tconv_channels=unit_predictor_tconv_channels,
+            unit_predictor_tconv_depth=unit_predictor_tconv_depth,
+            unit_predictor_dropout=unit_predictor_dropout,
+            case_name=case_name,
         )
 
         # train_all_surrogates_parallel 返回的是 state_dict；为了保持 run_surrogate 的返回形态
@@ -783,10 +1283,15 @@ def run_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS,
             lp_backend=lp_backend,
             constraint_generation_strategy=constraint_generation_strategy,
             ignore_startup_shutdown_costs=ignore_startup_shutdown_costs,
+            case_name=case_name,
         )
         if logger is not None:
             for trainer in trainers.values():
                 trainer.logger = logger
+        if unit_predictor is not None:
+            for trainer in trainers.values():
+                trainer.unit_predictor = unit_predictor
+                trainer.use_unit_predictor = True
         return dual_predictor_loaded, trainers
 
     trainers = {}
@@ -804,6 +1309,7 @@ def run_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS,
                 rho_dual_x_init=rho_dual_x_init,
                 rho_dual_coc_init=rho_dual_coc_init,
                 rho_binary_init=rho_binary_init,
+                rho_binary_max=rho_binary_max,
                 rho_opt_init=rho_opt_init,
                 loss_ratio_primal=loss_ratio_primal,
                 loss_ratio_dual_pg=loss_ratio_dual_pg,
@@ -839,6 +1345,20 @@ def run_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS,
                 dual_block_prox_weight=dual_block_prox_weight,
                 iter_delta_reg_weight=iter_delta_reg_weight,
                 iter_delta_reg_deadband=iter_delta_reg_deadband,
+                unit_predictor=unit_predictor,
+                use_unit_predictor=(unit_predictor is not None),
+                predictor_warmup_rounds=predictor_warmup_rounds,
+                sign4_curriculum_rounds=sign4_curriculum_rounds,
+                sign4_initial_scale=sign4_initial_scale,
+                sign4_final_scale=sign4_final_scale,
+                sign4_delay_rounds=sign4_delay_rounds,
+                enable_surrogate_delta_reference_lift=enable_surrogate_delta_reference_lift,
+                surrogate_delta_reference_eps=surrogate_delta_reference_eps,
+                surrogate_delta_reference_scope=surrogate_delta_reference_scope,
+                surrogate_delta_reference_min_abs_factor=surrogate_delta_reference_min_abs_factor,
+                unit_predictor_finetune_lr=unit_predictor_finetune_lr,
+                unit_predictor_weight_decay=unit_predictor_weight_decay,
+                case_name=case_name,
             )
         else:
             log(f"  机组 {g} ({i+1}/{len(unit_ids)}) — 样本级并行 n_workers={n_workers}")
@@ -853,6 +1373,7 @@ def run_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS,
                 rho_dual_x_init=rho_dual_x_init,
                 rho_dual_coc_init=rho_dual_coc_init,
                 rho_binary_init=rho_binary_init,
+                rho_binary_max=rho_binary_max,
                 rho_opt_init=rho_opt_init,
                 loss_ratio_primal=loss_ratio_primal,
                 loss_ratio_dual_pg=loss_ratio_dual_pg,
@@ -888,6 +1409,20 @@ def run_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS,
                 dual_block_prox_weight=dual_block_prox_weight,
                 iter_delta_reg_weight=iter_delta_reg_weight,
                 iter_delta_reg_deadband=iter_delta_reg_deadband,
+                unit_predictor=unit_predictor,
+                use_unit_predictor=(unit_predictor is not None),
+                predictor_warmup_rounds=predictor_warmup_rounds,
+                sign4_curriculum_rounds=sign4_curriculum_rounds,
+                sign4_initial_scale=sign4_initial_scale,
+                sign4_final_scale=sign4_final_scale,
+                sign4_delay_rounds=sign4_delay_rounds,
+                enable_surrogate_delta_reference_lift=enable_surrogate_delta_reference_lift,
+                surrogate_delta_reference_eps=surrogate_delta_reference_eps,
+                surrogate_delta_reference_scope=surrogate_delta_reference_scope,
+                surrogate_delta_reference_min_abs_factor=surrogate_delta_reference_min_abs_factor,
+                unit_predictor_finetune_lr=unit_predictor_finetune_lr,
+                unit_predictor_weight_decay=unit_predictor_weight_decay,
+                case_name=case_name,
                 n_workers=n_workers,
             )
         if load_path is not None:
@@ -919,7 +1454,8 @@ def load_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS, load_dir,
                    logger: 'TrainingLogger | None' = None,
                    lp_backend: str | None = None,
                    constraint_generation_strategy: str | None = None,
-                   ignore_startup_shutdown_costs: bool | None = None):
+                   ignore_startup_shutdown_costs: bool | None = None,
+                   case_name: str | None = None):
     """加载已有 dual_predictor 和 subproblem surrogate 模型。"""
     load_path = Path(load_dir)
     if not load_path.is_absolute():
@@ -928,6 +1464,35 @@ def load_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS, load_dir,
         raise FileNotFoundError(f"surrogate 模型目录不存在: {load_path}")
 
     log(f"从已有目录加载 subproblem 模型，跳过 subproblem 训练: {load_path}")
+    predictor_strategy = normalize_constraint_generation_strategy(
+        constraint_generation_strategy or SURROGATE_CONSTRAINT_STRATEGY
+    )
+    load_unit_predictor = bool(USE_UNIT_PREDICTOR) and predictor_strategy in {
+        'all_single_time',
+        'all_templates_sign4_plus_single',
+    }
+    unit_predictor_checkpoint = None
+    if load_unit_predictor:
+        raw_predictor_path = UNIT_PREDICTOR_LOAD_PATH
+        if raw_predictor_path:
+            p = Path(raw_predictor_path)
+            if not p.is_absolute():
+                p = Path(__file__).parent / p
+            if p.is_dir():
+                latest = p / 'LATEST.txt'
+                if latest.is_file():
+                    target = Path(latest.read_text(encoding='utf-8').strip())
+                    p = target if target.is_absolute() else p / target
+                else:
+                    p = p / 'unit_predictor.pth'
+            if not p.exists():
+                raise FileNotFoundError(
+                    f"UNIT_PREDICTOR_LOAD_PATH set but checkpoint not found: {p}"
+                )
+            unit_predictor_checkpoint = str(p)
+        else:
+            unit_predictor_checkpoint = str(load_path / 'unit_predictor.pth')
+
     dual_predictor, trainers = load_trained_models(
         ppc,
         all_samples,
@@ -937,6 +1502,18 @@ def load_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS, load_dir,
         lp_backend=lp_backend,
         constraint_generation_strategy=constraint_generation_strategy,
         ignore_startup_shutdown_costs=ignore_startup_shutdown_costs,
+        case_name=case_name,
+        unit_predictor_path=unit_predictor_checkpoint,
+        use_unit_predictor=load_unit_predictor,
+        unit_predictor_hidden_dims=UNIT_PREDICTOR_HIDDEN_DIMS,
+        unit_predictor_net_variant=UNIT_PREDICTOR_NET_VARIANT,
+        unit_predictor_tcn_channels=UNIT_PREDICTOR_TCN_CHANNELS,
+        unit_predictor_tcn_depth=UNIT_PREDICTOR_TCN_DEPTH,
+        unit_predictor_tconv_channels=UNIT_PREDICTOR_TCONV_CHANNELS,
+        unit_predictor_tconv_depth=UNIT_PREDICTOR_TCONV_DEPTH,
+        unit_predictor_dropout=UNIT_PREDICTOR_DROPOUT,
+        unit_predictor_finetune_lr=UNIT_PREDICTOR_FINETUNE_LR,
+        unit_predictor_weight_decay=UNIT_PREDICTOR_WEIGHT_DECAY,
     )
     if logger is not None:
         for trainer in trainers.values():
@@ -1429,6 +2006,7 @@ def run_feasibility_pump_test(ppc, all_samples, dual_predictor, trainers,
 
 def main():
     _bootstrap_runtime_environment()
+    _configure_unit_predictor_load_path_from_runtime()
     start_time = time.time()
 
     print("=" * 70, flush=True)
@@ -1459,6 +2037,41 @@ def main():
     DUAL_PREDICTOR_NORMALIZE_TARGETS_VALUE = DUAL_PREDICTOR_NORMALIZE_TARGETS
     DUAL_PREDICTOR_COSINE_LOSS_WEIGHT_VALUE = DUAL_PREDICTOR_COSINE_LOSS_WEIGHT
     DUAL_PREDICTOR_SMOOTH_L1_BETA_VALUE = DUAL_PREDICTOR_SMOOTH_L1_BETA
+    SURROGATE_DUAL_PREDICTOR_ONLY_VALUE = SURROGATE_DUAL_PREDICTOR_ONLY
+    USE_UNIT_PREDICTOR_VALUE = USE_UNIT_PREDICTOR
+    UNIT_PREDICTOR_EPOCHS_VALUE = UNIT_PREDICTOR_EPOCHS
+    UNIT_PREDICTOR_BATCH_STRATEGY_VALUE = UNIT_PREDICTOR_BATCH_STRATEGY
+    UNIT_PREDICTOR_BATCH_SIZE_VALUE = UNIT_PREDICTOR_BATCH_SIZE
+    UNIT_PREDICTOR_SHUFFLE_VALUE = UNIT_PREDICTOR_SHUFFLE
+    UNIT_PREDICTOR_LR_VALUE = UNIT_PREDICTOR_LR
+    UNIT_PREDICTOR_HIDDEN_DIMS_VALUE = UNIT_PREDICTOR_HIDDEN_DIMS
+    UNIT_PREDICTOR_NET_VARIANT_VALUE = UNIT_PREDICTOR_NET_VARIANT
+    UNIT_PREDICTOR_TCN_CHANNELS_VALUE = UNIT_PREDICTOR_TCN_CHANNELS
+    UNIT_PREDICTOR_TCN_DEPTH_VALUE = UNIT_PREDICTOR_TCN_DEPTH
+    UNIT_PREDICTOR_TCONV_CHANNELS_VALUE = UNIT_PREDICTOR_TCONV_CHANNELS
+    UNIT_PREDICTOR_TCONV_DEPTH_VALUE = UNIT_PREDICTOR_TCONV_DEPTH
+    UNIT_PREDICTOR_DROPOUT_VALUE = UNIT_PREDICTOR_DROPOUT
+    UNIT_PREDICTOR_ENABLE_POS_WEIGHT_VALUE = UNIT_PREDICTOR_ENABLE_POS_WEIGHT
+    UNIT_PREDICTOR_POS_WEIGHT_CLIP_VALUE = UNIT_PREDICTOR_POS_WEIGHT_CLIP
+    UNIT_PREDICTOR_LOSS_WEIGHT_BCE_VALUE = UNIT_PREDICTOR_LOSS_WEIGHT_BCE
+    UNIT_PREDICTOR_LOSS_WEIGHT_MSE_VALUE = UNIT_PREDICTOR_LOSS_WEIGHT_MSE
+    UNIT_PREDICTOR_LOSS_WEIGHT_L1_VALUE = UNIT_PREDICTOR_LOSS_WEIGHT_L1
+    UNIT_PREDICTOR_LOSS_WEIGHT_TV_VALUE = UNIT_PREDICTOR_LOSS_WEIGHT_TV
+    UNIT_PREDICTOR_LOSS_WEIGHT_TRANSITION_VALUE = UNIT_PREDICTOR_LOSS_WEIGHT_TRANSITION
+    UNIT_PREDICTOR_LOSS_WEIGHT_BINARIZE_VALUE = UNIT_PREDICTOR_LOSS_WEIGHT_BINARIZE
+    UNIT_PREDICTOR_LOSS_WEIGHT_STD_FLOOR_VALUE = UNIT_PREDICTOR_LOSS_WEIGHT_STD_FLOOR
+    UNIT_PREDICTOR_STD_FLOOR_SCALE_VALUE = UNIT_PREDICTOR_STD_FLOOR_SCALE
+    UNIT_PREDICTOR_LOSS_WEIGHT_TV_FLOOR_VALUE = UNIT_PREDICTOR_LOSS_WEIGHT_TV_FLOOR
+    UNIT_PREDICTOR_TV_FLOOR_SCALE_VALUE = UNIT_PREDICTOR_TV_FLOOR_SCALE
+    UNIT_PREDICTOR_LOAD_PATH_VALUE = UNIT_PREDICTOR_LOAD_PATH
+    UNIT_PREDICTOR_UNIT1_EXTRA_TV_EPOCHS_VALUE = UNIT_PREDICTOR_UNIT1_EXTRA_TV_EPOCHS
+    UNIT_PREDICTOR_UNIT1_EXTRA_TV_WEIGHT_VALUE = UNIT_PREDICTOR_UNIT1_EXTRA_TV_WEIGHT
+    UNIT_PREDICTOR_AUTO_EXTRA_TV_VALUE = UNIT_PREDICTOR_AUTO_EXTRA_TV
+    UNIT_PREDICTOR_AUTO_EXTRA_TV_EPOCHS_VALUE = UNIT_PREDICTOR_AUTO_EXTRA_TV_EPOCHS
+    UNIT_PREDICTOR_AUTO_EXTRA_TV_TV_THRESHOLD_VALUE = UNIT_PREDICTOR_AUTO_EXTRA_TV_TV_THRESHOLD
+    UNIT_PREDICTOR_AUTO_EXTRA_TV_WEIGHT_VALUE = UNIT_PREDICTOR_AUTO_EXTRA_TV_WEIGHT
+    UNIT_PREDICTOR_FINETUNE_LR_VALUE = UNIT_PREDICTOR_FINETUNE_LR
+    UNIT_PREDICTOR_WEIGHT_DECAY_VALUE = UNIT_PREDICTOR_WEIGHT_DECAY
     BCD_MAX_ITER_VALUE = BCD_MAX_ITER
     SUBPROBLEM_MAX_ITER_VALUE = SUBPROBLEM_MAX_ITER
     BCD_LAMBDA_INIT_STRATEGY_VALUE = BCD_LAMBDA_INIT_STRATEGY
@@ -1487,6 +2100,7 @@ def main():
     SUBPROBLEM_RHO_DUAL_X_INIT_VALUE = SUBPROBLEM_RHO_DUAL_X_INIT
     SUBPROBLEM_RHO_DUAL_COC_INIT_VALUE = SUBPROBLEM_RHO_DUAL_COC_INIT
     SUBPROBLEM_RHO_BINARY_INIT_VALUE = SUBPROBLEM_RHO_BINARY_INIT
+    SUBPROBLEM_RHO_BINARY_MAX_VALUE = SUBPROBLEM_RHO_BINARY_MAX
     SUBPROBLEM_RHO_OPT_INIT_VALUE = SUBPROBLEM_RHO_OPT_INIT
     SUBPROBLEM_LOSS_RATIO_PRIMAL_VALUE = SUBPROBLEM_LOSS_RATIO_PRIMAL
     SUBPROBLEM_LOSS_RATIO_DUAL_PG_VALUE = SUBPROBLEM_LOSS_RATIO_DUAL_PG
@@ -1503,6 +2117,17 @@ def main():
     SUBPROBLEM_MU_SIGN_HYSTERESIS_ROUNDS_VALUE = SUBPROBLEM_MU_SIGN_HYSTERESIS_ROUNDS
     SUBPROBLEM_MU_SIGN_FLIP_MIN_SHARE_VALUE = SUBPROBLEM_MU_SIGN_FLIP_MIN_SHARE
     SUBPROBLEM_X_BOUND_DUAL_ZERO_ROUNDS_VALUE = SUBPROBLEM_X_BOUND_DUAL_ZERO_ROUNDS
+    SUBPROBLEM_PREDICTOR_WARMUP_ROUNDS_VALUE = SUBPROBLEM_PREDICTOR_WARMUP_ROUNDS
+    SUBPROBLEM_SIGN4_CURRICULUM_ROUNDS_VALUE = SUBPROBLEM_SIGN4_CURRICULUM_ROUNDS
+    SUBPROBLEM_SIGN4_INITIAL_SCALE_VALUE = SUBPROBLEM_SIGN4_INITIAL_SCALE
+    SUBPROBLEM_SIGN4_FINAL_SCALE_VALUE = SUBPROBLEM_SIGN4_FINAL_SCALE
+    SUBPROBLEM_SIGN4_DELAY_ROUNDS_VALUE = SUBPROBLEM_SIGN4_DELAY_ROUNDS
+    SUBPROBLEM_SURROGATE_DELTA_REFERENCE_LIFT_VALUE = SUBPROBLEM_SURROGATE_DELTA_REFERENCE_LIFT
+    SUBPROBLEM_SURROGATE_DELTA_REFERENCE_EPS_VALUE = SUBPROBLEM_SURROGATE_DELTA_REFERENCE_EPS
+    SUBPROBLEM_SURROGATE_DELTA_REFERENCE_SCOPE_VALUE = SUBPROBLEM_SURROGATE_DELTA_REFERENCE_SCOPE
+    SUBPROBLEM_SURROGATE_DELTA_REFERENCE_MIN_ABS_FACTOR_VALUE = (
+        SUBPROBLEM_SURROGATE_DELTA_REFERENCE_MIN_ABS_FACTOR
+    )
     SUBPROBLEM_NN_BATCH_STRATEGY_VALUE = SUBPROBLEM_NN_BATCH_STRATEGY
     SUBPROBLEM_NN_BATCH_SIZE_VALUE = SUBPROBLEM_NN_BATCH_SIZE
     SUBPROBLEM_NN_SHUFFLE_VALUE = SUBPROBLEM_NN_SHUFFLE
@@ -1709,6 +2334,7 @@ def main():
                     lp_backend=SUBPROBLEM_LP_BACKEND,
                     constraint_generation_strategy=CONSTRAINT_GENERATION_STRATEGY,
                     ignore_startup_shutdown_costs=SUBPROBLEM_IGNORE_STARTUP_SHUTDOWN_COSTS_VALUE,
+                    case_name=CASE_NAME,
                 )
             else:
                 dual_predictor, trainers = run_surrogate(
@@ -1727,6 +2353,7 @@ def main():
                     rho_dual_x_init=SUBPROBLEM_RHO_DUAL_X_INIT_VALUE,
                     rho_dual_coc_init=SUBPROBLEM_RHO_DUAL_COC_INIT_VALUE,
                     rho_binary_init=SUBPROBLEM_RHO_BINARY_INIT_VALUE,
+                    rho_binary_max=SUBPROBLEM_RHO_BINARY_MAX_VALUE,
                     rho_opt_init=SUBPROBLEM_RHO_OPT_INIT_VALUE,
                     loss_ratio_primal=SUBPROBLEM_LOSS_RATIO_PRIMAL_VALUE,
                     loss_ratio_dual_pg=SUBPROBLEM_LOSS_RATIO_DUAL_PG_VALUE,
@@ -1768,6 +2395,53 @@ def main():
                     dual_normalize_targets=DUAL_PREDICTOR_NORMALIZE_TARGETS_VALUE,
                     dual_cosine_loss_weight=DUAL_PREDICTOR_COSINE_LOSS_WEIGHT_VALUE,
                     dual_smooth_l1_beta=DUAL_PREDICTOR_SMOOTH_L1_BETA_VALUE,
+                    dual_predictor_only=SURROGATE_DUAL_PREDICTOR_ONLY_VALUE,
+                    use_unit_predictor=USE_UNIT_PREDICTOR_VALUE,
+                    unit_predictor_epochs=UNIT_PREDICTOR_EPOCHS_VALUE,
+                    unit_predictor_batch_strategy=UNIT_PREDICTOR_BATCH_STRATEGY_VALUE,
+                    unit_predictor_batch_size=UNIT_PREDICTOR_BATCH_SIZE_VALUE,
+                    unit_predictor_shuffle=UNIT_PREDICTOR_SHUFFLE_VALUE,
+                    unit_predictor_lr=UNIT_PREDICTOR_LR_VALUE,
+                    unit_predictor_hidden_dims=UNIT_PREDICTOR_HIDDEN_DIMS_VALUE,
+                    unit_predictor_net_variant=UNIT_PREDICTOR_NET_VARIANT_VALUE,
+                    unit_predictor_tcn_channels=UNIT_PREDICTOR_TCN_CHANNELS_VALUE,
+                    unit_predictor_tcn_depth=UNIT_PREDICTOR_TCN_DEPTH_VALUE,
+                    unit_predictor_tconv_channels=UNIT_PREDICTOR_TCONV_CHANNELS_VALUE,
+                    unit_predictor_tconv_depth=UNIT_PREDICTOR_TCONV_DEPTH_VALUE,
+                    unit_predictor_dropout=UNIT_PREDICTOR_DROPOUT_VALUE,
+                    unit_predictor_enable_pos_weight=UNIT_PREDICTOR_ENABLE_POS_WEIGHT_VALUE,
+                    unit_predictor_pos_weight_clip=UNIT_PREDICTOR_POS_WEIGHT_CLIP_VALUE,
+                    unit_predictor_loss_weight_bce=UNIT_PREDICTOR_LOSS_WEIGHT_BCE_VALUE,
+                    unit_predictor_loss_weight_mse=UNIT_PREDICTOR_LOSS_WEIGHT_MSE_VALUE,
+                    unit_predictor_loss_weight_l1=UNIT_PREDICTOR_LOSS_WEIGHT_L1_VALUE,
+                    unit_predictor_loss_weight_tv=UNIT_PREDICTOR_LOSS_WEIGHT_TV_VALUE,
+                    unit_predictor_loss_weight_transition=UNIT_PREDICTOR_LOSS_WEIGHT_TRANSITION_VALUE,
+                    unit_predictor_loss_weight_binarize=UNIT_PREDICTOR_LOSS_WEIGHT_BINARIZE_VALUE,
+                    unit_predictor_loss_weight_std_floor=UNIT_PREDICTOR_LOSS_WEIGHT_STD_FLOOR_VALUE,
+                    unit_predictor_std_floor_scale=UNIT_PREDICTOR_STD_FLOOR_SCALE_VALUE,
+                    unit_predictor_loss_weight_tv_floor=UNIT_PREDICTOR_LOSS_WEIGHT_TV_FLOOR_VALUE,
+                    unit_predictor_tv_floor_scale=UNIT_PREDICTOR_TV_FLOOR_SCALE_VALUE,
+                    unit_predictor_load_path=UNIT_PREDICTOR_LOAD_PATH_VALUE,
+                    unit_predictor_unit1_extra_tv_epochs=UNIT_PREDICTOR_UNIT1_EXTRA_TV_EPOCHS_VALUE,
+                    unit_predictor_unit1_extra_tv_weight=UNIT_PREDICTOR_UNIT1_EXTRA_TV_WEIGHT_VALUE,
+                    unit_predictor_auto_extra_tv=UNIT_PREDICTOR_AUTO_EXTRA_TV_VALUE,
+                    unit_predictor_auto_extra_tv_epochs=UNIT_PREDICTOR_AUTO_EXTRA_TV_EPOCHS_VALUE,
+                    unit_predictor_auto_extra_tv_tv_threshold=UNIT_PREDICTOR_AUTO_EXTRA_TV_TV_THRESHOLD_VALUE,
+                    unit_predictor_auto_extra_tv_weight=UNIT_PREDICTOR_AUTO_EXTRA_TV_WEIGHT_VALUE,
+                    predictor_warmup_rounds=SUBPROBLEM_PREDICTOR_WARMUP_ROUNDS_VALUE,
+                    sign4_curriculum_rounds=SUBPROBLEM_SIGN4_CURRICULUM_ROUNDS_VALUE,
+                    sign4_initial_scale=SUBPROBLEM_SIGN4_INITIAL_SCALE_VALUE,
+                    sign4_final_scale=SUBPROBLEM_SIGN4_FINAL_SCALE_VALUE,
+                    sign4_delay_rounds=SUBPROBLEM_SIGN4_DELAY_ROUNDS_VALUE,
+                    enable_surrogate_delta_reference_lift=SUBPROBLEM_SURROGATE_DELTA_REFERENCE_LIFT_VALUE,
+                    surrogate_delta_reference_eps=SUBPROBLEM_SURROGATE_DELTA_REFERENCE_EPS_VALUE,
+                    surrogate_delta_reference_scope=SUBPROBLEM_SURROGATE_DELTA_REFERENCE_SCOPE_VALUE,
+                    surrogate_delta_reference_min_abs_factor=(
+                        SUBPROBLEM_SURROGATE_DELTA_REFERENCE_MIN_ABS_FACTOR_VALUE
+                    ),
+                    unit_predictor_finetune_lr=UNIT_PREDICTOR_FINETUNE_LR_VALUE,
+                    unit_predictor_weight_decay=UNIT_PREDICTOR_WEIGHT_DECAY_VALUE,
+                    case_name=CASE_NAME,
                 )
             print_surrogate_results(trainers, all_samples)
 
@@ -2008,6 +2682,7 @@ def main():
                     lp_backend=SUBPROBLEM_LP_BACKEND,
                     constraint_generation_strategy=CONSTRAINT_GENERATION_STRATEGY,
                     ignore_startup_shutdown_costs=SUBPROBLEM_IGNORE_STARTUP_SHUTDOWN_COSTS_VALUE,
+                    case_name=CASE_NAME,
                 )
             else:
                 dual_predictor, trainers = run_surrogate(
@@ -2026,6 +2701,7 @@ def main():
                     rho_dual_x_init=SUBPROBLEM_RHO_DUAL_X_INIT_VALUE,
                     rho_dual_coc_init=SUBPROBLEM_RHO_DUAL_COC_INIT_VALUE,
                     rho_binary_init=SUBPROBLEM_RHO_BINARY_INIT_VALUE,
+                    rho_binary_max=SUBPROBLEM_RHO_BINARY_MAX_VALUE,
                     rho_opt_init=SUBPROBLEM_RHO_OPT_INIT_VALUE,
                     loss_ratio_primal=SUBPROBLEM_LOSS_RATIO_PRIMAL_VALUE,
                     loss_ratio_dual_pg=SUBPROBLEM_LOSS_RATIO_DUAL_PG_VALUE,
@@ -2067,6 +2743,53 @@ def main():
                     dual_normalize_targets=DUAL_PREDICTOR_NORMALIZE_TARGETS_VALUE,
                     dual_cosine_loss_weight=DUAL_PREDICTOR_COSINE_LOSS_WEIGHT_VALUE,
                     dual_smooth_l1_beta=DUAL_PREDICTOR_SMOOTH_L1_BETA_VALUE,
+                    dual_predictor_only=SURROGATE_DUAL_PREDICTOR_ONLY_VALUE,
+                    use_unit_predictor=USE_UNIT_PREDICTOR_VALUE,
+                    unit_predictor_epochs=UNIT_PREDICTOR_EPOCHS_VALUE,
+                    unit_predictor_batch_strategy=UNIT_PREDICTOR_BATCH_STRATEGY_VALUE,
+                    unit_predictor_batch_size=UNIT_PREDICTOR_BATCH_SIZE_VALUE,
+                    unit_predictor_shuffle=UNIT_PREDICTOR_SHUFFLE_VALUE,
+                    unit_predictor_lr=UNIT_PREDICTOR_LR_VALUE,
+                    unit_predictor_hidden_dims=UNIT_PREDICTOR_HIDDEN_DIMS_VALUE,
+                    unit_predictor_net_variant=UNIT_PREDICTOR_NET_VARIANT_VALUE,
+                    unit_predictor_tcn_channels=UNIT_PREDICTOR_TCN_CHANNELS_VALUE,
+                    unit_predictor_tcn_depth=UNIT_PREDICTOR_TCN_DEPTH_VALUE,
+                    unit_predictor_tconv_channels=UNIT_PREDICTOR_TCONV_CHANNELS_VALUE,
+                    unit_predictor_tconv_depth=UNIT_PREDICTOR_TCONV_DEPTH_VALUE,
+                    unit_predictor_dropout=UNIT_PREDICTOR_DROPOUT_VALUE,
+                    unit_predictor_enable_pos_weight=UNIT_PREDICTOR_ENABLE_POS_WEIGHT_VALUE,
+                    unit_predictor_pos_weight_clip=UNIT_PREDICTOR_POS_WEIGHT_CLIP_VALUE,
+                    unit_predictor_loss_weight_bce=UNIT_PREDICTOR_LOSS_WEIGHT_BCE_VALUE,
+                    unit_predictor_loss_weight_mse=UNIT_PREDICTOR_LOSS_WEIGHT_MSE_VALUE,
+                    unit_predictor_loss_weight_l1=UNIT_PREDICTOR_LOSS_WEIGHT_L1_VALUE,
+                    unit_predictor_loss_weight_tv=UNIT_PREDICTOR_LOSS_WEIGHT_TV_VALUE,
+                    unit_predictor_loss_weight_transition=UNIT_PREDICTOR_LOSS_WEIGHT_TRANSITION_VALUE,
+                    unit_predictor_loss_weight_binarize=UNIT_PREDICTOR_LOSS_WEIGHT_BINARIZE_VALUE,
+                    unit_predictor_loss_weight_std_floor=UNIT_PREDICTOR_LOSS_WEIGHT_STD_FLOOR_VALUE,
+                    unit_predictor_std_floor_scale=UNIT_PREDICTOR_STD_FLOOR_SCALE_VALUE,
+                    unit_predictor_loss_weight_tv_floor=UNIT_PREDICTOR_LOSS_WEIGHT_TV_FLOOR_VALUE,
+                    unit_predictor_tv_floor_scale=UNIT_PREDICTOR_TV_FLOOR_SCALE_VALUE,
+                    unit_predictor_load_path=UNIT_PREDICTOR_LOAD_PATH_VALUE,
+                    unit_predictor_unit1_extra_tv_epochs=UNIT_PREDICTOR_UNIT1_EXTRA_TV_EPOCHS_VALUE,
+                    unit_predictor_unit1_extra_tv_weight=UNIT_PREDICTOR_UNIT1_EXTRA_TV_WEIGHT_VALUE,
+                    unit_predictor_auto_extra_tv=UNIT_PREDICTOR_AUTO_EXTRA_TV_VALUE,
+                    unit_predictor_auto_extra_tv_epochs=UNIT_PREDICTOR_AUTO_EXTRA_TV_EPOCHS_VALUE,
+                    unit_predictor_auto_extra_tv_tv_threshold=UNIT_PREDICTOR_AUTO_EXTRA_TV_TV_THRESHOLD_VALUE,
+                    unit_predictor_auto_extra_tv_weight=UNIT_PREDICTOR_AUTO_EXTRA_TV_WEIGHT_VALUE,
+                    predictor_warmup_rounds=SUBPROBLEM_PREDICTOR_WARMUP_ROUNDS_VALUE,
+                    sign4_curriculum_rounds=SUBPROBLEM_SIGN4_CURRICULUM_ROUNDS_VALUE,
+                    sign4_initial_scale=SUBPROBLEM_SIGN4_INITIAL_SCALE_VALUE,
+                    sign4_final_scale=SUBPROBLEM_SIGN4_FINAL_SCALE_VALUE,
+                    sign4_delay_rounds=SUBPROBLEM_SIGN4_DELAY_ROUNDS_VALUE,
+                    enable_surrogate_delta_reference_lift=SUBPROBLEM_SURROGATE_DELTA_REFERENCE_LIFT_VALUE,
+                    surrogate_delta_reference_eps=SUBPROBLEM_SURROGATE_DELTA_REFERENCE_EPS_VALUE,
+                    surrogate_delta_reference_scope=SUBPROBLEM_SURROGATE_DELTA_REFERENCE_SCOPE_VALUE,
+                    surrogate_delta_reference_min_abs_factor=(
+                        SUBPROBLEM_SURROGATE_DELTA_REFERENCE_MIN_ABS_FACTOR_VALUE
+                    ),
+                    unit_predictor_finetune_lr=UNIT_PREDICTOR_FINETUNE_LR_VALUE,
+                    unit_predictor_weight_decay=UNIT_PREDICTOR_WEIGHT_DECAY_VALUE,
+                    case_name=CASE_NAME,
                 )
             print_surrogate_results(trainers, all_samples)
 
