@@ -558,6 +558,7 @@ class Agent_NN_BCD:
         loss_ratio_opt: float = 1.0,
         loss_ratio_reg: float = 1.0,
         nn_smooth_abs_eps: float = 1e-6,
+        direct_train_config: dict | None = None,
         iter_delta_reg_weight: float = 1e-4,
         iter_delta_reg_deadband: float = 0.05,
         pg_block_prox_weight: float = 2e-2,
@@ -671,6 +672,7 @@ class Agent_NN_BCD:
         self.loss_ratio_opt = float(loss_ratio_opt)
         self.loss_ratio_reg = float(loss_ratio_reg)
         self.nn_smooth_abs_eps = max(float(nn_smooth_abs_eps), 0.0)
+        self.direct_train_config = dict(direct_train_config or {})
         self.iter_delta_reg_weight = float(iter_delta_reg_weight)
         self.iter_delta_reg_deadband = max(float(iter_delta_reg_deadband), 0.0)
         self.pg_block_prox_weight = max(float(pg_block_prox_weight), 0.0)
@@ -3355,6 +3357,14 @@ class Agent_NN_BCD:
             return self.zeta_values.copy()
         values = zeta_tensor.detach().cpu().numpy()
         return {name: float(val) for name, val in zip(self.zeta_var_names, values)}
+
+    def _vector_to_theta_dict(self, values) -> dict:
+        arr = np.asarray(values, dtype=float).reshape(-1)
+        return {name: float(arr[i]) for i, name in enumerate(self.theta_var_names[: arr.size])}
+
+    def _vector_to_zeta_dict(self, values) -> dict:
+        arr = np.asarray(values, dtype=float).reshape(-1)
+        return {name: float(arr[i]) for i, name in enumerate(self.zeta_var_names[: arr.size])}
     
     def _build_pg_cvxpy_persistent(self, sample_id: int):
         """Build a persistent CVXPY PG-block problem using cp.Parameter for every
@@ -5451,6 +5461,7 @@ class Agent_NN_BCD:
         nn_batch_size: int | None = None,
         nn_shuffle: bool | None = None,
         nn_learning_rate: float | None = None,
+        direct_train_config: dict | None = None,
     ):
         """
         主迭代循环（参考uc_dfsm_bcd.py）
@@ -5603,6 +5614,10 @@ class Agent_NN_BCD:
             if self.iter_delta_reg_weight > 0:
                 self._prev_theta_values_list = [dict(v) for v in self.theta_values_list]
                 self._prev_zeta_values_list = [dict(v) for v in self.zeta_values_list]
+            self.iter_with_direct_theta_zeta_targets(
+                union_analysis=active_union_analysis,
+                config=direct_train_config,
+            )
             theta_values_new, zeta_values_new = self.iter_with_theta_zeta_neural_network(
                 union_analysis=active_union_analysis,
                 num_epochs=nn_epochs,
@@ -6051,6 +6066,276 @@ class Agent_NN_BCD:
             totals['obj_opt'] += float(components['obj_opt'].cpu().item())
             totals['reg'] += float(components['reg_term'].cpu().item())
         return totals
+
+    def _bcd_direct_target_bounds(self, config: dict) -> tuple[np.ndarray, np.ndarray]:
+        theta_dim = len(self.theta_var_names)
+        zeta_dim = len(self.zeta_var_names)
+        coeff_bound = float(config.get("coeff_bound", 2.0))
+        rhs_bound = float(config.get("rhs_bound", 3.0))
+        lower = np.full(theta_dim + zeta_dim, -coeff_bound, dtype=np.float64)
+        upper = np.full(theta_dim + zeta_dim, coeff_bound, dtype=np.float64)
+        for i, name in enumerate(self.theta_var_names):
+            if "_rhs_" in name or name.startswith("theta_rhs_"):
+                lower[i] = -rhs_bound
+                upper[i] = rhs_bound
+        offset = theta_dim
+        for i, name in enumerate(self.zeta_var_names):
+            if "_rhs_" in name or name.startswith("zeta_rhs_"):
+                lower[offset + i] = -rhs_bound
+                upper[offset + i] = rhs_bound
+        return lower, upper
+
+    def _x_stationarity_inherent_np(self, sample_id: int, g: int, t: int) -> float:
+        lam = self.lambda_[sample_id]
+        return float(
+            self._build_x_dual_stationarity_expr(
+                g=g,
+                t=t,
+                lambda_cpower=np.asarray(lam['lambda_cpower'], dtype=float),
+                lambda_x_upper=np.asarray(lam['lambda_x_upper'], dtype=float),
+                lambda_x_lower=np.asarray(lam['lambda_x_lower'], dtype=float),
+                lambda_pg_lower=np.asarray(lam['lambda_pg_lower'], dtype=float),
+                lambda_pg_upper=np.asarray(lam['lambda_pg_upper'], dtype=float),
+                lambda_ramp_down=np.asarray(lam['lambda_ramp_down'], dtype=float),
+                lambda_ramp_up=np.asarray(lam['lambda_ramp_up'], dtype=float),
+                lambda_min_on=np.asarray(lam['lambda_min_on'], dtype=float),
+                lambda_min_off=np.asarray(lam['lambda_min_off'], dtype=float),
+                lambda_start_cost=np.asarray(lam['lambda_start_cost'], dtype=float),
+                lambda_shut_cost=np.asarray(lam['lambda_shut_cost'], dtype=float),
+                fixed_cost=float(self.gencost[g, -1] / self.T_delta),
+                pmin=float(self.gen[g, PMIN]),
+                pmax=float(self.gen[g, PMAX]),
+                rd_delta=float(self.Rd_co[g] - self.Rd[g]),
+                ru_delta=float(self.Ru_co[g] - self.Ru[g]),
+                start_cost=float(self.gencost[g, 1]),
+                shut_cost=float(self.gencost[g, 2]),
+                Ton=min(4, self.T),
+                Toff=min(4, self.T),
+            )
+        )
+
+    def _build_bcd_direct_targets(self, union_analysis, config: dict) -> dict[str, np.ndarray | float]:
+        if id(union_analysis) != self._cached_union_analysis_id:
+            self._preprocess_union_analysis_cache(union_analysis)
+
+        theta_dim = len(self.theta_var_names)
+        zeta_dim = len(self.zeta_var_names)
+        total_dim = theta_dim + zeta_dim
+        lower, upper = self._bcd_direct_target_bounds(config)
+        target_blend = min(max(float(config.get("target_blend", 0.75)), 0.0), 1.0)
+        dual_w = float(config.get("dual_eq_weight", 1.0))
+        active_w = float(config.get("active_opt_weight", 0.8))
+        inactive_w = float(config.get("inactive_margin_weight", 0.0))
+        inactive_margin = float(config.get("inactive_margin", 0.0))
+        anchor = float(config.get("anchor_weight", 0.15))
+        theta_anchor = float(config.get("theta_anchor_weight", anchor))
+        zeta_anchor = float(config.get("zeta_anchor_weight", anchor))
+        rhs_anchor = float(config.get("rhs_anchor_weight", anchor))
+        active_threshold = float(config.get("dual_active_threshold", 1e-7))
+
+        theta_targets = np.zeros((self.n_samples, theta_dim), dtype=np.float32)
+        zeta_targets = np.zeros((self.n_samples, zeta_dim), dtype=np.float32)
+        residuals: list[float] = []
+
+        for sample_id in range(self.n_samples):
+            y0 = np.concatenate([
+                np.asarray([self.theta_values_list[sample_id].get(name, 0.0) for name in self.theta_var_names], dtype=np.float64),
+                np.asarray([self.zeta_values_list[sample_id].get(name, 0.0) for name in self.zeta_var_names], dtype=np.float64),
+            ])
+            rows: list[np.ndarray] = []
+            rhs: list[float] = []
+            weights: list[float] = []
+            x_val = np.asarray(self.x[sample_id], dtype=np.float64)
+            mu_val = np.asarray(self.mu[sample_id], dtype=np.float64)
+            ita_val = np.asarray(self.ita[sample_id], dtype=np.float64)
+
+            for g in range(self.ng):
+                for t in range(self.T):
+                    row = np.zeros(total_dim, dtype=np.float64)
+                    for theta_idx, branch_id, anchor_time in self._dual_theta_lookup.get((g, t), []):
+                        if branch_id < self.nl:
+                            dual_scale = float(mu_val[branch_id, anchor_time])
+                        else:
+                            dual_scale = float(getattr(self, "dual_para_bound", 0.1))
+                        row[theta_idx] += self._get_theta_constraint_direction(branch_id, anchor_time) * dual_scale
+                    for zeta_idx in self._dual_zeta_lookup.get((g, t), []):
+                        row[theta_dim + zeta_idx] += self._get_zeta_constraint_direction(g, t) * float(ita_val[g, t])
+                    if np.any(np.abs(row) > 1e-12):
+                        rows.append(row)
+                        rhs.append(-self._x_stationarity_inherent_np(sample_id, g, t))
+                        weights.append(max(dual_w, 0.0))
+
+            for branch_id, time_slot, _ctype, coeff_list, rhs_idx in self._cached_theta_constraints:
+                row = np.zeros(total_dim, dtype=np.float64)
+                direction = self._get_theta_constraint_direction(branch_id, time_slot)
+                for unit_id, member_time, theta_idx in coeff_list:
+                    row[theta_idx] += direction * float(x_val[unit_id, member_time])
+                if rhs_idx >= 0:
+                    row[rhs_idx] -= direction
+                dual_abs = abs(float(mu_val[branch_id, time_slot])) if branch_id < self.nl else float(getattr(self, "dual_para_bound", 0.1))
+                if dual_abs > active_threshold and active_w > 0:
+                    rows.append(row)
+                    rhs.append(0.0)
+                    weights.append(active_w)
+                elif inactive_w > 0:
+                    rows.append(row)
+                    rhs.append(-inactive_margin)
+                    weights.append(inactive_w)
+
+            for unit_id, time_slot, zeta_idx, rhs_idx in self._cached_zeta_constraints:
+                row = np.zeros(total_dim, dtype=np.float64)
+                direction = self._get_zeta_constraint_direction(unit_id, time_slot)
+                row[theta_dim + zeta_idx] += direction * float(x_val[unit_id, time_slot])
+                if rhs_idx >= 0:
+                    row[theta_dim + rhs_idx] -= direction
+                dual_abs = abs(float(ita_val[unit_id, time_slot]))
+                if dual_abs > active_threshold and active_w > 0:
+                    rows.append(row)
+                    rhs.append(0.0)
+                    weights.append(active_w)
+                elif inactive_w > 0:
+                    rows.append(row)
+                    rhs.append(-inactive_margin)
+                    weights.append(inactive_w)
+
+            if rows:
+                mat = np.vstack(rows)
+                vec = np.asarray(rhs, dtype=np.float64)
+                w = np.sqrt(np.maximum(np.asarray(weights, dtype=np.float64), 0.0))
+                mat_w = mat * w[:, None]
+                vec_w = vec * w
+                anchor_diag = np.full(total_dim, max(anchor, 1e-8), dtype=np.float64)
+                for idx, name in enumerate(self.theta_var_names):
+                    anchor_diag[idx] = max(rhs_anchor if "_rhs_" in name or name.startswith("theta_rhs_") else theta_anchor, 1e-8)
+                for idx, name in enumerate(self.zeta_var_names):
+                    anchor_diag[theta_dim + idx] = max(rhs_anchor if "_rhs_" in name or name.startswith("zeta_rhs_") else zeta_anchor, 1e-8)
+                lhs = mat_w.T @ mat_w + np.diag(anchor_diag)
+                rhs_vec = mat_w.T @ vec_w + anchor_diag * y0
+                try:
+                    y = np.linalg.solve(lhs, rhs_vec)
+                except np.linalg.LinAlgError:
+                    y = np.linalg.lstsq(lhs, rhs_vec, rcond=None)[0]
+                residuals.append(float(np.mean(np.abs(mat @ y - vec))) if vec.size else 0.0)
+            else:
+                y = y0.copy()
+                residuals.append(0.0)
+            y = np.clip(y, lower, upper)
+            y = (1.0 - target_blend) * y0 + target_blend * y
+            theta_targets[sample_id] = y[:theta_dim]
+            zeta_targets[sample_id] = y[theta_dim:]
+
+        return {
+            "theta": theta_targets,
+            "zeta": zeta_targets,
+            "proxy_residual_mean": float(np.mean(residuals)) if residuals else 0.0,
+        }
+
+    def iter_with_direct_theta_zeta_targets(self, union_analysis=None, config: dict | None = None):
+        config = dict(self.direct_train_config if config is None else config)
+        epochs = int(config.get("direct_epochs", 0) or 0)
+        if not TORCH_AVAILABLE or epochs <= 0 or self.theta_net is None or self.zeta_net is None:
+            return None
+        if union_analysis is None:
+            union_analysis = self._current_union_analysis
+        resolved_batch_strategy = normalize_nn_batch_strategy(config.get("direct_batch_strategy", self.nn_batch_strategy))
+        if resolved_batch_strategy == "full-batch":
+            batch_size = max(1, self.n_samples)
+        else:
+            batch_size = max(1, int(config.get("direct_batch_size", self.nn_batch_size)))
+        shuffle = bool(config.get("direct_shuffle", self.nn_shuffle))
+        lr = float(config.get("direct_lr", max(self.nn_learning_rate * 20.0, 1e-4)))
+        eta_min_ratio = max(float(config.get("direct_eta_min_ratio", 0.10)), 0.0)
+        grad_clip = float(config.get("direct_grad_clip", 3.0))
+        wd = float(config.get("adam_weight_decay", 0.0) or 0.0)
+        loss_kind = str(config.get("direct_loss", "mse")).strip().lower()
+        beta = float(config.get("direct_beta", 1.0))
+        log_interval = int(config.get("direct_log_interval", 25) or 0)
+        proxy_kkt_w = float(config.get("proxy_kkt_loss_weight", 0.0))
+        feature_noise_std = max(float(config.get("feature_noise_std", 0.0) or 0.0), 0.0)
+
+        np_targets = self._build_bcd_direct_targets(union_analysis, config)
+        target_theta = torch.tensor(np_targets["theta"], dtype=torch.float32, device=self.device)
+        target_zeta = torch.tensor(np_targets["zeta"], dtype=torch.float32, device=self.device)
+        theta_scale = torch.clamp(torch.mean(torch.abs(target_theta)), min=0.25)
+        zeta_scale = torch.clamp(torch.mean(torch.abs(target_zeta)), min=0.25)
+        print(
+            f"[BCD][direct-NN] epochs={epochs}, direct_loss={loss_kind}, "
+            f"proxy_residual_mean={np_targets['proxy_residual_mean']:.6f}",
+            flush=True,
+        )
+
+        def group_loss(pred, target, scale):
+            err = (pred - target) / scale
+            if loss_kind in ("mse", "l2"):
+                return torch.sum(err * err)
+            return torch.nn.functional.smooth_l1_loss(err, torch.zeros_like(err), beta=beta, reduction="sum")
+
+        self.theta_net.train()
+        self.zeta_net.train()
+        theta_optimizer = optim.AdamW(self.theta_net.parameters(), lr=lr, weight_decay=wd)
+        zeta_optimizer = optim.AdamW(self.zeta_net.parameters(), lr=lr, weight_decay=wd)
+        theta_scheduler = optim.lr_scheduler.CosineAnnealingLR(theta_optimizer, T_max=max(epochs, 1), eta_min=lr * eta_min_ratio)
+        zeta_scheduler = optim.lr_scheduler.CosineAnnealingLR(zeta_optimizer, T_max=max(epochs, 1), eta_min=lr * eta_min_ratio)
+        last_avg = None
+        for epoch in range(epochs):
+            epoch_loss = 0.0
+            sample_indices = np.arange(self.n_samples, dtype=int)
+            if shuffle and self.n_samples > 1:
+                np.random.shuffle(sample_indices)
+            theta_optimizer.zero_grad()
+            zeta_optimizer.zero_grad()
+            for sample_pos, _sample_id in enumerate(sample_indices):
+                batch_start = (sample_pos // batch_size) * batch_size
+                is_batch_end = ((sample_pos + 1) % batch_size == 0) or sample_pos == self.n_samples - 1
+                if not is_batch_end:
+                    continue
+                batch_ids = sample_indices[batch_start: sample_pos + 1]
+                batch_index = torch.as_tensor(batch_ids, dtype=torch.long, device=self.device)
+                features_tensor = self._features_cache.index_select(0, batch_index)
+                if feature_noise_std > 0:
+                    features_tensor = features_tensor + torch.randn_like(features_tensor) * feature_noise_std
+                pred_theta = self.theta_net(features_tensor)
+                pred_zeta = self.zeta_net(features_tensor)
+                loss = group_loss(pred_theta, target_theta.index_select(0, batch_index), theta_scale)
+                loss = loss + group_loss(pred_zeta, target_zeta.index_select(0, batch_index), zeta_scale)
+                if proxy_kkt_w > 0:
+                    for local_pos, sid in enumerate(batch_ids):
+                        zeta_tensor = pred_zeta[local_pos]
+                        if self._unit_predictor_active():
+                            zeta_tensor = self._apply_unit_predictor_zeta_override(
+                                zeta_tensor,
+                                int(sid),
+                                train_predictor=False,
+                            )
+                        loss = loss + proxy_kkt_w * self.loss_function_differentiable(
+                            int(sid),
+                            pred_theta[local_pos],
+                            zeta_tensor,
+                            union_analysis=union_analysis,
+                            device=self.device,
+                        )
+                (loss / max(1, len(batch_ids))).backward()
+                epoch_loss += float(loss.detach().cpu().item())
+                torch.nn.utils.clip_grad_norm_(self.theta_net.parameters(), max_norm=grad_clip)
+                torch.nn.utils.clip_grad_norm_(self.zeta_net.parameters(), max_norm=grad_clip)
+                theta_optimizer.step()
+                zeta_optimizer.step()
+                theta_optimizer.zero_grad()
+                zeta_optimizer.zero_grad()
+            theta_scheduler.step()
+            zeta_scheduler.step()
+            last_avg = epoch_loss / max(self.n_samples, 1)
+            if epoch == 0 or epoch == epochs - 1 or (log_interval > 0 and (epoch + 1) % log_interval == 0):
+                print(
+                    f"  [BCD][direct-NN] epoch {epoch+1:>4}/{epochs}, "
+                    f"avg_target_loss={last_avg:.6f}, lr={theta_optimizer.param_groups[0]['lr']:.2e}",
+                    flush=True,
+                )
+
+        self.theta_net.eval()
+        self.zeta_net.eval()
+        self.refresh_theta_zeta_values_from_networks()
+        return {"avg_target_loss": None if last_avg is None else float(last_avg)}
     
     def loss_function_differentiable(self, sample_id, theta_tensor, zeta_tensor,
                                      union_analysis=None, device=None,

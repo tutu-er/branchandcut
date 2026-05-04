@@ -172,7 +172,7 @@ UNIT_PREDICTOR_WEIGHT_DECAY = 1e-4
 MAX_ITER = 300             # backward-compatible shared fallback
 BCD_MAX_ITER = MAX_ITER
 SUBPROBLEM_MAX_ITER = MAX_ITER
-NN_EPOCHS = 4
+NN_EPOCHS = 16
 UNIT_IDS = [1]              # None = 所有机组；或如 [0, 1, 2]
 FP_TEST_SAMPLES = 3
 # Windows 本地默认使用更保守的线程并发，优先稳定性和内存占用。
@@ -218,6 +218,30 @@ BCD_NN_BATCH_STRATEGY = 'full-batch'   # 'full-batch' / 'mini-batch'
 BCD_NN_BATCH_SIZE = 4
 BCD_NN_SHUFFLE = True
 BCD_NN_LR = 5e-5
+BCD_DIRECT_NN_EPOCHS = 120
+BCD_DIRECT_NN_LR = 2e-3
+BCD_DIRECT_NN_ETA_MIN_RATIO = 0.20
+BCD_DIRECT_NN_BATCH_STRATEGY = "mini-batch"
+BCD_DIRECT_NN_BATCH_SIZE = 16
+BCD_DIRECT_NN_SHUFFLE = True
+BCD_DIRECT_NN_LOSS = "mse"
+BCD_DIRECT_NN_GRAD_CLIP = 3.0
+BCD_DIRECT_NN_LOG_INTERVAL = 10
+BCD_DIRECT_NN_FEATURE_NOISE_STD = 0.005
+BCD_DIRECT_NN_ADAM_WD = 1e-5
+BCD_DIRECT_NN_TARGET_BLEND = 0.75
+BCD_DIRECT_NN_DUAL_EQ_WEIGHT = 1.0
+BCD_DIRECT_NN_ACTIVE_OPT_WEIGHT = 0.8
+BCD_DIRECT_NN_INACTIVE_MARGIN_WEIGHT = 0.08
+BCD_DIRECT_NN_INACTIVE_MARGIN = 0.15
+BCD_DIRECT_NN_ANCHOR_WEIGHT = 0.18
+BCD_DIRECT_NN_THETA_ANCHOR_WEIGHT = 0.22
+BCD_DIRECT_NN_ZETA_ANCHOR_WEIGHT = 0.22
+BCD_DIRECT_NN_RHS_ANCHOR_WEIGHT = 0.12
+BCD_DIRECT_NN_DUAL_ACTIVE_THRESHOLD = 1e-7
+BCD_DIRECT_NN_PROXY_KKT_LOSS_WEIGHT = 0.008
+BCD_DIRECT_NN_COEFF_BOUND = 2.0
+BCD_DIRECT_NN_RHS_BOUND = 3.0
 BCD_RHO_PRIMAL_INIT = 1e-3
 BCD_RHO_DUAL_INIT = 1e-3
 BCD_RHO_DUAL_PG_INIT = 1
@@ -532,6 +556,35 @@ def build_subproblem_c_pg_direct_train_config() -> dict:
     }
 
 
+def build_bcd_direct_train_config() -> dict:
+    return {
+        "direct_epochs": BCD_DIRECT_NN_EPOCHS,
+        "direct_lr": BCD_DIRECT_NN_LR,
+        "direct_eta_min_ratio": BCD_DIRECT_NN_ETA_MIN_RATIO,
+        "direct_batch_strategy": BCD_DIRECT_NN_BATCH_STRATEGY,
+        "direct_batch_size": BCD_DIRECT_NN_BATCH_SIZE,
+        "direct_shuffle": BCD_DIRECT_NN_SHUFFLE,
+        "direct_loss": BCD_DIRECT_NN_LOSS,
+        "direct_grad_clip": BCD_DIRECT_NN_GRAD_CLIP,
+        "direct_log_interval": BCD_DIRECT_NN_LOG_INTERVAL,
+        "feature_noise_std": BCD_DIRECT_NN_FEATURE_NOISE_STD,
+        "adam_weight_decay": BCD_DIRECT_NN_ADAM_WD,
+        "target_blend": BCD_DIRECT_NN_TARGET_BLEND,
+        "dual_eq_weight": BCD_DIRECT_NN_DUAL_EQ_WEIGHT,
+        "active_opt_weight": BCD_DIRECT_NN_ACTIVE_OPT_WEIGHT,
+        "inactive_margin_weight": BCD_DIRECT_NN_INACTIVE_MARGIN_WEIGHT,
+        "inactive_margin": BCD_DIRECT_NN_INACTIVE_MARGIN,
+        "anchor_weight": BCD_DIRECT_NN_ANCHOR_WEIGHT,
+        "theta_anchor_weight": BCD_DIRECT_NN_THETA_ANCHOR_WEIGHT,
+        "zeta_anchor_weight": BCD_DIRECT_NN_ZETA_ANCHOR_WEIGHT,
+        "rhs_anchor_weight": BCD_DIRECT_NN_RHS_ANCHOR_WEIGHT,
+        "dual_active_threshold": BCD_DIRECT_NN_DUAL_ACTIVE_THRESHOLD,
+        "proxy_kkt_loss_weight": BCD_DIRECT_NN_PROXY_KKT_LOSS_WEIGHT,
+        "coeff_bound": BCD_DIRECT_NN_COEFF_BOUND,
+        "rhs_bound": BCD_DIRECT_NN_RHS_BOUND,
+    }
+
+
 def load_json_data(data_file: Path) -> list:
     """加载 JSON 数据文件并规范化为 v3 所需格式。"""
     return load_v3_active_set_json(data_file, announce=log)
@@ -635,6 +688,7 @@ def create_bcd_agent(ppc, all_samples, T_DELTA, *,
                      nn_shuffle: bool = True,
                      nn_learning_rate: float = 5e-5,
                      nn_smooth_abs_eps: float = BCD_NN_SMOOTH_ABS_EPS,
+                     direct_train_config: dict | None = None,
                      pg_block_prox_weight: float = BCD_PG_BLOCK_PROX_WEIGHT,
                      dual_block_prox_weight: float = BCD_DUAL_BLOCK_PROX_WEIGHT,
                      iter_delta_reg_weight: float = BCD_ITER_DELTA_REG_WEIGHT,
@@ -670,6 +724,7 @@ def create_bcd_agent(ppc, all_samples, T_DELTA, *,
         nn_batch_size=nn_batch_size,
         nn_shuffle=nn_shuffle,
         nn_smooth_abs_eps=nn_smooth_abs_eps,
+        direct_train_config=direct_train_config,
         pg_block_prox_weight=pg_block_prox_weight,
         dual_block_prox_weight=dual_block_prox_weight,
         loss_ratio_primal=loss_ratio_primal,
@@ -1801,6 +1856,7 @@ def run_bcd(ppc, all_samples: list, T_DELTA, MAX_ITER, bcd_model_dir,
             nn_shuffle: bool = True,
             nn_learning_rate: float = 5e-5,
             nn_smooth_abs_eps: float = BCD_NN_SMOOTH_ABS_EPS,
+            direct_train_config: dict | None = None,
             pg_block_prox_weight: float = BCD_PG_BLOCK_PROX_WEIGHT,
             dual_block_prox_weight: float = BCD_DUAL_BLOCK_PROX_WEIGHT):
     ensure_bcd_modules_imported()
@@ -1840,6 +1896,12 @@ def run_bcd(ppc, all_samples: list, T_DELTA, MAX_ITER, bcd_model_dir,
     log(
         f"bcd_schedule: max_iter={MAX_ITER}, nn_epochs_per_iter={NN_EPOCHS}, "
         f"total_nn_epochs={MAX_ITER * NN_EPOCHS}"
+    )
+    log(
+        f"bcd_direct_nn: epochs={int((direct_train_config or {}).get('direct_epochs', 0) or 0)}, "
+        f"lr={(direct_train_config or {}).get('direct_lr', None)}, "
+        f"batch={(direct_train_config or {}).get('direct_batch_strategy', None)}/"
+        f"{(direct_train_config or {}).get('direct_batch_size', None)}"
     )
     log(
         f"bcd_solver: lp_backend={lp_backend}, n_workers={n_workers}, "
@@ -1954,6 +2016,7 @@ def run_bcd(ppc, all_samples: list, T_DELTA, MAX_ITER, bcd_model_dir,
             nn_batch_size=nn_batch_size,
             nn_shuffle=nn_shuffle,
             nn_smooth_abs_eps=nn_smooth_abs_eps,
+            direct_train_config=direct_train_config,
             pg_block_prox_weight=pg_block_prox_weight,
             dual_block_prox_weight=dual_block_prox_weight,
             loss_ratio_primal=loss_ratio_primal,
@@ -2002,6 +2065,7 @@ def run_bcd(ppc, all_samples: list, T_DELTA, MAX_ITER, bcd_model_dir,
             nn_batch_size=nn_batch_size,
             nn_shuffle=nn_shuffle,
             nn_smooth_abs_eps=nn_smooth_abs_eps,
+            direct_train_config=direct_train_config,
             pg_block_prox_weight=pg_block_prox_weight,
             dual_block_prox_weight=dual_block_prox_weight,
             loss_ratio_primal=loss_ratio_primal,
@@ -2035,6 +2099,7 @@ def run_bcd(ppc, all_samples: list, T_DELTA, MAX_ITER, bcd_model_dir,
         nn_batch_size=nn_batch_size,
         nn_shuffle=nn_shuffle,
         nn_learning_rate=nn_learning_rate,
+        direct_train_config=direct_train_config,
     )
 
     # 保存模型（含算例名和时间戳）
@@ -2175,6 +2240,7 @@ def run_sparse_bcd(ppc, all_samples: list, T_DELTA, MAX_ITER, bcd_model_dir,
         nn_batch_strategy=nn_batch_strategy,
         nn_batch_size=nn_batch_size,
         nn_shuffle=nn_shuffle,
+        direct_train_config=build_bcd_direct_train_config(),
     )
     sparse_dir = Path(__file__).parent / 'result' / 'sparse_templates'
     discovery_result, template_library = build_sparse_template_library_from_bcd_agent(
@@ -2606,6 +2672,7 @@ def main():
     SUBPROBLEM_PG_COST_C_PG_ADAM_WD_VALUE = SUBPROBLEM_PG_COST_C_PG_ADAM_WD
     SUBPROBLEM_MAIN_DIRECT_TRAIN_CONFIG_VALUE = build_subproblem_main_direct_train_config()
     SUBPROBLEM_C_PG_DIRECT_TRAIN_CONFIG_VALUE = build_subproblem_c_pg_direct_train_config()
+    BCD_DIRECT_TRAIN_CONFIG_VALUE = build_bcd_direct_train_config()
     SUBPROBLEM_PG_BLOCK_PROX_WEIGHT_VALUE = SUBPROBLEM_PG_BLOCK_PROX_WEIGHT
     SUBPROBLEM_DUAL_BLOCK_PROX_WEIGHT_VALUE = SUBPROBLEM_DUAL_BLOCK_PROX_WEIGHT
 
@@ -2635,6 +2702,12 @@ def main():
         f"NN size config: BCD={BCD_NN_SIZE_VALUE} {BCD_NN_HIDDEN_DIMS_VALUE}, "
         f"subproblem={SUBPROBLEM_NN_SIZE_VALUE} {SUBPROBLEM_NN_HIDDEN_DIMS_VALUE}, "
         f"subproblem_c_pg={SUBPROBLEM_C_PG_NN_SIZE_VALUE} {SUBPROBLEM_C_PG_NN_HIDDEN_DIMS_VALUE}"
+    )
+    log(
+        f"BCD direct-NN config: epochs={BCD_DIRECT_TRAIN_CONFIG_VALUE.get('direct_epochs')}, "
+        f"lr={BCD_DIRECT_TRAIN_CONFIG_VALUE.get('direct_lr')}, "
+        f"batch={BCD_DIRECT_TRAIN_CONFIG_VALUE.get('direct_batch_strategy')}/"
+        f"{BCD_DIRECT_TRAIN_CONFIG_VALUE.get('direct_batch_size')}"
     )
     log(
         f"Loss ratio config: BCD(primal={BCD_LOSS_RATIO_PRIMAL_VALUE}, dual_x={BCD_LOSS_RATIO_DUAL_X_VALUE}, "
@@ -2759,6 +2832,7 @@ def main():
                     nn_shuffle=BCD_NN_SHUFFLE_VALUE,
                     nn_learning_rate=BCD_NN_LR_VALUE,
                     nn_smooth_abs_eps=BCD_NN_SMOOTH_ABS_EPS_VALUE,
+                    direct_train_config=BCD_DIRECT_TRAIN_CONFIG_VALUE,
                     pg_block_prox_weight=BCD_PG_BLOCK_PROX_WEIGHT_VALUE,
                     dual_block_prox_weight=BCD_DUAL_BLOCK_PROX_WEIGHT_VALUE)
             if RUN_FP:
@@ -3275,6 +3349,7 @@ def main():
                     nn_shuffle=BCD_NN_SHUFFLE_VALUE,
                     nn_learning_rate=BCD_NN_LR_VALUE,
                     nn_smooth_abs_eps=BCD_NN_SMOOTH_ABS_EPS_VALUE,
+                    direct_train_config=BCD_DIRECT_TRAIN_CONFIG_VALUE,
                 )
 
             # Step 2: 加载 v3 格式样本（subproblem 独立训练，不注入 BCD 对偶变量）

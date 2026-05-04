@@ -74,6 +74,7 @@ class ParallelAgent_NN_BCD(Agent_NN_BCD):
         loss_ratio_opt: float = 1.0,
         loss_ratio_reg: float = 1.0,
         nn_smooth_abs_eps: float = 1e-6,
+        direct_train_config: dict | None = None,
         iter_delta_reg_weight: float = 1e-4,
         iter_delta_reg_deadband: float = 0.05,
         pg_block_prox_weight: float = 2e-2,
@@ -123,6 +124,7 @@ class ParallelAgent_NN_BCD(Agent_NN_BCD):
             loss_ratio_opt=loss_ratio_opt,
             loss_ratio_reg=loss_ratio_reg,
             nn_smooth_abs_eps=nn_smooth_abs_eps,
+            direct_train_config=direct_train_config,
             iter_delta_reg_weight=iter_delta_reg_weight,
             iter_delta_reg_deadband=iter_delta_reg_deadband,
             pg_block_prox_weight=pg_block_prox_weight,
@@ -142,6 +144,7 @@ class ParallelAgent_NN_BCD(Agent_NN_BCD):
         nn_batch_size: int | None = None,
         nn_shuffle: bool | None = None,
         nn_learning_rate: float | None = None,
+        direct_train_config: dict | None = None,
     ):
         if union_analysis is None:
             union_analysis = self._current_union_analysis
@@ -292,6 +295,11 @@ class ParallelAgent_NN_BCD(Agent_NN_BCD):
             if self.iter_delta_reg_weight > 0:
                 self._prev_theta_values_list = [dict(v) for v in self.theta_values_list]
                 self._prev_zeta_values_list = [dict(v) for v in self.zeta_values_list]
+
+            self.iter_with_direct_theta_zeta_targets(
+                union_analysis=active_union_analysis,
+                config=direct_train_config,
+            )
 
             theta_new, zeta_new = self.iter_with_theta_zeta_neural_network(
                 union_analysis=active_union_analysis,
