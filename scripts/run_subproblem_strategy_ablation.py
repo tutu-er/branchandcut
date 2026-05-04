@@ -462,8 +462,18 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--case118-preset", choices=("desktop", "server"), default="desktop")
 
-    p.add_argument("--sample-workers", type=int, default=None)
-    p.add_argument("--unit-workers", type=int, default=None)
+    p.add_argument(
+        "--sample-workers",
+        type=int,
+        default=1,
+        help="Sample-level workers. Default 1 keeps TrainingLogger metrics populated.",
+    )
+    p.add_argument(
+        "--unit-workers",
+        type=int,
+        default=1,
+        help="Unit-level workers. Default 1 keeps TrainingLogger metrics populated.",
+    )
     p.add_argument(
         "--keep-direct-targets-in-baseline",
         action="store_true",
