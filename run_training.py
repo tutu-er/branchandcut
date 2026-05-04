@@ -105,7 +105,7 @@ ENABLE_SPARSE_SUPPORTS = False
 RUN_FP = False
 
 # 顶部集中配置区：训练相关参数统一在这里调整
-CASE_NAME = 'case3lite'      # 'case3' / 'case3lite' / 'case14' / 'case30' / 'case39' / 'case118'
+CASE_NAME = 'case3lite'      # 'case3' / 'case3lite' / 'case14' / 'case30' / 'case30lite' / 'case39' / 'case118'
 MAX_SAMPLES = 100            # None = 使用全部样本
 T_DELTA = 1.0
 DUAL_EPOCHS = 200
@@ -233,6 +233,9 @@ BCD_NN_SMOOTH_ABS_EPS = 1e-5
 BCD_RESTORE_RHO_FROM_CHECKPOINT = False
 BCD_MAX_THETA_CONSTRAINTS_PER_TIME_SLOT = 20
 BCD_THETA_TRAINING_STAGES = None
+BCD_USE_UNIT_PREDICTOR = USE_UNIT_PREDICTOR
+BCD_UNIT_PREDICTOR_WARMUP_ROUNDS = round(BCD_MAX_ITER * 0.10)
+BCD_THETA_CONSTRAINT_DELAY_ROUNDS = round(BCD_MAX_ITER * 0.10)
 BCD_GAMMA_BASE = 1e-3
 DUAL_DECAY_ROUND = round(BCD_MAX_ITER/8)
 BCD_DUAL_SIGN_RELAX_INTERVAL = 4
@@ -1744,6 +1747,36 @@ def run_bcd(ppc, all_samples: list, T_DELTA, MAX_ITER, bcd_model_dir,
             zeta_hot_start_strategy: str = 'zero',
             theta_gaussian_std: float = 0.01,
             zeta_gaussian_std: float = 0.01,
+            use_unit_predictor: bool = False,
+            unit_predictor_epochs: int = 0,
+            unit_predictor_batch_strategy: str = 'full-batch',
+            unit_predictor_batch_size: int = 32,
+            unit_predictor_shuffle: bool = True,
+            unit_predictor_lr: float = 1e-3,
+            unit_predictor_hidden_dims: list[int] | None = None,
+            unit_predictor_net_variant: str = "mlp",
+            unit_predictor_tcn_channels: int = 64,
+            unit_predictor_tcn_depth: int = 6,
+            unit_predictor_tconv_channels: int = 64,
+            unit_predictor_tconv_depth: int = 4,
+            unit_predictor_dropout: float = 0.1,
+            unit_predictor_enable_pos_weight: bool = False,
+            unit_predictor_pos_weight_clip: float = 20.0,
+            unit_predictor_loss_weight_bce: float = 1.0,
+            unit_predictor_loss_weight_mse: float = 0.0,
+            unit_predictor_loss_weight_l1: float = 0.0,
+            unit_predictor_loss_weight_tv: float = 0.0,
+            unit_predictor_loss_weight_transition: float = 0.0,
+            unit_predictor_loss_weight_binarize: float = 0.0,
+            unit_predictor_loss_weight_std_floor: float = 0.0,
+            unit_predictor_std_floor_scale: float = 0.5,
+            unit_predictor_loss_weight_tv_floor: float = 0.0,
+            unit_predictor_tv_floor_scale: float = 0.8,
+            unit_predictor_load_path: str | None = None,
+            unit_predictor_warmup_rounds: int = 0,
+            unit_predictor_finetune_lr: float = 1e-5,
+            unit_predictor_weight_decay: float = 1e-4,
+            theta_constraint_delay_rounds: int = 0,
             enable_dropout_during_nn_training: bool = True,
             rho_primal_init: float = 1e-2,
             rho_dual_init: float = 1e-2,
@@ -1819,6 +1852,53 @@ def run_bcd(ppc, all_samples: list, T_DELTA, MAX_ITER, bcd_model_dir,
     else:
         log(f"Initializing ParallelAgent_NN_BCD, max_iter={MAX_ITER}, n_workers={n_workers}")
 
+    unit_predictor_obj = None
+    if use_unit_predictor:
+        resolved_unit_predictor_path = _resolve_unit_predictor_checkpoint_path(unit_predictor_load_path)
+        if resolved_unit_predictor_path is not None and not resolved_unit_predictor_path.is_file():
+            raise FileNotFoundError(
+                f"BCD unit_predictor checkpoint was requested but not found: {resolved_unit_predictor_path}"
+            )
+        unit_predictor_save_path = str(bcd_model_dir / 'unit_predictor.pth')
+        effective_unit_predictor_epochs = 0 if resolved_unit_predictor_path else int(unit_predictor_epochs)
+        log(
+            f"[BCD][unit_predictor] enabled, load_path={resolved_unit_predictor_path}, "
+            f"epochs={effective_unit_predictor_epochs}, save={unit_predictor_save_path}, "
+            f"warmup={unit_predictor_warmup_rounds}, theta_delay={theta_constraint_delay_rounds}"
+        )
+        unit_predictor_obj = train_unit_predictor_from_data(
+            ppc,
+            all_samples,
+            T_DELTA,
+            num_epochs=effective_unit_predictor_epochs,
+            hidden_dims=unit_predictor_hidden_dims,
+            batch_size=unit_predictor_batch_size,
+            batch_strategy=unit_predictor_batch_strategy,
+            shuffle=unit_predictor_shuffle,
+            learning_rate=unit_predictor_lr,
+            weight_decay=unit_predictor_weight_decay,
+            net_variant=unit_predictor_net_variant,
+            tcn_channels=unit_predictor_tcn_channels,
+            tcn_depth=unit_predictor_tcn_depth,
+            tconv_channels=unit_predictor_tconv_channels,
+            tconv_depth=unit_predictor_tconv_depth,
+            dropout=unit_predictor_dropout,
+            enable_pos_weight=unit_predictor_enable_pos_weight,
+            pos_weight_clip=unit_predictor_pos_weight_clip,
+            loss_weight_bce=unit_predictor_loss_weight_bce,
+            loss_weight_mse=unit_predictor_loss_weight_mse,
+            loss_weight_l1=unit_predictor_loss_weight_l1,
+            loss_weight_tv=unit_predictor_loss_weight_tv,
+            loss_weight_transition=unit_predictor_loss_weight_transition,
+            loss_weight_binarize=unit_predictor_loss_weight_binarize,
+            loss_weight_std_floor=unit_predictor_loss_weight_std_floor,
+            std_floor_scale=unit_predictor_std_floor_scale,
+            loss_weight_tv_floor=unit_predictor_loss_weight_tv_floor,
+            tv_floor_scale=unit_predictor_tv_floor_scale,
+            save_path=unit_predictor_save_path,
+            load_path=str(resolved_unit_predictor_path) if resolved_unit_predictor_path else None,
+        )
+
     print("\n" + "=" * 70)
     print("=" * 70)
 
@@ -1850,6 +1930,12 @@ def run_bcd(ppc, all_samples: list, T_DELTA, MAX_ITER, bcd_model_dir,
             zeta_hot_start_strategy=zeta_hot_start_strategy,
             theta_gaussian_std=theta_gaussian_std,
             zeta_gaussian_std=zeta_gaussian_std,
+            unit_predictor=unit_predictor_obj,
+            use_unit_predictor=(unit_predictor_obj is not None),
+            unit_predictor_warmup_rounds=unit_predictor_warmup_rounds,
+            unit_predictor_finetune_lr=unit_predictor_finetune_lr,
+            unit_predictor_weight_decay=unit_predictor_weight_decay,
+            theta_constraint_delay_rounds=theta_constraint_delay_rounds,
             enable_dropout_during_nn_training=enable_dropout_during_nn_training,
             rho_primal_init=rho_primal_init,
             rho_dual_init=rho_dual_init,
@@ -1892,6 +1978,12 @@ def run_bcd(ppc, all_samples: list, T_DELTA, MAX_ITER, bcd_model_dir,
             zeta_hot_start_strategy=zeta_hot_start_strategy,
             theta_gaussian_std=theta_gaussian_std,
             zeta_gaussian_std=zeta_gaussian_std,
+            unit_predictor=unit_predictor_obj,
+            use_unit_predictor=(unit_predictor_obj is not None),
+            unit_predictor_warmup_rounds=unit_predictor_warmup_rounds,
+            unit_predictor_finetune_lr=unit_predictor_finetune_lr,
+            unit_predictor_weight_decay=unit_predictor_weight_decay,
+            theta_constraint_delay_rounds=theta_constraint_delay_rounds,
             enable_dropout_during_nn_training=enable_dropout_during_nn_training,
             rho_primal_init=rho_primal_init,
             rho_dual_init=rho_dual_init,
@@ -2430,6 +2522,9 @@ def main():
     BCD_NN_SMOOTH_ABS_EPS_VALUE = BCD_NN_SMOOTH_ABS_EPS
     BCD_MAX_THETA_CONSTRAINTS_PER_TIME_SLOT_VALUE = BCD_MAX_THETA_CONSTRAINTS_PER_TIME_SLOT
     BCD_THETA_TRAINING_STAGES_VALUE = BCD_THETA_TRAINING_STAGES
+    BCD_USE_UNIT_PREDICTOR_VALUE = BCD_USE_UNIT_PREDICTOR
+    BCD_UNIT_PREDICTOR_WARMUP_ROUNDS_VALUE = BCD_UNIT_PREDICTOR_WARMUP_ROUNDS
+    BCD_THETA_CONSTRAINT_DELAY_ROUNDS_VALUE = BCD_THETA_CONSTRAINT_DELAY_ROUNDS
     BCD_LP_BACKEND_VALUE = BCD_LP_BACKEND
     BCD_GUROBI_THREADS_VALUE = BCD_GUROBI_THREADS
     BCD_GUROBI_LP_METHOD_VALUE = BCD_GUROBI_LP_METHOD
@@ -2528,7 +2623,7 @@ def main():
 
     # ── 加载 PyPower 案例 ────────────────────────────────
     log(f"Loading PyPower case: {CASE_NAME}")
-    supported_cases = ['case3', 'case3lite', 'case14', 'case30', 'case39', 'case118']
+    supported_cases = ['case3', 'case3lite', 'case14', 'case30', 'case30lite', 'case39', 'case118']
     if CASE_NAME not in supported_cases:
         print(f"Unknown case: {CASE_NAME}. Supported cases: {supported_cases}")
         sys.exit(1)
@@ -2561,7 +2656,10 @@ def main():
         f"tcn=({UNIT_PREDICTOR_TCN_CHANNELS_VALUE},{UNIT_PREDICTOR_TCN_DEPTH_VALUE}), "
         f"tconv=({UNIT_PREDICTOR_TCONV_CHANNELS_VALUE},{UNIT_PREDICTOR_TCONV_DEPTH_VALUE}), "
         f"dropout={UNIT_PREDICTOR_DROPOUT_VALUE}, "
-        f"predictor_warmup_rounds={SUBPROBLEM_PREDICTOR_WARMUP_ROUNDS_VALUE}"
+        f"predictor_warmup_rounds={SUBPROBLEM_PREDICTOR_WARMUP_ROUNDS_VALUE}, "
+        f"bcd_use={BCD_USE_UNIT_PREDICTOR_VALUE}, "
+        f"bcd_warmup={BCD_UNIT_PREDICTOR_WARMUP_ROUNDS_VALUE}, "
+        f"bcd_theta_delay={BCD_THETA_CONSTRAINT_DELAY_ROUNDS_VALUE}"
     )
 
     # ── 查找数据文件 ─────────────────────────────────────
@@ -2607,6 +2705,36 @@ def main():
                     zeta_hot_start_strategy=ZETA_WARM_START_STRATEGY,
                     theta_gaussian_std=THETA_WARM_START_GAUSSIAN_STD,
                     zeta_gaussian_std=ZETA_WARM_START_GAUSSIAN_STD,
+                    use_unit_predictor=BCD_USE_UNIT_PREDICTOR_VALUE,
+                    unit_predictor_epochs=UNIT_PREDICTOR_EPOCHS_VALUE,
+                    unit_predictor_batch_strategy=UNIT_PREDICTOR_BATCH_STRATEGY_VALUE,
+                    unit_predictor_batch_size=UNIT_PREDICTOR_BATCH_SIZE_VALUE,
+                    unit_predictor_shuffle=UNIT_PREDICTOR_SHUFFLE_VALUE,
+                    unit_predictor_lr=UNIT_PREDICTOR_LR_VALUE,
+                    unit_predictor_hidden_dims=UNIT_PREDICTOR_HIDDEN_DIMS_VALUE,
+                    unit_predictor_net_variant=UNIT_PREDICTOR_NET_VARIANT_VALUE,
+                    unit_predictor_tcn_channels=UNIT_PREDICTOR_TCN_CHANNELS_VALUE,
+                    unit_predictor_tcn_depth=UNIT_PREDICTOR_TCN_DEPTH_VALUE,
+                    unit_predictor_tconv_channels=UNIT_PREDICTOR_TCONV_CHANNELS_VALUE,
+                    unit_predictor_tconv_depth=UNIT_PREDICTOR_TCONV_DEPTH_VALUE,
+                    unit_predictor_dropout=UNIT_PREDICTOR_DROPOUT_VALUE,
+                    unit_predictor_enable_pos_weight=UNIT_PREDICTOR_ENABLE_POS_WEIGHT_VALUE,
+                    unit_predictor_pos_weight_clip=UNIT_PREDICTOR_POS_WEIGHT_CLIP_VALUE,
+                    unit_predictor_loss_weight_bce=UNIT_PREDICTOR_LOSS_WEIGHT_BCE_VALUE,
+                    unit_predictor_loss_weight_mse=UNIT_PREDICTOR_LOSS_WEIGHT_MSE_VALUE,
+                    unit_predictor_loss_weight_l1=UNIT_PREDICTOR_LOSS_WEIGHT_L1_VALUE,
+                    unit_predictor_loss_weight_tv=UNIT_PREDICTOR_LOSS_WEIGHT_TV_VALUE,
+                    unit_predictor_loss_weight_transition=UNIT_PREDICTOR_LOSS_WEIGHT_TRANSITION_VALUE,
+                    unit_predictor_loss_weight_binarize=UNIT_PREDICTOR_LOSS_WEIGHT_BINARIZE_VALUE,
+                    unit_predictor_loss_weight_std_floor=UNIT_PREDICTOR_LOSS_WEIGHT_STD_FLOOR_VALUE,
+                    unit_predictor_std_floor_scale=UNIT_PREDICTOR_STD_FLOOR_SCALE_VALUE,
+                    unit_predictor_loss_weight_tv_floor=UNIT_PREDICTOR_LOSS_WEIGHT_TV_FLOOR_VALUE,
+                    unit_predictor_tv_floor_scale=UNIT_PREDICTOR_TV_FLOOR_SCALE_VALUE,
+                    unit_predictor_load_path=UNIT_PREDICTOR_LOAD_PATH_VALUE,
+                    unit_predictor_warmup_rounds=BCD_UNIT_PREDICTOR_WARMUP_ROUNDS_VALUE,
+                    unit_predictor_finetune_lr=UNIT_PREDICTOR_FINETUNE_LR_VALUE,
+                    unit_predictor_weight_decay=UNIT_PREDICTOR_WEIGHT_DECAY_VALUE,
+                    theta_constraint_delay_rounds=BCD_THETA_CONSTRAINT_DELAY_ROUNDS_VALUE,
                     enable_dropout_during_nn_training=BCD_ENABLE_DROPOUT_DURING_NN_TRAINING_VALUE,
                     rho_primal_init=BCD_RHO_PRIMAL_INIT_VALUE,
                     rho_dual_init=BCD_RHO_DUAL_INIT_VALUE,
@@ -3007,6 +3135,59 @@ def main():
                         nn_shuffle=BCD_NN_SHUFFLE_VALUE,
                         n_workers=N_WORKERS_BCD,
                     )
+                if BCD_USE_UNIT_PREDICTOR_VALUE:
+                    resolved_bcd_unit_predictor = _resolve_unit_predictor_checkpoint_path(
+                        UNIT_PREDICTOR_LOAD_PATH_VALUE
+                    )
+                    if resolved_bcd_unit_predictor is None or not resolved_bcd_unit_predictor.is_file():
+                        sibling_predictor = bcd_path.parent / 'unit_predictor.pth'
+                        resolved_bcd_unit_predictor = (
+                            sibling_predictor.resolve()
+                            if sibling_predictor.is_file()
+                            else None
+                        )
+                    if resolved_bcd_unit_predictor is not None:
+                        log(f"[BCD][unit_predictor] 加载 checkpoint 配套 predictor: {resolved_bcd_unit_predictor}")
+                        bcd_unit_predictor_obj = train_unit_predictor_from_data(
+                            ppc,
+                            all_samples_bcd,
+                            T_DELTA,
+                            num_epochs=0,
+                            hidden_dims=UNIT_PREDICTOR_HIDDEN_DIMS_VALUE,
+                            batch_size=UNIT_PREDICTOR_BATCH_SIZE_VALUE,
+                            batch_strategy=UNIT_PREDICTOR_BATCH_STRATEGY_VALUE,
+                            shuffle=UNIT_PREDICTOR_SHUFFLE_VALUE,
+                            learning_rate=UNIT_PREDICTOR_LR_VALUE,
+                            weight_decay=UNIT_PREDICTOR_WEIGHT_DECAY_VALUE,
+                            net_variant=UNIT_PREDICTOR_NET_VARIANT_VALUE,
+                            tcn_channels=UNIT_PREDICTOR_TCN_CHANNELS_VALUE,
+                            tcn_depth=UNIT_PREDICTOR_TCN_DEPTH_VALUE,
+                            tconv_channels=UNIT_PREDICTOR_TCONV_CHANNELS_VALUE,
+                            tconv_depth=UNIT_PREDICTOR_TCONV_DEPTH_VALUE,
+                            dropout=UNIT_PREDICTOR_DROPOUT_VALUE,
+                            enable_pos_weight=UNIT_PREDICTOR_ENABLE_POS_WEIGHT_VALUE,
+                            pos_weight_clip=UNIT_PREDICTOR_POS_WEIGHT_CLIP_VALUE,
+                            loss_weight_bce=UNIT_PREDICTOR_LOSS_WEIGHT_BCE_VALUE,
+                            loss_weight_mse=UNIT_PREDICTOR_LOSS_WEIGHT_MSE_VALUE,
+                            loss_weight_l1=UNIT_PREDICTOR_LOSS_WEIGHT_L1_VALUE,
+                            loss_weight_tv=UNIT_PREDICTOR_LOSS_WEIGHT_TV_VALUE,
+                            loss_weight_transition=UNIT_PREDICTOR_LOSS_WEIGHT_TRANSITION_VALUE,
+                            loss_weight_binarize=UNIT_PREDICTOR_LOSS_WEIGHT_BINARIZE_VALUE,
+                            loss_weight_std_floor=UNIT_PREDICTOR_LOSS_WEIGHT_STD_FLOOR_VALUE,
+                            std_floor_scale=UNIT_PREDICTOR_STD_FLOOR_SCALE_VALUE,
+                            loss_weight_tv_floor=UNIT_PREDICTOR_LOSS_WEIGHT_TV_FLOOR_VALUE,
+                            tv_floor_scale=UNIT_PREDICTOR_TV_FLOOR_SCALE_VALUE,
+                            save_path=None,
+                            load_path=str(resolved_bcd_unit_predictor),
+                        )
+                        agent.unit_predictor = bcd_unit_predictor_obj
+                        agent.use_unit_predictor = True
+                        agent.unit_predictor_warmup_rounds = BCD_UNIT_PREDICTOR_WARMUP_ROUNDS_VALUE
+                        agent.unit_predictor_finetune_lr = UNIT_PREDICTOR_FINETUNE_LR_VALUE
+                        agent.unit_predictor_weight_decay = UNIT_PREDICTOR_WEIGHT_DECAY_VALUE
+                        agent.theta_constraint_delay_rounds = BCD_THETA_CONSTRAINT_DELAY_ROUNDS_VALUE
+                    else:
+                        log("[BCD][unit_predictor] 警告: 已启用 BCD_USE_UNIT_PREDICTOR，但未找到可加载的 predictor checkpoint")
                 agent.load_model_parameters(
                     str(bcd_path),
                     restore_rho_state=BCD_RESTORE_RHO_FROM_CHECKPOINT,
@@ -3038,6 +3219,36 @@ def main():
                     zeta_hot_start_strategy=ZETA_WARM_START_STRATEGY,
                     theta_gaussian_std=THETA_WARM_START_GAUSSIAN_STD,
                     zeta_gaussian_std=ZETA_WARM_START_GAUSSIAN_STD,
+                    use_unit_predictor=BCD_USE_UNIT_PREDICTOR_VALUE,
+                    unit_predictor_epochs=UNIT_PREDICTOR_EPOCHS_VALUE,
+                    unit_predictor_batch_strategy=UNIT_PREDICTOR_BATCH_STRATEGY_VALUE,
+                    unit_predictor_batch_size=UNIT_PREDICTOR_BATCH_SIZE_VALUE,
+                    unit_predictor_shuffle=UNIT_PREDICTOR_SHUFFLE_VALUE,
+                    unit_predictor_lr=UNIT_PREDICTOR_LR_VALUE,
+                    unit_predictor_hidden_dims=UNIT_PREDICTOR_HIDDEN_DIMS_VALUE,
+                    unit_predictor_net_variant=UNIT_PREDICTOR_NET_VARIANT_VALUE,
+                    unit_predictor_tcn_channels=UNIT_PREDICTOR_TCN_CHANNELS_VALUE,
+                    unit_predictor_tcn_depth=UNIT_PREDICTOR_TCN_DEPTH_VALUE,
+                    unit_predictor_tconv_channels=UNIT_PREDICTOR_TCONV_CHANNELS_VALUE,
+                    unit_predictor_tconv_depth=UNIT_PREDICTOR_TCONV_DEPTH_VALUE,
+                    unit_predictor_dropout=UNIT_PREDICTOR_DROPOUT_VALUE,
+                    unit_predictor_enable_pos_weight=UNIT_PREDICTOR_ENABLE_POS_WEIGHT_VALUE,
+                    unit_predictor_pos_weight_clip=UNIT_PREDICTOR_POS_WEIGHT_CLIP_VALUE,
+                    unit_predictor_loss_weight_bce=UNIT_PREDICTOR_LOSS_WEIGHT_BCE_VALUE,
+                    unit_predictor_loss_weight_mse=UNIT_PREDICTOR_LOSS_WEIGHT_MSE_VALUE,
+                    unit_predictor_loss_weight_l1=UNIT_PREDICTOR_LOSS_WEIGHT_L1_VALUE,
+                    unit_predictor_loss_weight_tv=UNIT_PREDICTOR_LOSS_WEIGHT_TV_VALUE,
+                    unit_predictor_loss_weight_transition=UNIT_PREDICTOR_LOSS_WEIGHT_TRANSITION_VALUE,
+                    unit_predictor_loss_weight_binarize=UNIT_PREDICTOR_LOSS_WEIGHT_BINARIZE_VALUE,
+                    unit_predictor_loss_weight_std_floor=UNIT_PREDICTOR_LOSS_WEIGHT_STD_FLOOR_VALUE,
+                    unit_predictor_std_floor_scale=UNIT_PREDICTOR_STD_FLOOR_SCALE_VALUE,
+                    unit_predictor_loss_weight_tv_floor=UNIT_PREDICTOR_LOSS_WEIGHT_TV_FLOOR_VALUE,
+                    unit_predictor_tv_floor_scale=UNIT_PREDICTOR_TV_FLOOR_SCALE_VALUE,
+                    unit_predictor_load_path=UNIT_PREDICTOR_LOAD_PATH_VALUE,
+                    unit_predictor_warmup_rounds=BCD_UNIT_PREDICTOR_WARMUP_ROUNDS_VALUE,
+                    unit_predictor_finetune_lr=UNIT_PREDICTOR_FINETUNE_LR_VALUE,
+                    unit_predictor_weight_decay=UNIT_PREDICTOR_WEIGHT_DECAY_VALUE,
+                    theta_constraint_delay_rounds=BCD_THETA_CONSTRAINT_DELAY_ROUNDS_VALUE,
                     enable_dropout_during_nn_training=BCD_ENABLE_DROPOUT_DURING_NN_TRAINING_VALUE,
                     rho_primal_init=BCD_RHO_PRIMAL_INIT_VALUE,
                     rho_dual_init=BCD_RHO_DUAL_INIT_VALUE,

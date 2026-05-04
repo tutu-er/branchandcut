@@ -106,6 +106,13 @@ class ParallelActiveSetLearner(ActiveSetLearner):
         n_workers: int | None = None,
         gurobi_threads: int = 4,
         verbose_solver: bool = False,
+        load_perturbation_low: float = 0.95,
+        load_perturbation_high: float = 1.05,
+        system_load_scale_low: float = 1.0,
+        system_load_scale_high: float = 1.0,
+        temporal_wave_amplitude: float = 0.0,
+        temporal_wave_cycles_low: float = 0.75,
+        temporal_wave_cycles_high: float = 1.75,
     ):
         super().__init__(
             alpha=alpha,
@@ -116,6 +123,13 @@ class ParallelActiveSetLearner(ActiveSetLearner):
             Pd=Pd,
             case_name=case_name,
             verbose_solver=verbose_solver,
+            load_perturbation_low=load_perturbation_low,
+            load_perturbation_high=load_perturbation_high,
+            system_load_scale_low=system_load_scale_low,
+            system_load_scale_high=system_load_scale_high,
+            temporal_wave_amplitude=temporal_wave_amplitude,
+            temporal_wave_cycles_low=temporal_wave_cycles_low,
+            temporal_wave_cycles_high=temporal_wave_cycles_high,
         )
         self.gurobi_threads = gurobi_threads
         if n_workers is None:

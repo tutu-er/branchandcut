@@ -42,6 +42,12 @@ class ParallelAgent_NN_BCD(Agent_NN_BCD):
         zeta_hot_start_strategy: str = "zero",
         theta_gaussian_std: float = 0.01,
         zeta_gaussian_std: float = 0.01,
+        unit_predictor=None,
+        use_unit_predictor: bool = False,
+        unit_predictor_warmup_rounds: int = 0,
+        unit_predictor_finetune_lr: float = 1e-5,
+        unit_predictor_weight_decay: float = 1e-4,
+        theta_constraint_delay_rounds: int = 0,
         enable_dropout_during_nn_training: bool = True,
         rho_primal_init: float = 1e-2,
         rho_dual_init: float = 1e-2,
@@ -85,6 +91,12 @@ class ParallelAgent_NN_BCD(Agent_NN_BCD):
             zeta_hot_start_strategy=zeta_hot_start_strategy,
             theta_gaussian_std=theta_gaussian_std,
             zeta_gaussian_std=zeta_gaussian_std,
+            unit_predictor=unit_predictor,
+            use_unit_predictor=use_unit_predictor,
+            unit_predictor_warmup_rounds=unit_predictor_warmup_rounds,
+            unit_predictor_finetune_lr=unit_predictor_finetune_lr,
+            unit_predictor_weight_decay=unit_predictor_weight_decay,
+            theta_constraint_delay_rounds=theta_constraint_delay_rounds,
             enable_dropout_during_nn_training=enable_dropout_during_nn_training,
             rho_primal_init=rho_primal_init,
             rho_dual_init=rho_dual_init,
@@ -276,6 +288,10 @@ class ParallelAgent_NN_BCD(Agent_NN_BCD):
             )
             if TORCH_AVAILABLE and hasattr(self, 'device'):
                 self._refresh_iter_tensor_cache()
+
+            if self.iter_delta_reg_weight > 0:
+                self._prev_theta_values_list = [dict(v) for v in self.theta_values_list]
+                self._prev_zeta_values_list = [dict(v) for v in self.zeta_values_list]
 
             theta_new, zeta_new = self.iter_with_theta_zeta_neural_network(
                 union_analysis=active_union_analysis,

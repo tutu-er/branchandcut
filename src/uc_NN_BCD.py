@@ -526,6 +526,12 @@ class Agent_NN_BCD:
         zeta_hot_start_strategy: str = "zero",
         theta_gaussian_std: float = 0.01,
         zeta_gaussian_std: float = 0.01,
+        unit_predictor=None,
+        use_unit_predictor: bool = False,
+        unit_predictor_warmup_rounds: int = 0,
+        unit_predictor_finetune_lr: float = 1e-5,
+        unit_predictor_weight_decay: float = 1e-4,
+        theta_constraint_delay_rounds: int = 0,
         enable_dropout_during_nn_training: bool = True,
         rho_primal_init: float = 1e-2,
         rho_dual_init: float = 1e-2,
@@ -643,6 +649,15 @@ class Agent_NN_BCD:
         self.zeta_hot_start_strategy = normalize_zeta_hot_start_strategy(zeta_hot_start_strategy)
         self.theta_gaussian_std = float(theta_gaussian_std)
         self.zeta_gaussian_std = float(zeta_gaussian_std)
+        self.unit_predictor = unit_predictor
+        self.use_unit_predictor = bool(use_unit_predictor)
+        self.unit_predictor_warmup_rounds = max(int(unit_predictor_warmup_rounds), 0)
+        self.unit_predictor_finetune_lr = max(float(unit_predictor_finetune_lr), 1e-10)
+        self.unit_predictor_weight_decay = max(float(unit_predictor_weight_decay), 0.0)
+        self.theta_constraint_delay_rounds = max(int(theta_constraint_delay_rounds), 0)
+        self._unit_predictor_optimizer = None
+        self._unit_predictor_optimizer_lr = None
+        self._theta_delay_reported_round = None
         self.enable_dropout_during_nn_training = bool(enable_dropout_during_nn_training)
         self.nn_hidden_dims = normalize_nn_hidden_dims(nn_hidden_dims, [64, 128])
         self.nn_learning_rate = float(nn_learning_rate)
@@ -706,6 +721,7 @@ class Agent_NN_BCD:
             self.device = None
             # 回退：用随机初始化填充占位值
         self._apply_hot_start_initial_values(self._current_union_analysis)
+        self._apply_unit_predictor_initial_values()
 
         # ----- Persistent Gurobi model cache -----
         # 每个样本只建一次模型，后续迭代通过 setObjective / chgCoeff 更新
@@ -2529,11 +2545,12 @@ class Agent_NN_BCD:
     def _resolve_active_union_analysis(self, iter_index: int, max_iter: int, union_analysis, theta_training_stages):
         stage = self._resolve_active_theta_stage(iter_index, max_iter, theta_training_stages)
         if stage is None:
-            return union_analysis, None
+            return self._apply_theta_delay_to_union_analysis(union_analysis, iter_index), None
         active_union_analysis = self._build_theta_limited_union_analysis(
             union_analysis,
             stage['max_constraints_per_time_slot'],
         )
+        active_union_analysis = self._apply_theta_delay_to_union_analysis(active_union_analysis, iter_index)
         return active_union_analysis, stage
     
     def initialize_theta_values(self, union_analysis=None):
@@ -2690,6 +2707,191 @@ class Agent_NN_BCD:
             flush=True,
         )
 
+    def _unit_predictor_active(self) -> bool:
+        if not getattr(self, 'use_unit_predictor', False):
+            return False
+        if getattr(self, 'unit_predictor', None) is None:
+            return False
+        return bool(TORCH_AVAILABLE)
+
+    def _unit_predictor_finetune_active(self) -> bool:
+        if not self._unit_predictor_active():
+            return False
+        return int(getattr(self, 'iter_number', 0)) >= int(getattr(self, 'unit_predictor_warmup_rounds', 0))
+
+    def _unit_predictor_parameters(self) -> list:
+        if not self._unit_predictor_active():
+            return []
+        params = []
+        seen = set()
+        for g in range(self.ng):
+            net = self.unit_predictor.get_network(g)
+            for p in net.parameters():
+                if id(p) not in seen:
+                    params.append(p)
+                    seen.add(id(p))
+        return params
+
+    def _ensure_unit_predictor_optimizer(self, learning_rate: float | None = None) -> None:
+        if not self._unit_predictor_finetune_active():
+            self._unit_predictor_optimizer = None
+            self._unit_predictor_optimizer_lr = None
+            return
+        resolved_lr = (
+            self.unit_predictor_finetune_lr if learning_rate is None
+            else max(float(learning_rate), 1e-10)
+        )
+        params = self._unit_predictor_parameters()
+        if not params:
+            self._unit_predictor_optimizer = None
+            self._unit_predictor_optimizer_lr = None
+            return
+        if self._unit_predictor_optimizer is None or self._unit_predictor_optimizer_lr != resolved_lr:
+            self._unit_predictor_optimizer = optim.Adam(
+                params,
+                lr=resolved_lr,
+                weight_decay=self.unit_predictor_weight_decay,
+            )
+            self._unit_predictor_optimizer_lr = resolved_lr
+
+    def _extract_unit_predictor_features(self, sample_id: int) -> np.ndarray:
+        sample = normalize_sample_arrays(dict(self.active_set_data[sample_id]))
+        features = np.asarray(get_feature_vector_from_sample(sample), dtype=np.float32)
+        if self._unit_predictor_active():
+            expected = int(getattr(self.unit_predictor, 'input_dim', features.size))
+            if features.size == expected:
+                return features
+            net_load_features = np.asarray(get_sample_net_load(sample), dtype=np.float32).flatten()
+            if net_load_features.size == expected:
+                return net_load_features
+            raise ValueError(
+                f"UnitPredictor feature dimension mismatch for sample {sample_id}: "
+                f"got {features.size}, net_load={net_load_features.size}, expected={expected}"
+            )
+        return features
+
+    def _refresh_unit_predictor_feature_cache(self) -> None:
+        if not self._unit_predictor_active() or self.device is None:
+            self._unit_predictor_features_cache = None
+            return
+        self._unit_predictor_features_cache = torch.stack([
+            torch.tensor(self._extract_unit_predictor_features(s), dtype=torch.float32)
+            for s in range(self.n_samples)
+        ]).to(self.device)
+
+    def _unit_predictor_feature_tensor(self, sample_id: int) -> torch.Tensor:
+        if not hasattr(self, '_unit_predictor_features_cache') or self._unit_predictor_features_cache is None:
+            self._refresh_unit_predictor_feature_cache()
+        return self._unit_predictor_features_cache[sample_id:sample_id + 1]
+
+    def _apply_unit_predictor_zeta_override(
+        self,
+        zeta_tensor: torch.Tensor,
+        sample_id: int,
+        train_predictor: bool = False,
+    ) -> torch.Tensor:
+        """Replace zeta single-unit constraints with differentiable unit-predictor output.
+
+        Mapping mirrors the subproblem single-time slice:
+          x_hat = sigmoid(logits)
+          zeta = 1 - 2*x_hat
+          rhs  = x_hat*zeta
+
+        So x_hat≈0 yields x<=0, while x_hat≈1 yields -x<=-1.
+        """
+        if not self._unit_predictor_active():
+            return zeta_tensor
+        if not self.enable_zeta_constraints:
+            return zeta_tensor
+        union_analysis = getattr(self, '_current_union_analysis', None)
+        if not union_analysis or 'union_zeta_constraints' not in union_analysis:
+            return zeta_tensor
+        if zeta_tensor.numel() == 0:
+            return zeta_tensor
+
+        features_tensor = self._unit_predictor_feature_tensor(sample_id)
+        replacements = {}
+        for g in range(self.ng):
+            net = self.unit_predictor.get_network(g)
+            was_training = bool(net.training)
+            if train_predictor:
+                net.train()
+                logits = self.unit_predictor.forward_logits(g, features_tensor)
+            else:
+                net.eval()
+                with torch.no_grad():
+                    logits = self.unit_predictor.forward_logits(g, features_tensor)
+                if was_training:
+                    net.train()
+            x_hat = torch.sigmoid(logits).reshape(-1)
+            zeta_pred = 1.0 - 2.0 * x_hat
+            rhs_pred = x_hat * zeta_pred
+            replacements[g] = (zeta_pred, rhs_pred)
+
+        values = []
+        for idx, name in enumerate(self.zeta_var_names):
+            if name.startswith('zeta_rhs_unit_'):
+                parsed = name[len('zeta_rhs_unit_'):]
+                unit_text, _, time_text = parsed.partition('_time_')
+                if unit_text.isdigit() and time_text.isdigit():
+                    g = int(unit_text)
+                    t = int(time_text)
+                    if g in replacements and t < replacements[g][1].numel():
+                        values.append(replacements[g][1][t])
+                        continue
+            elif name.startswith('zeta_unit_'):
+                parsed = name[len('zeta_unit_'):]
+                unit_text, _, time_text = parsed.partition('_time_')
+                if unit_text.isdigit() and time_text.isdigit():
+                    g = int(unit_text)
+                    t = int(time_text)
+                    if g in replacements and t < replacements[g][0].numel():
+                        values.append(replacements[g][0][t])
+                        continue
+            values.append(zeta_tensor[idx])
+        return torch.stack(values).to(device=zeta_tensor.device, dtype=zeta_tensor.dtype)
+
+    def _apply_unit_predictor_initial_values(self) -> None:
+        if not self._unit_predictor_active() or not hasattr(self, 'zeta_var_names'):
+            return
+        if not self.zeta_values_list:
+            return
+        self._refresh_unit_predictor_feature_cache()
+        updated = []
+        with torch.no_grad():
+            for sample_id in range(self.n_samples):
+                base_tensor = torch.tensor(
+                    [float(self.zeta_values_list[sample_id].get(name, 0.0)) for name in self.zeta_var_names],
+                    dtype=torch.float32,
+                    device=self.device,
+                )
+                zeta_tensor = self._apply_unit_predictor_zeta_override(
+                    base_tensor,
+                    sample_id,
+                    train_predictor=False,
+                )
+                updated.append(self._tensor_to_zeta_dict(zeta_tensor))
+        self.zeta_values_list = updated
+        self.zeta_values = self.zeta_values_list[0] if self.zeta_values_list else {}
+        print("✓ BCD unit predictor 已用于初始化 zeta 代理约束", flush=True)
+
+    def _apply_theta_delay_to_union_analysis(self, union_analysis, iter_index: int):
+        delay = max(int(getattr(self, 'theta_constraint_delay_rounds', 0) or 0), 0)
+        if delay <= 0 or int(iter_index) >= delay:
+            return union_analysis
+        if not union_analysis or 'union_constraints' not in union_analysis:
+            return union_analysis
+        if self._theta_delay_reported_round != int(iter_index):
+            print(
+                f"[BCD][theta-delay] iter={int(iter_index) + 1}, "
+                f"theta constraints disabled until iter {delay}",
+                flush=True,
+            )
+            self._theta_delay_reported_round = int(iter_index)
+        delayed = dict(union_analysis)
+        delayed['union_constraints'] = []
+        return delayed
+
     def add_theta_variables_for_branches(self, union_analysis=None):
         """为参数化约束添加theta变量（参考uc_NN.py）"""
         if union_analysis is None:
@@ -2842,7 +3044,9 @@ class Agent_NN_BCD:
 
         for i in range(self.n_samples):
             self.theta_values_list[i] = self._tensor_to_theta_dict(theta_out[i])
-            self.zeta_values_list[i] = self._tensor_to_zeta_dict(zeta_out[i])
+            self.zeta_values_list[i] = self._tensor_to_zeta_dict(
+                self._apply_unit_predictor_zeta_override(zeta_out[i], i, train_predictor=False)
+            )
 
         self.theta_values = self.theta_values_list[0]
         self.zeta_values = self.zeta_values_list[0]
@@ -2878,7 +3082,9 @@ class Agent_NN_BCD:
             for i in range(self.n_samples)
         ]
         self.zeta_values_list = [
-            self._tensor_to_zeta_dict(zeta_out[i])
+            self._tensor_to_zeta_dict(
+                self._apply_unit_predictor_zeta_override(zeta_out[i], i, train_predictor=False)
+            )
             for i in range(self.n_samples)
         ]
         self.theta_values = self.theta_values_list[0] if self.theta_values_list else {}
@@ -3134,6 +3340,7 @@ class Agent_NN_BCD:
             torch.tensor(np.asarray(self._extract_features(s)), dtype=torch.float32)
             for s in range(self.n_samples)
         ]).to(self.device)
+        self._refresh_unit_predictor_feature_cache()
     
     def _tensor_to_theta_dict(self, theta_tensor):
         """将theta张量转换为字典（参考uc_NN.py）"""
@@ -5059,6 +5266,32 @@ class Agent_NN_BCD:
             base_batch_size = self.nn_batch_size if batch_size is None else int(batch_size)
             resolved_batch_size = max(1, base_batch_size)
 
+        self.theta_optimizer = optim.Adam(
+            self.theta_net.parameters(),
+            lr=resolved_learning_rate,
+            weight_decay=0.0,
+        )
+        self.zeta_optimizer = optim.Adam(
+            self.zeta_net.parameters(),
+            lr=resolved_learning_rate,
+            weight_decay=0.0,
+        )
+        self.theta_scheduler = optim.lr_scheduler.CosineAnnealingLR(
+            self.theta_optimizer,
+            T_max=max(int(num_epochs), 1),
+            eta_min=resolved_learning_rate * 0.05,
+        )
+        self.zeta_scheduler = optim.lr_scheduler.CosineAnnealingLR(
+            self.zeta_optimizer,
+            T_max=max(int(num_epochs), 1),
+            eta_min=resolved_learning_rate * 0.05,
+        )
+        predictor_train_active = self._unit_predictor_finetune_active()
+        if predictor_train_active:
+            self._ensure_unit_predictor_optimizer()
+            for g in range(self.ng):
+                self.unit_predictor.get_network(g).train()
+        predictor_override_active = self._unit_predictor_active()
         all_params = list(self.theta_net.parameters()) + list(self.zeta_net.parameters())
         self.optimizer = optim.Adam(all_params, lr=resolved_learning_rate, weight_decay=0.0)
         if self.enable_dropout_during_nn_training:
@@ -5080,7 +5313,10 @@ class Agent_NN_BCD:
                 'opt_term': None,
                 'reg_term': None,
             }
-            self.optimizer.zero_grad()
+            self.theta_optimizer.zero_grad()
+            self.zeta_optimizer.zero_grad()
+            if predictor_train_active and self._unit_predictor_optimizer is not None:
+                self._unit_predictor_optimizer.zero_grad()
             batch_count = 0
             need_epoch_breakdown = self.n_samples > 0 and (epoch == 0 or epoch == num_epochs - 1)
             sample_indices = np.arange(self.n_samples, dtype=int)
@@ -5099,6 +5335,12 @@ class Agent_NN_BCD:
                 zeta_output = self.zeta_net(features_tensor)
                 theta_tensor = theta_output[0]
                 zeta_tensor = zeta_output[0]
+                if predictor_override_active:
+                    zeta_tensor = self._apply_unit_predictor_zeta_override(
+                        zeta_tensor,
+                        sample_id,
+                        train_predictor=predictor_train_active,
+                    )
 
                 # 计算可微分的loss + scaled backward
                 if need_epoch_breakdown:
@@ -5131,9 +5373,20 @@ class Agent_NN_BCD:
                 if batch_count == resolved_batch_size or sample_pos == self.n_samples - 1:
                     torch.nn.utils.clip_grad_norm_(self.theta_net.parameters(), max_norm=1.0)
                     torch.nn.utils.clip_grad_norm_(self.zeta_net.parameters(), max_norm=1.0)
-                    self.optimizer.step()
-                    self.optimizer.zero_grad()
+                    if predictor_train_active and self._unit_predictor_optimizer is not None:
+                        torch.nn.utils.clip_grad_norm_(self._unit_predictor_parameters(), max_norm=1.0)
+                    self.theta_optimizer.step()
+                    self.zeta_optimizer.step()
+                    if predictor_train_active and self._unit_predictor_optimizer is not None:
+                        self._unit_predictor_optimizer.step()
+                    self.theta_optimizer.zero_grad()
+                    self.zeta_optimizer.zero_grad()
+                    if predictor_train_active and self._unit_predictor_optimizer is not None:
+                        self._unit_predictor_optimizer.zero_grad()
                     batch_count = 0
+
+            self.theta_scheduler.step()
+            self.zeta_scheduler.step()
 
             if self.n_samples > 0 and (epoch == 0 or epoch == num_epochs - 1):
                 avg_loss = epoch_total_loss / self.n_samples
@@ -5177,7 +5430,12 @@ class Agent_NN_BCD:
                 theta_output = self.theta_net(features_tensor)
                 zeta_output = self.zeta_net(features_tensor)
                 theta_values_new_list.append(self._tensor_to_theta_dict(theta_output[0]))
-                zeta_values_new_list.append(self._tensor_to_zeta_dict(zeta_output[0]))
+                zeta_tensor = self._apply_unit_predictor_zeta_override(
+                    zeta_output[0],
+                    sample_id,
+                    train_predictor=False,
+                )
+                zeta_values_new_list.append(self._tensor_to_zeta_dict(zeta_tensor))
 
         return theta_values_new_list, zeta_values_new_list
     
@@ -7096,6 +7354,11 @@ class Agent_NN_BCD:
             "theta_constraint_direction_signs": self.theta_constraint_direction_signs,
             "zeta_constraint_direction_signs": self.zeta_constraint_direction_signs,
             "dual_sign_relax_interval": self.dual_sign_relax_interval,
+            "use_unit_predictor": self.use_unit_predictor,
+            "unit_predictor_warmup_rounds": self.unit_predictor_warmup_rounds,
+            "unit_predictor_finetune_lr": self.unit_predictor_finetune_lr,
+            "unit_predictor_weight_decay": self.unit_predictor_weight_decay,
+            "theta_constraint_delay_rounds": self.theta_constraint_delay_rounds,
             "rho_primal": self.rho_primal,
             "rho_binary": self.rho_binary,
             "rho_dual": self.rho_dual,
@@ -7233,6 +7496,22 @@ class Agent_NN_BCD:
         if "zeta_constraint_direction_signs" in state:
             self.zeta_constraint_direction_signs = np.asarray(state["zeta_constraint_direction_signs"], dtype=float)
         self.dual_sign_relax_interval = max(int(state.get("dual_sign_relax_interval", self.dual_sign_relax_interval)), 0)
+        self.unit_predictor_warmup_rounds = max(
+            int(state.get("unit_predictor_warmup_rounds", self.unit_predictor_warmup_rounds)),
+            0,
+        )
+        self.unit_predictor_finetune_lr = max(
+            float(state.get("unit_predictor_finetune_lr", self.unit_predictor_finetune_lr)),
+            1e-10,
+        )
+        self.unit_predictor_weight_decay = max(
+            float(state.get("unit_predictor_weight_decay", self.unit_predictor_weight_decay)),
+            0.0,
+        )
+        self.theta_constraint_delay_rounds = max(
+            int(state.get("theta_constraint_delay_rounds", self.theta_constraint_delay_rounds)),
+            0,
+        )
         if restore_rho_state:
             if "rho_primal" in state:
                 self.rho_primal = state["rho_primal"]

@@ -7430,15 +7430,33 @@ class SubproblemSurrogateTrainer:
         features = np.concatenate([pd_flat, lambda_val, unit_params])
         features_tensor = torch.tensor(features, dtype=torch.float32, device=self.device).unsqueeze(0)
 
+        nc = int(self.num_coupling_constraints)
         with torch.no_grad():
             alphas, betas, gammas, deltas, costs = self.surrogate_net.forward_main(features_tensor)
             pg_costs = self.surrogate_net.forward_pg_cost(features_tensor)
-            deltas = self._postprocess_delta_tensor(deltas.squeeze(0)).unsqueeze(0)
+            a_full = alphas.squeeze(0)
+            b_full = betas.squeeze(0)
+            c_full = gammas.squeeze(0)
+            d_proc = self._postprocess_delta_tensor(deltas.squeeze(0))
+            a_nc = a_full[:nc]
+            b_nc = b_full[:nc]
+            c_nc = c_full[:nc]
+            d_nc = d_proc[:nc]
+            a_nc, b_nc, c_nc, d_nc = self._apply_unit_predictor_override(
+                a_nc, b_nc, c_nc, d_nc, features_tensor,
+            )
+            if a_full.numel() > nc:
+                alphas_t = torch.cat([a_nc, a_full[nc:]], dim=0)
+                betas_t = torch.cat([b_nc, b_full[nc:]], dim=0)
+                gammas_t = torch.cat([c_nc, c_full[nc:]], dim=0)
+                deltas_t = torch.cat([d_nc, d_proc[nc:]], dim=0)
+            else:
+                alphas_t, betas_t, gammas_t, deltas_t = a_nc, b_nc, c_nc, d_nc
 
-        alphas_np = alphas.squeeze(0).cpu().numpy()
-        betas_np = betas.squeeze(0).cpu().numpy()
-        gammas_np = gammas.squeeze(0).cpu().numpy()
-        deltas_np = deltas.squeeze(0).cpu().numpy()
+        alphas_np = alphas_t.cpu().numpy()
+        betas_np = betas_t.cpu().numpy()
+        gammas_np = gammas_t.cpu().numpy()
+        deltas_np = deltas_t.cpu().numpy()
         alphas_np, betas_np, gammas_np, deltas_np = self._apply_surrogate_direction_to_params(
             alphas_np,
             betas_np,

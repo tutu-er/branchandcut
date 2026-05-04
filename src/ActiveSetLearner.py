@@ -29,7 +29,8 @@ sys.path.append(str(root_dir))
 
 from src.case39_pypower import get_case39_pypower
 from src.case3_uc_data import get_case3_uc_ppc, get_case3lite_uc_ppc
-from src.case30_uc_data import get_case30_uc_ppc
+from src.case14_uc_data import get_case14_uc_ppc
+from src.case30_uc_data import get_case30_uc_ppc, get_case30lite_uc_ppc
 from src.uc_gurobipy import UnitCommitmentModel
 from src.ed_gurobipy import EconomicDispatchGurobi
 from src.scenario_utils import normalize_sample_arrays
@@ -80,7 +81,11 @@ def extract_ed_dual_bundle(ppc, ed_model, T: int) -> dict:
 
 class ActiveSetLearner:
     def __init__(self, alpha=0.05, delta=0.01, epsilon=0.04, ppc=None, T_delta=4, Pd=None,
-                 case_name=None, renewable_data=None, verbose_solver=False):
+                 case_name=None, renewable_data=None, verbose_solver=False,
+                 load_perturbation_low=0.95, load_perturbation_high=1.05,
+                 system_load_scale_low=1.0, system_load_scale_high=1.0,
+                 temporal_wave_amplitude=0.0, temporal_wave_cycles_low=0.75,
+                 temporal_wave_cycles_high=1.75):
         self.alpha = alpha
         self.delta = delta
         self.epsilon = epsilon
@@ -91,14 +96,25 @@ class ActiveSetLearner:
             ppc = get_case3_uc_ppc()
         if ppc is None and case_name == 'case3lite':
             ppc = get_case3lite_uc_ppc()
+        if ppc is None and case_name == 'case14':
+            ppc = get_case14_uc_ppc()
         if ppc is None and case_name == 'case30':
             ppc = get_case30_uc_ppc()
+        if ppc is None and case_name == 'case30lite':
+            ppc = get_case30lite_uc_ppc()
         self.ppc = ppc
         self.T_delta = T_delta
         self.Pd = Pd
         self.renewable_data = renewable_data
         self.case_name = case_name
         self.verbose_solver = verbose_solver
+        self.load_perturbation_low = float(load_perturbation_low)
+        self.load_perturbation_high = float(load_perturbation_high)
+        self.system_load_scale_low = float(system_load_scale_low)
+        self.system_load_scale_high = float(system_load_scale_high)
+        self.temporal_wave_amplitude = float(temporal_wave_amplitude)
+        self.temporal_wave_cycles_low = float(temporal_wave_cycles_low)
+        self.temporal_wave_cycles_high = float(temporal_wave_cycles_high)
         self._cal_W()  # 计算初始窗口大小
 
     @staticmethod
@@ -123,9 +139,28 @@ class ActiveSetLearner:
         self.W = n
     
     def _generate_random_Pd(self, rng=42):
-        np.random.seed(rng)  # 设置随机种子
-        perturb = np.random.uniform(0.95, 1.05, self.Pd.shape)
-        Pd_perturbed = self.Pd * perturb
+        rng_obj = np.random.default_rng(int(rng))
+        low = min(self.load_perturbation_low, self.load_perturbation_high)
+        high = max(self.load_perturbation_low, self.load_perturbation_high)
+        perturb = rng_obj.uniform(low, high, self.Pd.shape)
+
+        scale_low = min(self.system_load_scale_low, self.system_load_scale_high)
+        scale_high = max(self.system_load_scale_low, self.system_load_scale_high)
+        system_scale = rng_obj.uniform(scale_low, scale_high)
+
+        Pd_perturbed = np.asarray(self.Pd, dtype=float) * perturb * system_scale
+        wave_amp = max(0.0, float(self.temporal_wave_amplitude))
+        if wave_amp > 0.0 and Pd_perturbed.ndim == 2 and Pd_perturbed.shape[1] > 1:
+            T = Pd_perturbed.shape[1]
+            cycles_low = min(self.temporal_wave_cycles_low, self.temporal_wave_cycles_high)
+            cycles_high = max(self.temporal_wave_cycles_low, self.temporal_wave_cycles_high)
+            cycles = rng_obj.uniform(cycles_low, cycles_high)
+            phase = rng_obj.uniform(0.0, 2.0 * np.pi)
+            t = np.arange(T, dtype=float)
+            wave = 1.0 + wave_amp * np.sin(2.0 * np.pi * cycles * t / max(T, 1) + phase)
+            wave = np.maximum(wave, 0.05)
+            wave = wave / max(float(np.mean(wave)), 1e-9)
+            Pd_perturbed = Pd_perturbed * wave[None, :]
         return Pd_perturbed
 
     def _solve_optimization(self, Pd, renewable_data=None):
@@ -241,7 +276,16 @@ class ActiveSetLearner:
                 'delta': self.delta,
                 'epsilon': self.epsilon,
                 'T_delta': self.T_delta,
-                'W': self.W
+                'W': self.W,
+                'load_sampling': {
+                    'load_perturbation_low': self.load_perturbation_low,
+                    'load_perturbation_high': self.load_perturbation_high,
+                    'system_load_scale_low': self.system_load_scale_low,
+                    'system_load_scale_high': self.system_load_scale_high,
+                    'temporal_wave_amplitude': self.temporal_wave_amplitude,
+                    'temporal_wave_cycles_low': self.temporal_wave_cycles_low,
+                    'temporal_wave_cycles_high': self.temporal_wave_cycles_high,
+                }
             },
             'unique_active_sets': active_sets_list,
             'all_samples': all_samples

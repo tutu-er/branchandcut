@@ -70,8 +70,8 @@ if not check_and_install_dependencies_safe():
 #
 MODE      = 'surrogate'
 RUN_FP    = True       # surrogate / both 模式：是否运行可行性泵测试
-CASE_NAME = 'case3lite'   # 'case3' / 'case3lite' / 'case14' / 'case30' / 'case39' / 'case118'
-SURROGATE_CONSTRAINT_STRATEGY = 'all_single_time'  # 'auto' / 'sensitive' / 'all' / 'all_templates_sign4' / 'all_single_time'
+CASE_NAME = 'case3lite'   # 'case3' / 'case3lite' / 'case14' / 'case30' / 'case30lite' / 'case39' / 'case118'
+SURROGATE_CONSTRAINT_STRATEGY = 'auto'  # 'auto' / 'sensitive' / 'all' / 'all_templates_sign4' / 'all_single_time'
 SUBPROBLEM_IGNORE_STARTUP_SHUTDOWN_COSTS = False
 BCD_LAMBDA_INIT_STRATEGY = 'lp_relaxation'   # 'lp_relaxation' / 'ed_on_x_opt'
 THETA_HOT_START_STRATEGY = 'dcpf_relative'   # 'dcpf_relative' / 'gaussian'
@@ -91,8 +91,8 @@ BCD_GAMMA_BASE = 1e-2
 # surrogate / both 模式：已训练 surrogate 模型目录（训练时输出的带时间戳路径）
 # 设为 None 则自动查找 result/surrogate_models/ 下最新的匹配目录
 # 环境变量 RUN_TEST_SURROGATE_MODEL_DIR 可覆盖本常量（agentic_fp_optimizer 会注入）
-MODEL_DIR = None
-# 可选：测试时注入外部 unit_predictor（当 MODEL_DIR 下缺少 unit_predictor.pth 时自动复制一份）
+MODEL_DIR = "result/surrogate_models/subproblem_models_case3lite_20260430_174643"
+# 可选：测试时注入外部 unit_predictor（当 MODEL_DIR 下缺少 unit_predictor.pth 时自动复制一份）  
 # 环境变量 RUN_TEST_UNIT_PREDICTOR_DIR 可覆盖本常量
 UNIT_PREDICTOR_DIR = None
 
@@ -120,7 +120,7 @@ def _auto_discover_model_path(directory, glob_pattern, label):
 
 # 顶部集中配置区：测试相关参数统一在这里调整
 MAX_SAMPLES = None         # None = 使用全部样本
-SAMPLE_RANGE = "0:1"       # 左闭右开；例如 "210:220"
+SAMPLE_RANGE = "0:100"       # 左闭右开；例如 "210:220"
 T_DELTA = 1.0
 UNIT_IDS = [1]            # None = 所有机组；或如 [0, 1, 2]
 TEST_SAMPLES_DEFAULT = 3
@@ -145,6 +145,7 @@ FP_PROJECTION_OBJECTIVE_TAU = 'adaptive'
 USE_CASE3LITE_CUSTOM_FP = True
 CASE3LITE_CUSTOM_FP_MAX_GLOBAL_COMBINATIONS = 24
 CASE3LITE_CUSTOM_FP_PLOT_DIR = 'result/figures_case3lite_custom_fp'
+USE_CASE118_CUSTOM_FP = True
 ACTIVE_SETS_FILE = 'result/active_set/active_sets_case3lite_T24_n1000_20260403_180137.json'  # 指定 active_sets JSON 文件路径（None=自动查找最新）
 
 # ──────────────────────── 导入 ────────────────────────
@@ -215,6 +216,7 @@ if MODE in ('surrogate', 'both'):
             _resolve_surrogate_constraint_timesteps,
         )
         from feasibility_pump_case3lite import recover_integer_solution_case3lite
+        from feasibility_pump_case118 import recover_integer_solution_case118
     except ImportError as e:
         print(f"feasibility_pump 模块导入失败: {e}")
         sys.exit(1)
@@ -456,6 +458,62 @@ def _load_saved_subproblem_ignore_startup_shutdown_costs(model_dir: str, unit_id
     return discovered[0]
 
 
+_UNIT_PREDICTOR_STRATEGIES = frozenset({
+    'all_single_time',
+    'all_templates_sign4_plus_single',
+})
+
+
+def _peek_unit_predictor_metadata(checkpoint_path: str) -> dict:
+    """读取 unit_predictor.pth 中 metadata，用于与训练时网络结构对齐。"""
+    try:
+        import torch
+    except ImportError:
+        return {}
+    try:
+        try:
+            state = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
+        except TypeError:
+            state = torch.load(checkpoint_path, map_location='cpu')
+    except Exception:
+        return {}
+    meta = state.get('metadata')
+    return dict(meta) if isinstance(meta, dict) else {}
+
+
+def _unit_predictor_kw_for_test(model_dir: str, strategy_norm: str | None) -> dict:
+    """当策略包含 single-time 且目录下存在 checkpoint 时，返回传给 load_trained_models 的 unit_predictor 参数。"""
+    if not strategy_norm or strategy_norm not in _UNIT_PREDICTOR_STRATEGIES:
+        return {}
+    path = os.path.join(str(model_dir), 'unit_predictor.pth')
+    if not os.path.isfile(path):
+        return {}
+    meta = _peek_unit_predictor_metadata(path)
+    if meta:
+        log(
+            "单机组 0/1 预测器: 将加载并与 surrogate 前向对齐 "
+            f"(net_variant={meta.get('net_variant', 'mlp')})"
+        )
+    else:
+        log(f"单机组 0/1 预测器: 将加载 {path}（checkpoint 无 metadata，使用默认结构）")
+    hd = meta.get('hidden_dims')
+    if hd is not None:
+        hd = list(hd)
+    return {
+        'use_unit_predictor': True,
+        'unit_predictor_path': path,
+        'unit_predictor_net_variant': str(meta.get('net_variant', 'mlp')).strip().lower(),
+        'unit_predictor_hidden_dims': hd,
+        'unit_predictor_resmlp_width': int(meta.get('resmlp_width', 512)),
+        'unit_predictor_resmlp_depth': int(meta.get('resmlp_depth', 4)),
+        'unit_predictor_tcn_channels': int(meta.get('tcn_channels', 64)),
+        'unit_predictor_tcn_depth': int(meta.get('tcn_depth', 6)),
+        'unit_predictor_tconv_channels': int(meta.get('tconv_channels', 64)),
+        'unit_predictor_tconv_depth': int(meta.get('tconv_depth', 4)),
+        'unit_predictor_dropout': float(meta.get('dropout', 0.1)),
+    }
+
+
 def load_trained_models_for_test(ppc, all_samples: list, T_DELTA: float,
                                  model_dir: str, unit_ids,
                                  requested_strategy: str | None,
@@ -466,8 +524,13 @@ def load_trained_models_for_test(ppc, all_samples: list, T_DELTA: float,
         if requested_ignore_startup_shutdown_costs is None
         else bool(requested_ignore_startup_shutdown_costs)
     )
+    saved_strategy = _load_saved_surrogate_strategy(model_dir, unit_ids)
+    strategy_for_predictor = resolved_strategy if resolved_strategy is not None else saved_strategy
+    if strategy_for_predictor is not None:
+        strategy_for_predictor = normalize_constraint_generation_strategy(strategy_for_predictor)
+    up_kw = _unit_predictor_kw_for_test(model_dir, strategy_for_predictor)
+
     if resolved_strategy is None:
-        saved_strategy = _load_saved_surrogate_strategy(model_dir, unit_ids)
         if saved_strategy is not None:
             log(f"约束生成策略: 使用模型保存值 {saved_strategy}")
         saved_ignore = _load_saved_subproblem_ignore_startup_shutdown_costs(model_dir, unit_ids)
@@ -480,6 +543,7 @@ def load_trained_models_for_test(ppc, all_samples: list, T_DELTA: float,
                 unit_ids=unit_ids,
                 constraint_generation_strategy=None,
                 ignore_startup_shutdown_costs=resolved_ignore_startup_shutdown_costs,
+                **up_kw,
             )
         except ValueError as exc:
             if "Surrogate model startup/shutdown-cost setting mismatch" not in str(exc):
@@ -494,6 +558,7 @@ def load_trained_models_for_test(ppc, all_samples: list, T_DELTA: float,
                 unit_ids=unit_ids,
                 constraint_generation_strategy=None,
                 ignore_startup_shutdown_costs=None,
+                **up_kw,
             )
 
     try:
@@ -506,6 +571,7 @@ def load_trained_models_for_test(ppc, all_samples: list, T_DELTA: float,
             unit_ids=unit_ids,
             constraint_generation_strategy=resolved_strategy,
             ignore_startup_shutdown_costs=resolved_ignore_startup_shutdown_costs,
+            **up_kw,
         )
     except ValueError as exc:
         if (
@@ -513,7 +579,6 @@ def load_trained_models_for_test(ppc, all_samples: list, T_DELTA: float,
             and "Surrogate model startup/shutdown-cost setting mismatch" not in str(exc)
         ):
             raise
-        saved_strategy = _load_saved_surrogate_strategy(model_dir, unit_ids)
         saved_ignore = _load_saved_subproblem_ignore_startup_shutdown_costs(model_dir, unit_ids)
         if saved_strategy is None and saved_ignore is None:
             raise
@@ -529,6 +594,7 @@ def load_trained_models_for_test(ppc, all_samples: list, T_DELTA: float,
             unit_ids=unit_ids,
             constraint_generation_strategy=None,
             ignore_startup_shutdown_costs=None,
+            **up_kw,
         )
 
 
@@ -1872,6 +1938,44 @@ def run_fp_test(ppc, all_samples: list, dual_predictor, trainers: dict,
                     max_global_combinations=CASE3LITE_CUSTOM_FP_MAX_GLOBAL_COMBINATIONS,
                     verbose=True,
                 )
+            elif CASE_NAME == 'case118' and USE_CASE118_CUSTOM_FP:
+                x_result, success, fp_details = recover_integer_solution_case118(
+                    sample, trainers, dual_predictor, ppc, T_DELTA,
+                    agent=agent,
+                    max_fp_iter=FP_MAX_ITER,
+                    conf_threshold=FP_CONF_THRESHOLD,
+                    n_perturbations=max(FP_MAX_PERTURBATION_HOT_STARTS, 8),
+                    scenario_bank=scenario_bank,
+                    surrogate_screen_mode=FP_SURROGATE_SCREEN_MODE,
+                    surrogate_screen_max_constraints_per_unit=FP_SURROGATE_SCREEN_MAX_CONSTRAINTS_PER_UNIT,
+                    surrogate_screen_min_support_ratio=FP_SURROGATE_SCREEN_MIN_SUPPORT_RATIO,
+                    surrogate_screen_max_normalized_violation=FP_SURROGATE_SCREEN_MAX_NORMALIZED_VIOLATION,
+                    surrogate_screen_min_mean_margin=FP_SURROGATE_SCREEN_MIN_MEAN_MARGIN,
+                    surrogate_screen_candidate_violation_tol=FP_SURROGATE_SCREEN_CANDIDATE_VIOLATION_TOL,
+                    surrogate_screen_soft_penalty=FP_SURROGATE_SCREEN_SOFT_PENALTY,
+                    projection_objective_tau=FP_PROJECTION_OBJECTIVE_TAU,
+                    return_details=True,
+                    verbose=True,
+                )
+                screen_summary = fp_details.get('surrogate_screen_summary', {})
+                if screen_summary:
+                    screening_records.append(
+                        {
+                            'sample_index': i,
+                            'hot_starts_before': int(screen_summary.get('hot_starts_before', 0)),
+                            'hot_starts_after': int(screen_summary.get('hot_starts_after', 0)),
+                            'x_pool_before': int(screen_summary.get('x_pool_before', 0)),
+                            'x_pool_after': int(screen_summary.get('x_pool_after', 0)),
+                            'n_constraints': int(screen_summary.get('n_constraints', 0)),
+                        }
+                    )
+                    log(
+                        "  case118 FP screening: "
+                        f"hot_starts {screen_summary.get('hot_starts_before', 0)} -> {screen_summary.get('hot_starts_after', 0)} | "
+                        f"x_pool {screen_summary.get('x_pool_before', 0)} -> {screen_summary.get('x_pool_after', 0)} | "
+                        f"stable_rows={screen_summary.get('n_constraints', 0)} | "
+                        f"selected={fp_details.get('selected_hot_start')}"
+                    )
             else:
                 x_result, success, fp_details = recover_integer_solution(
                     sample, trainers, dual_predictor, ppc, T_DELTA,
@@ -3005,7 +3109,7 @@ def main():
 
     # ── 加载 PyPower 案例 ────────────────────────────────
     log(f"加载 PyPower 案例: {CASE_NAME}")
-    supported_cases = ['case3', 'case3lite', 'case14', 'case30', 'case39', 'case118']
+    supported_cases = ['case3', 'case3lite', 'case14', 'case30', 'case30lite', 'case39', 'case118']
     if CASE_NAME not in supported_cases:
         print(f"未知案例: {CASE_NAME}，可选 {supported_cases}")
         sys.exit(1)

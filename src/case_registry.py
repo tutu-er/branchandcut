@@ -12,13 +12,16 @@ import pypower.case14
 import pypower.case39
 from pypower.idx_bus import PD
 
+from src.case14_uc_data import get_case14_uc_ppc
 from src.case3_uc_data import get_case3_uc_ppc, get_case3lite_uc_ppc
-from src.case30_uc_data import get_case30_uc_ppc
+from src.case30_uc_data import get_case30_uc_ppc, get_case30lite_uc_ppc
 
 
 CASE3_LOAD_SCALE = 1.40
 CASE3LITE_LOAD_SCALE = 1.28
+CASE14_LOAD_SCALE = 1.08
 CASE30_LOAD_SCALE = 1.15
+CASE30LITE_LOAD_SCALE = 1.04
 LOAD_PROFILE_PATH = Path(__file__).resolve().parent / "load.csv"
 
 
@@ -58,8 +61,18 @@ def build_case3lite_base_load(horizon: int, scale: float = CASE3LITE_LOAD_SCALE)
     return ppc, build_scaled_base_load(ppc, horizon, scale=scale)
 
 
+def build_case14_base_load(horizon: int, scale: float = CASE14_LOAD_SCALE) -> tuple[dict, np.ndarray]:
+    ppc = get_case14_uc_ppc()
+    return ppc, build_scaled_base_load(ppc, horizon, scale=scale)
+
+
 def build_case30_base_load(horizon: int, scale: float = CASE30_LOAD_SCALE) -> tuple[dict, np.ndarray]:
     ppc = get_case30_uc_ppc()
+    return ppc, build_scaled_base_load(ppc, horizon, scale=scale)
+
+
+def build_case30lite_base_load(horizon: int, scale: float = CASE30LITE_LOAD_SCALE) -> tuple[dict, np.ndarray]:
+    ppc = get_case30lite_uc_ppc()
     return ppc, build_scaled_base_load(ppc, horizon, scale=scale)
 
 
@@ -72,8 +85,9 @@ def get_case_ppc(case_name: str) -> dict:
     ppc_map = {
         "case3": get_case3_uc_ppc,
         "case3lite": get_case3lite_uc_ppc,
-        "case14": pypower.case14.case14,
+        "case14": get_case14_uc_ppc,
         "case30": get_case30_uc_ppc,
+        "case30lite": get_case30lite_uc_ppc,
         "case39": pypower.case39.case39,
     }
     if case_name not in ppc_map:

@@ -58,6 +58,7 @@ sys.modules.setdefault('src.sparse_constraint_templates', dummy_sparse_templates
 sys.modules.setdefault('sparse_constraint_templates', dummy_sparse_templates)
 
 from src import feasibility_pump_case3lite as fp_case3lite
+from src import feasibility_pump_case118 as fp_case118
 from src import feasibility_pump as fp
 
 
@@ -198,3 +199,77 @@ def test_case3lite_x_pool_contains_only_logic_feasible_candidates():
     for candidate in x_pool:
         is_valid, _reason = fp.check_commitment_logic_feasibility(candidate, ppc, 1.0)
         assert is_valid
+
+
+def test_case118_historical_candidates_rank_similar_commitments():
+    ppc = _build_test_ppc(ng=2, min_up=[1.0, 1.0], min_down=[1.0, 1.0])
+    target = {
+        "load_data": np.full((2, 3), 10.0, dtype=float),
+        "renewable_data": np.zeros((2, 3), dtype=float),
+    }
+    close_commitment = np.array([[1, 1, 1], [0, 0, 0]], dtype=int)
+    far_commitment = np.array([[0, 0, 0], [1, 1, 1]], dtype=int)
+    scenario_bank = [
+        {
+            "load_data": np.full((2, 3), 10.5, dtype=float),
+            "renewable_data": np.zeros((2, 3), dtype=float),
+            "unit_commitment_matrix": close_commitment,
+        },
+        {
+            "load_data": np.full((2, 3), 40.0, dtype=float),
+            "renewable_data": np.zeros((2, 3), dtype=float),
+            "unit_commitment_matrix": far_commitment,
+        },
+    ]
+    x_lp = np.array([[0.9, 0.9, 0.9], [0.1, 0.1, 0.1]], dtype=float)
+    x_surr_lp = x_lp.copy()
+    x_init_k = close_commitment.copy()
+    x_init_k_m = close_commitment[:, None, :].copy()
+
+    candidates, records = fp_case118.build_case118_historical_candidates(
+        target,
+        trainers={},
+        scenario_bank=scenario_bank,
+        x_lp=x_lp,
+        x_surr_lp=x_surr_lp,
+        x_init_k=x_init_k,
+        x_init_k_m=x_init_k_m,
+        ppc=ppc,
+        T_delta=1.0,
+        max_candidates=2,
+        candidate_pool_size=2,
+    )
+
+    assert candidates
+    assert candidates[0][0] == "case118_history_1"
+    np.testing.assert_array_equal(candidates[0][1], close_commitment)
+    assert records[0]["subproblem_distance"] == 0.0
+
+
+def test_case118_heuristic_candidates_repair_capacity_shortfall():
+    ppc = _build_test_ppc(ng=2, min_up=[1.0, 1.0], min_down=[1.0, 1.0])
+    ppc["gen"][:, 2] = np.array([40.0, 80.0], dtype=float)
+    ppc["gencost"] = np.zeros((2, 7), dtype=float)
+    ppc["gencost"][:, -2] = np.array([1.0, 2.0], dtype=float)
+
+    pd_data = np.full((2, 3), 35.0, dtype=float)
+    x_lp = np.zeros((2, 3), dtype=float)
+    x_surr_lp = np.zeros((2, 3), dtype=float)
+    x_init_k = np.zeros((2, 3), dtype=int)
+    x_init_k_m = np.zeros((2, 1, 3), dtype=int)
+
+    candidates = fp_case118.build_case118_heuristic_candidates(
+        x_lp,
+        x_surr_lp,
+        x_init_k,
+        x_init_k_m,
+        ppc,
+        pd_data,
+        T_delta=1.0,
+        reserve_margin=0.0,
+    )
+
+    capacity_candidates = [candidate for name, candidate in candidates if name == "case118_capacity_support"]
+    assert capacity_candidates
+    online_capacity = ppc["gen"][:, 2] @ capacity_candidates[0]
+    assert np.all(online_capacity >= np.sum(pd_data, axis=0))
