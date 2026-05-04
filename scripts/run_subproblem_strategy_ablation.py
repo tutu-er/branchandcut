@@ -34,6 +34,8 @@ if str(ROOT) not in sys.path:
 
 DEFAULT_CASES = ("case3lite", "case118")
 DEFAULT_VARIANTS = ("method", "no_strategy")
+DEFAULT_PLOT_TEST_SAMPLES = 20
+DEFAULT_PLOT_TEST_MAX_ITER = 60
 
 
 @dataclass(frozen=True)
@@ -430,14 +432,34 @@ def _build_parser() -> argparse.ArgumentParser:
 
     p.add_argument("--case3lite-active-set", default=None)
     p.add_argument("--case3lite-units", type=_parse_units, default=None)
-    p.add_argument("--case3lite-max-samples", type=int, default=None)
-    p.add_argument("--case3lite-max-iter", type=int, default=None)
+    p.add_argument(
+        "--case3lite-max-samples",
+        type=int,
+        default=DEFAULT_PLOT_TEST_SAMPLES,
+        help=f"Samples used by case3lite runs. Default: {DEFAULT_PLOT_TEST_SAMPLES}.",
+    )
+    p.add_argument(
+        "--case3lite-max-iter",
+        type=int,
+        default=DEFAULT_PLOT_TEST_MAX_ITER,
+        help=f"Subproblem BCD iterations for case3lite. Default: {DEFAULT_PLOT_TEST_MAX_ITER}.",
+    )
     p.add_argument("--case3lite-backend", choices=("gurobi", "cvxpy_highs"), default=None)
 
     p.add_argument("--case118-active-set", default=None)
     p.add_argument("--case118-units", type=_parse_units, default=None)
-    p.add_argument("--case118-max-samples", type=int, default=None)
-    p.add_argument("--case118-max-iter", type=int, default=None)
+    p.add_argument(
+        "--case118-max-samples",
+        type=int,
+        default=DEFAULT_PLOT_TEST_SAMPLES,
+        help=f"Samples used by case118 runs. Default: {DEFAULT_PLOT_TEST_SAMPLES}.",
+    )
+    p.add_argument(
+        "--case118-max-iter",
+        type=int,
+        default=DEFAULT_PLOT_TEST_MAX_ITER,
+        help=f"Subproblem BCD iterations for case118. Default: {DEFAULT_PLOT_TEST_MAX_ITER}.",
+    )
     p.add_argument("--case118-preset", choices=("desktop", "server"), default="desktop")
 
     p.add_argument("--sample-workers", type=int, default=None)

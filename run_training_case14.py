@@ -12,11 +12,11 @@ import run_training as rt
 CASE_NAME = "case14"
 TRAIN_TARGET = "both"  # "both" | "surrogate" | "bcd"
 ACTIVE_SETS_FILE: str | None = None
-MAX_SAMPLES = 300
+MAX_SAMPLES = 100
 BCD_MAX_ITER = 120
 SUBPROBLEM_MAX_ITER = 180
 DUAL_EPOCHS = 180
-UNIT_PREDICTOR_EPOCHS = 160
+UNIT_PREDICTOR_EPOCHS = 520
 NN_EPOCHS = 4
 N_WORKERS_SAMPLE = 2
 N_WORKERS_UNIT = 1
@@ -60,6 +60,17 @@ def main() -> None:
     rt.UNIT_IDS = None
     rt.DUAL_EPOCHS = DUAL_EPOCHS
     rt.UNIT_PREDICTOR_EPOCHS = UNIT_PREDICTOR_EPOCHS
+    rt.UNIT_PREDICTOR_BATCH_SIZE = 64
+    rt.UNIT_PREDICTOR_LR = 1.5e-3
+    rt.UNIT_PREDICTOR_WEIGHT_DECAY = 0.0
+    rt.UNIT_PREDICTOR_HIDDEN_DIMS = [512, 256, 128]
+    rt.UNIT_PREDICTOR_DROPOUT = 0.0
+    rt.UNIT_PREDICTOR_ENABLE_POS_WEIGHT = True
+    rt.UNIT_PREDICTOR_LOSS_WEIGHT_MSE = 0.25
+    rt.UNIT_PREDICTOR_LOSS_WEIGHT_TRANSITION = 0.08
+    rt.UNIT_PREDICTOR_LOSS_WEIGHT_BINARIZE = 0.02
+    rt.UNIT_PREDICTOR_LOSS_WEIGHT_TV_FLOOR = 0.04
+    rt.UNIT_PREDICTOR_TV_FLOOR_SCALE = 0.70
     rt.NN_EPOCHS = NN_EPOCHS
     rt.N_WORKERS_SAMPLE = max(1, int(args.sample_workers))
     rt.N_WORKERS_SUBPROBLEM = rt.N_WORKERS_SAMPLE
@@ -74,6 +85,9 @@ def main() -> None:
     rt.SURROGATE_DUAL_PREDICTOR_ONLY = False
     rt.BCD_MODEL_FILE = None
     rt.SURROGATE_MODEL_DIR = None
+
+    rt.UNIT_PREDICTOR_LOAD_PATH = "result/surrogate_models/unit_predictor_case14_20260504_132051/unit_predictor.pth"
+
     _configure_iterations(args.bcd_iter, args.sub_iter)
 
     print("=" * 72, flush=True)

@@ -46,6 +46,7 @@ class UnitPredictorConfig:
     loss_weight_tv_floor: float = 0.05
     tv_floor_scale: float = 0.75
     scheduler_patience: int = 12
+    scheduler_min_lr: float = 1e-8
 
 
 def parse_hidden_dims(text: str) -> list[int] | None:
@@ -180,6 +181,17 @@ def add_common_args(parser: argparse.ArgumentParser, cfg: UnitPredictorConfig) -
     parser.add_argument("--weight-decay", type=float, default=cfg.weight_decay)
     parser.add_argument("--hidden-dims", type=str, default=",".join(str(x) for x in cfg.hidden_dims))
     parser.add_argument("--net", choices=("mlp", "resmlp", "tconv", "tcn", "tcn_shared_film"), default=cfg.net_variant)
+    parser.add_argument("--dropout", type=float, default=cfg.dropout)
+    parser.add_argument("--scheduler-patience", type=int, default=cfg.scheduler_patience)
+    parser.add_argument("--scheduler-min-lr", type=float, default=cfg.scheduler_min_lr)
+    parser.add_argument("--no-scheduler", action="store_true")
+    parser.add_argument("--pos-weight", action="store_true", default=cfg.enable_pos_weight)
+    parser.add_argument("--no-pos-weight", action="store_false", dest="pos_weight")
+    parser.add_argument("--loss-mse", type=float, default=cfg.loss_weight_mse)
+    parser.add_argument("--loss-transition", type=float, default=cfg.loss_weight_transition)
+    parser.add_argument("--loss-binarize", type=float, default=cfg.loss_weight_binarize)
+    parser.add_argument("--loss-tv-floor", type=float, default=cfg.loss_weight_tv_floor)
+    parser.add_argument("--tv-floor-scale", type=float, default=cfg.tv_floor_scale)
     parser.add_argument("--val-ratio", type=float, default=cfg.val_ratio)
     parser.add_argument("--seed", type=int, default=cfg.seed)
     parser.add_argument("--unit-ids", type=str, default=None, help="comma-separated unit ids; default trains all units")
@@ -219,7 +231,8 @@ def run_unit_predictor_training(cfg: UnitPredictorConfig, args: argparse.Namespa
     )
     print(
         f"net={args.net} hidden={args.hidden_dims} epochs={args.epochs} "
-        f"batch={args.batch_size} lr={args.lr} out={out_dir}",
+        f"batch={args.batch_size} lr={args.lr} wd={args.weight_decay} "
+        f"dropout={args.dropout} out={out_dir}",
         flush=True,
     )
     print("=" * 78, flush=True)
@@ -241,25 +254,25 @@ def run_unit_predictor_training(cfg: UnitPredictorConfig, args: argparse.Namespa
         tcn_depth=cfg.tcn_depth,
         tconv_channels=cfg.tconv_channels,
         tconv_depth=cfg.tconv_depth,
-        dropout=cfg.dropout,
+        dropout=max(0.0, float(args.dropout)),
         save_path=str(save_path),
         load_path=args.load_path,
-        enable_scheduler=True,
-        scheduler_patience=cfg.scheduler_patience,
+        enable_scheduler=not bool(args.no_scheduler),
+        scheduler_patience=max(0, int(args.scheduler_patience)),
         scheduler_factor=0.5,
-        scheduler_min_lr=1e-7,
-        enable_pos_weight=cfg.enable_pos_weight,
+        scheduler_min_lr=max(0.0, float(args.scheduler_min_lr)),
+        enable_pos_weight=bool(args.pos_weight),
         pos_weight_clip=20.0,
         loss_weight_bce=cfg.loss_weight_bce,
-        loss_weight_mse=cfg.loss_weight_mse,
+        loss_weight_mse=float(args.loss_mse),
         loss_weight_l1=0.0,
         loss_weight_tv=0.0,
-        loss_weight_transition=cfg.loss_weight_transition,
-        loss_weight_binarize=cfg.loss_weight_binarize,
+        loss_weight_transition=float(args.loss_transition),
+        loss_weight_binarize=float(args.loss_binarize),
         loss_weight_std_floor=0.0,
         std_floor_scale=0.5,
-        loss_weight_tv_floor=cfg.loss_weight_tv_floor,
-        tv_floor_scale=cfg.tv_floor_scale,
+        loss_weight_tv_floor=float(args.loss_tv_floor),
+        tv_floor_scale=float(args.tv_floor_scale),
     )
 
     (out_dir / "LATEST.txt").write_text(str(save_path).replace("\\", "/"), encoding="utf-8")

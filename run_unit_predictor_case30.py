@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Train the standalone UnitPredictor for case14."""
+"""Train the standalone UnitPredictor for case30."""
 
 from __future__ import annotations
 
@@ -14,18 +14,18 @@ from run_unit_predictor_common import (
 
 
 CONFIG = UnitPredictorConfig(
-    case_name="case14",
-    max_samples=300,
-    epochs=720,
+    case_name="case30",
+    max_samples=340,
+    epochs=760,
     batch_size=64,
     lr=1.5e-3,
     weight_decay=0.0,
     hidden_dims=(512, 256, 128),
     dropout=0.0,
-    loss_weight_mse=0.25,
-    loss_weight_transition=0.08,
+    loss_weight_mse=0.22,
+    loss_weight_transition=0.07,
     loss_weight_binarize=0.02,
-    loss_weight_tv_floor=0.04,
+    loss_weight_tv_floor=0.035,
     tv_floor_scale=0.70,
     scheduler_patience=80,
     scheduler_min_lr=1.0e-8,
