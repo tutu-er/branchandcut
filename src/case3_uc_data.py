@@ -49,6 +49,8 @@ def get_case3_uc_ppc() -> dict:
             ],
             dtype=float,
         ),
+        "uc_min_up_time_h": np.array([4.0, 2.0, 1.0], dtype=float),
+        "uc_min_down_time_h": np.array([4.0, 2.0, 1.0], dtype=float),
     }
 
 
@@ -95,6 +97,8 @@ def get_case3lite_uc_ppc() -> dict:
             ],
             dtype=float,
         ),
+        "uc_min_up_time_h": np.array([3.0, 2.0, 1.0], dtype=float),
+        "uc_min_down_time_h": np.array([3.0, 2.0, 1.0], dtype=float),
     }
 
 

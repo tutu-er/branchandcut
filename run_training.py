@@ -172,7 +172,7 @@ UNIT_PREDICTOR_WEIGHT_DECAY = 1e-4
 MAX_ITER = 300             # backward-compatible shared fallback
 BCD_MAX_ITER = MAX_ITER
 SUBPROBLEM_MAX_ITER = MAX_ITER
-NN_EPOCHS = 16
+NN_EPOCHS = 4
 UNIT_IDS = [1]              # None = 所有机组；或如 [0, 1, 2]
 FP_TEST_SAMPLES = 3
 # Windows 本地默认使用更保守的线程并发，优先稳定性和内存占用。

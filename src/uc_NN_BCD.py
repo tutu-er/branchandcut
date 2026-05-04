@@ -504,6 +504,22 @@ def _get_ramp_limits_from_ppc(ppc_raw, gen: np.ndarray, T_delta: float) -> Tuple
     return Ru, Rd, Ru_co, Rd_co
 
 
+def _get_min_up_down_steps_from_ppc(ppc_raw, ng: int, T: int, T_delta: float) -> Tuple[np.ndarray, np.ndarray, int, int]:
+    """Return per-generator min up/down steps, aligned with the UC MIP wrapper."""
+    default_steps = max(int(4 * T_delta), 1)
+    min_up_h = _get_custom_generator_array_from_ppc(ppc_raw, ng, 'uc_min_up_time_h')
+    min_down_h = _get_custom_generator_array_from_ppc(ppc_raw, ng, 'uc_min_down_time_h')
+    if min_up_h is None or min_down_h is None:
+        min_up = np.full(ng, default_steps, dtype=int)
+        min_down = np.full(ng, default_steps, dtype=int)
+    else:
+        min_up = np.maximum(np.ceil(np.asarray(min_up_h, dtype=float) / T_delta).astype(int), 1)
+        min_down = np.maximum(np.ceil(np.asarray(min_down_h, dtype=float) / T_delta).astype(int), 1)
+    min_up = np.minimum(min_up, max(int(T), 1))
+    min_down = np.minimum(min_down, max(int(T), 1))
+    return min_up, min_down, int(np.max(min_up)), int(np.max(min_down))
+
+
 class Agent_NN_BCD:
     """
     结合BCD迭代和神经网络更新的混合方法
@@ -628,6 +644,12 @@ class Agent_NN_BCD:
             
         self.ng = self.gen.shape[0]
         self.nl = self.branch.shape[0]
+        (
+            self.min_up_steps,
+            self.min_down_steps,
+            self.Ton,
+            self.Toff,
+        ) = _get_min_up_down_steps_from_ppc(self.ppc_raw, self.ng, self.T, self.T_delta)
         self._generator_incidence_matrix = self._build_generator_incidence_matrix()
         self._ptdf_matrix = makePTDF(self.baseMVA, self.bus, self.branch)
         self._branch_limit = np.asarray(self.branch[:, RATE_A], dtype=float)
@@ -742,6 +764,12 @@ class Agent_NN_BCD:
             self.rho_dual_x,
             self.rho_dual_coc,
         ]))
+
+    def _min_up_horizon(self, g: int) -> int:
+        return int(self.min_up_steps[g])
+
+    def _min_down_horizon(self, g: int) -> int:
+        return int(self.min_down_steps[g])
 
     def _smooth_abs(self, tensor: torch.Tensor, eps: float | None = None) -> torch.Tensor:
         resolved_eps = self.nn_smooth_abs_eps if eps is None else max(float(eps), 0.0)
@@ -1063,14 +1091,14 @@ class Agent_NN_BCD:
                                  name=f'ramp_down_{g}_{t}')
 
             # 最小开关机时间约束（松弛版本）
-            Ton = min(4, self.T)
-            Toff = min(4, self.T)
+            Ton = self.Ton
+            Toff = self.Toff
             for g in range(self.ng):
-                for t in range(1, Ton + 1):
+                for t in range(1, self._min_up_horizon(g) + 1):
                     for t1 in range(self.T - t):
                         lp.addConstr(x[g, t1 + 1] - x[g, t1] <= x[g, t1 + t], name=f'min_on_{g}_{t}_{t1}')
             for g in range(self.ng):
-                for t in range(1, Toff + 1):
+                for t in range(1, self._min_down_horizon(g) + 1):
                     for t1 in range(self.T - t):
                         lp.addConstr(-x[g, t1 + 1] + x[g, t1] <= 1 - x[g, t1 + t], name=f'min_off_{g}_{t}_{t1}')
 
@@ -1135,8 +1163,8 @@ class Agent_NN_BCD:
                 return None
 
         try:
-            Ton = min(4, self.T)
-            Toff = min(4, self.T)
+            Ton = self.Ton
+            Toff = self.Toff
             result = {}
 
             def _to_array(v, shape):
@@ -1253,14 +1281,14 @@ class Agent_NN_BCD:
                     model.addConstr(pg[g, t - 1] - pg[g, t] <= self.Rd[g] * x[g, t] + self.Rd_co[g] * (1 - x[g, t]),
                                     name=f'ramp_down_{g}_{t}')
 
-            Ton = min(4, self.T)
-            Toff = min(4, self.T)
+            Ton = self.Ton
+            Toff = self.Toff
             for g in range(self.ng):
-                for t in range(1, Ton + 1):
+                for t in range(1, self._min_up_horizon(g) + 1):
                     for t1 in range(self.T - t):
                         model.addConstr(x[g, t1 + 1] - x[g, t1] <= x[g, t1 + t], name=f'min_on_{g}_{t}_{t1}')
             for g in range(self.ng):
-                for t in range(1, Toff + 1):
+                for t in range(1, self._min_down_horizon(g) + 1):
                     for t1 in range(self.T - t):
                         model.addConstr(-x[g, t1 + 1] + x[g, t1] <= 1 - x[g, t1 + t], name=f'min_off_{g}_{t}_{t1}')
 
@@ -1487,15 +1515,15 @@ class Agent_NN_BCD:
             implicit_duals['min_on'] = {}
             implicit_duals['min_off'] = {}
             
-            Ton = min(4, self.T)
-            Toff = min(4, self.T)
+            Ton = self.Ton
+            Toff = self.Toff
             
             for g in range(self.ng):
                 implicit_duals['min_on'][g] = {}
                 implicit_duals['min_off'][g] = {}
                 
                 # 最小开机时间约束
-                for tau in range(1, Ton+1):
+                for tau in range(1, self._min_up_horizon(g) + 1):
                     for t1 in range(self.T - tau):
                         cname_on = f'min_on_{g}_{tau}_{t1}'
                         constr_on = model.getConstrByName(cname_on)
@@ -1508,7 +1536,7 @@ class Agent_NN_BCD:
                                 implicit_duals['min_on'][g][tau][t1] = 0.0
                 
                 # 最小关机时间约束
-                for tau in range(1, Toff+1):
+                for tau in range(1, self._min_down_horizon(g) + 1):
                     for t1 in range(self.T - tau):
                         cname_off = f'min_off_{g}_{tau}_{t1}'
                         constr_off = model.getConstrByName(cname_off)
@@ -1678,8 +1706,8 @@ class Agent_NN_BCD:
                 lambda_sol_implicit['lambda_ramp_down'] = np.zeros((self.ng, self.T-1))
             
             # 4. 最小开关机时间约束对偶变量: shape (ng, Ton/Toff, T)
-            Ton = min(4, self.T)
-            Toff = min(4, self.T)
+            Ton = self.Ton
+            Toff = self.Toff
             
             if 'min_on' in implicit_duals_dict:
                 lambda_sol_implicit['lambda_min_on'] = np.zeros((self.ng, Ton, self.T))
@@ -1764,8 +1792,8 @@ class Agent_NN_BCD:
         """
         创建空的对偶变量字典（所有值设为0）
         """
-        Ton = min(4, self.T)
-        Toff = min(4, self.T)
+        Ton = self.Ton
+        Toff = self.Toff
         return {
             'lambda_power_balance': np.zeros(self.T),
             'lambda_pg_lower': np.zeros((self.ng, self.T)),
@@ -1980,15 +2008,15 @@ class Agent_NN_BCD:
                 constraints.append(cons)
                 ramp_down_cons[g][t - 1] = cons
 
-        Ton = min(4, self.T)
-        Toff = min(4, self.T)
+        Ton = self.Ton
+        Toff = self.Toff
         for g in range(self.ng):
-            for tau in range(1, Ton + 1):
+            for tau in range(1, self._min_up_horizon(g) + 1):
                 for t1 in range(self.T - tau):
                     cons = x[g, t1 + 1] - x[g, t1] <= x[g, t1 + tau]
                     constraints.append(cons)
                     min_on_cons[g, tau - 1, t1] = cons
-            for tau in range(1, Toff + 1):
+            for tau in range(1, self._min_down_horizon(g) + 1):
                 for t1 in range(self.T - tau):
                     cons = -x[g, t1 + 1] + x[g, t1] <= 1 - x[g, t1 + tau]
                     constraints.append(cons)
@@ -2268,7 +2296,10 @@ class Agent_NN_BCD:
         if t < self.T - 1:
             dual_expr = dual_expr + ru_delta * lambda_ramp_up[g, t]
 
-        for tau in range(1, Ton + 1):
+        ton_g = min(int(Ton), self._min_up_horizon(g))
+        toff_g = min(int(Toff), self._min_down_horizon(g))
+
+        for tau in range(1, ton_g + 1):
             for t1 in range(self.T - tau):
                 if t == t1 + 1:
                     dual_expr = dual_expr + lambda_min_on[g, tau - 1, t1]
@@ -2277,7 +2308,7 @@ class Agent_NN_BCD:
                 if t == t1 + tau:
                     dual_expr = dual_expr - lambda_min_on[g, tau - 1, t1]
 
-        for tau in range(1, Toff + 1):
+        for tau in range(1, toff_g + 1):
             for t1 in range(self.T - tau):
                 if t == t1 + 1:
                     dual_expr = dual_expr - lambda_min_off[g, tau - 1, t1]
@@ -3383,8 +3414,8 @@ class Agent_NN_BCD:
         b  = (self.gencost[:, -1] / self.T_delta).reshape(self.ng, 1)
         start_cost = self.gencost[:, 1]
         shut_cost  = self.gencost[:, 2]
-        Ton  = min(4, self.T)
-        Toff = min(4, self.T)
+        Ton  = self.Ton
+        Toff = self.Toff
 
         # ── Decision variables ──────────────────────────────────────────────
         pg  = cp.Variable((self.ng, self.T))
@@ -3466,16 +3497,17 @@ class Agent_NN_BCD:
             obj_opt_terms.append(cp.sum(cp.multiply(p_lambda_rd, cp.abs(rd_expr))))
 
         # Min-on / min-off
-        for tau in range(1, Ton + 1):
-            expr = x[:, 1:self.T - tau + 1] - x[:, :self.T - tau] - x[:, tau:]
-            obj_primal_terms.append(cp.sum(cp.pos(expr)))
-            obj_opt_terms.append(
-                cp.sum(cp.multiply(p_lambda_mon[:, tau - 1, :self.T - tau], cp.abs(expr))))
-        for tau in range(1, Toff + 1):
-            expr = -x[:, 1:self.T - tau + 1] + x[:, :self.T - tau] - (1 - x[:, tau:])
-            obj_primal_terms.append(cp.sum(cp.pos(expr)))
-            obj_opt_terms.append(
-                cp.sum(cp.multiply(p_lambda_moff[:, tau - 1, :self.T - tau], cp.abs(expr))))
+        for g in range(self.ng):
+            for tau in range(1, self._min_up_horizon(g) + 1):
+                expr = x[g, 1:self.T - tau + 1] - x[g, :self.T - tau] - x[g, tau:]
+                obj_primal_terms.append(cp.sum(cp.pos(expr)))
+                obj_opt_terms.append(
+                    cp.sum(cp.multiply(p_lambda_mon[g, tau - 1, :self.T - tau], cp.abs(expr))))
+            for tau in range(1, self._min_down_horizon(g) + 1):
+                expr = -x[g, 1:self.T - tau + 1] + x[g, :self.T - tau] - (1 - x[g, tau:])
+                obj_primal_terms.append(cp.sum(cp.pos(expr)))
+                obj_opt_terms.append(
+                    cp.sum(cp.multiply(p_lambda_moff[g, tau - 1, :self.T - tau], cp.abs(expr))))
 
         # Start/shut costs + coc
         if self.T > 1:
@@ -3608,8 +3640,8 @@ class Agent_NN_BCD:
         Ru_co= self.Ru_co; Rd_co= self.Rd_co
         start_cost   = self.gencost[:, 1]
         shut_cost    = self.gencost[:, 2]
-        Ton  = min(4, self.T)
-        Toff = min(4, self.T)
+        Ton  = self.Ton
+        Toff = self.Toff
 
         # ---- floor / sign-relax flags ----
         floor_active     = self._is_dual_floor_active()
@@ -3805,12 +3837,12 @@ class Agent_NN_BCD:
                         opt_terms.append(rd_v * lambda_rd[g, t-1])
 
         for g in range(self.ng):
-            for tau in range(1, Ton+1):
+            for tau in range(1, self._min_up_horizon(g) + 1):
                 for t1 in range(self.T - tau):
                     v = abs(float(x_arr[g, t1+1]) - float(x_arr[g, t1]) - float(x_arr[g, t1+tau]))
                     if v > 1e-10:
                         opt_terms.append(v * lambda_mon[g, tau-1, t1])
-            for tau in range(1, Toff+1):
+            for tau in range(1, self._min_down_horizon(g) + 1):
                 for t1 in range(self.T - tau):
                     v = abs(-float(x_arr[g, t1+1]) + float(x_arr[g, t1]) - 1.0 + float(x_arr[g, t1+tau]))
                     if v > 1e-10:
@@ -4020,8 +4052,8 @@ class Agent_NN_BCD:
         ramp_up_abs        = model.addVars(self.ng, self.T-1,   lb=0, name='ramp_up_abs')
         ramp_down_abs      = model.addVars(self.ng, self.T-1,   lb=0, name='ramp_down_abs')
 
-        Ton  = min(4, self.T)
-        Toff = min(4, self.T)
+        Ton  = self.Ton
+        Toff = self.Toff
         min_on_viol   = model.addVars(self.ng, Ton,  self.T,   lb=0, name='min_on_viol')
         min_off_viol  = model.addVars(self.ng, Toff, self.T,   lb=0, name='min_off_viol')
         min_on_abs    = model.addVars(self.ng, Ton,  self.T,   lb=0, name='min_on_abs')
@@ -4076,14 +4108,14 @@ class Agent_NN_BCD:
 
         # 最小开/关机时间约束
         for g in range(self.ng):
-            for t in range(1, Ton+1):
+            for t in range(1, self._min_up_horizon(g) + 1):
                 for t1 in range(self.T - t):
                     e = x[g,t1+1] - x[g,t1] - x[g,t1+t]
                     model.addConstr(min_on_viol[g,t-1,t1] >= e,  name=f'mon_viol_{g}_{t}_{t1}')
                     model.addConstr(min_on_abs[g,t-1,t1]  >= e,  name=f'mon_abs1_{g}_{t}_{t1}')
                     model.addConstr(min_on_abs[g,t-1,t1]  >= -e, name=f'mon_abs2_{g}_{t}_{t1}')
                     obj_primal += min_on_viol[g,t-1,t1]
-            for t in range(1, Toff+1):
+            for t in range(1, self._min_down_horizon(g) + 1):
                 for t1 in range(self.T - t):
                     e = -x[g,t1+1] + x[g,t1] - (1 - x[g,t1+t])
                     model.addConstr(min_off_viol[g,t-1,t1] >= e,  name=f'moff_viol_{g}_{t}_{t1}')
@@ -4317,10 +4349,10 @@ class Agent_NN_BCD:
                 obj_opt += ramp_up_abs[g,t-1]   * abs(lam['lambda_ramp_up'][g,t-1])
                 obj_opt += ramp_down_abs[g,t-1] * abs(lam['lambda_ramp_down'][g,t-1])
         for g in range(self.ng):
-            for tau in range(1, Ton+1):
+            for tau in range(1, self._min_up_horizon(g) + 1):
                 for t1 in range(self.T - tau):
                     obj_opt += min_on_abs[g,tau-1,t1] * abs(lam['lambda_min_on'][g,tau-1,t1])
-            for tau in range(1, Toff+1):
+            for tau in range(1, self._min_down_horizon(g) + 1):
                 for t1 in range(self.T - tau):
                     obj_opt += min_off_abs[g,tau-1,t1] * abs(lam['lambda_min_off'][g,tau-1,t1])
         for t in range(1, self.T):
@@ -4356,6 +4388,7 @@ class Agent_NN_BCD:
             + self.pg_block_prox_weight * obj_prox,
             GRB.MINIMIZE,
         )
+        vars_dict['obj_opt'] = obj_opt
 
     # ------------------------------------------------------------------
 
@@ -4403,10 +4436,13 @@ class Agent_NN_BCD:
             if sample_id <= 2:
                 obj_primal_v = vars_dict['obj_primal'].getValue()
                 obj_binary_v = vars_dict['obj_binary'].getValue()
+                obj_opt_v = vars_dict.get('obj_opt', 0.0)
+                obj_opt_v = obj_opt_v.getValue() if hasattr(obj_opt_v, 'getValue') else float(obj_opt_v)
                 print(
                     f"pg_block, sample_id: {sample_id}, "
                     f"obj_primal: {obj_primal_v:.4f}, "
-                    f"obj_binary: {obj_binary_v:.4f}",
+                    f"obj_binary: {obj_binary_v:.4f}, "
+                    f"obj_opt: {obj_opt_v:.4f}",
                     flush=True,
                 )
             return pg_sol, x_sol, cpower_sol, coc_sol
@@ -4434,8 +4470,8 @@ class Agent_NN_BCD:
         lambda_ramp_up       = model.addVars(self.ng, self.T-1,lb=0, name='lambda_ramp_up')
         lambda_ramp_down     = model.addVars(self.ng, self.T-1,lb=0, name='lambda_ramp_down')
 
-        Ton  = min(4, self.T)
-        Toff = min(4, self.T)
+        Ton  = self.Ton
+        Toff = self.Toff
         lambda_min_on    = model.addVars(self.ng, Ton,  self.T,   lb=0, name='lambda_min_on')
         lambda_min_off   = model.addVars(self.ng, Toff, self.T,   lb=0, name='lambda_min_off')
         lambda_start_cost= model.addVars(self.ng, self.T-1,        lb=0, name='lambda_sc')
@@ -4705,12 +4741,12 @@ class Agent_NN_BCD:
                     obj_opt += rd_v * lam_rd[g,t-1]
 
         for g in range(self.ng):
-            for tau in range(1, Ton+1):
+            for tau in range(1, self._min_up_horizon(g) + 1):
                 for t1 in range(self.T - tau):
                     v = abs(float(self.x[sample_id,g,t1+1]) - float(self.x[sample_id,g,t1]) - float(self.x[sample_id,g,t1+tau]))
                     if v > 1e-10:
                         obj_opt += v * lam_mon[g,tau-1,t1]
-            for tau in range(1, Toff+1):
+            for tau in range(1, self._min_down_horizon(g) + 1):
                 for t1 in range(self.T - tau):
                     v = abs(-float(self.x[sample_id,g,t1+1]) + float(self.x[sample_id,g,t1]) - 1 + float(self.x[sample_id,g,t1+tau]))
                     if v > 1e-10:
@@ -4920,8 +4956,8 @@ class Agent_NN_BCD:
         lambda_ramp_up = model.addVars(self.ng, self.T-1, lb=0, name='lambda_ramp_up')
         lambda_ramp_down = model.addVars(self.ng, self.T-1, lb=0, name='lambda_ramp_down')
         
-        Ton = min(4, self.T)
-        Toff = min(4, self.T)
+        Ton = self.Ton
+        Toff = self.Toff
         lambda_min_on = model.addVars(self.ng, Ton, self.T, lb=0, name='lambda_min_on')
         lambda_min_off = model.addVars(self.ng, Toff, self.T, lb=0, name='lambda_min_off')
         lambda_start_cost = model.addVars(self.ng, self.T-1, lb=0, name='lambda_start_cost')
@@ -5111,14 +5147,14 @@ class Agent_NN_BCD:
                     obj_opt += ramp_down_viol * lambda_ramp_down[g, t-1]
 
         for g in range(self.ng):
-            for t in range(1, Ton+1):
+            for t in range(1, self._min_up_horizon(g) + 1):
                 for t1 in range(self.T - t):
                     min_on_viol = abs(self.x[sample_id, g, t1+1] - self.x[sample_id, g, t1] - self.x[sample_id, g, t1+t])
                     if min_on_viol > 1e-10:
                         obj_opt += min_on_viol * lambda_min_on[g, t-1, t1]
 
         for g in range(self.ng):
-            for t in range(1, Toff+1):
+            for t in range(1, self._min_down_horizon(g) + 1):
                 for t1 in range(self.T - t):
                     min_off_viol = abs(-self.x[sample_id, g, t1+1] + self.x[sample_id, g, t1] - 1 + self.x[sample_id, g, t1+t])
                     if min_off_viol > 1e-10:
@@ -5728,8 +5764,8 @@ class Agent_NN_BCD:
         obj_opt = 0
         
         # 预计算常量
-        Ton = min(4, self.T)
-        Toff = min(4, self.T)
+        Ton = self.Ton
+        Toff = self.Toff
         Ru = self.Ru
         Rd = self.Rd
         Ru_co = self.Ru_co
@@ -5799,7 +5835,7 @@ class Agent_NN_BCD:
             
             # 最小开关机时间约束
             for g in range(self.ng):
-                for t in range(1, Ton+1):
+                for t in range(1, self._min_up_horizon(g) + 1):
                     for t1 in range(self.T - t):
                         min_on_expr = x[g, t1+1] - x[g, t1] - x[g, t1+t]
                         obj_primal += max(0, min_on_expr)
@@ -5807,7 +5843,7 @@ class Agent_NN_BCD:
                             obj_opt += abs(min_on_expr) * abs(self.lambda_[sample_id]['lambda_min_on'][g, t-1, t1])
             
             for g in range(self.ng):
-                for t in range(1, Toff+1):
+                for t in range(1, self._min_down_horizon(g) + 1):
                     for t1 in range(self.T - t):
                         min_off_expr = -x[g, t1+1] + x[g, t1] - (1 - x[g, t1+t])
                         obj_primal += max(0, min_off_expr)
@@ -6109,8 +6145,8 @@ class Agent_NN_BCD:
                 ru_delta=float(self.Ru_co[g] - self.Ru[g]),
                 start_cost=float(self.gencost[g, 1]),
                 shut_cost=float(self.gencost[g, 2]),
-                Ton=min(4, self.T),
-                Toff=min(4, self.T),
+                Ton=self.Ton,
+                Toff=self.Toff,
             )
         )
 
@@ -6381,8 +6417,8 @@ class Agent_NN_BCD:
         gencost_fixed = ct['gencost_fixed']
         start_cost    = ct['start_cost']
         shut_cost     = ct['shut_cost']
-        Ton = min(4, self.T)
-        Toff = min(4, self.T)
+        Ton = self.Ton
+        Toff = self.Toff
         Ru    = ct['Ru']
         Rd    = ct['Rd']
         Ru_co = ct['Ru_co']
@@ -7281,14 +7317,14 @@ class Agent_NN_BCD:
                               name=f'ramp_down_{g}_{t}')
         
         # 最小开关机时间约束
-        Ton = min(4, self.T)
-        Toff = min(4, self.T)
+        Ton = self.Ton
+        Toff = self.Toff
         for g in range(self.ng):
-            for t in range(1, Ton+1):
+            for t in range(1, self._min_up_horizon(g) + 1):
                 for t1 in range(self.T - t):
                     model.addConstr(x[g, t1+1] - x[g, t1] <= x[g, t1+t], name=f'min_on_{g}_{t}_{t1}')
         for g in range(self.ng):
-            for t in range(1, Toff+1):
+            for t in range(1, self._min_down_horizon(g) + 1):
                 for t1 in range(self.T - t):
                     model.addConstr(-x[g, t1+1] + x[g, t1] <= 1 - x[g, t1+t], name=f'min_off_{g}_{t}_{t1}')
         
@@ -7376,16 +7412,16 @@ class Agent_NN_BCD:
                 model.addConstr(ramp_down_expr <= 0, name=f'ramp_down_{g}_{t}')
         
         # 最小开机时间和最小关机时间约束
-        Ton = min(4, self.T)
-        Toff = min(4, self.T)
+        Ton = self.Ton
+        Toff = self.Toff
         for g in range(self.ng):
-            for t in range(1, Ton+1):
+            for t in range(1, self._min_up_horizon(g) + 1):
                 for t1 in range(self.T - t):
                     min_on_expr = x[g, t1+1] - x[g, t1] - x[g, t1+t]
                     model.addConstr(min_on_expr <= 0, name=f'min_on_{g}_{t}_{t1}')
         
         for g in range(self.ng):
-            for t in range(1, Toff+1):
+            for t in range(1, self._min_down_horizon(g) + 1):
                 for t1 in range(self.T - t):
                     min_off_expr = -x[g, t1+1] + x[g, t1] - (1 - x[g, t1+t])
                     model.addConstr(min_off_expr <= 0, name=f'min_off_{g}_{t}_{t1}')
