@@ -5651,6 +5651,8 @@ class Agent_NN_BCD:
                 flush=True,
             )
             self.rho_primal = min(self.rho_primal + gamma * obj_primal, self.rho_max)
+            obj_binary = self.cal_obj_binary_gap()
+            obj_binary = obj_binary if abs(obj_binary) >= EPS else 0.0
             self.rho_binary = min(self.rho_binary + gamma * obj_binary, self.rho_max)
             gamma_dual = gamma * self.gamma_dual_component_scale
             self.rho_dual_pg = min(self.rho_dual_pg + gamma_dual * obj_dual_pg, self.rho_max)
@@ -5659,7 +5661,8 @@ class Agent_NN_BCD:
             self._sync_rho_dual_summary()
             self.rho_opt = min(self.rho_opt + gamma * obj_opt, self.rho_max)
             print(
-                f"[BCD][rho] primal={self.rho_primal}, dual_pg={self.rho_dual_pg}, "
+                f"[BCD][rho] primal={self.rho_primal}, binary={self.rho_binary}, "
+                f"dual_pg={self.rho_dual_pg}, "
                 f"dual_x={self.rho_dual_x}, dual_coc={self.rho_dual_coc}, "
                 f"dual={self.rho_dual}, opt={self.rho_opt}",
                 flush=True,
@@ -5991,6 +5994,20 @@ class Agent_NN_BCD:
             union_analysis=union_analysis
         )
         return obj_primal, obj_dual, obj_opt
+
+    def cal_obj_binary_gap(self) -> float:
+        """Match PG-block obj_binary: sum |x - reference commitment| over samples."""
+        total = 0.0
+        for sample_id in range(self.n_samples):
+            uc_matrix = _get_uc_matrix_from_sample(
+                self.active_set_data[sample_id],
+                self.ng,
+                self.T,
+            )
+            if uc_matrix is None:
+                continue
+            total += float(np.sum(np.abs(np.asarray(self.x[sample_id], dtype=float) - uc_matrix)))
+        return total
 
     def cal_nn_logging_components(self, union_analysis=None) -> dict[str, float]:
         if not TORCH_AVAILABLE or self.n_samples <= 0:
