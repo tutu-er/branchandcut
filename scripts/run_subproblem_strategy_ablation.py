@@ -36,6 +36,7 @@ DEFAULT_CASES = ("case3lite", "case118")
 DEFAULT_VARIANTS = ("method", "no_strategy")
 DEFAULT_PLOT_TEST_SAMPLES = 20
 DEFAULT_PLOT_TEST_MAX_ITER = 60
+DEFAULT_PLOT_TEST_UNITS = [0]
 
 
 @dataclass(frozen=True)
@@ -431,7 +432,12 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--dry-run", action="store_true", help="Print resolved configs without training.")
 
     p.add_argument("--case3lite-active-set", default=None)
-    p.add_argument("--case3lite-units", type=_parse_units, default=None)
+    p.add_argument(
+        "--case3lite-units",
+        type=_parse_units,
+        default=list(DEFAULT_PLOT_TEST_UNITS),
+        help="Comma-separated case3lite unit ids. Default: 0.",
+    )
     p.add_argument(
         "--case3lite-max-samples",
         type=int,
@@ -447,7 +453,12 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--case3lite-backend", choices=("gurobi", "cvxpy_highs"), default=None)
 
     p.add_argument("--case118-active-set", default=None)
-    p.add_argument("--case118-units", type=_parse_units, default=None)
+    p.add_argument(
+        "--case118-units",
+        type=_parse_units,
+        default=list(DEFAULT_PLOT_TEST_UNITS),
+        help="Comma-separated case118 unit ids. Default: 0.",
+    )
     p.add_argument(
         "--case118-max-samples",
         type=int,
