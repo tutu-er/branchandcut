@@ -124,6 +124,7 @@ def _savefig(fig: plt.Figure, output_base: Path) -> None:
     output_base.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(output_base.with_suffix(".png"), dpi=300, bbox_inches="tight")
     fig.savefig(output_base.with_suffix(".pdf"), dpi=300, bbox_inches="tight")
+    fig.savefig(output_base.with_suffix(".svg"), bbox_inches="tight")
     plt.close(fig)
 
 
@@ -456,6 +457,7 @@ def plot_case(case: str, series: dict[tuple[str, str], list[dict[str, float]]], 
         plotted = _plot_line_set(ax, series.get((case, variant), []), "mu_mean", variant) or plotted
     ax.set_title(f"{case}: mean mu")
     _style_axis(ax, "mean mu")
+    ax.set_yscale("log")
     if plotted:
         ax.legend(frameon=False)
     out = output_dir / f"{case}_mean_mu"

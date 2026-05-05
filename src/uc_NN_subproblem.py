@@ -451,21 +451,23 @@ def _compute_subproblem_min_up_down_tau_max(
       （``ceil``，至少 1），与全模型 UC 对齐。
     - 其余算例（含 ``case3``、``case30``、``None`` 等）：保持原 ``min(4, T)`` 紧凑建模。
     """
+    min_up_h = _get_custom_generator_array_from_ppc(
+        ppc_raw, gen.shape[0], "uc_min_up_time_h"
+    )
+    min_down_h = _get_custom_generator_array_from_ppc(
+        ppc_raw, gen.shape[0], "uc_min_down_time_h"
+    )
+    if min_up_h is not None and min_down_h is not None:
+        ton = int(np.maximum(np.ceil(float(min_up_h[unit_id]) / float(T_delta)), 1))
+        toff = int(np.maximum(np.ceil(float(min_down_h[unit_id]) / float(T_delta)), 1))
+        return ton, toff
+
     if str(case_name).strip().lower() == "case118":
-        min_up_h = _get_custom_generator_array_from_ppc(
-            ppc_raw, gen.shape[0], "uc_min_up_time_h"
-        )
-        min_down_h = _get_custom_generator_array_from_ppc(
-            ppc_raw, gen.shape[0], "uc_min_down_time_h"
-        )
         if min_up_h is None or min_down_h is None:
             raise ValueError(
                 "case118 子问题需要 ppc 上包含 uc_min_up_time_h 与 uc_min_down_time_h "
                 "（与 load_case118_ppc_with_mti_limits 一致）。"
             )
-        ton = int(np.maximum(np.ceil(float(min_up_h[unit_id]) / float(T_delta)), 1))
-        toff = int(np.maximum(np.ceil(float(min_down_h[unit_id]) / float(T_delta)), 1))
-        return ton, toff
     cap = min(max(int(4 * float(T_delta)), 1), int(T))
     return cap, cap
 

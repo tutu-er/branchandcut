@@ -201,6 +201,7 @@ BCD_MODEL_FILE = None
 BCD_CONTINUE_TRAINING = False
 SURROGATE_MODEL_DIR = None
 SURROGATE_CONTINUE_TRAINING = False
+SURROGATE_SKIP_EXISTING_UNITS = False
 # surrogate 模式：为 True 时只训练/微调 dual_predictor（写出 dual_predictor.pth），跳过各机组子问题代理
 SURROGATE_DUAL_PREDICTOR_ONLY = False
 SPARSE_TOP_K_VARIABLES = 20
@@ -1025,6 +1026,7 @@ def run_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS,
                   surrogate_delta_reference_min_abs_factor: float = 1e-9,
                   unit_predictor_finetune_lr: float = 1e-5,
                   unit_predictor_weight_decay: float = 1e-4,
+                  skip_existing_units: bool = False,
                   case_name: str | None = None):
     """V3 代理约束训练（样本级并行），返回 (dual_predictor, trainers)。"""
     import os
@@ -1352,6 +1354,51 @@ def run_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS,
 
     # 步骤 2：训练代理约束（支持机组级并行或样本级并行）
     # B1：机组级并行（Level 1）
+    unit_ids_to_train = list(unit_ids)
+    if load_path is not None and bool(skip_existing_units):
+        import shutil
+
+        existing_units = []
+        missing_units = []
+        for g in unit_ids:
+            src_path = load_path / f"surrogate_unit_{int(g)}.pth"
+            if src_path.exists():
+                existing_units.append(int(g))
+                if save_dir:
+                    dst_path = Path(save_dir) / src_path.name
+                    if src_path.resolve() != dst_path.resolve():
+                        shutil.copy2(src_path, dst_path)
+            else:
+                missing_units.append(int(g))
+        unit_ids_to_train = missing_units
+        if existing_units:
+            log(
+                f"resume surrogate: reuse existing units={existing_units}; "
+                f"train missing units={unit_ids_to_train}"
+            )
+        if not unit_ids_to_train:
+            model_dir_for_load = str(Path(save_dir)) if save_dir else str(load_path)
+            log("resume surrogate: all requested unit models already exist; skip subproblem training")
+            dual_predictor_loaded, trainers = load_trained_models(
+                ppc,
+                all_samples,
+                T_DELTA,
+                load_dir=model_dir_for_load,
+                unit_ids=unit_ids,
+                lp_backend=lp_backend,
+                constraint_generation_strategy=constraint_generation_strategy,
+                ignore_startup_shutdown_costs=ignore_startup_shutdown_costs,
+                case_name=case_name,
+            )
+            if logger is not None:
+                for trainer in trainers.values():
+                    trainer.logger = logger
+            if unit_predictor is not None:
+                for trainer in trainers.values():
+                    trainer.unit_predictor = unit_predictor
+                    trainer.use_unit_predictor = True
+            return dual_predictor_loaded, trainers
+
     if N_WORKERS_UNIT > 1:
         from uc_NN_subproblem_parallel import train_all_surrogates_parallel
 
@@ -1370,7 +1417,7 @@ def run_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS,
             lambda_predictor=dual_predictor,
             lp_backend=lp_backend,
             constraint_generation_strategy=constraint_generation_strategy,
-            unit_ids=unit_ids,
+            unit_ids=unit_ids_to_train,
             max_iter=SUBPROBLEM_MAX_ITER,
             nn_epochs=NN_EPOCHS,
             rho_primal_init=rho_primal_init,
@@ -1473,7 +1520,7 @@ def run_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS,
         return dual_predictor_loaded, trainers
 
     trainers = {}
-    for i, g in enumerate(unit_ids):
+    for i, g in enumerate(unit_ids_to_train):
         if n_workers <= 1:
             log(f"  机组 {g} ({i+1}/{len(unit_ids)}) — 串行")
             trainer = SubproblemSurrogateTrainer(
@@ -1656,6 +1703,28 @@ def run_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS,
         trainers[g] = trainer
         if save_dir:
             trainer.save(os.path.join(save_dir, f'surrogate_unit_{g}.pth'))
+
+    if load_path is not None and bool(skip_existing_units):
+        model_dir_for_load = str(Path(save_dir)) if save_dir else str(load_path)
+        dual_predictor_loaded, trainers = load_trained_models(
+            ppc,
+            all_samples,
+            T_DELTA,
+            load_dir=model_dir_for_load,
+            unit_ids=unit_ids,
+            lp_backend=lp_backend,
+            constraint_generation_strategy=constraint_generation_strategy,
+            ignore_startup_shutdown_costs=ignore_startup_shutdown_costs,
+            case_name=case_name,
+        )
+        if logger is not None:
+            for trainer in trainers.values():
+                trainer.logger = logger
+        if unit_predictor is not None:
+            for trainer in trainers.values():
+                trainer.unit_predictor = unit_predictor
+                trainer.use_unit_predictor = True
+        return dual_predictor_loaded, trainers
 
     return dual_predictor, trainers
 
@@ -3032,6 +3101,7 @@ def main():
                     surrogate_delta_reference_eps=SUBPROBLEM_SURROGATE_DELTA_REFERENCE_EPS_VALUE,
                     surrogate_delta_reference_scope=SUBPROBLEM_SURROGATE_DELTA_REFERENCE_SCOPE_VALUE,
                     surrogate_delta_reference_min_abs_factor=SUBPROBLEM_SURROGATE_DELTA_REFERENCE_MIN_ABS_FACTOR_VALUE,
+                    skip_existing_units=SURROGATE_SKIP_EXISTING_UNITS,
                     unit_predictor_finetune_lr=UNIT_PREDICTOR_FINETUNE_LR_VALUE,
                     unit_predictor_weight_decay=UNIT_PREDICTOR_WEIGHT_DECAY_VALUE,
                     case_name=CASE_NAME,
@@ -3488,6 +3558,7 @@ def main():
                     surrogate_delta_reference_eps=SUBPROBLEM_SURROGATE_DELTA_REFERENCE_EPS_VALUE,
                     surrogate_delta_reference_scope=SUBPROBLEM_SURROGATE_DELTA_REFERENCE_SCOPE_VALUE,
                     surrogate_delta_reference_min_abs_factor=SUBPROBLEM_SURROGATE_DELTA_REFERENCE_MIN_ABS_FACTOR_VALUE,
+                    skip_existing_units=SURROGATE_SKIP_EXISTING_UNITS,
                     unit_predictor_finetune_lr=UNIT_PREDICTOR_FINETUNE_LR_VALUE,
                     unit_predictor_weight_decay=UNIT_PREDICTOR_WEIGHT_DECAY_VALUE,
                     case_name=CASE_NAME,

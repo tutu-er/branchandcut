@@ -252,7 +252,13 @@ def _run_one(spec: RunSpec, args: argparse.Namespace, out_dir: Path) -> dict[str
         return {"spec": spec.__dict__, "config": config, "metrics_json": None}
 
     before = _metrics_files(spec.case)
-    print(f"[run] {spec.slug}", flush=True)
+    print(
+        f"[run] {spec.slug} | UNIT_IDS={config.get('UNIT_IDS')} | "
+        f"MAX_SAMPLES={config.get('MAX_SAMPLES')} | "
+        f"SUBPROBLEM_MAX_ITER={config.get('SUBPROBLEM_MAX_ITER')} | "
+        f"PG_COST_START={config.get('SUBPROBLEM_PG_COST_START_ROUND')}",
+        flush=True,
+    )
     rt.main()
     new_files = sorted(
         _metrics_files(spec.case) - before,

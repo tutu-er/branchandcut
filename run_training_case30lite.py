@@ -12,6 +12,7 @@ import run_training as rt
 CASE_NAME = "case30lite"
 TRAIN_TARGET = "both"  # "both" | "surrogate" | "bcd"
 ACTIVE_SETS_FILE: str | None = None
+RESUME_SURROGATE_DIR: str | None = None
 MAX_SAMPLES = 100
 BCD_MAX_ITER = 110
 SUBPROBLEM_MAX_ITER = 60
@@ -30,6 +31,8 @@ def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--target", choices=("both", "surrogate", "bcd"), default=TRAIN_TARGET)
     p.add_argument("--active-sets", type=str, default=ACTIVE_SETS_FILE)
+    p.add_argument("--resume-dir", type=str, default=RESUME_SURROGATE_DIR)
+    p.add_argument("--retrain-existing", action="store_true")
     p.add_argument("--max-samples", type=int, default=MAX_SAMPLES)
     p.add_argument("--bcd-iter", type=int, default=BCD_MAX_ITER)
     p.add_argument("--sub-iter", type=int, default=SUBPROBLEM_MAX_ITER)
@@ -56,6 +59,9 @@ def main() -> None:
     rt.MODE = args.target
     rt.RUN_FP = False
     rt.ACTIVE_SETS_FILE = args.active_sets
+    rt.SURROGATE_MODEL_DIR = args.resume_dir
+    rt.SURROGATE_CONTINUE_TRAINING = bool(args.resume_dir)
+    rt.SURROGATE_SKIP_EXISTING_UNITS = bool(args.resume_dir) and not bool(args.retrain_existing)
     rt.MAX_SAMPLES = max(1, int(args.max_samples))
     rt.UNIT_IDS = None
     rt.DUAL_EPOCHS = DUAL_EPOCHS
@@ -84,7 +90,6 @@ def main() -> None:
     rt.UNIT_PREDICTOR_AUTO_LATEST_STANDALONE = True
     rt.SURROGATE_DUAL_PREDICTOR_ONLY = False
     rt.BCD_MODEL_FILE = None
-    rt.SURROGATE_MODEL_DIR = None
 
     rt.UNIT_PREDICTOR_LOAD_PATH = "result/surrogate_models/unit_predictor_case30lite_20260504_132021/unit_predictor.pth"
 
@@ -94,7 +99,9 @@ def main() -> None:
     print(
         f"case30lite training | target={rt.MODE} | max_samples={rt.MAX_SAMPLES} | "
         f"bcd_iter={rt.BCD_MAX_ITER} | sub_iter={rt.SUBPROBLEM_MAX_ITER} | "
-        f"active_sets={rt.ACTIVE_SETS_FILE or 'auto-latest'}",
+        f"active_sets={rt.ACTIVE_SETS_FILE or 'auto-latest'} | "
+        f"resume_dir={rt.SURROGATE_MODEL_DIR or '(none)'} | "
+        f"skip_existing={rt.SURROGATE_SKIP_EXISTING_UNITS}",
         flush=True,
     )
     print("=" * 72, flush=True)
