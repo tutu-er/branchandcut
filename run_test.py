@@ -70,7 +70,7 @@ if not check_and_install_dependencies_safe():
 #
 MODE      = 'surrogate'
 RUN_FP    = True       # surrogate / both 模式：是否运行可行性泵测试
-CASE_NAME = 'case3lite'   # 'case3' / 'case3lite' / 'case14' / 'case30' / 'case30lite' / 'case39' / 'case118'
+CASE_NAME = 'case3lite'   # 'case3' / 'case3lite' / 'case14' / 'case30' / 'case30lite' / 'case30lite_perturbed' / 'case39' / 'case118'
 SURROGATE_CONSTRAINT_STRATEGY = 'auto'  # 'auto' / 'sensitive' / 'all' / 'all_templates_sign4' / 'all_single_time'
 SUBPROBLEM_IGNORE_STARTUP_SHUTDOWN_COSTS = False
 BCD_LAMBDA_INIT_STRATEGY = 'lp_relaxation'   # 'lp_relaxation' / 'ed_on_x_opt'
@@ -3109,7 +3109,7 @@ def main():
 
     # ── 加载 PyPower 案例 ────────────────────────────────
     log(f"加载 PyPower 案例: {CASE_NAME}")
-    supported_cases = ['case3', 'case3lite', 'case14', 'case30', 'case30lite', 'case39', 'case118']
+    supported_cases = ['case3', 'case3lite', 'case14', 'case30', 'case30lite', 'case30lite_perturbed', 'case39', 'case118']
     if CASE_NAME not in supported_cases:
         print(f"未知案例: {CASE_NAME}，可选 {supported_cases}")
         sys.exit(1)

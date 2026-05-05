@@ -171,6 +171,7 @@ def _apply_no_strategy(rt, *, disable_direct_targets: bool) -> None:
     rt.SUBPROBLEM_SIGN4_FINAL_SCALE = 1.0
     rt.SUBPROBLEM_SIGN4_DELAY_ROUNDS = 0
     rt.SUBPROBLEM_SURROGATE_DELTA_REFERENCE_LIFT = False
+    rt.SUBPROBLEM_PG_COST_START_ROUND = int(getattr(rt, "SUBPROBLEM_MAX_ITER", 0)) + 1
 
     if disable_direct_targets:
         rt.SUBPROBLEM_MAIN_DIRECT_EPOCHS = 0
@@ -226,6 +227,7 @@ def _config_snapshot(rt, spec: RunSpec) -> dict[str, Any]:
         "SUBPROBLEM_SIGN4_FINAL_SCALE",
         "SUBPROBLEM_SIGN4_DELAY_ROUNDS",
         "SUBPROBLEM_SURROGATE_DELTA_REFERENCE_LIFT",
+        "SUBPROBLEM_PG_COST_START_ROUND",
         "SUBPROBLEM_MAIN_DIRECT_EPOCHS",
         "SUBPROBLEM_C_PG_DIRECT_EPOCHS",
     ]

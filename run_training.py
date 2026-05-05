@@ -105,7 +105,7 @@ ENABLE_SPARSE_SUPPORTS = False
 RUN_FP = False
 
 # 顶部集中配置区：训练相关参数统一在这里调整
-CASE_NAME = 'case3lite'      # 'case3' / 'case3lite' / 'case14' / 'case30' / 'case30lite' / 'case39' / 'case118'
+CASE_NAME = 'case3lite'      # 'case3' / 'case3lite' / 'case14' / 'case30' / 'case30lite' / 'case30lite_perturbed' / 'case39' / 'case118'
 MAX_SAMPLES = 100            # None = 使用全部样本
 T_DELTA = 1.0
 DUAL_EPOCHS = 200
@@ -2690,7 +2690,7 @@ def main():
 
     # ── 加载 PyPower 案例 ────────────────────────────────
     log(f"Loading PyPower case: {CASE_NAME}")
-    supported_cases = ['case3', 'case3lite', 'case14', 'case30', 'case30lite', 'case39', 'case118']
+    supported_cases = ['case3', 'case3lite', 'case14', 'case30', 'case30lite', 'case30lite_perturbed', 'case39', 'case118']
     if CASE_NAME not in supported_cases:
         print(f"Unknown case: {CASE_NAME}. Supported cases: {supported_cases}")
         sys.exit(1)

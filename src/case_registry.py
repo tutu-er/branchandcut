@@ -14,7 +14,11 @@ from pypower.idx_bus import PD
 
 from src.case14_uc_data import get_case14_uc_ppc
 from src.case3_uc_data import get_case3_uc_ppc, get_case3lite_uc_ppc
-from src.case30_uc_data import get_case30_uc_ppc, get_case30lite_uc_ppc
+from src.case30_uc_data import (
+    get_case30_uc_ppc,
+    get_case30lite_perturbed_uc_ppc,
+    get_case30lite_uc_ppc,
+)
 
 
 CASE3_LOAD_SCALE = 1.40
@@ -76,6 +80,14 @@ def build_case30lite_base_load(horizon: int, scale: float = CASE30LITE_LOAD_SCAL
     return ppc, build_scaled_base_load(ppc, horizon, scale=scale)
 
 
+def build_case30lite_perturbed_base_load(
+    horizon: int,
+    scale: float = CASE30LITE_LOAD_SCALE,
+) -> tuple[dict, np.ndarray]:
+    ppc = get_case30lite_perturbed_uc_ppc()
+    return ppc, build_scaled_base_load(ppc, horizon, scale=scale)
+
+
 def get_case_ppc(case_name: str) -> dict:
     if case_name == "case118":
         from src.mti118_data_loader import load_case118_ppc_with_mti_limits
@@ -88,6 +100,7 @@ def get_case_ppc(case_name: str) -> dict:
         "case14": get_case14_uc_ppc,
         "case30": get_case30_uc_ppc,
         "case30lite": get_case30lite_uc_ppc,
+        "case30lite_perturbed": get_case30lite_perturbed_uc_ppc,
         "case39": pypower.case39.case39,
     }
     if case_name not in ppc_map:

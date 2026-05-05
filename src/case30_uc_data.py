@@ -36,6 +36,14 @@ CASE30LITE_UC_GENCOST = np.array([
     [2, 70.0,  35.0, 3, 0.0600, 3.30, 4.0],
 ], dtype=float)
 
+CASE30LITE_PERTURBED_UNIT_ID = 0
+CASE30LITE_PERTURBED_PMAX_SCALE = 0.85
+CASE30LITE_PERTURBED_RAMP_SCALE = 0.75
+CASE30LITE_PERTURBED_LINEAR_COST_SCALE = 1.18
+CASE30LITE_PERTURBED_QUAD_COST_SCALE = 1.12
+CASE30LITE_PERTURBED_STARTUP_SCALE = 1.10
+CASE30LITE_PERTURBED_SHUTDOWN_SCALE = 1.10
+
 
 def _ensure_branch_limits(ppc: dict, default_limit: float = 75.0) -> None:
     branch = np.asarray(ppc["branch"], dtype=float)
@@ -87,4 +95,53 @@ def get_case30lite_uc_ppc() -> dict:
     ppc_uc["uc_ramp_up_mw_per_h"] = np.maximum(0.50 * gen[:, PMAX], gen[:, PMIN])
     ppc_uc["uc_ramp_down_mw_per_h"] = np.maximum(0.50 * gen[:, PMAX], gen[:, PMIN])
     _ensure_branch_limits(ppc_uc, default_limit=75.0)
+    return ppc_uc
+
+
+def get_case30lite_perturbed_uc_ppc(
+    unit_id: int = CASE30LITE_PERTURBED_UNIT_ID,
+    pmax_scale: float = CASE30LITE_PERTURBED_PMAX_SCALE,
+    ramp_scale: float = CASE30LITE_PERTURBED_RAMP_SCALE,
+    linear_cost_scale: float = CASE30LITE_PERTURBED_LINEAR_COST_SCALE,
+    quad_cost_scale: float = CASE30LITE_PERTURBED_QUAD_COST_SCALE,
+    startup_scale: float = CASE30LITE_PERTURBED_STARTUP_SCALE,
+    shutdown_scale: float = CASE30LITE_PERTURBED_SHUTDOWN_SCALE,
+) -> dict:
+    """Return case30lite with one generator moderately perturbed.
+
+    The default perturbation makes unit 0 slightly less capable and more
+    expensive, which is enough to shift active sets without changing topology.
+    """
+    ppc_uc = get_case30lite_uc_ppc()
+    g = int(unit_id)
+    gen = np.asarray(ppc_uc["gen"], dtype=float).copy()
+    gencost = np.asarray(ppc_uc["gencost"], dtype=float).copy()
+    if g < 0 or g >= gen.shape[0]:
+        raise ValueError(f"unit_id={g} out of range for case30lite with {gen.shape[0]} units")
+
+    old_pmax = float(gen[g, PMAX])
+    gen[g, PMAX] = max(float(gen[g, PMIN]) + 1.0, old_pmax * float(pmax_scale))
+    ppc_uc["gen"] = gen
+
+    gencost[g, 1] *= float(startup_scale)
+    gencost[g, 2] *= float(shutdown_scale)
+    gencost[g, 4] *= float(quad_cost_scale)
+    gencost[g, 5] *= float(linear_cost_scale)
+    ppc_uc["gencost"] = gencost
+
+    for key in ("uc_ramp_up_mw_per_h", "uc_ramp_down_mw_per_h"):
+        arr = np.asarray(ppc_uc[key], dtype=float).copy()
+        arr[g] = max(float(gen[g, PMIN]), float(arr[g]) * float(ramp_scale))
+        ppc_uc[key] = arr
+
+    ppc_uc["case30lite_perturbation"] = {
+        "base_case": "case30lite",
+        "unit_id": g,
+        "pmax_scale": float(pmax_scale),
+        "ramp_scale": float(ramp_scale),
+        "linear_cost_scale": float(linear_cost_scale),
+        "quad_cost_scale": float(quad_cost_scale),
+        "startup_scale": float(startup_scale),
+        "shutdown_scale": float(shutdown_scale),
+    }
     return ppc_uc
