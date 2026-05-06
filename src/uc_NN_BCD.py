@@ -3514,11 +3514,11 @@ class Agent_NN_BCD:
         # Ramp
         if self.T > 1:
             ru_expr = (pg[:, 1:] - pg[:, :-1]
-                       - self.Ru.reshape(self.ng, 1) * x[:, :-1]
-                       - self.Ru_co.reshape(self.ng, 1) * (1 - x[:, :-1]))
+                       - cp.multiply(self.Ru.reshape(self.ng, 1), x[:, :-1])
+                       - cp.multiply(self.Ru_co.reshape(self.ng, 1), 1 - x[:, :-1]))
             rd_expr = (pg[:, :-1] - pg[:, 1:]
-                       - self.Rd.reshape(self.ng, 1) * x[:, 1:]
-                       - self.Rd_co.reshape(self.ng, 1) * (1 - x[:, 1:]))
+                       - cp.multiply(self.Rd.reshape(self.ng, 1), x[:, 1:])
+                       - cp.multiply(self.Rd_co.reshape(self.ng, 1), 1 - x[:, 1:]))
             obj_primal_terms.append(cp.sum(cp.pos(ru_expr)))
             obj_primal_terms.append(cp.sum(cp.pos(rd_expr)))
             obj_opt_terms.append(cp.sum(cp.multiply(p_lambda_ru, cp.abs(ru_expr))))
@@ -3539,8 +3539,8 @@ class Agent_NN_BCD:
 
         # Start/shut costs + coc
         if self.T > 1:
-            sc_expr  = start_cost.reshape(self.ng, 1) * (x[:, 1:] - x[:, :-1]) - coc
-            shc_expr = shut_cost.reshape(self.ng, 1)  * (x[:, :-1] - x[:, 1:]) - coc
+            sc_expr  = cp.multiply(start_cost.reshape(self.ng, 1), x[:, 1:] - x[:, :-1]) - coc
+            shc_expr = cp.multiply(shut_cost.reshape(self.ng, 1), x[:, :-1] - x[:, 1:]) - coc
             obj_primal_terms.append(cp.sum(cp.pos(sc_expr)))
             obj_primal_terms.append(cp.sum(cp.pos(shc_expr)))
             obj_opt_terms.append(cp.sum(cp.multiply(p_lambda_sc,  cp.abs(sc_expr))))
