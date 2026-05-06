@@ -23,6 +23,9 @@ BCD_MAX_ITER = base.BCD_MAX_ITER
 SUBPROBLEM_MAX_ITER = base.SUBPROBLEM_MAX_ITER
 N_WORKERS_SAMPLE = base.N_WORKERS_SAMPLE
 UNIT_PREDICTOR_LOAD_PATH = base.UNIT_PREDICTOR_LOAD_PATH
+N_WORKERS_BCD = base.N_WORKERS_BCD
+BCD_LP_BACKEND = base.BCD_LP_BACKEND
+BCD_GUROBI_THREADS = 1
 
 # Stronger-than-default complex-constraint dual floors.
 # - theta_dual_floor is passed to BCD_MU_DUAL_FLOOR_INIT, i.e. the main-model
@@ -45,6 +48,9 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--bcd-iter", type=int, default=BCD_MAX_ITER)
     p.add_argument("--sub-iter", type=int, default=SUBPROBLEM_MAX_ITER)
     p.add_argument("--sample-workers", type=int, default=N_WORKERS_SAMPLE)
+    p.add_argument("--bcd-workers", type=int, default=N_WORKERS_BCD)
+    p.add_argument("--bcd-backend", choices=("gurobi", "cvxpy_highs"), default=BCD_LP_BACKEND)
+    p.add_argument("--gurobi-threads", type=int, default=BCD_GUROBI_THREADS)
     p.add_argument("--unit-predictor", type=str, default=UNIT_PREDICTOR_LOAD_PATH)
     p.add_argument("--no-unit-predictor", action="store_true")
     p.add_argument("--no-auto-latest-unit-predictor", action="store_true")
@@ -119,9 +125,10 @@ def main() -> None:
     rt.N_WORKERS_SAMPLE = max(1, int(args.sample_workers))
     rt.N_WORKERS_SUBPROBLEM = rt.N_WORKERS_SAMPLE
     rt.N_WORKERS_UNIT = base.N_WORKERS_UNIT
-    rt.N_WORKERS_BCD = base.N_WORKERS_BCD
+    rt.N_WORKERS_BCD = max(1, int(args.bcd_workers))
     rt.SUBPROBLEM_LP_BACKEND = base.SUBPROBLEM_LP_BACKEND
-    rt.BCD_LP_BACKEND = base.BCD_LP_BACKEND
+    rt.BCD_LP_BACKEND = args.bcd_backend
+    rt.BCD_GUROBI_THREADS = None if int(args.gurobi_threads) <= 0 else int(args.gurobi_threads)
     rt.SURROGATE_CONSTRAINT_STRATEGY = base.SURROGATE_CONSTRAINT_STRATEGY
     rt.USE_UNIT_PREDICTOR = not bool(args.no_unit_predictor)
     rt.BCD_USE_UNIT_PREDICTOR = rt.USE_UNIT_PREDICTOR
@@ -140,6 +147,11 @@ def main() -> None:
         f"case3lite strong-complex-dual-floor training | target={rt.MODE} | "
         f"max_samples={rt.MAX_SAMPLES} | bcd_iter={rt.BCD_MAX_ITER} | "
         f"sub_iter={rt.SUBPROBLEM_MAX_ITER} | active_sets={rt.ACTIVE_SETS_FILE or 'auto-latest'}",
+        flush=True,
+    )
+    print(
+        f"bcd_backend={rt.BCD_LP_BACKEND} | bcd_workers={rt.N_WORKERS_BCD} | "
+        f"gurobi_threads={rt.BCD_GUROBI_THREADS if rt.BCD_GUROBI_THREADS is not None else 'auto'}",
         flush=True,
     )
     print(

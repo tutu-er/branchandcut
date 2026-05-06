@@ -1656,15 +1656,20 @@ def _solve_unit_surrogate_model(
             model.addConstr(pg[t] >= trainer.gen[g, PMIN] * x[t])
             model.addConstr(pg[t] <= trainer.gen[g, PMAX] * x[t])
 
-        Ru = 0.4 * trainer.gen[g, PMAX] / trainer.T_delta
-        Rd = 0.4 * trainer.gen[g, PMAX] / trainer.T_delta
-        Ru_co = 0.3 * trainer.gen[g, PMAX]
-        Rd_co = 0.3 * trainer.gen[g, PMAX]
+        ppc_ref = getattr(trainer, 'ppc_raw', getattr(trainer, 'ppc', {'gen': trainer.gen}))
+        Ru_all, Rd_all, Ru_co_all, Rd_co_all = _get_ramp_limits_from_ppc(
+            ppc_ref,
+            trainer.gen,
+            trainer.T_delta,
+        )
+        Ru = float(Ru_all[g])
+        Rd = float(Rd_all[g])
+        Ru_co = float(Ru_co_all[g])
+        Rd_co = float(Rd_co_all[g])
         for t in range(1, T):
             model.addConstr(pg[t] - pg[t-1] <= Ru * x[t-1] + Ru_co * (1 - x[t-1]))
             model.addConstr(pg[t-1] - pg[t] <= Rd * x[t] + Rd_co * (1 - x[t]))
 
-        ppc_ref = getattr(trainer, 'ppc_raw', getattr(trainer, 'ppc', {'gen': trainer.gen}))
         min_up_steps, min_down_steps = _get_min_up_down_time_steps(
             ppc_ref, trainer.ng, trainer.T_delta, T,
         )
@@ -2205,12 +2210,8 @@ def solve_global_LP_relaxation(
     ng = gen.shape[0]
     T = pd_matrix.shape[1]
     Pd_sum = np.sum(pd_matrix, axis=0)  # (T,)
-    Ru = 0.4 * gen[:, PMAX] / T_delta
-    Rd = 0.4 * gen[:, PMAX] / T_delta
-    Ru_co = 0.3 * gen[:, PMAX]
-    Rd_co = 0.3 * gen[:, PMAX]
-    Ton = min(int(4 * T_delta), T - 1)
-    Toff = min(int(4 * T_delta), T - 1)
+    Ru, Rd, Ru_co, Rd_co = _get_ramp_limits_from_ppc(ppc, gen, T_delta)
+    min_up_steps, min_down_steps = _get_min_up_down_time_steps(ppc, ng, T_delta, T)
     start_cost = gencost[:, 1]   # gencost �?1 列：启动成本
     shut_cost  = gencost[:, 2]   # gencost �?2 列：关机成本
 
@@ -2449,10 +2450,12 @@ def solve_global_LP_relaxation(
                     pg[g, t-1] - pg[g, t] <= Rd[g] * x[g, t] + Rd_co[g] * (1 - x[g, t])
                 )
 
-            for tau in range(1, Ton + 1):
+            Ton_g = int(min_up_steps[g])
+            Toff_g = int(min_down_steps[g])
+            for tau in range(1, Ton_g + 1):
                 for t1 in range(T - tau):
                     model.addConstr(x[g, t1+1] - x[g, t1] <= x[g, t1+tau])
-            for tau in range(1, Toff + 1):
+            for tau in range(1, Toff_g + 1):
                 for t1 in range(T - tau):
                     model.addConstr(-x[g, t1+1] + x[g, t1] <= 1 - x[g, t1+tau])
 
@@ -2683,12 +2686,8 @@ def solve_global_LP_relaxation_without_surrogate(
         )
 
     # 爬坡参数（与 UnitCommitmentModel 一致）
-    Ru = 0.4 * gen[:, PMAX] / T_delta
-    Rd = 0.4 * gen[:, PMAX] / T_delta
-    Ru_co = 0.3 * gen[:, PMAX]
-    Rd_co = 0.3 * gen[:, PMAX]
-    Ton = min(int(4 * T_delta), T - 1)
-    Toff = min(int(4 * T_delta), T - 1)
+    Ru, Rd, Ru_co, Rd_co = _get_ramp_limits_from_ppc(ppc, gen, T_delta)
+    min_up_steps, min_down_steps = _get_min_up_down_time_steps(ppc, ng, T_delta, T)
     start_cost = gencost[:, 1]   # gencost �?1 列：启动成本
     shut_cost  = gencost[:, 2]   # gencost �?2 列：关机成本
 
@@ -2708,10 +2707,12 @@ def solve_global_LP_relaxation_without_surrogate(
             )
 
         # 最小开关机时间
-        for tau in range(1, Ton + 1):
+        Ton_g = int(min_up_steps[g])
+        Toff_g = int(min_down_steps[g])
+        for tau in range(1, Ton_g + 1):
             for t1 in range(T - tau):
                 model.addConstr(x[g, t1+1] - x[g, t1] <= x[g, t1+tau])
-        for tau in range(1, Toff + 1):
+        for tau in range(1, Toff_g + 1):
             for t1 in range(T - tau):
                 model.addConstr(-x[g, t1+1] + x[g, t1] <= 1 - x[g, t1+tau])
 
@@ -2798,6 +2799,27 @@ def _get_min_up_down_time_steps(ppc: dict, ng: int, T_delta: float, horizon: int
     min_up = np.minimum(min_up, max(horizon - 1, 0))
     min_down = np.minimum(min_down, max(horizon - 1, 0))
     return min_up, min_down
+
+
+def _get_ramp_limits_from_ppc(ppc: dict, gen: np.ndarray, T_delta: float) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Return ramp limits aligned with UC training models."""
+    default_up = 0.4 * gen[:, PMAX] / T_delta
+    default_down = 0.4 * gen[:, PMAX] / T_delta
+    default_up_co = 0.3 * gen[:, PMAX]
+    default_down_co = 0.3 * gen[:, PMAX]
+
+    ramp_up_h = _get_ordered_ppc_generator_array(ppc, 'uc_ramp_up_mw_per_h', gen.shape[0])
+    ramp_down_h = _get_ordered_ppc_generator_array(ppc, 'uc_ramp_down_mw_per_h', gen.shape[0])
+    if ramp_up_h is None or ramp_down_h is None:
+        return default_up, default_down, default_up_co, default_down_co
+
+    Ru = np.asarray(ramp_up_h, dtype=float) * T_delta
+    Rd = np.asarray(ramp_down_h, dtype=float) * T_delta
+    Ru = np.maximum(Ru, default_up)
+    Rd = np.maximum(Rd, default_down)
+    Ru_co = np.maximum(Ru, gen[:, PMIN])
+    Rd_co = np.maximum(Rd, gen[:, PMIN])
+    return Ru, Rd, Ru_co, Rd_co
 
 
 def check_commitment_logic_feasibility(
@@ -2935,10 +2957,7 @@ def check_uc_feasibility(
     slack_pos = model.addVars(T, lb=0, name='sp')
     slack_neg = model.addVars(T, lb=0, name='sn')
 
-    Ru = 0.4 * gen[:, PMAX] / T_delta
-    Rd = 0.4 * gen[:, PMAX] / T_delta
-    Ru_co = 0.3 * gen[:, PMAX]
-    Rd_co = 0.3 * gen[:, PMAX]
+    Ru, Rd, Ru_co, Rd_co = _get_ramp_limits_from_ppc(ppc, gen, T_delta)
 
     for g in range(ng):
         for t in range(T):
@@ -3039,14 +3058,10 @@ def run_feasibility_pump(
     ng, T = x_curr.shape
     Pd_sum = np.sum(pd_data, axis=0)
 
-    Ru = 0.4 * gen[:, PMAX] / T_delta
-    Rd = 0.4 * gen[:, PMAX] / T_delta
-    Ru_co = 0.3 * gen[:, PMAX]
-    Rd_co = 0.3 * gen[:, PMAX]
+    Ru, Rd, Ru_co, Rd_co = _get_ramp_limits_from_ppc(ppc, gen, T_delta)
     start_cost = gencost[:, 1]
     shut_cost = gencost[:, 2]
-    Ton = min(int(4 * T_delta), T - 1)
-    Toff = min(int(4 * T_delta), T - 1)
+    min_up_steps, min_down_steps = _get_min_up_down_time_steps(ppc, ng, T_delta, T)
 
     # 预计�?DC 潮流数据（循环外一次性完成，避免重复构建 PTDF�?
     _dc_available = False
@@ -3169,10 +3184,12 @@ def run_feasibility_pump(
                 )
 
             # 最小开关机时间
-            for tau in range(1, Ton + 1):
+            Ton_g = int(min_up_steps[g])
+            Toff_g = int(min_down_steps[g])
+            for tau in range(1, Ton_g + 1):
                 for t1 in range(T - tau):
                     model.addConstr(x[g, t1+1] - x[g, t1] <= x[g, t1+tau])
-            for tau in range(1, Toff + 1):
+            for tau in range(1, Toff_g + 1):
                 for t1 in range(T - tau):
                     model.addConstr(-x[g, t1+1] + x[g, t1] <= 1 - x[g, t1+tau])
 
