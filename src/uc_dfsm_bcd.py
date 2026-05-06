@@ -25,6 +25,7 @@ root_dir = Path(__file__).resolve().parent.parent
 sys.path.append(str(root_dir))
 
 from src.case39_pypower import get_case39_pypower
+from src.uc_time_utils import get_min_up_down_steps_from_ppc, get_ramp_limits_from_ppc
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', line_buffering=True)
 
 def load_active_set_from_json(json_filepath: str, sample_id: Optional[int] = None) -> Dict:
@@ -358,6 +359,7 @@ class Iter_BCD:
             use_zeta: 是否在迭代时使用zeta系列约束及变量（默认True）
         """
         self.ppc = ppc
+        self.ppc_raw = ppc
         ppc = ext2int(ppc)
         self.baseMVA = ppc['baseMVA']
         self.bus = ppc['bus']
@@ -390,6 +392,12 @@ class Iter_BCD:
             
         self.ng = self.gen.shape[0]
         self.nl = self.branch.shape[0]
+        self.min_up_steps, self.min_down_steps, self.Ton, self.Toff = get_min_up_down_steps_from_ppc(
+            self.ppc_raw, self.ng, self.T, self.T_delta
+        )
+        self.Ru, self.Rd, self.Ru_co, self.Rd_co = get_ramp_limits_from_ppc(
+            self.ppc_raw, self.gen, self.T_delta
+        )
         
         self.active_set_data = active_set_data
         
