@@ -1,4 +1,4 @@
-from datetime import datetime
+﻿from datetime import datetime
 import json
 import time
 import numpy as np
@@ -454,8 +454,8 @@ class Iter_BCD:
             x = model.addVars(self.ng, self.T, lb=0, name='x')        
             coc = model.addVars(self.ng, self.T-1, lb=0, name='coc')
             cpower = model.addVars(self.ng, self.T, lb=0, name='cpower')
-            Ton = min(4, self.T)
-            Toff = min(4, self.T)
+            Ton = self.Ton
+            Toff = self.Toff
             Pd = self.active_set_data[sample_id]['pd_data']
             
             for t in range(self.T):
@@ -474,10 +474,7 @@ class Iter_BCD:
                     )
             
             # 爬坡约束
-            Ru = 0.4 * self.gen[:, PMAX] / self.T_delta
-            Rd = 0.4 * self.gen[:, PMAX] / self.T_delta
-            Ru_co = 0.3 * self.gen[:, PMAX]
-            Rd_co = 0.3 * self.gen[:, PMAX]
+            Ru, Rd, Ru_co, Rd_co = self.Ru, self.Rd, self.Ru_co, self.Rd_co
             for t in range(1, self.T):
                 for g in range(self.ng):
                     model.addConstr(pg[g, t] - pg[g, t-1] <= Ru[g] * x[g, t-1] + Ru_co[g] * (1 - x[g, t-1]), name=f'ramp_up_{g}_{t}')
@@ -485,13 +482,13 @@ class Iter_BCD:
             # 最小开机时间和最小关机时间约束
             # 最小开机时间约束（与matlab一致）
             for g in range(self.ng):
-                for t in range(1, Ton+1):
+                for t in range(1, int(self.min_up_steps[g]) + 1):
                     for t1 in range(self.T - t):
                         model.addConstr(x[g, t1+1] - x[g, t1] <= x[g, t1+t],
                         name=f'min_on_{g}_{t}_{t1}')
             # 最小关机时间约束（与matlab一致）
             for g in range(self.ng):
-                for t in range(1, Toff+1):
+                for t in range(1, int(self.min_down_steps[g]) + 1):
                     for t1 in range(self.T - t):
                         model.addConstr(-x[g, t1+1] + x[g, t1] <= 1 - x[g, t1+t],
                         name=f'min_off_{g}_{t}_{t1}')
@@ -629,15 +626,15 @@ class Iter_BCD:
             implicit_duals['min_on'] = {}
             implicit_duals['min_off'] = {}
             
-            Ton = min(4, self.T)
-            Toff = min(4, self.T)
+            Ton = self.Ton
+            Toff = self.Toff
             
             for g in range(self.ng):
                 implicit_duals['min_on'][g] = {}
                 implicit_duals['min_off'][g] = {}
                 
                 # 最小开机时间约束
-                for tau in range(1, Ton+1):
+                for tau in range(1, int(self.min_up_steps[g]) + 1):
                     for t1 in range(self.T - tau):
                         cname_on = f'min_on_{g}_{tau}_{t1}'
                         constr_on = model.getConstrByName(cname_on)
@@ -647,7 +644,7 @@ class Iter_BCD:
                             implicit_duals['min_on'][g][tau][t1] = constr_on.Pi
                 
                 # 最小关机时间约束
-                for tau in range(1, Toff+1):
+                for tau in range(1, int(self.min_down_steps[g]) + 1):
                     for t1 in range(self.T - tau):
                         cname_off = f'min_off_{g}_{tau}_{t1}'
                         constr_off = model.getConstrByName(cname_off)
@@ -831,13 +828,13 @@ class Iter_BCD:
                 ])
             
             # 4. 最小开关机时间约束对偶变量: shape (ng, Ton/Toff, T)
-            Ton = min(4, self.T)
-            Toff = min(4, self.T)
+            Ton = self.Ton
+            Toff = self.Toff
             
             if 'min_on' in implicit_duals_dict:
                 lambda_sol_implicit['lambda_min_on'] = np.zeros((self.ng, Ton, self.T))
                 for g in range(self.ng):
-                    for tau in range(Ton):
+                    for tau in range(int(self.min_up_steps[g])):
                         for t in range(self.T):
                             val = implicit_duals_dict['min_on'].get(g, {}).get(tau+1, {}).get(t, 0)
                             lambda_sol_implicit['lambda_min_on'][g, tau, t] = abs(val)
@@ -845,7 +842,7 @@ class Iter_BCD:
             if 'min_off' in implicit_duals_dict:
                 lambda_sol_implicit['lambda_min_off'] = np.zeros((self.ng, Toff, self.T))
                 for g in range(self.ng):
-                    for tau in range(Toff):
+                    for tau in range(int(self.min_down_steps[g])):
                         for t in range(self.T):
                             val = implicit_duals_dict['min_off'].get(g, {}).get(tau+1, {}).get(t, 0)
                             lambda_sol_implicit['lambda_min_off'][g, tau, t] = abs(val)
@@ -3122,8 +3119,8 @@ class Iter_BCD:
         ramp_down_abs = model.addVars(self.ng, self.T-1, lb=0, name='ramp_down_abs')
         
         # 最小开关机时间
-        Ton = min(4, self.T)
-        Toff = min(4, self.T)
+        Ton = self.Ton
+        Toff = self.Toff
         # 最小开关机时间违反量
         min_on_viol = model.addVars(self.ng, Ton, self.T, lb=0, name='min_on_viol')
         min_off_viol = model.addVars(self.ng, Toff, self.T, lb=0, name='min_off_viol')
@@ -3159,8 +3156,8 @@ class Iter_BCD:
         # 二进制变量偏差
         x_binary_dev = model.addVars(self.ng, self.T, lb=0, name='x_binary_dev')
 
-        Ton = min(4, self.T)
-        Toff = min(4, self.T)
+        Ton = self.Ton
+        Toff = self.Toff
         
         # 构建约束和目标函数项
         obj_primal = 0
@@ -3214,10 +3211,7 @@ class Iter_BCD:
                 obj_opt += (1 - x[g, t]) * abs(self.lambda_[sample_id]['lambda_x_upper'][g, t])
 
         # 爬坡约束（类似处理）
-        Ru = 0.4 * self.gen[:, PMAX] / self.T_delta
-        Rd = 0.4 * self.gen[:, PMAX] / self.T_delta
-        Ru_co = 0.3 * self.gen[:, PMAX]
-        Rd_co = 0.3 * self.gen[:, PMAX]
+        Ru, Rd, Ru_co, Rd_co = self.Ru, self.Rd, self.Ru_co, self.Rd_co
 
         for t in range(1, self.T):
             for g in range(self.ng):
@@ -3243,7 +3237,7 @@ class Iter_BCD:
         # 最小开机时间和最小关机时间约束
         # 最小开机时间约束（与matlab一致）
         for g in range(self.ng):
-            for t in range(1, Ton+1):
+            for t in range(1, int(self.min_up_steps[g]) + 1):
                 for t1 in range(self.T - t):
                     min_on_expr = x[g, t1+1] - x[g, t1] - x[g, t1+t]
                     model.addConstr(min_on_viol[g, t-1, t1] >= min_on_expr, name=f'min_on_viol_{g}_{t}_{t1}')
@@ -3255,7 +3249,7 @@ class Iter_BCD:
 
         # 最小关机时间约束（与matlab一致）
         for g in range(self.ng):
-            for t in range(1, Toff+1):
+            for t in range(1, int(self.min_down_steps[g]) + 1):
                 for t1 in range(self.T - t):
                     min_off_expr = -x[g, t1+1] + x[g, t1] - (1 - x[g, t1+t])
                     model.addConstr(min_off_viol[g, t-1, t1] >= min_off_expr, name=f'min_off_viol_{g}_{t}_{t1}')
@@ -3383,8 +3377,8 @@ class Iter_BCD:
         lambda_ramp_down = model.addVars(self.ng, self.T-1, lb=0, name='lambda_ramp_down')
         
         # 最小开机/关机时间约束的对偶变量
-        Ton = min(4, self.T)
-        Toff = min(4, self.T)
+        Ton = self.Ton
+        Toff = self.Toff
         lambda_min_on = model.addVars(self.ng, Ton, self.T, lb=0, name='lambda_min_on')
         lambda_min_off = model.addVars(self.ng, Toff, self.T, lb=0, name='lambda_min_off')
         
@@ -3438,10 +3432,7 @@ class Iter_BCD:
         PTDF = makePTDF(self.baseMVA, self.bus, self.branch)
         branch_limit = self.branch[:, RATE_A]  # 线路容量
 
-        Ru = 0.4 * self.gen[:, PMAX] / self.T_delta
-        Rd = 0.4 * self.gen[:, PMAX] / self.T_delta
-        Ru_co = 0.3 * self.gen[:, PMAX]
-        Rd_co = 0.3 * self.gen[:, PMAX]
+        Ru, Rd, Ru_co, Rd_co = self.Ru, self.Rd, self.Ru_co, self.Rd_co
         
         start_cost = self.gencost[:, 1]
         shut_cost = self.gencost[:, 2]
@@ -3603,14 +3594,14 @@ class Iter_BCD:
         # 最小开机时间和最小关机时间约束
         # 最小开机时间约束（与matlab一致）
         for g in range(self.ng):
-            for t in range(1, Ton+1):
+            for t in range(1, int(self.min_up_steps[g]) + 1):
                 for t1 in range(self.T - t):
                     min_on_viol = abs(self.x[sample_id, g, t1+1] - self.x[sample_id, g, t1] - self.x[sample_id, g, t1+t])
                     if min_on_viol > 1e-10:
                         obj_opt += min_on_viol * lambda_min_on[g, t-1, t1]
         # 最小关机时间约束（与matlab一致）
         for g in range(self.ng):
-            for t in range(1, Toff+1):
+            for t in range(1, int(self.min_down_steps[g]) + 1):
                 for t1 in range(self.T - t):
                     min_off_viol = abs(-self.x[sample_id, g, t1+1] + self.x[sample_id, g, t1] - 1 + self.x[sample_id, g, t1+t])
                     if min_off_viol > 1e-10:
@@ -3677,6 +3668,15 @@ class Iter_BCD:
         model.optimize()
         
         if model.status == GRB.OPTIMAL:
+            lambda_min_on_arr = np.zeros((self.ng, Ton, self.T), dtype=float)
+            lambda_min_off_arr = np.zeros((self.ng, Toff, self.T), dtype=float)
+            for g in range(self.ng):
+                for tau in range(min(Ton, int(self.min_up_steps[g]))):
+                    for t in range(self.T):
+                        lambda_min_on_arr[g, tau, t] = float(lambda_min_on[g, tau, t].X)
+                for tau in range(min(Toff, int(self.min_down_steps[g]))):
+                    for t in range(self.T):
+                        lambda_min_off_arr[g, tau, t] = float(lambda_min_off[g, tau, t].X)
             lambda_sol = {
                 # 功率平衡约束对偶变量: shape (T,)
                 'lambda_power_balance': np.array([lambda_power_balance[t].X for t in range(self.T)]),
@@ -3690,8 +3690,8 @@ class Iter_BCD:
                 'lambda_ramp_down': np.array([[lambda_ramp_down[g, t].X for t in range(self.T-1)] for g in range(self.ng)]),
                 
                 # 最小开关机时间约束对偶变量: shape (ng, Ton, T) 和 (ng, Toff, T)
-                'lambda_min_on': np.array([[[lambda_min_on[g, tau, t].X for t in range(self.T)] for tau in range(Ton)] for g in range(self.ng)]),
-                'lambda_min_off': np.array([[[lambda_min_off[g, tau, t].X for t in range(self.T)] for tau in range(Toff)] for g in range(self.ng)]),
+                'lambda_min_on': lambda_min_on_arr,
+                'lambda_min_off': lambda_min_off_arr,
                 
                 # 启停成本约束对偶变量: shape (ng, T-1)
                 'lambda_start_cost': np.array([[lambda_start_cost[g, t].X for t in range(self.T-1)] for g in range(self.ng)]),
@@ -3758,8 +3758,8 @@ class Iter_BCD:
                 model.addConstr(max_zeta >= model_zeta_vars_abs[zeta_var], name=f'max_zeta_constr_{zeta_var}')
         
 
-        Ton = min(4, self.T)
-        Toff = min(4, self.T)
+        Ton = self.Ton
+        Toff = self.Toff
         
         nb = self.bus.shape[0]
         G = np.zeros((nb, self.ng))
@@ -3770,10 +3770,7 @@ class Iter_BCD:
         PTDF = makePTDF(self.baseMVA, self.bus, self.branch)
         branch_limit = self.branch[:, RATE_A]  # 线路容量
 
-        Ru = 0.4 * self.gen[:, PMAX] / self.T_delta
-        Rd = 0.4 * self.gen[:, PMAX] / self.T_delta
-        Ru_co = 0.3 * self.gen[:, PMAX]
-        Rd_co = 0.3 * self.gen[:, PMAX]
+        Ru, Rd, Ru_co, Rd_co = self.Ru, self.Rd, self.Ru_co, self.Rd_co
         
         start_cost = self.gencost[:, 1]
         shut_cost = self.gencost[:, 2]
@@ -3924,14 +3921,11 @@ class Iter_BCD:
         obj_dual = 0
         
         # 预计算不依赖于sample_id的常量，避免在循环内重复计算
-        Ton = min(4, self.T)
-        Toff = min(4, self.T)
+        Ton = self.Ton
+        Toff = self.Toff
         
         # 爬坡约束参数
-        Ru = 0.4 * self.gen[:, PMAX] / self.T_delta
-        Rd = 0.4 * self.gen[:, PMAX] / self.T_delta
-        Ru_co = 0.3 * self.gen[:, PMAX]
-        Rd_co = 0.3 * self.gen[:, PMAX]
+        Ru, Rd, Ru_co, Rd_co = self.Ru, self.Rd, self.Ru_co, self.Rd_co
         
         # 启停成本
         start_cost = self.gencost[:, 1]
@@ -4003,7 +3997,7 @@ class Iter_BCD:
             # 最小开机时间和最小关机时间约束
             # 最小开机时间约束（与matlab一致）
             for g in range(self.ng):
-                for t in range(1, Ton+1):
+                for t in range(1, int(self.min_up_steps[g]) + 1):
                     for t1 in range(self.T - t):
                         min_on_expr = x[g, t1+1] - x[g, t1] - x[g, t1+t]
 
@@ -4012,7 +4006,7 @@ class Iter_BCD:
 
             # 最小关机时间约束（与matlab一致）
             for g in range(self.ng):
-                for t in range(1, Toff+1):
+                for t in range(1, int(self.min_down_steps[g]) + 1):
                     for t1 in range(self.T - t):
                         min_off_expr = -x[g, t1+1] + x[g, t1] - (1 - x[g, t1+t])
 
@@ -4262,8 +4256,8 @@ class Iter_BCD:
         cpower = model.addVars(self.ng, self.T, lb=0, name='cpower')
         
         # 最小开关机时间
-        Ton = min(4, self.T)
-        Toff = min(4, self.T)
+        Ton = self.Ton
+        Toff = self.Toff
         
         # 构建约束和目标函数项
         obj = 0
@@ -4284,10 +4278,7 @@ class Iter_BCD:
                 model.addConstr(pg_upper_expr <= 0, name=f'pg_upper_viol_{g}_{t}')
 
         # 爬坡约束（类似处理）
-        Ru = 0.4 * self.gen[:, PMAX] / self.T_delta
-        Rd = 0.4 * self.gen[:, PMAX] / self.T_delta
-        Ru_co = 0.3 * self.gen[:, PMAX]
-        Rd_co = 0.3 * self.gen[:, PMAX]
+        Ru, Rd, Ru_co, Rd_co = self.Ru, self.Rd, self.Ru_co, self.Rd_co
 
         for t in range(1, self.T):
             for g in range(self.ng):
@@ -4302,14 +4293,14 @@ class Iter_BCD:
         # 最小开机时间和最小关机时间约束
         # 最小开机时间约束（与matlab一致）
         for g in range(self.ng):
-            for t in range(1, Ton+1):
+            for t in range(1, int(self.min_up_steps[g]) + 1):
                 for t1 in range(self.T - t):
                     min_on_expr = x[g, t1+1] - x[g, t1] - x[g, t1+t]
                     model.addConstr(min_on_expr <= 0, name=f'min_on_viol_{g}_{t}_{t1}')
 
         # 最小关机时间约束（与matlab一致）
         for g in range(self.ng):
-            for t in range(1, Toff+1):
+            for t in range(1, int(self.min_down_steps[g]) + 1):
                 for t1 in range(self.T - t):
                     min_off_expr = -x[g, t1+1] + x[g, t1] - (1 - x[g, t1+t])
                     model.addConstr(min_off_expr <= 0, name=f'min_off_viol_{g}_{t}_{t1}')
@@ -4404,8 +4395,8 @@ class Iter_BCD:
         cpower = model.addVars(self.ng, self.T, lb=0, name='cpower')
         
         # 最小开关机时间
-        Ton = min(4, self.T)
-        Toff = min(4, self.T)
+        Ton = self.Ton
+        Toff = self.Toff
         
         # 构建约束和目标函数项
         obj = 0
@@ -4426,10 +4417,7 @@ class Iter_BCD:
                 model.addConstr(pg_upper_expr <= 0, name=f'pg_upper_viol_{g}_{t}')
 
         # 爬坡约束（类似处理）
-        Ru = 0.4 * self.gen[:, PMAX] / self.T_delta
-        Rd = 0.4 * self.gen[:, PMAX] / self.T_delta
-        Ru_co = 0.3 * self.gen[:, PMAX]
-        Rd_co = 0.3 * self.gen[:, PMAX]
+        Ru, Rd, Ru_co, Rd_co = self.Ru, self.Rd, self.Ru_co, self.Rd_co
 
         for t in range(1, self.T):
             for g in range(self.ng):
@@ -4444,14 +4432,14 @@ class Iter_BCD:
         # 最小开机时间和最小关机时间约束
         # 最小开机时间约束（与matlab一致）
         for g in range(self.ng):
-            for t in range(1, Ton+1):
+            for t in range(1, int(self.min_up_steps[g]) + 1):
                 for t1 in range(self.T - t):
                     min_on_expr = x[g, t1+1] - x[g, t1] - x[g, t1+t]
                     model.addConstr(min_on_expr <= 0, name=f'min_on_viol_{g}_{t}_{t1}')
 
         # 最小关机时间约束（与matlab一致）
         for g in range(self.ng):
-            for t in range(1, Toff+1):
+            for t in range(1, int(self.min_down_steps[g]) + 1):
                 for t1 in range(self.T - t):
                     min_off_expr = -x[g, t1+1] + x[g, t1] - (1 - x[g, t1+t])
                     model.addConstr(min_off_expr <= 0, name=f'min_off_viol_{g}_{t}_{t1}')
@@ -4524,8 +4512,8 @@ class Iter_BCD:
         cpower = model.addVars(self.ng, self.T, lb=0, name='cpower')
         
         # 最小开关机时间
-        Ton = min(4, self.T)
-        Toff = min(4, self.T)
+        Ton = self.Ton
+        Toff = self.Toff
         
         # 构建约束和目标函数项
         obj = 0
@@ -4546,10 +4534,7 @@ class Iter_BCD:
                 model.addConstr(pg_upper_expr <= 0, name=f'pg_upper_viol_{g}_{t}')
 
         # 爬坡约束（类似处理）
-        Ru = 0.4 * self.gen[:, PMAX] / self.T_delta
-        Rd = 0.4 * self.gen[:, PMAX] / self.T_delta
-        Ru_co = 0.3 * self.gen[:, PMAX]
-        Rd_co = 0.3 * self.gen[:, PMAX]
+        Ru, Rd, Ru_co, Rd_co = self.Ru, self.Rd, self.Ru_co, self.Rd_co
 
         for t in range(1, self.T):
             for g in range(self.ng):
@@ -4564,14 +4549,14 @@ class Iter_BCD:
         # 最小开机时间和最小关机时间约束
         # 最小开机时间约束（与matlab一致）
         for g in range(self.ng):
-            for t in range(1, Ton+1):
+            for t in range(1, int(self.min_up_steps[g]) + 1):
                 for t1 in range(self.T - t):
                     min_on_expr = x[g, t1+1] - x[g, t1] - x[g, t1+t]
                     model.addConstr(min_on_expr <= 0, name=f'min_on_viol_{g}_{t}_{t1}')
 
         # 最小关机时间约束（与matlab一致）
         for g in range(self.ng):
-            for t in range(1, Toff+1):
+            for t in range(1, int(self.min_down_steps[g]) + 1):
                 for t1 in range(self.T - t):
                     min_off_expr = -x[g, t1+1] + x[g, t1] - (1 - x[g, t1+t])
                     model.addConstr(min_off_expr <= 0, name=f'min_off_viol_{g}_{t}_{t1}')
