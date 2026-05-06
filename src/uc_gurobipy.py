@@ -310,10 +310,7 @@ class UnitCommitmentModel:
                 )
         
         # 爬坡约束
-        Ru = 0.4 * self.gen[:, PMAX] / self.T_delta
-        Rd = 0.4 * self.gen[:, PMAX] / self.T_delta
-        Ru_co = 0.3 * self.gen[:, PMAX]
-        Rd_co = 0.3 * self.gen[:, PMAX]
+        Ru, Rd, Ru_co, Rd_co = self._get_ramp_limits()
         for t in range(1, self.T):
             for g in range(self.ng):
                 model.addConstr(pg[g, t] - pg[g, t-1] <= Ru[g] * x[g, t-1] + Ru_co[g] * (1 - x[g, t-1]), name=f'ramp_up_{g}_{t}')
