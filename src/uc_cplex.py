@@ -11,10 +11,12 @@ from pypower.idx_bus import BUS_I, BUS_TYPE, PD, QD, GS, BS, BUS_AREA, VM, VA, B
 from pypower.idx_brch import F_BUS, T_BUS, BR_R, BR_X, BR_B, RATE_A, RATE_B, RATE_C, TAP, SHIFT, BR_STATUS, ANGMIN, ANGMAX
 
 from src.case39_pypower import get_case39_pypower
+from src.uc_time_utils import get_min_up_down_steps_from_ppc, get_ramp_limits_from_ppc
 
 class UnitCommitmentModelCplex:
     def __init__(self, ppc, Pd, T_delta):
         self.ppc = ppc
+        self.ppc_raw = ppc
         ppc = ext2int(ppc)
         self.baseMVA = ppc['baseMVA']
         self.bus = ppc['bus']
@@ -64,10 +66,7 @@ class UnitCommitmentModelCplex:
                     senses=["L"], rhs=[0])
                 
         # 爬坡约束
-        Ru = 0.4 * self.gen[:, PMAX] / self.T_delta
-        Rd = 0.4 * self.gen[:, PMAX] / self.T_delta
-        Ru_co = 0.3 * self.gen[:, PMAX]
-        Rd_co = 0.3 * self.gen[:, PMAX]
+        Ru, Rd, Ru_co, Rd_co = get_ramp_limits_from_ppc(self.ppc_raw, self.gen, self.T_delta)
         for t in range(1, T):
             for g in range(ng):
                 # up
@@ -83,10 +82,11 @@ class UnitCommitmentModelCplex:
                     ], [1, -1, Rd_co[g]-Rd[g]])],
                     senses=["L"], rhs=[Rd_co[g]])
         # 最小开机/关机时间
-        Ton = int(4 * self.T_delta)
-        Toff = int(4 * self.T_delta)
+        min_up_steps, min_down_steps, _, _ = get_min_up_down_steps_from_ppc(
+            self.ppc_raw, self.ng, self.T, self.T_delta
+        )
         for g in range(ng):
-            for t in range(2, Ton+1):
+            for t in range(2, int(min_up_steps[g]) + 1):
                 for t1 in range(T - t):
                     self.model.linear_constraints.add(
                         lin_expr=[cplex.SparsePair([
@@ -94,7 +94,7 @@ class UnitCommitmentModelCplex:
                         ], [1, -1, -1])],
                         senses=["L"], rhs=[0])
         for g in range(ng):
-            for t in range(2, Toff+1):
+            for t in range(2, int(min_down_steps[g]) + 1):
                 for t1 in range(T - t):
                     self.model.linear_constraints.add(
                         lin_expr=[cplex.SparsePair([

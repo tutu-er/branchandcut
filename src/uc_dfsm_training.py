@@ -23,6 +23,7 @@ root_dir = Path(__file__).resolve().parent.parent
 sys.path.append(str(root_dir))
 
 from src.case39_pypower import get_case39_pypower
+from src.uc_time_utils import get_min_up_down_steps_from_ppc, get_ramp_limits_from_ppc
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
 
 def load_active_set_from_json(json_filepath: str, sample_id: int = 0) -> Dict:
@@ -173,6 +174,7 @@ class ActiveSetReader:
 class UnitCommitmentModel:
     def __init__(self, ppc, Pd, T_delta):
         self.ppc = ppc
+        self.ppc_raw = ppc
         ppc = ext2int(ppc)
         self.baseMVA = ppc['baseMVA']
         self.bus = ppc['bus']
@@ -184,6 +186,12 @@ class UnitCommitmentModel:
         self.T = Pd.shape[1]
         self.ng = self.gen.shape[0]
         self.nb = self.branch.shape[0]
+        self.min_up_steps, self.min_down_steps, self.Ton, self.Toff = get_min_up_down_steps_from_ppc(
+            self.ppc_raw, self.ng, self.T, self.T_delta
+        )
+        self.Ru, self.Rd, self.Ru_co, self.Rd_co = get_ramp_limits_from_ppc(
+            self.ppc_raw, self.gen, self.T_delta
+        )
         
         # 建立约束编号映射
         self._build_constraint_mapping()
@@ -738,24 +746,20 @@ class UnitCommitmentModel:
                 self.model.addConstr(self.pg[g, t] <= self.gen[g, PMAX] * self.x[g, t], name=f'gen_max_{g}_{t}')
         
         # 爬坡约束
-        Ru = 0.4 * self.gen[:, PMAX] / self.T_delta
-        Rd = 0.4 * self.gen[:, PMAX] / self.T_delta
-        Ru_co = 0.3 * self.gen[:, PMAX]
-        Rd_co = 0.3 * self.gen[:, PMAX]
+        Ru, Rd, Ru_co, Rd_co = self.Ru, self.Rd, self.Ru_co, self.Rd_co
         for t in range(1, self.T):
             for g in range(self.ng):
                 self.model.addConstr(self.pg[g, t] - self.pg[g, t-1] <= Ru[g] * self.x[g, t-1] + Ru_co[g] * (1 - self.x[g, t-1]), name=f'ramp_up_{g}_{t}')
                 self.model.addConstr(self.pg[g, t-1] - self.pg[g, t] <= Rd[g] * self.x[g, t] + Rd_co[g] * (1 - self.x[g, t]), name=f'ramp_down_{g}_{t}')
         
         # 最小开机时间和最小关机时间约束
-        Ton = int(4 * self.T_delta)
-        Toff = int(4 * self.T_delta)
+        Ton, Toff = self.Ton, self.Toff
         for g in range(self.ng):
-            for t in range(1, Ton+1):
+            for t in range(1, int(self.min_up_steps[g]) + 1):
                 for t1 in range(self.T - t):
                     self.model.addConstr(self.x[g, t1+1] - self.x[g, t1] <= self.x[g, t1+t], name=f'min_up_time_{g}_{t1}_{t1+t}')
         for g in range(self.ng):
-            for t in range(1, Toff+1):
+            for t in range(1, int(self.min_down_steps[g]) + 1):
                 for t1 in range(self.T - t):
                     self.model.addConstr(-self.x[g, t1+1] + self.x[g, t1] <= 1 - self.x[g, t1+t], name=f'min_down_time_{g}_{t1}_{t1+t}')
         
@@ -1118,10 +1122,10 @@ class UnitCommitmentModel:
                 rhs_g.append(0.0)
             
             # 2. 爬坡约束
-            Ru = 0.4 * self.gen[g, PMAX] / self.T_delta
-            Rd = 0.4 * self.gen[g, PMAX] / self.T_delta
-            Ru_co = 0.3 * self.gen[g, PMAX]
-            Rd_co = 0.3 * self.gen[g, PMAX]
+            Ru = float(self.Ru[g])
+            Rd = float(self.Rd[g])
+            Ru_co = float(self.Ru_co[g])
+            Rd_co = float(self.Rd_co[g])
             
             for t in range(1, self.T):
                 # 上爬坡: pg[g,t] - pg[g,t-1] - Ru * x[g,t-1] + Ru_co * x[g,t-1] <= Ru_co
@@ -1141,8 +1145,8 @@ class UnitCommitmentModel:
                 rhs_g.append(Rd_co)
             
             # 3. 最小开机/关机时间约束
-            Ton = int(4 * self.T_delta)
-            Toff = int(4 * self.T_delta)
+            Ton = int(self.min_up_steps[g])
+            Toff = int(self.min_down_steps[g])
             
             # 最小开机时间: x[g,t1+1] - x[g,t1] - x[g,t1+t] <= 0
             for t in range(1, min(Ton+1, self.T)):
