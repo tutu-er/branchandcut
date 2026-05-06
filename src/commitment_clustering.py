@@ -38,6 +38,11 @@ from pypower.idx_brch import RATE_A, BR_STATUS
 
 from src.uc_NN_subproblem import ActiveSetReader
 from src.ed_gurobipy import EconomicDispatchGurobi
+from src.uc_time_utils import (
+    get_custom_generator_array,
+    get_min_up_down_steps_from_ppc,
+    get_ramp_limits_from_ppc,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -45,50 +50,17 @@ from src.ed_gurobipy import EconomicDispatchGurobi
 # ---------------------------------------------------------------------------
 
 def _get_custom_generator_array(ppc_raw: dict, key: str, ng: int) -> Optional[np.ndarray]:
-    values = ppc_raw.get(key)
-    if values is None:
-        return None
-    values = np.asarray(values)
-    if values.shape[0] != ng:
-        return None
-    raw_gen = np.asarray(ppc_raw.get("gen"))
-    if raw_gen.shape[0] != ng:
-        return values
-    order = np.argsort(raw_gen[:, GEN_BUS], kind="stable")
-    return values[order]
+    return get_custom_generator_array(ppc_raw, ng, key)
 
 
 def _get_ramp_limits(ppc_raw: dict, gen: np.ndarray, T_delta: float):
-    ng = gen.shape[0]
-    default_up = 0.4 * gen[:, PMAX] / T_delta
-    default_down = 0.4 * gen[:, PMAX] / T_delta
-    default_up_co = 0.3 * gen[:, PMAX]
-    default_down_co = 0.3 * gen[:, PMAX]
-
-    ramp_up_h = _get_custom_generator_array(ppc_raw, "uc_ramp_up_mw_per_h", ng)
-    ramp_down_h = _get_custom_generator_array(ppc_raw, "uc_ramp_down_mw_per_h", ng)
-    if ramp_up_h is None or ramp_down_h is None:
-        return default_up, default_down, default_up_co, default_down_co
-
-    Ru = np.maximum(np.asarray(ramp_up_h, dtype=float) * T_delta, default_up)
-    Rd = np.maximum(np.asarray(ramp_down_h, dtype=float) * T_delta, default_down)
-    Ru_co = np.maximum(Ru, gen[:, PMIN])
-    Rd_co = np.maximum(Rd, gen[:, PMIN])
-    return Ru, Rd, Ru_co, Rd_co
+    return get_ramp_limits_from_ppc(ppc_raw, gen, T_delta)
 
 
 def _get_min_up_down_steps(ppc_raw: dict, gen: np.ndarray, T_delta: float):
-    ng = gen.shape[0]
-    min_up_h = _get_custom_generator_array(ppc_raw, "uc_min_up_time_h", ng)
-    min_down_h = _get_custom_generator_array(ppc_raw, "uc_min_down_time_h", ng)
-    if min_up_h is None or min_down_h is None:
-        default_steps = max(int(4 * T_delta), 1)
-        return (
-            np.full(ng, default_steps, dtype=int),
-            np.full(ng, default_steps, dtype=int),
-        )
-    min_up = np.maximum(np.ceil(np.asarray(min_up_h, dtype=float) / T_delta).astype(int), 1)
-    min_down = np.maximum(np.ceil(np.asarray(min_down_h, dtype=float) / T_delta).astype(int), 1)
+    min_up, min_down, _, _ = get_min_up_down_steps_from_ppc(
+        ppc_raw, int(gen.shape[0]), 10**9, T_delta
+    )
     return min_up, min_down
 
 

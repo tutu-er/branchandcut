@@ -12,6 +12,7 @@ from pypower.ext2int import ext2int
 from pypower.idx_gen import GEN_BUS, PMIN, PMAX, QMIN, QMAX, VG, MBASE, GEN_STATUS
 from pypower.idx_bus import BUS_I, BUS_TYPE, PD, QD, GS, BS, BUS_AREA, VM, VA, BASE_KV, ZONE, VMAX, VMIN
 from pypower.idx_brch import F_BUS, T_BUS, BR_R, BR_X, BR_B, RATE_A, RATE_B, RATE_C, TAP, SHIFT, BR_STATUS, ANGMIN, ANGMAX
+from src.uc_time_utils import get_custom_generator_array, get_ramp_limits_from_ppc
 
 class EconomicDispatchGurobi:
     def __init__(self, ppc, Pd, T_delta, x, renewable_data=None, verbose=False):
@@ -59,36 +60,10 @@ class EconomicDispatchGurobi:
         self._build_model()
 
     def _get_ramp_limits(self):
-        default_up = 0.4 * self.gen[:, PMAX] / self.T_delta
-        default_down = 0.4 * self.gen[:, PMAX] / self.T_delta
-        default_up_co = 0.3 * self.gen[:, PMAX]
-        default_down_co = 0.3 * self.gen[:, PMAX]
-
-        ramp_up_h = self._get_custom_generator_array('uc_ramp_up_mw_per_h')
-        ramp_down_h = self._get_custom_generator_array('uc_ramp_down_mw_per_h')
-        if ramp_up_h is None or ramp_down_h is None:
-            return default_up, default_down, default_up_co, default_down_co
-
-        Ru = np.asarray(ramp_up_h, dtype=float) * self.T_delta
-        Rd = np.asarray(ramp_down_h, dtype=float) * self.T_delta
-        Ru = np.maximum(Ru, default_up)
-        Rd = np.maximum(Rd, default_down)
-        Ru_co = np.maximum(Ru, self.gen[:, PMIN])
-        Rd_co = np.maximum(Rd, self.gen[:, PMIN])
-        return Ru, Rd, Ru_co, Rd_co
+        return get_ramp_limits_from_ppc(self.ppc_raw, self.gen, self.T_delta)
 
     def _get_custom_generator_array(self, key):
-        values = self.ppc_raw.get(key)
-        if values is None:
-            return None
-        values = np.asarray(values)
-        if values.shape[0] != self.ng:
-            return None
-        raw_gen = np.asarray(self.ppc_raw.get('gen'))
-        if raw_gen.shape[0] != self.ng:
-            return values
-        order = np.argsort(raw_gen[:, GEN_BUS], kind='stable')
-        return values[order]
+        return get_custom_generator_array(self.ppc_raw, self.ng, key)
 
     def _build_model(self):
         for t in range(self.T):

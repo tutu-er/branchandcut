@@ -11,6 +11,7 @@ from pypower.idx_cost import MODEL, NCOST, COST
 from pypower.idx_bus import PD, BUS_TYPE, REF
 from pypower.idx_gen import PMAX, PMIN, GEN_BUS
 from pypower.idx_brch import F_BUS, T_BUS, BR_X, RATE_A
+from src.uc_time_utils import get_min_up_down_steps_from_ppc, get_ramp_limits_from_ppc
 
 # ==========================================
 # 0. 解析 Gurobi 输出日志中的割平面统计
@@ -268,10 +269,7 @@ def solve_uc_case118():
             m.addConstr(p_in - p_out_load == p_out_flow)
     
     # 5. 爬坡约束
-    Ru = 0.4 * p_max / T_delta  # 上爬坡速率 (MW/h)
-    Rd = 0.4 * p_max / T_delta  # 下爬坡速率 (MW/h)
-    Ru_co = 0.3 * p_max  # 冷启动上爬坡速率
-    Rd_co = 0.3 * p_max  # 冷启动下爬坡速率
+    Ru, Rd, Ru_co, Rd_co = get_ramp_limits_from_ppc(mpc, gens, T_delta)
     
     for t in range(1, T):
         for g in range(n_gens):
@@ -281,17 +279,16 @@ def solve_uc_case118():
             m.addConstr(p_gen[g, t-1] - p_gen[g, t] <= Rd[g] * u_gen[g, t] + Rd_co[g] * (1 - u_gen[g, t]))
     
     # 6. 最小开机时间和最小关机时间约束
-    Ton = int(4 * T_delta)  # 最小开机时间：4小时
-    Toff = int(4 * T_delta)  # 最小关机时间：4小时
+    min_up_steps, min_down_steps, _, _ = get_min_up_down_steps_from_ppc(mpc, n_gens, T, T_delta)
     
     for g in range(n_gens):
         # 最小开机时间约束：如果机组在t1+1时刻启动，则必须在t1到t1+t期间保持运行
-        for t in range(1, Ton+1):
+        for t in range(1, int(min_up_steps[g]) + 1):
             for t1 in range(T - t):
                 m.addConstr(u_gen[g, t1+1] - u_gen[g, t1] <= u_gen[g, t1+t])
         
         # 最小关机时间约束：如果机组在t1+1时刻停机，则必须在t1到t1+t期间保持停机
-        for t in range(1, Toff+1):
+        for t in range(1, int(min_down_steps[g]) + 1):
             for t1 in range(T - t):
                 m.addConstr(-u_gen[g, t1+1] + u_gen[g, t1] <= 1 - u_gen[g, t1+t])
     

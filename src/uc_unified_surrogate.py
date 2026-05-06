@@ -26,6 +26,7 @@ if hasattr(sys.stdout, 'reconfigure'):
 from pypower.ext2int import ext2int
 from pypower.idx_gen import GEN_BUS, PMIN, PMAX
 from pypower.idx_brch import RATE_A, BR_STATUS
+from src.uc_time_utils import get_min_up_down_steps_from_ppc, get_ramp_limits_from_ppc
 
 try:
     import torch
@@ -128,6 +129,21 @@ class UnifiedSurrogateManager:
         self._ppc_int = ext2int(self.ppc)
         self._gen = self._ppc_int['gen']
         self._gencost = self._ppc_int['gencost']
+        if hasattr(agent, 'min_up_steps') and hasattr(agent, 'min_down_steps'):
+            self.min_up_steps = np.asarray(agent.min_up_steps, dtype=int)
+            self.min_down_steps = np.asarray(agent.min_down_steps, dtype=int)
+            self.Ton = int(getattr(agent, 'Ton', np.max(self.min_up_steps)))
+            self.Toff = int(getattr(agent, 'Toff', np.max(self.min_down_steps)))
+        else:
+            (
+                self.min_up_steps,
+                self.min_down_steps,
+                self.Ton,
+                self.Toff,
+            ) = get_min_up_down_steps_from_ppc(getattr(agent, 'ppc_raw', agent.ppc), self.ng, self.T, self.T_delta)
+        self.Ru, self.Rd, self.Ru_co, self.Rd_co = get_ramp_limits_from_ppc(
+            getattr(agent, 'ppc_raw', agent.ppc), self._gen, self.T_delta
+        )
 
     # =========================================================================
     # 核心方法：原始块（全局 LP 求解 pg/x）
@@ -161,12 +177,8 @@ class UnifiedSurrogateManager:
         ng, T = self.ng, self.T
         T_delta = self.T_delta
 
-        Ru = 0.4 * gen[:, PMAX] / T_delta
-        Rd = 0.4 * gen[:, PMAX] / T_delta
-        Ru_co = 0.3 * gen[:, PMAX]
-        Rd_co = 0.3 * gen[:, PMAX]
-        Ton = min(int(4 * T_delta), T - 1)
-        Toff = min(int(4 * T_delta), T - 1)
+        Ru, Rd, Ru_co, Rd_co = self.Ru, self.Rd, self.Ru_co, self.Rd_co
+        Ton, Toff = self.Ton, self.Toff
         start_cost = gencost[:, 1]
         shut_cost = gencost[:, 2]
         M_SURR = 1e5
@@ -196,10 +208,10 @@ class UnifiedSurrogateManager:
                 model.addConstr(pg[g, t] - pg[g, t-1] <= Ru[g] * x[g, t-1] + Ru_co[g] * (1 - x[g, t-1]))
                 model.addConstr(pg[g, t-1] - pg[g, t] <= Rd[g] * x[g, t] + Rd_co[g] * (1 - x[g, t]))
 
-            for tau in range(1, Ton + 1):
+            for tau in range(1, int(self.min_up_steps[g]) + 1):
                 for t1 in range(T - tau):
                     model.addConstr(x[g, t1+1] - x[g, t1] <= x[g, t1+tau])
-            for tau in range(1, Toff + 1):
+            for tau in range(1, int(self.min_down_steps[g]) + 1):
                 for t1 in range(T - tau):
                     model.addConstr(-x[g, t1+1] + x[g, t1] <= 1 - x[g, t1+tau])
 
@@ -473,12 +485,8 @@ class UnifiedSurrogateManager:
         T_delta = self.T_delta
         Pd_sum = np.sum(pd_data, axis=0)
 
-        Ru = 0.4 * gen[:, PMAX] / T_delta
-        Rd = 0.4 * gen[:, PMAX] / T_delta
-        Ru_co = 0.3 * gen[:, PMAX]
-        Rd_co = 0.3 * gen[:, PMAX]
-        Ton = min(int(4 * T_delta), T - 1)
-        Toff = min(int(4 * T_delta), T - 1)
+        Ru, Rd, Ru_co, Rd_co = self.Ru, self.Rd, self.Ru_co, self.Rd_co
+        Ton, Toff = self.Ton, self.Toff
         start_cost = gencost[:, 1]
         shut_cost = gencost[:, 2]
         M_SURR = 1e5
@@ -508,10 +516,10 @@ class UnifiedSurrogateManager:
                 model.addConstr(pg[g, t] - pg[g, t-1] <= Ru[g] * x[g, t-1] + Ru_co[g] * (1 - x[g, t-1]))
                 model.addConstr(pg[g, t-1] - pg[g, t] <= Rd[g] * x[g, t] + Rd_co[g] * (1 - x[g, t]))
 
-            for tau in range(1, Ton + 1):
+            for tau in range(1, int(self.min_up_steps[g]) + 1):
                 for t1 in range(T - tau):
                     model.addConstr(x[g, t1+1] - x[g, t1] <= x[g, t1+tau])
-            for tau in range(1, Toff + 1):
+            for tau in range(1, int(self.min_down_steps[g]) + 1):
                 for t1 in range(T - tau):
                     model.addConstr(-x[g, t1+1] + x[g, t1] <= 1 - x[g, t1+tau])
 

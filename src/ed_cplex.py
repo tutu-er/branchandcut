@@ -6,10 +6,12 @@ from pypower.ext2int import ext2int
 from pypower.idx_gen import GEN_BUS, PMIN, PMAX, QMIN, QMAX, VG, MBASE, GEN_STATUS
 from pypower.idx_bus import BUS_I, BUS_TYPE, PD, QD, GS, BS, BUS_AREA, VM, VA, BASE_KV, ZONE, VMAX, VMIN
 from pypower.idx_brch import F_BUS, T_BUS, BR_R, BR_X, BR_B, RATE_A, RATE_B, RATE_C, TAP, SHIFT, BR_STATUS, ANGMIN, ANGMAX
+from src.uc_time_utils import get_ramp_limits_from_ppc
 
 class EconomicDispatchCplex:
     def __init__(self, ppc, Pd, T_delta, x):
         self.ppc = ppc
+        self.ppc_raw = ppc
         ppc = ext2int(ppc)
         self.baseMVA = ppc['baseMVA']
         self.bus = ppc['bus']
@@ -53,10 +55,7 @@ class EconomicDispatchCplex:
                     lin_expr=[cplex.SparsePair([f"pg_{g}_{t}"], [1.0])],
                     senses=["L"], rhs=[self.gen[g, PMAX] * self.x[g, t]])
         # 爬坡约束
-        Ru = 0.4 * self.gen[:, PMAX] / self.T_delta
-        Rd = 0.4 * self.gen[:, PMAX] / self.T_delta
-        Ru_co = 0.3 * self.gen[:, PMAX]
-        Rd_co = 0.3 * self.gen[:, PMAX]
+        Ru, Rd, Ru_co, Rd_co = get_ramp_limits_from_ppc(self.ppc_raw, self.gen, self.T_delta)
         for t in range(1, T):
             for g in range(ng):
                 # up
