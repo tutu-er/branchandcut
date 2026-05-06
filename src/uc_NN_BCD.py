@@ -771,6 +771,34 @@ class Agent_NN_BCD:
     def _min_down_horizon(self, g: int) -> int:
         return int(self.min_down_steps[g])
 
+    def _zero_unused_min_up_entries(self, values) -> np.ndarray:
+        arr = np.asarray(values, dtype=float).copy()
+        for g in range(self.ng):
+            arr[g, self._min_up_horizon(g):, :] = 0.0
+        return arr
+
+    def _zero_unused_min_down_entries(self, values) -> np.ndarray:
+        arr = np.asarray(values, dtype=float).copy()
+        for g in range(self.ng):
+            arr[g, self._min_down_horizon(g):, :] = 0.0
+        return arr
+
+    def _extract_min_up_gurobi_values(self, vars_dict, width: int) -> np.ndarray:
+        values = np.zeros((self.ng, int(width), self.T), dtype=float)
+        for g in range(self.ng):
+            for tau in range(min(int(width), self._min_up_horizon(g))):
+                for t in range(self.T):
+                    values[g, tau, t] = float(vars_dict[g, tau, t].X)
+        return values
+
+    def _extract_min_down_gurobi_values(self, vars_dict, width: int) -> np.ndarray:
+        values = np.zeros((self.ng, int(width), self.T), dtype=float)
+        for g in range(self.ng):
+            for tau in range(min(int(width), self._min_down_horizon(g))):
+                for t in range(self.T):
+                    values[g, tau, t] = float(vars_dict[g, tau, t].X)
+        return values
+
     def _smooth_abs(self, tensor: torch.Tensor, eps: float | None = None) -> torch.Tensor:
         resolved_eps = self.nn_smooth_abs_eps if eps is None else max(float(eps), 0.0)
         if resolved_eps <= 0:
@@ -921,7 +949,7 @@ class Agent_NN_BCD:
                         max(1.0, abs(prev_val)),
                     )
 
-            for tau in range(Ton):
+            for tau in range(self._min_up_horizon(g)):
                 for t in range(self.T):
                     prev_val = float(prev_lambda['lambda_min_on'][g, tau, t])
                     prox_obj += self._add_squared_distance_term(
@@ -929,7 +957,7 @@ class Agent_NN_BCD:
                         prev_val,
                         max(1.0, abs(prev_val)),
                     )
-            for tau in range(Toff):
+            for tau in range(self._min_down_horizon(g)):
                 for t in range(self.T):
                     prev_val = float(prev_lambda['lambda_min_off'][g, tau, t])
                     prox_obj += self._add_squared_distance_term(
@@ -1712,7 +1740,7 @@ class Agent_NN_BCD:
             if 'min_on' in implicit_duals_dict:
                 lambda_sol_implicit['lambda_min_on'] = np.zeros((self.ng, Ton, self.T))
                 for g in range(self.ng):
-                    for tau in range(Ton):
+                    for tau in range(self._min_up_horizon(g)):
                         for t in range(self.T):
                             val = implicit_duals_dict['min_on'].get(g, {}).get(tau+1, {}).get(t, 0)
                             lambda_sol_implicit['lambda_min_on'][g, tau, t] = abs(val)
@@ -1722,7 +1750,7 @@ class Agent_NN_BCD:
             if 'min_off' in implicit_duals_dict:
                 lambda_sol_implicit['lambda_min_off'] = np.zeros((self.ng, Toff, self.T))
                 for g in range(self.ng):
-                    for tau in range(Toff):
+                    for tau in range(self._min_down_horizon(g)):
                         for t in range(self.T):
                             val = implicit_duals_dict['min_off'].get(g, {}).get(tau+1, {}).get(t, 0)
                             lambda_sol_implicit['lambda_min_off'][g, tau, t] = abs(val)
@@ -2083,10 +2111,10 @@ class Agent_NN_BCD:
                 dtype=float,
             )
         for g in range(self.ng):
-            for tau in range(Ton):
+            for tau in range(self._min_up_horizon(g)):
                 for t1 in range(self.T - (tau + 1)):
                     lambda_dict['lambda_min_on'][g, tau, t1] = abs(_cvxpy_pi_to_gurobi_pi(min_on_cons[g, tau, t1], 'le'))
-            for tau in range(Toff):
+            for tau in range(self._min_down_horizon(g)):
                 for t1 in range(self.T - (tau + 1)):
                     lambda_dict['lambda_min_off'][g, tau, t1] = abs(_cvxpy_pi_to_gurobi_pi(min_off_cons[g, tau, t1], 'le'))
         lambda_dict['lambda_cpower'] = np.array(
@@ -3946,12 +3974,12 @@ class Agent_NN_BCD:
                             pv = float(prev_lam[key][g, t])
                             sc = max(1.0, abs(pv))
                             prox_terms.append(cp.square((var[g, t] - pv) / sc))
-                    for tau in range(Ton):
+                    for tau in range(self._min_up_horizon(g)):
                         for t in range(self.T):
                             pv = float(prev_lam['lambda_min_on'][g, tau, t])
                             sc = max(1.0, abs(pv))
                             prox_terms.append(cp.square((lambda_mon[g, tau, t] - pv) / sc))
-                    for tau in range(Toff):
+                    for tau in range(self._min_down_horizon(g)):
                         for t in range(self.T):
                             pv = float(prev_lam['lambda_min_off'][g, tau, t])
                             sc = max(1.0, abs(pv))
@@ -4003,8 +4031,8 @@ class Agent_NN_BCD:
             'lambda_pg_upper':      _v(lambda_pgu),
             'lambda_ramp_up':       _v(lambda_ru)  if self.T > 1 else np.zeros((self.ng, 0)),
             'lambda_ramp_down':     _v(lambda_rd)  if self.T > 1 else np.zeros((self.ng, 0)),
-            'lambda_min_on':        _v(lambda_mon),
-            'lambda_min_off':       _v(lambda_moff),
+            'lambda_min_on':        self._zero_unused_min_up_entries(_v(lambda_mon)),
+            'lambda_min_off':       self._zero_unused_min_down_entries(_v(lambda_moff)),
             'lambda_start_cost':    _v(lambda_sc)  if self.T > 1 else np.zeros((self.ng, 0)),
             'lambda_shut_cost':     _v(lambda_shc) if self.T > 1 else np.zeros((self.ng, 0)),
             'lambda_coc_nonneg':    _v(lambda_coc_nonneg) if self.T > 1 else np.zeros((self.ng, 0)),
@@ -4914,8 +4942,8 @@ class Agent_NN_BCD:
                 'lambda_pg_upper':      np.array([[lam_pgu[g,t].X  for t in range(self.T)]   for g in range(self.ng)]),
                 'lambda_ramp_up':       np.array([[lam_ru[g,t].X   for t in range(self.T-1)] for g in range(self.ng)]),
                 'lambda_ramp_down':     np.array([[lam_rd[g,t].X   for t in range(self.T-1)] for g in range(self.ng)]),
-                'lambda_min_on':        np.array([[[lam_mon[g,tau,t1].X for t1 in range(self.T)] for tau in range(Ton)]  for g in range(self.ng)]),
-                'lambda_min_off':       np.array([[[lam_moff[g,tau,t1].X for t1 in range(self.T)] for tau in range(Toff)] for g in range(self.ng)]),
+                'lambda_min_on':        self._extract_min_up_gurobi_values(lam_mon, Ton),
+                'lambda_min_off':       self._extract_min_down_gurobi_values(lam_moff, Toff),
                 'lambda_start_cost':    np.array([[lam_sc[g,t].X   for t in range(self.T-1)] for g in range(self.ng)]),
                 'lambda_shut_cost':     np.array([[lam_shc[g,t].X  for t in range(self.T-1)] for g in range(self.ng)]),
                 'lambda_coc_nonneg':    np.array([[lam_coc[g,t].X  for t in range(self.T-1)] for g in range(self.ng)]),
@@ -5248,8 +5276,8 @@ class Agent_NN_BCD:
                 'lambda_pg_upper': np.array([[lambda_pg_upper[g, t].X for t in range(self.T)] for g in range(self.ng)]),
                 'lambda_ramp_up': np.array([[lambda_ramp_up[g, t].X for t in range(self.T-1)] for g in range(self.ng)]),
                 'lambda_ramp_down': np.array([[lambda_ramp_down[g, t].X for t in range(self.T-1)] for g in range(self.ng)]),
-                'lambda_min_on': np.array([[[lambda_min_on[g, tau, t].X for t in range(self.T)] for tau in range(Ton)] for g in range(self.ng)]),
-                'lambda_min_off': np.array([[[lambda_min_off[g, tau, t].X for t in range(self.T)] for tau in range(Toff)] for g in range(self.ng)]),
+                'lambda_min_on': self._extract_min_up_gurobi_values(lambda_min_on, Ton),
+                'lambda_min_off': self._extract_min_down_gurobi_values(lambda_min_off, Toff),
                 'lambda_start_cost': np.array([[lambda_start_cost[g, t].X for t in range(self.T - 1)] for g in range(self.ng)]),
                 'lambda_shut_cost': np.array([[lambda_shut_cost[g, t].X for t in range(self.T - 1)] for g in range(self.ng)]),
                 'lambda_coc_nonneg': np.array([[lambda_coc_nonneg[g, t].X for t in range(self.T - 1)] for g in range(self.ng)]),

@@ -5,10 +5,12 @@ from pypower.ext2int import ext2int
 from pypower.idx_gen import GEN_BUS, PMIN, PMAX, QMIN, QMAX, VG, MBASE, GEN_STATUS
 from pypower.idx_bus import BUS_I, BUS_TYPE, PD, QD, GS, BS, BUS_AREA, VM, VA, BASE_KV, ZONE, VMAX, VMIN
 from pypower.idx_brch import F_BUS, T_BUS, BR_R, BR_X, BR_B, RATE_A, RATE_B, RATE_C, TAP, SHIFT, BR_STATUS, ANGMIN, ANGMAX
+from src.uc_time_utils import get_min_up_down_steps_from_ppc, get_ramp_limits_from_ppc
 
 class UnitCommitmentModelCVXPY:
     def __init__(self, ppc, Pd, T_delta):
         self.ppc = ppc
+        self.ppc_raw = ppc
         ppc = ext2int(ppc)
         self.baseMVA = ppc['baseMVA']
         self.bus = ppc['bus']
@@ -39,23 +41,21 @@ class UnitCommitmentModelCVXPY:
                 self.constraints.append(self.pg[g, t] >= self.gen[g, PMIN] * self.x[g, t])
                 self.constraints.append(self.pg[g, t] <= self.gen[g, PMAX] * self.x[g, t])
         # 爬坡约束
-        Ru = 0.4 * self.gen[:, PMAX] / self.T_delta
-        Rd = 0.4 * self.gen[:, PMAX] / self.T_delta
-        Ru_co = 0.3 * self.gen[:, PMAX]
-        Rd_co = 0.3 * self.gen[:, PMAX]
+        Ru, Rd, Ru_co, Rd_co = get_ramp_limits_from_ppc(self.ppc_raw, self.gen, self.T_delta)
         for t in range(1, T):
             for g in range(ng):
                 self.constraints.append(self.pg[g, t] - self.pg[g, t-1] <= Ru[g] * self.x[g, t-1] + Ru_co[g] * (1 - self.x[g, t-1]))
                 self.constraints.append(self.pg[g, t-1] - self.pg[g, t] <= Rd[g] * self.x[g, t] + Rd_co[g] * (1 - self.x[g, t]))
         # 最小开机/关机时间
-        Ton = int(4 * self.T_delta)
-        Toff = int(4 * self.T_delta)
+        min_up_steps, min_down_steps, _, _ = get_min_up_down_steps_from_ppc(
+            self.ppc_raw, self.ng, self.T, self.T_delta
+        )
         for g in range(ng):
-            for t in range(1, Ton+1):
+            for t in range(1, int(min_up_steps[g]) + 1):
                 for t1 in range(T - t):
                     self.constraints.append(self.x[g, t1+1] - self.x[g, t1] <= self.x[g, t1+t])
         for g in range(ng):
-            for t in range(1, Toff+1):
+            for t in range(1, int(min_down_steps[g]) + 1):
                 for t1 in range(T - t):
                     self.constraints.append(-self.x[g, t1+1] + self.x[g, t1] <= 1 - self.x[g, t1+t])
         # 启停成本

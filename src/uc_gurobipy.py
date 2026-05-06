@@ -21,6 +21,11 @@ root_dir = Path(__file__).resolve().parent.parent
 sys.path.append(str(root_dir))
 
 from src.case39_pypower import get_case39_pypower
+from src.uc_time_utils import (
+    get_custom_generator_array,
+    get_min_up_down_steps_from_ppc,
+    get_ramp_limits_from_ppc,
+)
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
 
 # TODO: 数据读取部分请根据你的数据格式自行实现
@@ -68,50 +73,35 @@ class UnitCommitmentModel:
         self._build_model()
 
     def _get_ramp_limits(self):
-        default_up = 0.4 * self.gen[:, PMAX] / self.T_delta
-        default_down = 0.4 * self.gen[:, PMAX] / self.T_delta
-        default_up_co = 0.3 * self.gen[:, PMAX]
-        default_down_co = 0.3 * self.gen[:, PMAX]
-
-        ramp_up_h = self._get_custom_generator_array('uc_ramp_up_mw_per_h')
-        ramp_down_h = self._get_custom_generator_array('uc_ramp_down_mw_per_h')
-        if ramp_up_h is None or ramp_down_h is None:
-            return default_up, default_down, default_up_co, default_down_co
-
-        Ru = np.asarray(ramp_up_h, dtype=float) * self.T_delta
-        Rd = np.asarray(ramp_down_h, dtype=float) * self.T_delta
-        Ru = np.maximum(Ru, default_up)
-        Rd = np.maximum(Rd, default_down)
-        Ru_co = np.maximum(Ru, self.gen[:, PMIN])
-        Rd_co = np.maximum(Rd, self.gen[:, PMIN])
-        return Ru, Rd, Ru_co, Rd_co
+        return get_ramp_limits_from_ppc(self.ppc_raw, self.gen, self.T_delta)
 
     def _get_min_up_down_time_steps(self):
-        min_up_h = self._get_custom_generator_array('uc_min_up_time_h')
-        min_down_h = self._get_custom_generator_array('uc_min_down_time_h')
-        if min_up_h is None or min_down_h is None:
-            default_steps = max(int(4 * self.T_delta), 1)
-            return (
-                np.full(self.ng, default_steps, dtype=int),
-                np.full(self.ng, default_steps, dtype=int),
-            )
-
-        min_up = np.maximum(np.ceil(np.asarray(min_up_h, dtype=float) / self.T_delta).astype(int), 1)
-        min_down = np.maximum(np.ceil(np.asarray(min_down_h, dtype=float) / self.T_delta).astype(int), 1)
+        min_up, min_down, _, _ = self._get_min_up_down_horizons()
         return min_up, min_down
 
+    def _get_min_up_down_horizons(self):
+        return get_min_up_down_steps_from_ppc(self.ppc_raw, self.ng, self.T, self.T_delta)
+
     def _get_custom_generator_array(self, key):
-        values = self.ppc_raw.get(key)
-        if values is None:
-            return None
-        values = np.asarray(values)
-        if values.shape[0] != self.ng:
-            return None
-        raw_gen = np.asarray(self.ppc_raw.get('gen'))
-        if raw_gen.shape[0] != self.ng:
-            return values
-        order = np.argsort(raw_gen[:, GEN_BUS], kind='stable')
-        return values[order]
+        return get_custom_generator_array(self.ppc_raw, self.ng, key)
+
+    def _extract_min_up_values(self, vars_dict, width):
+        arr = np.zeros((self.ng, int(width), self.T), dtype=float)
+        min_up_steps, _, _, _ = self._get_min_up_down_horizons()
+        for g in range(self.ng):
+            for tau in range(min(int(width), int(min_up_steps[g]))):
+                for t in range(self.T):
+                    arr[g, tau, t] = float(vars_dict[g, tau, t].X)
+        return arr
+
+    def _extract_min_down_values(self, vars_dict, width):
+        arr = np.zeros((self.ng, int(width), self.T), dtype=float)
+        _, min_down_steps, _, _ = self._get_min_up_down_horizons()
+        for g in range(self.ng):
+            for tau in range(min(int(width), int(min_down_steps[g]))):
+                for t in range(self.T):
+                    arr[g, tau, t] = float(vars_dict[g, tau, t].X)
+        return arr
 
     def _build_model(self):
         # 有功平衡
@@ -283,8 +273,7 @@ class UnitCommitmentModel:
         lambda_ramp_down = model.addVars(self.ng, self.T-1, lb=0, name='lambda_ramp_down')
         
         # 最小开机/关机时间约束的对偶变量
-        Ton = min(4, self.T)
-        Toff = min(4, self.T)
+        min_up_steps, min_down_steps, Ton, Toff = self._get_min_up_down_horizons()
         lambda_min_on = model.addVars(self.ng, Ton, self.T, lb=0, name='lambda_min_on')
         lambda_min_off = model.addVars(self.ng, Toff, self.T, lb=0, name='lambda_min_off')
         
@@ -332,13 +321,13 @@ class UnitCommitmentModel:
         # 最小开机时间和最小关机时间约束
         # 最小开机时间约束（与matlab一致）
         for g in range(self.ng):
-            for t in range(1, Ton+1):
+            for t in range(1, int(min_up_steps[g]) + 1):
                 for t1 in range(self.T - t):
                     model.addConstr(x[g, t1+1] - x[g, t1] <= x[g, t1+t],
                     name=f'min_on_{g}_{t}_{t1}')
         # 最小关机时间约束（与matlab一致）
         for g in range(self.ng):
-            for t in range(1, Toff+1):
+            for t in range(1, int(min_down_steps[g]) + 1):
                 for t1 in range(self.T - t):
                     model.addConstr(-x[g, t1+1] + x[g, t1] <= 1 - x[g, t1+t],
                     name=f'min_off_{g}_{t}_{t1}')
@@ -499,7 +488,7 @@ class UnitCommitmentModel:
                 dual_obj += lambda_ramp_down[g, t] * (Rd_co[g])
         
         for g in range(self.ng):
-            for t in range(1, Toff+1):
+            for t in range(1, int(min_down_steps[g]) + 1):
                 for t1 in range(self.T - t):
                     dual_obj += lambda_min_off[g, t-1, t1]
         
@@ -564,8 +553,8 @@ class UnitCommitmentModel:
                 'lambda_ramp_down': np.array([[lambda_ramp_down[g, t].X for t in range(self.T-1)] for g in range(self.ng)]),
                 
                 # 最小开关机时间约束对偶变量: shape (ng, Ton, T) 和 (ng, Toff, T)
-                'lambda_min_on': np.array([[[lambda_min_on[g, tau, t].X for t in range(self.T)] for tau in range(Ton)] for g in range(self.ng)]),
-                'lambda_min_off': np.array([[[lambda_min_off[g, tau, t].X for t in range(self.T)] for tau in range(Toff)] for g in range(self.ng)]),
+                'lambda_min_on': self._extract_min_up_values(lambda_min_on, Ton),
+                'lambda_min_off': self._extract_min_down_values(lambda_min_off, Toff),
                 
                 # 启停成本约束对偶变量: shape (ng, T-1)
                 'lambda_start_cost': np.array([[lambda_start_cost[g, t].X for t in range(self.T-1)] for g in range(self.ng)]),
@@ -797,15 +786,14 @@ class UnitCommitmentModel:
             implicit_duals['min_on'] = {}
             implicit_duals['min_off'] = {}
             
-            Ton = min(4, self.T)
-            Toff = min(4, self.T)
+            min_up_steps, min_down_steps, Ton, Toff = self._get_min_up_down_horizons()
             
             for g in range(self.ng):
                 implicit_duals['min_on'][g] = {}
                 implicit_duals['min_off'][g] = {}
                 
                 # 最小开机时间约束
-                for tau in range(1, Ton+1):
+                for tau in range(1, int(min_up_steps[g]) + 1):
                     for t1 in range(self.T - tau):
                         cname_on = f'min_on_{g}_{tau}_{t1}'
                         constr_on = model.getConstrByName(cname_on)
@@ -815,7 +803,7 @@ class UnitCommitmentModel:
                             implicit_duals['min_on'][g][tau][t1] = constr_on.Pi
                 
                 # 最小关机时间约束
-                for tau in range(1, Toff+1):
+                for tau in range(1, int(min_down_steps[g]) + 1):
                     for t1 in range(self.T - tau):
                         cname_off = f'min_off_{g}_{tau}_{t1}'
                         constr_off = model.getConstrByName(cname_off)
@@ -999,13 +987,12 @@ class UnitCommitmentModel:
                 ])
             
             # 4. 最小开关机时间约束对偶变量: shape (ng, Ton/Toff, T)
-            Ton = min(4, self.T)
-            Toff = min(4, self.T)
+            min_up_steps, min_down_steps, Ton, Toff = self._get_min_up_down_horizons()
             
             if 'min_on' in implicit_duals_dict:
                 lambda_sol_implicit['lambda_min_on'] = np.zeros((self.ng, Ton, self.T))
                 for g in range(self.ng):
-                    for tau in range(Ton):
+                    for tau in range(int(min_up_steps[g])):
                         for t in range(self.T):
                             val = implicit_duals_dict['min_on'].get(g, {}).get(tau+1, {}).get(t, 0)
                             lambda_sol_implicit['lambda_min_on'][g, tau, t] = val
@@ -1013,7 +1000,7 @@ class UnitCommitmentModel:
             if 'min_off' in implicit_duals_dict:
                 lambda_sol_implicit['lambda_min_off'] = np.zeros((self.ng, Toff, self.T))
                 for g in range(self.ng):
-                    for tau in range(Toff):
+                    for tau in range(int(min_down_steps[g])):
                         for t in range(self.T):
                             val = implicit_duals_dict['min_off'].get(g, {}).get(tau+1, {}).get(t, 0)
                             lambda_sol_implicit['lambda_min_off'][g, tau, t] = val

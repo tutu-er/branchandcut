@@ -50,6 +50,7 @@ from pypower.ext2int import ext2int
 from pypower.idx_gen import GEN_BUS, PMIN, PMAX
 from pypower.idx_brch import RATE_A
 from pypower.makePTDF import makePTDF
+from src.uc_time_utils import get_min_up_down_steps_from_ppc, get_ramp_limits_from_ppc
 try:
     from scenario_utils import get_feature_vector_from_sample, normalize_sample_arrays
 except ImportError:
@@ -289,6 +290,7 @@ class Agent_NN:
     def __init__(self, ppc, active_set_data, T_delta, union_analysis=None):
         """初始化Agent_NN"""
         self.ppc = ppc
+        self.ppc_raw = ppc
         ppc = ext2int(ppc)
         self.baseMVA = ppc['baseMVA']
         self.bus = ppc['bus']
@@ -326,6 +328,12 @@ class Agent_NN:
             self.T = active_set_data['pd_data'].shape[1]
         self.ng = self.gen.shape[0]
         self.nl = self.branch.shape[0]
+        (
+            self.min_up_steps,
+            self.min_down_steps,
+            self.Ton,
+            self.Toff,
+        ) = get_min_up_down_steps_from_ppc(self.ppc_raw, self.ng, self.T, self.T_delta)
         
         self.active_set_data = active_set_data
         
@@ -413,6 +421,28 @@ class Agent_NN:
         
         return np.array(pg_sol), np.array(x_sol), np.array(coc_sol), np.array(cpower_sol), lambda_sol
     
+    def _min_up_horizon(self, g: int) -> int:
+        return int(self.min_up_steps[g])
+
+    def _min_down_horizon(self, g: int) -> int:
+        return int(self.min_down_steps[g])
+
+    def _extract_min_up_gurobi_values(self, vars_dict, width: int) -> np.ndarray:
+        values = np.zeros((self.ng, int(width), self.T), dtype=float)
+        for g in range(self.ng):
+            for tau in range(min(int(width), self._min_up_horizon(g))):
+                for t in range(self.T):
+                    values[g, tau, t] = float(vars_dict[g, tau, t].X)
+        return values
+
+    def _extract_min_down_gurobi_values(self, vars_dict, width: int) -> np.ndarray:
+        values = np.zeros((self.ng, int(width), self.T), dtype=float)
+        for g in range(self.ng):
+            for tau in range(min(int(width), self._min_down_horizon(g))):
+                for t in range(self.T):
+                    values[g, tau, t] = float(vars_dict[g, tau, t].X)
+        return values
+
     def _add_uc_constraints(self, model, pg, x, coc, cpower, Pd):
         """添加UC问题的基本约束"""
         # 功率平衡约束
@@ -429,8 +459,7 @@ class Agent_NN:
                 model.addConstr(pg[g, t] <= self.gen[g, PMAX] * x[g, t], name=f'pg_upper_{g}_{t}')
         
         # 爬坡约束
-        Ru = 0.4 * self.gen[:, PMAX] / self.T_delta
-        Rd = 0.4 * self.gen[:, PMAX] / self.T_delta
+        Ru, Rd, _, _ = get_ramp_limits_from_ppc(self.ppc_raw, self.gen, self.T_delta)
         for g in range(self.ng):
             for t in range(1, self.T):
                 model.addConstr(pg[g, t] - pg[g, t-1] <= Ru[g] * x[g, t-1] + self.gen[g, PMAX] * (1 - x[g, t-1]), 
@@ -439,14 +468,13 @@ class Agent_NN:
                               name=f'ramp_down_{g}_{t}')
         
         # 最小开关机时间约束
-        Ton = min(4, self.T)
-        Toff = min(4, self.T)
+        Ton, Toff = self.Ton, self.Toff
         for g in range(self.ng):
-            for t in range(1, Ton+1):
+            for t in range(1, self._min_up_horizon(g) + 1):
                 for t1 in range(self.T - t):
                     model.addConstr(x[g, t1+1] - x[g, t1] <= x[g, t1+t], name=f'min_on_{g}_{t}_{t1}')
         for g in range(self.ng):
-            for t in range(1, Toff+1):
+            for t in range(1, self._min_down_horizon(g) + 1):
                 for t1 in range(self.T - t):
                     model.addConstr(-x[g, t1+1] + x[g, t1] <= 1 - x[g, t1+t], name=f'min_off_{g}_{t}_{t1}')
         
@@ -471,8 +499,7 @@ class Agent_NN:
     def _extract_dual_variables(self, model) -> Dict:
         """通过约束名称提取对偶变量"""
         implicit_duals = {}
-        Ton = min(4, self.T)
-        Toff = min(4, self.T)
+        Ton, Toff = self.Ton, self.Toff
         
         try:
             # 功率平衡约束
@@ -589,8 +616,7 @@ class Agent_NN:
         try:
             implicit_duals_dict = self._extract_dual_variables(model)
             lambda_sol = {}
-            Ton = min(4, self.T)
-            Toff = min(4, self.T)
+            Ton, Toff = self.Ton, self.Toff
             
             # 功率平衡约束: shape (T,)
             lambda_sol['lambda_power_balance'] = np.array([
@@ -682,8 +708,7 @@ class Agent_NN:
     
     def _create_empty_lambda_dict(self) -> Dict:
         """创建空的对偶变量字典"""
-        Ton = min(4, self.T)
-        Toff = min(4, self.T)
+        Ton, Toff = self.Ton, self.Toff
         return {
             'lambda_power_balance': np.zeros(self.T),
             'lambda_pg_lower': np.zeros((self.ng, self.T)),
@@ -1044,7 +1069,7 @@ class Agent_NN:
         cpower = model.addVars(self.ng, self.T, lb=0, name='cpower')
         
         # 辅助变量
-        Ton, Toff = min(4, self.T), min(4, self.T)
+        Ton, Toff = self.Ton, self.Toff
         power_balance_viol = model.addVars(self.T, lb=0, name='power_balance_viol')
         pg_lower_viol = model.addVars(self.ng, self.T, lb=0, name='pg_lower_viol')
         pg_upper_viol = model.addVars(self.ng, self.T, lb=0, name='pg_upper_viol')
@@ -1098,10 +1123,7 @@ class Agent_NN:
                 obj_opt += (1 - x[g, t]) * abs(self.lambda_[sample_id]['lambda_x_upper'][g, t])
 
         # 爬坡约束
-        Ru = 0.4 * self.gen[:, PMAX] / self.T_delta
-        Rd = 0.4 * self.gen[:, PMAX] / self.T_delta
-        Ru_co = 0.3 * self.gen[:, PMAX]
-        Rd_co = 0.3 * self.gen[:, PMAX]
+        Ru, Rd, Ru_co, Rd_co = get_ramp_limits_from_ppc(self.ppc_raw, self.gen, self.T_delta)
 
         for t in range(1, self.T):
             for g in range(self.ng):
@@ -1122,7 +1144,7 @@ class Agent_NN:
 
         # 最小开关机时间约束
         for g in range(self.ng):
-            for t in range(1, Ton+1):
+            for t in range(1, self._min_up_horizon(g) + 1):
                 for t1 in range(self.T - t):
                     min_on_expr = x[g, t1+1] - x[g, t1] - x[g, t1+t]
                     model.addConstr(min_on_viol[g, t-1, t1] >= min_on_expr, name=f'min_on_viol_{g}_{t}_{t1}')
@@ -1132,7 +1154,7 @@ class Agent_NN:
                     obj_opt += min_on_abs[g, t-1, t1] * abs(self.lambda_[sample_id]['lambda_min_on'][g, t-1, t1])
 
         for g in range(self.ng):
-            for t in range(1, Toff+1):
+            for t in range(1, self._min_down_horizon(g) + 1):
                 for t1 in range(self.T - t):
                     min_off_expr = -x[g, t1+1] + x[g, t1] - (1 - x[g, t1+t])
                     model.addConstr(min_off_viol[g, t-1, t1] >= min_off_expr, name=f'min_off_viol_{g}_{t}_{t1}')
@@ -1240,7 +1262,7 @@ class Agent_NN:
         model.Params.OutputFlag = 0
         Pd = self.active_set_data[sample_id]['pd_data']
         
-        Ton, Toff = min(4, self.T), min(4, self.T)
+        Ton, Toff = self.Ton, self.Toff
         
         # 对偶变量
         lambda_power_balance = model.addVars(self.T, lb=-GRB.INFINITY, name='lambda_power_balance')
@@ -1274,10 +1296,7 @@ class Agent_NN:
         PTDF = makePTDF(self.baseMVA, self.bus, self.branch)
         branch_limit = self.branch[:, RATE_A]
 
-        Ru = 0.4 * self.gen[:, PMAX] / self.T_delta
-        Rd = 0.4 * self.gen[:, PMAX] / self.T_delta
-        Ru_co = 0.3 * self.gen[:, PMAX]
-        Rd_co = 0.3 * self.gen[:, PMAX]
+        Ru, Rd, Ru_co, Rd_co = get_ramp_limits_from_ppc(self.ppc_raw, self.gen, self.T_delta)
         start_cost = self.gencost[:, 1]
         shut_cost = self.gencost[:, 2]
         
@@ -1321,7 +1340,7 @@ class Agent_NN:
                 if t < self.T - 1:
                     dual_expr += (Ru_co[g] - Ru[g]) * lambda_ramp_up[g, t]
 
-                for tau in range(1, Ton + 1):
+                for tau in range(1, self._min_up_horizon(g) + 1):
                     for t1 in range(self.T - tau):
                         if t == t1 + 1:
                             dual_expr += lambda_min_on[g, tau-1, t1]
@@ -1330,7 +1349,7 @@ class Agent_NN:
                         if t == t1 + tau:
                             dual_expr -= lambda_min_on[g, tau-1, t1]
                             
-                for tau in range(1, Toff + 1):
+                for tau in range(1, self._min_down_horizon(g) + 1):
                     for t1 in range(self.T - tau):
                         if t == t1 + 1:
                             dual_expr -= lambda_min_off[g, tau-1, t1]
@@ -1425,8 +1444,8 @@ class Agent_NN:
                 'lambda_pg_upper': np.array([[lambda_pg_upper[g, t].X for t in range(self.T)] for g in range(self.ng)]),
                 'lambda_ramp_up': np.array([[lambda_ramp_up[g, t].X for t in range(self.T-1)] for g in range(self.ng)]),
                 'lambda_ramp_down': np.array([[lambda_ramp_down[g, t].X for t in range(self.T-1)] for g in range(self.ng)]),
-                'lambda_min_on': np.array([[[lambda_min_on[g, tau, t].X for t in range(self.T)] for tau in range(Ton)] for g in range(self.ng)]),
-                'lambda_min_off': np.array([[[lambda_min_off[g, tau, t].X for t in range(self.T)] for tau in range(Toff)] for g in range(self.ng)]),
+                'lambda_min_on': self._extract_min_up_gurobi_values(lambda_min_on, Ton),
+                'lambda_min_off': self._extract_min_down_gurobi_values(lambda_min_off, Toff),
                 'lambda_start_cost': np.array([[lambda_start_cost[g, t].X for t in range(self.T - 1)] for g in range(self.ng)]),
                 'lambda_shut_cost': np.array([[lambda_shut_cost[g, t].X for t in range(self.T - 1)] for g in range(self.ng)]),
                 'lambda_coc_nonneg': np.array([[lambda_coc_nonneg[g, t].X for t in range(self.T - 1)] for g in range(self.ng)]),
@@ -1595,11 +1614,8 @@ class Agent_NN:
         
         obj_primal, obj_opt, obj_dual = 0, 0, 0
         
-        Ton, Toff = min(4, self.T), min(4, self.T)
-        Ru = 0.4 * self.gen[:, PMAX] / self.T_delta
-        Rd = 0.4 * self.gen[:, PMAX] / self.T_delta
-        Ru_co = 0.3 * self.gen[:, PMAX]
-        Rd_co = 0.3 * self.gen[:, PMAX]
+        Ton, Toff = self.Ton, self.Toff
+        Ru, Rd, Ru_co, Rd_co = get_ramp_limits_from_ppc(self.ppc_raw, self.gen, self.T_delta)
         start_cost = self.gencost[:, 1]
         shut_cost = self.gencost[:, 2]
         
@@ -1723,11 +1739,12 @@ class Agent_NN:
         gen_PMAX = torch.tensor(self.gen[:, PMAX], dtype=torch.float32, device=device)
         gencost_fixed = torch.tensor(self.gencost[:, -1] / self.T_delta, dtype=torch.float32, device=device)
         
-        Ton, Toff = min(4, self.T), min(4, self.T)
-        Ru_co = torch.tensor(0.3 * self.gen[:, PMAX], dtype=torch.float32, device=device)
-        Rd_co = torch.tensor(0.3 * self.gen[:, PMAX], dtype=torch.float32, device=device)
-        Ru = torch.tensor(0.4 * self.gen[:, PMAX] / self.T_delta, dtype=torch.float32, device=device)
-        Rd = torch.tensor(0.4 * self.gen[:, PMAX] / self.T_delta, dtype=torch.float32, device=device)
+        Ton, Toff = self.Ton, self.Toff
+        Ru_np, Rd_np, Ru_co_np, Rd_co_np = get_ramp_limits_from_ppc(self.ppc_raw, self.gen, self.T_delta)
+        Ru_co = torch.tensor(Ru_co_np, dtype=torch.float32, device=device)
+        Rd_co = torch.tensor(Rd_co_np, dtype=torch.float32, device=device)
+        Ru = torch.tensor(Ru_np, dtype=torch.float32, device=device)
+        Rd = torch.tensor(Rd_np, dtype=torch.float32, device=device)
         start_cost = torch.tensor(self.gencost[:, 1], dtype=torch.float32, device=device)
         shut_cost = torch.tensor(self.gencost[:, 2], dtype=torch.float32, device=device)
         
@@ -1867,7 +1884,7 @@ class Agent_NN:
                 if t < self.T - 1:
                     dual_expr = dual_expr + (Ru_co[g] - Ru[g]) * lambda_ramp_up[g, t]
                 
-                for tau in range(1, Ton + 1):
+                for tau in range(1, self._min_up_horizon(g) + 1):
                     lmon_g_tau = lambda_min_on[g, tau - 1]  # (T,)
                     if 0 < t <= self.T - tau:     # t1 = t-1
                         dual_expr = dual_expr + lmon_g_tau[t - 1]
@@ -1876,7 +1893,7 @@ class Agent_NN:
                     if tau <= t < self.T:         # t1 = t-tau
                         dual_expr = dual_expr - lmon_g_tau[t - tau]
 
-                for tau in range(1, Toff + 1):
+                for tau in range(1, self._min_down_horizon(g) + 1):
                     lmoff_g_tau = lambda_min_off[g, tau - 1]  # (T,)
                     if 0 < t <= self.T - tau:     # t1 = t-1
                         dual_expr = dual_expr - lmoff_g_tau[t - 1]
@@ -1927,14 +1944,14 @@ class Agent_NN:
                     obj_complementary = obj_complementary + fb_lower ** 2
             
             for g in range(self.ng):
-                for tau in range(1, Ton + 1):
+                for tau in range(1, self._min_up_horizon(g) + 1):
                     for t1 in range(self.T - tau):
                         g_min_on = x[g, t1+1] - x[g, t1] - x[g, t1+tau]
                         fb_min_on = fischer_burmeister(lambda_min_on[g, tau-1, t1], -g_min_on)
                         obj_complementary = obj_complementary + fb_min_on ** 2
             
             for g in range(self.ng):
-                for tau in range(1, Toff + 1):
+                for tau in range(1, self._min_down_horizon(g) + 1):
                     for t1 in range(self.T - tau):
                         g_min_off = -x[g, t1+1] + x[g, t1] - (1 - x[g, t1+tau])
                         fb_min_off = fischer_burmeister(lambda_min_off[g, tau-1, t1], -g_min_off)
