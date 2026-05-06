@@ -36,6 +36,7 @@ from pypower.idx_brch import RATE_A
 from pypower.makePTDF import makePTDF
 
 from src.uc_NN_BCD import _get_uc_matrix_from_sample
+from src.uc_time_utils import get_min_up_down_steps_from_ppc, get_ramp_limits_from_ppc
 from src.uc_NN_subproblem import (
     build_surrogate_constraint_expression,
     iterate_surrogate_constraint_terms,
@@ -70,6 +71,21 @@ class JointLPTrainer:
         self.n_samples = agent.n_samples
         self.active_set_data = agent.active_set_data
         self.device = agent.device if hasattr(agent, 'device') else torch.device('cpu')
+        if hasattr(agent, 'min_up_steps') and hasattr(agent, 'min_down_steps'):
+            self.min_up_steps = np.asarray(agent.min_up_steps, dtype=int)
+            self.min_down_steps = np.asarray(agent.min_down_steps, dtype=int)
+            self.Ton = int(getattr(agent, 'Ton', np.max(self.min_up_steps)))
+            self.Toff = int(getattr(agent, 'Toff', np.max(self.min_down_steps)))
+        else:
+            (
+                self.min_up_steps,
+                self.min_down_steps,
+                self.Ton,
+                self.Toff,
+            ) = get_min_up_down_steps_from_ppc(getattr(agent, 'ppc_raw', agent.ppc), self.ng, self.T, self.T_delta)
+        self.Ru, self.Rd, self.Ru_co, self.Rd_co = get_ramp_limits_from_ppc(
+            getattr(agent, 'ppc_raw', agent.ppc), self.gen, self.T_delta
+        )
 
         # 预计算 PTDF 和 G 矩阵
         nb = self.bus.shape[0]
@@ -94,8 +110,7 @@ class JointLPTrainer:
 
     def _create_empty_lambda_dict(self) -> Dict[str, np.ndarray]:
         """Create a zero-filled dual variable dictionary with canonical shapes."""
-        Ton = min(4, self.T)
-        Toff = min(4, self.T)
+        Ton, Toff = self.Ton, self.Toff
         return {
             'lambda_power_balance': np.zeros(self.T),
             'lambda_pg_lower': np.zeros((self.ng, self.T)),
@@ -113,6 +128,22 @@ class JointLPTrainer:
             'lambda_x_upper': np.zeros((self.ng, self.T)),
             'lambda_x_lower': np.zeros((self.ng, self.T)),
         }
+
+    def _extract_min_up_gurobi_values(self, vars_dict, width: int) -> np.ndarray:
+        arr = np.zeros((self.ng, int(width), self.T), dtype=float)
+        for g in range(self.ng):
+            for tau in range(min(int(width), int(self.min_up_steps[g]))):
+                for t in range(self.T):
+                    arr[g, tau, t] = float(vars_dict[g, tau, t].X)
+        return arr
+
+    def _extract_min_down_gurobi_values(self, vars_dict, width: int) -> np.ndarray:
+        arr = np.zeros((self.ng, int(width), self.T), dtype=float)
+        for g in range(self.ng):
+            for tau in range(min(int(width), int(self.min_down_steps[g]))):
+                for t in range(self.T):
+                    arr[g, tau, t] = float(vars_dict[g, tau, t].X)
+        return arr
 
     def _normalize_lambda_dict(self, raw_lambda) -> Dict[str, np.ndarray]:
         """Coerce a raw lambda dict to canonical shapes, padding invalid/missing fields with zeros."""
@@ -182,8 +213,7 @@ class JointLPTrainer:
         ramp_up_abs = model.addVars(self.ng, self.T - 1, lb=0, name='ramp_up_abs')
         ramp_down_abs = model.addVars(self.ng, self.T - 1, lb=0, name='ramp_down_abs')
 
-        Ton = min(4, self.T)
-        Toff = min(4, self.T)
+        Ton, Toff = self.Ton, self.Toff
         min_on_viol = model.addVars(self.ng, Ton, self.T, lb=0, name='min_on_viol')
         min_off_viol = model.addVars(self.ng, Toff, self.T, lb=0, name='min_off_viol')
         min_on_abs = model.addVars(self.ng, Ton, self.T, lb=0, name='min_on_abs')
@@ -230,10 +260,7 @@ class JointLPTrainer:
                 obj_opt += (1 - x[g, t]) * abs(agent.lambda_[sample_id]['lambda_x_upper'][g, t])
 
         # --- 爬坡约束 ---
-        Ru = 0.4 * self.gen[:, PMAX] / self.T_delta
-        Rd = 0.4 * self.gen[:, PMAX] / self.T_delta
-        Ru_co = 0.3 * self.gen[:, PMAX]
-        Rd_co = 0.3 * self.gen[:, PMAX]
+        Ru, Rd, Ru_co, Rd_co = self.Ru, self.Rd, self.Ru_co, self.Rd_co
 
         for t in range(1, self.T):
             for g in range(self.ng):
@@ -254,7 +281,7 @@ class JointLPTrainer:
 
         # --- 最小开关机时间约束 ---
         for g in range(self.ng):
-            for t in range(1, Ton + 1):
+            for t in range(1, int(self.min_up_steps[g]) + 1):
                 for t1 in range(self.T - t):
                     min_on_expr = x[g, t1 + 1] - x[g, t1] - x[g, t1 + t]
                     model.addConstr(min_on_viol[g, t - 1, t1] >= min_on_expr)
@@ -264,7 +291,7 @@ class JointLPTrainer:
                     obj_opt += min_on_abs[g, t - 1, t1] * abs(agent.lambda_[sample_id]['lambda_min_on'][g, t - 1, t1])
 
         for g in range(self.ng):
-            for t in range(1, Toff + 1):
+            for t in range(1, int(self.min_down_steps[g]) + 1):
                 for t1 in range(self.T - t):
                     min_off_expr = -x[g, t1 + 1] + x[g, t1] - (1 - x[g, t1 + t])
                     model.addConstr(min_off_viol[g, t - 1, t1] >= min_off_expr)
@@ -428,8 +455,7 @@ class JointLPTrainer:
         lambda_ramp_up = model.addVars(self.ng, self.T - 1, lb=0, name='lambda_ramp_up')
         lambda_ramp_down = model.addVars(self.ng, self.T - 1, lb=0, name='lambda_ramp_down')
 
-        Ton = min(4, self.T)
-        Toff = min(4, self.T)
+        Ton, Toff = self.Ton, self.Toff
         lambda_min_on = model.addVars(self.ng, Ton, self.T, lb=0, name='lambda_min_on')
         lambda_min_off = model.addVars(self.ng, Toff, self.T, lb=0, name='lambda_min_off')
         lambda_start_cost = model.addVars(self.ng, self.T - 1, lb=0, name='lambda_start_cost')
@@ -482,10 +508,7 @@ class JointLPTrainer:
         PTDF = self.PTDF
         G_mat = self.G
         branch_limit = self.branch_limit
-        Ru = 0.4 * self.gen[:, PMAX] / self.T_delta
-        Rd = 0.4 * self.gen[:, PMAX] / self.T_delta
-        Ru_co = 0.3 * self.gen[:, PMAX]
-        Rd_co = 0.3 * self.gen[:, PMAX]
+        Ru, Rd, Ru_co, Rd_co = self.Ru, self.Rd, self.Ru_co, self.Rd_co
         start_cost_coeff = self.gencost[:, 1]
         shut_cost_coeff = self.gencost[:, 2]
 
@@ -552,7 +575,7 @@ class JointLPTrainer:
                 if t < self.T - 1:
                     dual_expr += (Ru_co[g] - Ru[g]) * lambda_ramp_up[g, t]
 
-                for tau in range(1, Ton + 1):
+                for tau in range(1, int(self.min_up_steps[g]) + 1):
                     for t1 in range(self.T - tau):
                         if t == t1 + 1:
                             dual_expr += lambda_min_on[g, tau - 1, t1]
@@ -561,7 +584,7 @@ class JointLPTrainer:
                         if t == t1 + tau:
                             dual_expr -= lambda_min_on[g, tau - 1, t1]
 
-                for tau in range(1, Toff + 1):
+                for tau in range(1, int(self.min_down_steps[g]) + 1):
                     for t1 in range(self.T - tau):
                         if t == t1 + 1:
                             dual_expr -= lambda_min_off[g, tau - 1, t1]
@@ -649,14 +672,14 @@ class JointLPTrainer:
                     obj_opt += rd_viol * lambda_ramp_down[g, t - 1]
 
         for g in range(self.ng):
-            for t in range(1, Ton + 1):
+            for t in range(1, int(self.min_up_steps[g]) + 1):
                 for t1 in range(self.T - t):
                     mon_viol = abs(x_arr[g, t1 + 1] - x_arr[g, t1] - x_arr[g, t1 + t])
                     if mon_viol > 1e-10:
                         obj_opt += mon_viol * lambda_min_on[g, t - 1, t1]
 
         for g in range(self.ng):
-            for t in range(1, Toff + 1):
+            for t in range(1, int(self.min_down_steps[g]) + 1):
                 for t1 in range(self.T - t):
                     moff_viol = abs(-x_arr[g, t1 + 1] + x_arr[g, t1] - 1 + x_arr[g, t1 + t])
                     if moff_viol > 1e-10:
@@ -749,8 +772,8 @@ class JointLPTrainer:
                 'lambda_pg_upper': np.array([[lambda_pg_upper[g, t].X for t in range(self.T)] for g in range(self.ng)]),
                 'lambda_ramp_up': np.array([[lambda_ramp_up[g, t].X for t in range(self.T - 1)] for g in range(self.ng)]),
                 'lambda_ramp_down': np.array([[lambda_ramp_down[g, t].X for t in range(self.T - 1)] for g in range(self.ng)]),
-                'lambda_min_on': np.array([[[lambda_min_on[g, tau, t].X for t in range(self.T)] for tau in range(Ton)] for g in range(self.ng)]),
-                'lambda_min_off': np.array([[[lambda_min_off[g, tau, t].X for t in range(self.T)] for tau in range(Toff)] for g in range(self.ng)]),
+                'lambda_min_on': self._extract_min_up_gurobi_values(lambda_min_on, Ton),
+                'lambda_min_off': self._extract_min_down_gurobi_values(lambda_min_off, Toff),
                 'lambda_start_cost': np.array([[lambda_start_cost[g, t].X for t in range(self.T - 1)] for g in range(self.ng)]),
                 'lambda_shut_cost': np.array([[lambda_shut_cost[g, t].X for t in range(self.T - 1)] for g in range(self.ng)]),
                 'lambda_coc_nonneg': np.array([[lambda_coc_nonneg[g, t].X for t in range(self.T - 1)] for g in range(self.ng)]),

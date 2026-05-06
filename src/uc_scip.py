@@ -18,6 +18,7 @@ root_dir = Path(__file__).resolve().parent.parent
 sys.path.append(str(root_dir))
 
 from src.case39_pypower import get_case39_pypower
+from src.uc_time_utils import get_min_up_down_steps_from_ppc, get_ramp_limits_from_ppc
 
 def print_basic_info(model):
     """打印基本求解信息"""
@@ -119,6 +120,7 @@ def save_problem_to_file(model, filename):
 class UnitCommitmentModelSCIP:
     def __init__(self, ppc, Pd, T_delta):
         self.ppc = ppc
+        self.ppc_raw = ppc
         ppc = ext2int(ppc)
         self.baseMVA = ppc['baseMVA']
         self.bus = ppc['bus']
@@ -160,10 +162,7 @@ class UnitCommitmentModelSCIP:
                 self.model.addCons(self.pg[g, t] <= self.gen[g, PMAX] * self.x[g, t])
 
         # 爬坡约束
-        Ru = 0.4 * self.gen[:, PMAX] / self.T_delta
-        Rd = 0.4 * self.gen[:, PMAX] / self.T_delta
-        Ru_co = 0.3 * self.gen[:, PMAX]
-        Rd_co = 0.3 * self.gen[:, PMAX]
+        Ru, Rd, Ru_co, Rd_co = get_ramp_limits_from_ppc(self.ppc_raw, self.gen, self.T_delta)
         for t in range(1, self.T):
             for g in range(self.ng):
                 self.model.addCons(
@@ -174,13 +173,14 @@ class UnitCommitmentModelSCIP:
                 )
 
         # 最小开机/关机时间约束
-        Ton = int(4 * self.T_delta)
-        Toff = int(4 * self.T_delta)
+        min_up_steps, min_down_steps, _, _ = get_min_up_down_steps_from_ppc(
+            self.ppc_raw, self.ng, self.T, self.T_delta
+        )
         for g in range(self.ng):
-            for t in range(1, Ton+1):
+            for t in range(1, int(min_up_steps[g]) + 1):
                 for t1 in range(self.T - t):
                     self.model.addCons(self.x[g, t1+1] - self.x[g, t1] <= self.x[g, t1+t])
-            for t in range(1, Toff+1):
+            for t in range(1, int(min_down_steps[g]) + 1):
                 for t1 in range(self.T - t):
                     self.model.addCons(-self.x[g, t1+1] + self.x[g, t1] <= 1 - self.x[g, t1+t])
 
