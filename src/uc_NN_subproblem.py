@@ -2512,6 +2512,17 @@ def resolve_constraint_offsets_from_trainer(
     strategy = normalize_constraint_generation_strategy(
         getattr(trainer, 'constraint_generation_strategy', 'sensitive') or 'sensitive'
     )
+    if strategy == CONSTRAINT_STRATEGY_ALL_TEMPLATES_SIGN4_PLUS_SINGLE:
+        T = int(getattr(trainer, 'T', 0) or 0)
+        group_size = max(int(getattr(trainer, 'all_mode_group_size', 4) or 4), 1)
+        head = group_size * max(T - 2, 0)
+        default_offsets = [
+            SURROGATE_TRIPLE_WINDOW_OFFSETS if k < head else SURROGATE_SINGLE_TIME_OFFSETS
+            for k in range(n_constraints)
+        ]
+        if 'resolved' in locals() and resolved:
+            return (resolved + default_offsets[len(resolved):])[:n_constraints]
+        return default_offsets
     default_offsets = (
         SURROGATE_SINGLE_TIME_OFFSETS
         if strategy == CONSTRAINT_STRATEGY_ALL_SINGLE_TIME
@@ -2728,6 +2739,7 @@ class SubproblemSurrogateTrainer:
                  surrogate_delta_reference_eps: float = 1e-6,
                  surrogate_delta_reference_scope: str = "sign4_only",
                  surrogate_delta_reference_min_abs_factor: float = 1e-9,
+                 skip_initial_solve: bool = False,
                  device=None):
         """
         初始化单机组子问题代理约束训练器 - V3三时段版本
@@ -3007,7 +3019,14 @@ class SubproblemSurrogateTrainer:
         self._apply_initial_surrogate_templates()
         
         # 初始化求解
-        self._initialize_solve()
+        self._skip_initial_solve = bool(skip_initial_solve)
+        if self._skip_initial_solve:
+            print(
+                f"  [Unit-{self.unit_id}] skip initial solve for checkpoint loading/test-only evaluation",
+                flush=True,
+            )
+        else:
+            self._initialize_solve()
         if self.enable_surrogate_delta_reference_lift:
             self._sync_surrogate_direction_strategy_state()
             self._lift_surrogate_delta_for_reference_x()
@@ -8616,6 +8635,7 @@ def load_trained_models(ppc, active_set_data: List[Dict], T_delta: float,
                          unit_predictor_dropout: float = 0.1,
                          unit_predictor_finetune_lr: float = 1e-5,
                          unit_predictor_weight_decay: float = 1e-4,
+                         skip_initial_solve: bool = True,
                          device=None):
     """
     加载已训练的模型
@@ -8772,6 +8792,7 @@ def load_trained_models(ppc, active_set_data: List[Dict], T_delta: float,
             use_unit_predictor=(unit_predictor_obj is not None),
             unit_predictor_finetune_lr=unit_predictor_finetune_lr,
             unit_predictor_weight_decay=unit_predictor_weight_decay,
+            skip_initial_solve=skip_initial_solve,
             device=device,
         )
         trainer.load(surrogate_path)

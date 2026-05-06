@@ -14,6 +14,7 @@ import sys
 import subprocess
 import time
 import json
+import csv
 from datetime import datetime
 from pathlib import Path
 
@@ -1700,6 +1701,262 @@ def plot_lp_vs_true(x_LP_list: list, x_true_list: list,
     _save_fig(fig, fig_dir / f'{case_name}_lp_vs_true', 'LP 与真实解对比')
 
 
+def _safe_float_for_json(value):
+    try:
+        x = float(value)
+    except Exception:
+        return None
+    return x if np.isfinite(x) else None
+
+
+def _save_global_surrogate_solve_stats(rows: list[dict], fig_dir: Path, case_name: str) -> None:
+    """Persist and plot solve statistics for the global LP with all surrogate constraints."""
+    if not rows:
+        return
+
+    source_fields = {
+        "num_base_constraints",
+        "num_proxy_constraints",
+        "num_subproblem_surrogate_constraints",
+        "num_bcd_theta_constraints",
+        "num_bcd_zeta_constraints",
+        "num_sparse_constraints",
+        "objective_solver_full",
+        "objective_bound",
+    }
+    rows = [{k: v for k, v in row.items() if k not in source_fields} for row in rows]
+
+    stats_dir = Path(__file__).parent / "result" / "solve_stats"
+    stats_dir.mkdir(parents=True, exist_ok=True)
+    base = stats_dir / f"{case_name}_global_surrogate_solve_stats"
+
+    field_order = [
+        "sample_index", "status_name", "status", "stage_name", "stage_index",
+        "used_fallback_stage", "used_soft_subproblem", "used_soft_bcd",
+        "runtime_sec", "work", "iter_count", "bar_iter_count",
+        "objective", "objective_problem", "objective_uc_cost", "objective_surrogate_aux",
+        "num_vars", "num_constraints", "num_nonzeros",
+        "num_subproblem_slacks", "num_bcd_slacks",
+        "subproblem_slack_sum", "subproblem_slack_max", "bcd_slack_sum", "bcd_slack_max",
+        "integrality_gap", "l1_to_true", "hamming_to_true",
+    ]
+    fields = field_order + sorted({k for row in rows for k in row.keys()} - set(field_order))
+
+    csv_path = base.with_suffix(".csv")
+    with csv_path.open("w", newline="", encoding="utf-8-sig") as f:
+        writer = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
+
+    json_rows = []
+    for row in rows:
+        clean = {}
+        for k, v in row.items():
+            if isinstance(v, np.integer):
+                clean[k] = int(v)
+            elif isinstance(v, (np.floating, float)):
+                clean[k] = _safe_float_for_json(v)
+            else:
+                clean[k] = v
+        json_rows.append(clean)
+    json_path = base.with_suffix(".json")
+    json_path.write_text(json.dumps(json_rows, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    valid = [r for r in rows if str(r.get("status_name")) == "OPTIMAL"]
+    log_section("Global surrogate main-model solve statistics")
+    log(f"stats files: {csv_path} / {json_path}")
+    log(f"valid_optimal={len(valid)}/{len(rows)}")
+    if valid:
+        runtime = np.asarray([float(r.get("runtime_sec", np.nan)) for r in valid], dtype=float)
+        runtime = runtime[np.isfinite(runtime)]
+        obj = np.asarray([float(r.get("objective", np.nan)) for r in valid], dtype=float)
+        obj = obj[np.isfinite(obj)]
+        integ = np.asarray([float(r.get("integrality_gap", np.nan)) for r in valid], dtype=float)
+        integ = integ[np.isfinite(integ)]
+        hamming = np.asarray([float(r.get("hamming_to_true", np.nan)) for r in valid], dtype=float)
+        hamming = hamming[np.isfinite(hamming)]
+        if runtime.size:
+            log(
+                "runtime_sec: "
+                f"mean={np.mean(runtime):.4f}, median={np.median(runtime):.4f}, "
+                f"min={np.min(runtime):.4f}, max={np.max(runtime):.4f}"
+            )
+        if obj.size:
+            log(
+                "objective: "
+                f"mean={np.mean(obj):.4f}, median={np.median(obj):.4f}, "
+                f"min={np.min(obj):.4f}, max={np.max(obj):.4f}"
+            )
+        if integ.size:
+            log(
+                "integrality_gap: "
+                f"mean={np.mean(integ):.4f}, median={np.median(integ):.4f}, max={np.max(integ):.4f}"
+            )
+        if hamming.size:
+            log(
+                "hamming_to_true: "
+                f"mean={np.mean(hamming):.2f}, median={np.median(hamming):.2f}, max={np.max(hamming):.0f}"
+            )
+        log(f"constraints: total={int(valid[0].get('num_constraints', 0))}")
+
+    if RUN_TEST_DISABLE_PLOTS or not MPL_AVAILABLE:
+        return
+
+    _apply_style()
+    plot_dir = fig_dir / f"{case_name}_global_surrogate_solve_stats"
+    plot_dir.mkdir(parents=True, exist_ok=True)
+    sample_x = np.asarray([int(r["sample_index"]) for r in rows], dtype=int)
+    runtime_all = np.asarray([float(r.get("runtime_sec", np.nan)) for r in rows], dtype=float)
+    objective_all = np.asarray([float(r.get("objective", np.nan)) for r in rows], dtype=float)
+    integ_all = np.asarray([float(r.get("integrality_gap", np.nan)) for r in rows], dtype=float)
+    hamming_all = np.asarray([float(r.get("hamming_to_true", np.nan)) for r in rows], dtype=float)
+
+    fig, ax = plt.subplots(figsize=(7, 4))
+    ax.plot(sample_x, runtime_all, marker="o", linewidth=1.4, color="#0A3F70")
+    ax.set_title("Runtime by sample", loc="left", fontsize=10)
+    ax.set_xlabel("Sample index")
+    ax.set_ylabel("Seconds")
+    ax.grid(True, axis="y", alpha=0.3)
+    fig.tight_layout()
+    _save_fig(fig, plot_dir / "runtime_by_sample", "Global surrogate runtime by sample")
+
+    fig, ax = plt.subplots(figsize=(5, 4))
+    finite_runtime = runtime_all[np.isfinite(runtime_all)]
+    if finite_runtime.size:
+        ax.boxplot(finite_runtime, vert=True, widths=0.5)
+    ax.set_title("Runtime distribution", loc="left", fontsize=10)
+    ax.set_xticks([1])
+    ax.set_xticklabels(["Global surrogate LP"])
+    ax.set_ylabel("Seconds")
+    ax.grid(True, axis="y", alpha=0.3)
+    fig.tight_layout()
+    _save_fig(fig, plot_dir / "runtime_distribution", "Global surrogate runtime distribution")
+
+    fig, ax = plt.subplots(figsize=(7, 4))
+    ax.plot(sample_x, objective_all, marker="s", linewidth=1.4, color="#238B45")
+    ax.set_title("Problem objective by sample", loc="left", fontsize=10)
+    ax.set_xlabel("Sample index")
+    ax.set_ylabel("Objective without soft penalties")
+    ax.grid(True, axis="y", alpha=0.3)
+    fig.tight_layout()
+    _save_fig(fig, plot_dir / "problem_objective_by_sample", "Global surrogate problem objective")
+
+    fig, ax1 = plt.subplots(figsize=(7, 4))
+    ax1.plot(sample_x, integ_all, marker="o", linewidth=1.4, color="#2166AC", label="Integrality")
+    ax1.set_xlabel("Sample index")
+    ax1.set_ylabel("Mean integrality gap")
+    ax2 = ax1.twinx()
+    ax2.plot(sample_x, hamming_all, marker="s", linewidth=1.4, color="#D6604D", label="Hamming")
+    ax2.set_ylabel("Hamming distance")
+    ax1.set_title("Solution quality by sample", loc="left", fontsize=10)
+    ax1.grid(True, axis="y", alpha=0.3)
+    fig.tight_layout()
+    _save_fig(fig, plot_dir / "solution_quality_by_sample", "Global surrogate solution quality")
+
+
+def _save_global_main_constraint_activity(rows: list[dict], fig_dir: Path, case_name: str) -> None:
+    """Persist and plot main-problem activity for proxy constraints in the global model."""
+    if not rows:
+        return
+
+    plot_dir = fig_dir / f"{case_name}_global_surrogate_solve_stats" / "main_activity"
+    plot_dir.mkdir(parents=True, exist_ok=True)
+    csv_path = plot_dir / "main_constraint_activity_by_sample_row.csv"
+    field_order = [
+        "sample_index", "kind", "constraint_name", "unit_id", "constraint_index",
+        "branch_id", "time_slot", "stage_name", "row_slack", "abs_row_slack",
+        "dual", "abs_dual", "is_row_active_1e_6", "is_dual_active_1e_7",
+        "relaxation_value", "is_relaxed",
+    ]
+    fields = field_order + sorted({k for row in rows for k in row.keys()} - set(field_order))
+    with csv_path.open("w", newline="", encoding="utf-8-sig") as f:
+        writer = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
+
+    groups: dict[tuple[int, str], list[dict]] = {}
+    for row in rows:
+        key = (int(row.get("sample_index", -1)), str(row.get("kind", "unknown")))
+        groups.setdefault(key, []).append(row)
+    aggregate_rows = []
+    for (sample_idx, kind), items in sorted(groups.items()):
+        slacks = np.asarray([float(r.get("abs_row_slack", np.nan)) for r in items], dtype=float)
+        duals = np.asarray([float(r.get("abs_dual", np.nan)) for r in items], dtype=float)
+        aggregate_rows.append({
+            "sample_index": sample_idx,
+            "kind": kind,
+            "n_rows": len(items),
+            "row_active_rate_1e_6": float(np.mean([bool(r.get("is_row_active_1e_6", False)) for r in items])),
+            "dual_active_rate_1e_7": float(np.mean([bool(r.get("is_dual_active_1e_7", False)) for r in items])),
+            "relaxed_rate_1e_8": float(np.mean([bool(r.get("is_relaxed", False)) for r in items])),
+            "abs_slack_mean": float(np.nanmean(slacks)) if slacks.size else float("nan"),
+            "abs_slack_median": float(np.nanmedian(slacks)) if slacks.size else float("nan"),
+            "abs_slack_max": float(np.nanmax(slacks)) if slacks.size else float("nan"),
+            "abs_dual_mean": float(np.nanmean(duals)) if duals.size else float("nan"),
+            "abs_dual_median": float(np.nanmedian(duals)) if duals.size else float("nan"),
+            "abs_dual_max": float(np.nanmax(duals)) if duals.size else float("nan"),
+        })
+    aggregate_path = plot_dir / "main_constraint_activity_summary.csv"
+    if aggregate_rows:
+        with aggregate_path.open("w", newline="", encoding="utf-8-sig") as f:
+            writer = csv.DictWriter(f, fieldnames=list(aggregate_rows[0].keys()))
+            writer.writeheader()
+            writer.writerows(aggregate_rows)
+
+    log_section("Global main-problem proxy constraint activity")
+    log(f"activity files: {csv_path} / {aggregate_path}")
+    log(f"activity rows={len(rows)} | summary rows={len(aggregate_rows)}")
+
+    if RUN_TEST_DISABLE_PLOTS or not MPL_AVAILABLE or not aggregate_rows:
+        return
+
+    _apply_style()
+    sample_ids = sorted({int(r["sample_index"]) for r in aggregate_rows})
+    kinds = sorted({str(r["kind"]) for r in aggregate_rows})
+
+    fig, ax = plt.subplots(figsize=(8, 4.5))
+    for kind in kinds:
+        y = []
+        for sid in sample_ids:
+            rec = next((r for r in aggregate_rows if r["sample_index"] == sid and r["kind"] == kind), None)
+            y.append(np.nan if rec is None else float(rec["row_active_rate_1e_6"]))
+        ax.plot(sample_ids, y, marker="o", linewidth=1.4, label=kind)
+    ax.set_title("Main-problem proxy row activity", loc="left", fontsize=10)
+    ax.set_xlabel("Sample index")
+    ax.set_ylabel("Active row rate")
+    ax.set_ylim(-0.02, 1.02)
+    ax.legend(frameon=True)
+    ax.grid(True, axis="y", alpha=0.3)
+    fig.tight_layout()
+    _save_fig(fig, plot_dir / "main_row_active_rate_by_sample", "Main-problem proxy row activity")
+
+    fig, ax = plt.subplots(figsize=(7, 4))
+    slack_vals = np.asarray([float(r.get("abs_row_slack", np.nan)) for r in rows], dtype=float)
+    slack_vals = slack_vals[np.isfinite(slack_vals)]
+    if slack_vals.size:
+        ax.hist(np.log10(slack_vals + 1e-12), bins=30, color="#3182BD", alpha=0.85)
+    ax.set_title("Main-problem proxy slack distribution", loc="left", fontsize=10)
+    ax.set_xlabel(r"$\log_{10}(|slack| + 10^{-12})$")
+    ax.set_ylabel("Rows")
+    ax.grid(True, axis="y", alpha=0.3)
+    fig.tight_layout()
+    _save_fig(fig, plot_dir / "main_row_slack_hist", "Main-problem proxy slack distribution")
+
+    fig, ax = plt.subplots(figsize=(7, 4))
+    dual_vals = np.asarray([float(r.get("abs_dual", np.nan)) for r in rows], dtype=float)
+    dual_vals = dual_vals[np.isfinite(dual_vals)]
+    if dual_vals.size:
+        ax.hist(np.log10(dual_vals + 1e-12), bins=30, color="#D6604D", alpha=0.85)
+    ax.set_title("Main-problem proxy dual distribution", loc="left", fontsize=10)
+    ax.set_xlabel(r"$\log_{10}(|dual| + 10^{-12})$")
+    ax.set_ylabel("Rows")
+    ax.grid(True, axis="y", alpha=0.3)
+    fig.tight_layout()
+    _save_fig(fig, plot_dir / "main_row_dual_hist", "Main-problem proxy dual distribution")
+
+
 def run_lp_compare_test(ppc, all_samples: list, dual_predictor, trainers: dict,
                         T_DELTA: float, n_test: int,
                         fig_dir: Path, agent=None) -> list:
@@ -1724,6 +1981,8 @@ def run_lp_compare_test(ppc, all_samples: list, dual_predictor, trainers: dict,
     log_section(f"LP 松弛解质量评估 | samples={test_n}")
 
     x_LP_plain_list, x_LP_surr_list, x_true_list = [], [], []
+    global_surr_stats_rows: list[dict] = []
+    global_main_activity_rows: list[dict] = []
     first_plot_payload = None
 
     for i in range(test_n):
@@ -1736,8 +1995,15 @@ def run_lp_compare_test(ppc, all_samples: list, dual_predictor, trainers: dict,
         try:
             lambda_val = dual_predictor.predict(sample)
             x_lp_plain = solve_global_LP_relaxation_without_surrogate(ppc, pd_data, T_DELTA)
-            x_lp_surr = solve_global_LP_relaxation(ppc, sample, T_DELTA, trainers, lambda_val,
-                                                   agent=agent)
+            x_lp_surr, solve_stats = solve_global_LP_relaxation(
+                ppc,
+                sample,
+                T_DELTA,
+                trainers,
+                lambda_val,
+                agent=agent,
+                return_stats=True,
+            )
         except Exception as e:
             log(f"  LP 求解失败: {e}")
             continue
@@ -1749,11 +2015,30 @@ def run_lp_compare_test(ppc, all_samples: list, dual_predictor, trainers: dict,
         x_lp_surr_rounded = (x_lp_surr >= 0.5).astype(int)
         hamming_plain = int(np.sum(x_lp_plain_rounded != x_true.astype(int)))
         hamming_surr = int(np.sum(x_lp_surr_rounded != x_true.astype(int)))
+        l1_surr = float(np.sum(np.abs(x_lp_surr - x_true)))
         integ_plain = float(np.mean(np.minimum(x_lp_plain, 1.0 - x_lp_plain)))
         integ_surr = float(np.mean(np.minimum(x_lp_surr, 1.0 - x_lp_surr)))
+        stats_row = dict(solve_stats or {})
+        activity_rows = list(stats_row.pop("main_constraint_activity_rows", []) or [])
+        for activity_row in activity_rows:
+            activity_row = dict(activity_row)
+            activity_row["sample_index"] = int(i)
+            global_main_activity_rows.append(activity_row)
+        stats_row["num_main_activity_rows"] = int(len(activity_rows))
+        stats_row["num_stage_attempts"] = len(stats_row.get("all_stage_attempts") or [])
+        stats_row.pop("all_stage_attempts", None)
+        stats_row.update({
+            "sample_index": int(i),
+            "integrality_gap": float(integ_surr),
+            "l1_to_true": float(l1_surr),
+            "hamming_to_true": int(hamming_surr),
+        })
+        global_surr_stats_rows.append(stats_row)
         log(
             f"  LP: integ={integ_plain:.4f} | Hamming={hamming_plain} | "
-            f"Surrogate LP: integ={integ_surr:.4f} | Hamming={hamming_surr}"
+            f"Surrogate LP: integ={integ_surr:.4f} | Hamming={hamming_surr} | "
+            f"runtime={float(stats_row.get('runtime_sec', float('nan'))):.4f}s | "
+            f"stage={stats_row.get('stage_name', 'n/a')}"
         )
 
         x_LP_plain_list.append(x_lp_plain)
@@ -1783,6 +2068,9 @@ def run_lp_compare_test(ppc, all_samples: list, dual_predictor, trainers: dict,
             plot_surrogate_commitment_comparison(
                 x_true, x_lp_plain, x_lp_surr, x_sub, sample_id, fig_dir, CASE_NAME,
             )
+
+    _save_global_surrogate_solve_stats(global_surr_stats_rows, fig_dir, CASE_NAME)
+    _save_global_main_constraint_activity(global_main_activity_rows, fig_dir, CASE_NAME)
 
     return list(zip(x_LP_plain_list, x_LP_surr_list, x_true_list))
 

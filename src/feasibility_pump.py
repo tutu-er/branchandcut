@@ -13,7 +13,8 @@ import numpy as np
 import gurobipy as gp
 from gurobipy import GRB
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Dict, List, Optional, Tuple
+import re
+from typing import Any, Dict, List, Optional, Tuple
 
 from pypower.ext2int import ext2int
 from pypower.makePTDF import makePTDF
@@ -26,11 +27,13 @@ try:
         CONSTRAINT_STRATEGY_ALL,
         CONSTRAINT_STRATEGY_ALL_SINGLE_TIME,
         CONSTRAINT_STRATEGY_ALL_TEMPLATES_SIGN4,
+        CONSTRAINT_STRATEGY_ALL_TEMPLATES_SIGN4_PLUS_SINGLE,
         SURROGATE_SINGLE_TIME_OFFSETS,
         SURROGATE_TRIPLE_WINDOW_OFFSETS,
         build_surrogate_constraint_expression,
         normalize_constraint_generation_strategy,
         resolve_constraint_offsets_from_trainer,
+        select_constraint_layout,
     )
 except ImportError:
     from src.uc_NN_subproblem import (
@@ -38,11 +41,13 @@ except ImportError:
         CONSTRAINT_STRATEGY_ALL,
         CONSTRAINT_STRATEGY_ALL_SINGLE_TIME,
         CONSTRAINT_STRATEGY_ALL_TEMPLATES_SIGN4,
+        CONSTRAINT_STRATEGY_ALL_TEMPLATES_SIGN4_PLUS_SINGLE,
         SURROGATE_SINGLE_TIME_OFFSETS,
         SURROGATE_TRIPLE_WINDOW_OFFSETS,
         build_surrogate_constraint_expression,
         normalize_constraint_generation_strategy,
         resolve_constraint_offsets_from_trainer,
+        select_constraint_layout,
     )
 try:
     from sparse_surrogate_mining import (
@@ -199,23 +204,28 @@ def _resolve_surrogate_constraint_timesteps(
     n_constraints: int,
 ) -> List[int]:
     """Map surrogate parameter indices to the intended 3-period windows."""
-    if n_constraints <= 0 or T < 3:
+    if n_constraints <= 0:
         return []
 
-    T_triples = T - 2
     strategy = normalize_constraint_generation_strategy(
         getattr(trainer, 'constraint_generation_strategy', 'sensitive') or 'sensitive'
     )
 
-    if strategy == CONSTRAINT_STRATEGY_ALL_SINGLE_TIME:
-        return [min(k, T - 1) for k in range(n_constraints)]
+    if strategy != 'sensitive':
+        layout_timesteps, _ = select_constraint_layout(
+            np.zeros(max(int(T), 0), dtype=float),
+            strategy=strategy,
+            max_constraints=n_constraints,
+        )
+        if len(layout_timesteps) < n_constraints:
+            raise ValueError(
+                f"Strategy {strategy} produced {len(layout_timesteps)} timesteps, "
+                f"but {n_constraints} surrogate constraints were requested."
+            )
+        return list(layout_timesteps[:n_constraints])
 
-    if strategy == CONSTRAINT_STRATEGY_ALL:
-        return [k % T_triples for k in range(n_constraints)]
-
-    if strategy == CONSTRAINT_STRATEGY_ALL_TEMPLATES_SIGN4:
-        group_size = max(int(getattr(trainer, 'all_mode_group_size', 4) or 4), 1)
-        return [min(k // group_size, T_triples - 1) for k in range(n_constraints)]
+    if T < 3:
+        return []
 
     sample_id = _resolve_surrogate_sample_id(trainer, sample)
     if sample_id is None:
@@ -2162,7 +2172,8 @@ def solve_global_LP_relaxation(
     agent=None,
     sparse_library: Optional[SparseSurrogateLibrary] = None,
     sparse_x_template_library: Optional[SparseConstraintTemplateLibrary] = None,
-) -> np.ndarray:
+    return_stats: bool = False,
+) -> np.ndarray | Tuple[np.ndarray, Dict[str, Any]]:
     """
     构建完整 UC LP 松弛（x �?[0,1]），按以下顺序分级尝试代理约束：
       1. BCD + subproblem 全部硬约�?      2. 保持 BCD 为硬约束，仅�?subproblem 约束软化到高罚项
@@ -2204,7 +2215,154 @@ def solve_global_LP_relaxation(
     shut_cost  = gencost[:, 2]   # gencost �?2 列：关机成本
 
     last_status = None
+    stage_stats: List[Dict[str, Any]] = []
     stages = _build_surrogate_relaxation_stages()
+
+    def _safe_attr(_model, _name: str, _default=None):
+        try:
+            return getattr(_model, _name)
+        except Exception:
+            return _default
+
+    def _collect_model_stats(_model, _stage: dict, _stage_index: int) -> Dict[str, Any]:
+        try:
+            constr_names = [c.ConstrName for c in _model.getConstrs()]
+        except Exception:
+            constr_names = []
+        n_subproblem = sum(1 for name in constr_names if name.startswith("g") and "_surr_" in name)
+        n_theta = sum(1 for name in constr_names if name.startswith("theta_surr_"))
+        n_zeta = sum(1 for name in constr_names if name.startswith("zeta_surr_"))
+        n_sparse = sum(1 for name in constr_names if name.startswith("sparse"))
+        n_total = int(_safe_attr(_model, "NumConstrs", len(constr_names)) or 0)
+        n_proxy = int(n_subproblem + n_theta + n_zeta + n_sparse)
+        sol_count = int(_safe_attr(_model, "SolCount", 0) or 0)
+        stats = {
+            "stage_index": int(_stage_index),
+            "stage_name": str(_stage["name"]),
+            "status": int(_safe_attr(_model, "Status", _model.status) or _model.status),
+            "status_name": _gurobi_status_name(_safe_attr(_model, "Status", _model.status)),
+            "runtime_sec": float(_safe_attr(_model, "Runtime", float("nan"))),
+            "work": float(_safe_attr(_model, "Work", float("nan"))),
+            "iter_count": float(_safe_attr(_model, "IterCount", float("nan"))),
+            "bar_iter_count": float(_safe_attr(_model, "BarIterCount", float("nan"))),
+            "objective": float(_safe_attr(_model, "ObjVal", float("nan"))) if sol_count > 0 else float("nan"),
+            "objective_bound": float(_safe_attr(_model, "ObjBound", float("nan"))) if sol_count > 0 else float("nan"),
+            "num_vars": int(_safe_attr(_model, "NumVars", 0) or 0),
+            "num_constraints": n_total,
+            "num_nonzeros": int(_safe_attr(_model, "NumNZs", 0) or 0),
+            "num_proxy_constraints": n_proxy,
+            "num_subproblem_surrogate_constraints": int(n_subproblem),
+            "num_bcd_theta_constraints": int(n_theta),
+            "num_bcd_zeta_constraints": int(n_zeta),
+            "num_sparse_constraints": int(n_sparse),
+            "num_base_constraints": int(max(0, n_total - n_proxy)),
+            "num_subproblem_slacks": int(len(subproblem_slacks)),
+            "num_bcd_slacks": int(len(bcd_slacks)),
+            "hard_subproblem": bool(_stage["hard_subproblem"]),
+            "hard_bcd": bool(_stage["hard_bcd"]),
+            "used_soft_subproblem": not bool(_stage["hard_subproblem"]),
+            "used_soft_bcd": not bool(_stage["hard_bcd"]),
+            "used_fallback_stage": int(_stage_index) > 1,
+        }
+        if subproblem_slacks and sol_count > 0:
+            vals = [float(v.X) for v in subproblem_slacks]
+            stats["subproblem_slack_sum"] = float(np.sum(vals))
+            stats["subproblem_slack_max"] = float(np.max(vals))
+        else:
+            stats["subproblem_slack_sum"] = 0.0
+            stats["subproblem_slack_max"] = 0.0
+        if bcd_slacks and sol_count > 0:
+            vals = [float(v.X) for v in bcd_slacks]
+            stats["bcd_slack_sum"] = float(np.sum(vals))
+            stats["bcd_slack_max"] = float(np.max(vals))
+        else:
+            stats["bcd_slack_sum"] = 0.0
+            stats["bcd_slack_max"] = 0.0
+        return stats
+
+    def _collect_main_constraint_activity_rows(_model, _stage: dict, _stage_index: int) -> List[Dict[str, Any]]:
+        var_values = {}
+        try:
+            var_values = {v.VarName: float(v.X) for v in _model.getVars()}
+        except Exception:
+            var_values = {}
+
+        rows: List[Dict[str, Any]] = []
+        try:
+            constrs = list(_model.getConstrs())
+        except Exception:
+            return rows
+
+        for c in constrs:
+            name = str(getattr(c, "ConstrName", ""))
+            kind = None
+            unit_id = None
+            constraint_index = None
+            branch_id = None
+            time_slot = None
+            relaxation_var = None
+
+            m = re.match(r"^g(\d+)_surr_(\d+)$", name)
+            if m:
+                kind = "subproblem_surrogate"
+                unit_id = int(m.group(1))
+                constraint_index = int(m.group(2))
+                relaxation_var = f"g{unit_id}_surr_slack_{constraint_index}"
+            else:
+                m = re.match(r"^theta_surr_(\d+)_(\d+)$", name)
+                if m:
+                    kind = "bcd_theta"
+                    branch_id = int(m.group(1))
+                    time_slot = int(m.group(2))
+                    relaxation_var = f"theta_slack_{branch_id}_{time_slot}"
+                else:
+                    m = re.match(r"^zeta_surr_(\d+)_(\d+)$", name)
+                    if m:
+                        kind = "bcd_zeta"
+                        unit_id = int(m.group(1))
+                        time_slot = int(m.group(2))
+                        relaxation_var = f"zeta_slack_{unit_id}_{time_slot}"
+                    elif name.startswith("sparse"):
+                        kind = "sparse_surrogate"
+
+            if kind is None:
+                continue
+
+            try:
+                slack = float(c.Slack)
+            except Exception:
+                slack = float("nan")
+            try:
+                dual = float(c.Pi)
+            except Exception:
+                dual = float("nan")
+            relax_value = (
+                float(var_values[relaxation_var])
+                if relaxation_var is not None and relaxation_var in var_values
+                else 0.0
+            )
+            rows.append({
+                "stage_index": int(_stage_index),
+                "stage_name": str(_stage["name"]),
+                "constraint_name": name,
+                "kind": kind,
+                "unit_id": unit_id,
+                "constraint_index": constraint_index,
+                "branch_id": branch_id,
+                "time_slot": time_slot,
+                "row_slack": slack,
+                "abs_row_slack": abs(slack) if np.isfinite(slack) else float("nan"),
+                "dual": dual,
+                "abs_dual": abs(dual) if np.isfinite(dual) else float("nan"),
+                "is_row_active_1e_6": bool(np.isfinite(slack) and abs(slack) <= 1e-6),
+                "is_dual_active_1e_7": bool(np.isfinite(dual) and abs(dual) > 1e-7),
+                "relaxation_var": relaxation_var,
+                "relaxation_value": relax_value,
+                "is_relaxed": bool(relax_value > 1e-8),
+                "hard_subproblem": bool(_stage["hard_subproblem"]),
+                "hard_bcd": bool(_stage["hard_bcd"]),
+            })
+        return rows
 
     def _infer_agent_theta_zeta(_agent, _sample, _pd_matrix):
         """Infer sample-specific theta/zeta for the current scenario.
@@ -2433,21 +2591,39 @@ def solve_global_LP_relaxation(
             name_prefix="sparse_x",
         )
 
-        obj = (gp.quicksum(cpower[g, t] for g in range(ng) for t in range(T))
-               + gp.quicksum(coc[g, t] for g in range(ng) for t in range(T - 1))
-               + aux_obj)
+        uc_obj = (gp.quicksum(cpower[g, t] for g in range(ng) for t in range(T))
+                  + gp.quicksum(coc[g, t] for g in range(ng) for t in range(T - 1)))
+        problem_obj = uc_obj + aux_obj
+        full_obj = problem_obj
         if subproblem_slacks:
-            obj += stage['penalty_subproblem'] * gp.quicksum(subproblem_slacks)
+            full_obj += stage['penalty_subproblem'] * gp.quicksum(subproblem_slacks)
         if bcd_slacks:
-            obj += stage['penalty_bcd'] * gp.quicksum(bcd_slacks)
-        model.setObjective(obj, GRB.MINIMIZE)
+            full_obj += stage['penalty_bcd'] * gp.quicksum(bcd_slacks)
+        model.setObjective(full_obj, GRB.MINIMIZE)
         model.optimize()
 
         last_status = model.status
+        current_stats = _collect_model_stats(model, stage, stage_index)
+        if int(current_stats.get("status", -1)) == int(GRB.OPTIMAL):
+            current_stats["objective_solver_full"] = current_stats.get("objective", float("nan"))
+            current_stats["objective"] = float(problem_obj.getValue())
+            current_stats["objective_problem"] = float(problem_obj.getValue())
+            current_stats["objective_uc_cost"] = float(uc_obj.getValue())
+            current_stats["objective_surrogate_aux"] = float(aux_obj.getValue())
+        stage_stats.append(dict(current_stats))
         if model.status == GRB.OPTIMAL:
             if stage_index > 1:
                 print(f"  全局 LP 使用回退阶段求解成功: {stage['name']}", flush=True)
-            return np.array([[x[g, t].X for t in range(T)] for g in range(ng)])
+            x_sol = np.array([[x[g, t].X for t in range(T)] for g in range(ng)])
+            if return_stats:
+                current_stats["main_constraint_activity_rows"] = _collect_main_constraint_activity_rows(
+                    model,
+                    stage,
+                    stage_index,
+                )
+                current_stats["all_stage_attempts"] = stage_stats
+                return x_sol, current_stats
+            return x_sol
 
         if stage_index < len(stages):
             print(
@@ -2456,7 +2632,17 @@ def solve_global_LP_relaxation(
             )
 
     print(f"  警告: 全局 LP 松弛求解失败 (status={last_status})，返回零矩阵", flush=True)
-    return np.zeros((ng, T))
+    x_zero = np.zeros((ng, T))
+    if return_stats:
+        failed_stats = dict(stage_stats[-1]) if stage_stats else {}
+        failed_stats.update({
+            "stage_name": failed_stats.get("stage_name", "failed"),
+            "status": int(last_status) if last_status is not None else -1,
+            "status_name": _gurobi_status_name(last_status),
+            "all_stage_attempts": stage_stats,
+        })
+        return x_zero, failed_stats
+    return x_zero
 
 def solve_global_LP_relaxation_without_surrogate(
     ppc: dict,
