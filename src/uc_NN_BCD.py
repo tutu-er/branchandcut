@@ -3870,8 +3870,44 @@ class Agent_NN_BCD:
         lambda_pgu  = cp.Variable((self.ng, self.T),   nonneg=True)
         lambda_ru   = cp.Variable((self.ng, self.T-1), nonneg=True) if self.T > 1 else None
         lambda_rd   = cp.Variable((self.ng, self.T-1), nonneg=True) if self.T > 1 else None
-        lambda_mon  = cp.Variable((self.ng, Ton,  self.T), nonneg=True)
-        lambda_moff = cp.Variable((self.ng, Toff, self.T), nonneg=True)
+
+        class _MinTimeDualVarBlock:
+            """2D/1D CVXPY variable wrapper with legacy 3-index access."""
+
+            def __init__(self, ng: int, width: int, horizon: int, name: str):
+                self.ng = int(ng)
+                self.width = int(width)
+                self.horizon = int(horizon)
+                self._vars = [
+                    [
+                        cp.Variable(self.horizon, nonneg=True, name=f"{name}_{g}_{tau}")
+                        for tau in range(self.width)
+                    ]
+                    for g in range(self.ng)
+                ]
+
+            def __getitem__(self, key):
+                if not isinstance(key, tuple):
+                    raise TypeError("min-time dual variables require tuple indexing")
+                if len(key) == 3:
+                    g, tau, t = key
+                    return self._vars[int(g)][int(tau)][int(t)]
+                if len(key) == 2:
+                    g, tau = key
+                    return self._vars[int(g)][int(tau)]
+                raise IndexError(key)
+
+            def value_array(self) -> np.ndarray:
+                out = np.zeros((self.ng, self.width, self.horizon), dtype=float)
+                for g in range(self.ng):
+                    for tau in range(self.width):
+                        val = self._vars[g][tau].value
+                        if val is not None:
+                            out[g, tau, :] = np.asarray(val, dtype=float)
+                return out
+
+        lambda_mon = _MinTimeDualVarBlock(self.ng, Ton, self.T, "lambda_min_on")
+        lambda_moff = _MinTimeDualVarBlock(self.ng, Toff, self.T, "lambda_min_off")
         lambda_sc   = cp.Variable((self.ng, self.T-1), nonneg=True) if self.T > 1 else None
         lambda_shc  = cp.Variable((self.ng, self.T-1), nonneg=True) if self.T > 1 else None
         lambda_coc_nonneg = cp.Variable((self.ng, self.T-1), nonneg=True) if self.T > 1 else None
@@ -4218,8 +4254,8 @@ class Agent_NN_BCD:
             'lambda_pg_upper':      _v(lambda_pgu),
             'lambda_ramp_up':       _v(lambda_ru)  if self.T > 1 else np.zeros((self.ng, 0)),
             'lambda_ramp_down':     _v(lambda_rd)  if self.T > 1 else np.zeros((self.ng, 0)),
-            'lambda_min_on':        self._zero_unused_min_up_entries(_v(lambda_mon)),
-            'lambda_min_off':       self._zero_unused_min_down_entries(_v(lambda_moff)),
+            'lambda_min_on':        self._zero_unused_min_up_entries(lambda_mon.value_array()),
+            'lambda_min_off':       self._zero_unused_min_down_entries(lambda_moff.value_array()),
             'lambda_start_cost':    _v(lambda_sc)  if self.T > 1 else np.zeros((self.ng, 0)),
             'lambda_shut_cost':     _v(lambda_shc) if self.T > 1 else np.zeros((self.ng, 0)),
             'lambda_coc_nonneg':    _v(lambda_coc_nonneg) if self.T > 1 else np.zeros((self.ng, 0)),
