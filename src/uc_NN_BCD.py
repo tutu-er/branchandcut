@@ -874,6 +874,28 @@ class Agent_NN_BCD:
 
         return prox_obj
 
+    def _build_pg_block_prox_expr_cvxpy(self, sample_id: int, pg, x, coc):
+        if self.pg_block_prox_weight <= 0:
+            return 0.0
+
+        prev_pg = np.asarray(self.pg[sample_id], dtype=float)
+        prev_x = np.asarray(self.x[sample_id], dtype=float)
+        prev_coc = np.asarray(self.coc[sample_id], dtype=float)
+        start_cost = self.gencost[:, 1]
+        shut_cost = self.gencost[:, 2]
+
+        terms = []
+        for g in range(self.ng):
+            pg_scale = max(float(self.gen[g, PMAX]), 1.0)
+            coc_scale = max(float(start_cost[g]), float(shut_cost[g]), 1.0)
+            for t in range(self.T):
+                terms.append(cp.square((pg[g, t] - prev_pg[g, t]) / pg_scale))
+                terms.append(cp.square(x[g, t] - prev_x[g, t]))
+            for t in range(self.T - 1):
+                terms.append(cp.square((coc[g, t] - prev_coc[g, t]) / coc_scale))
+
+        return _sum_scalar_terms(terms)
+
     def _build_dual_block_prox_obj(
         self,
         model,
@@ -3455,7 +3477,6 @@ class Agent_NN_BCD:
 
         # ── Scalar rho parameters ───────────────────────────────────────────
         p_rho_primal = cp.Parameter(nonneg=True)
-        p_rho_opt    = cp.Parameter(nonneg=True)
         p_rho_binary = cp.Parameter(nonneg=True)
 
         # ── Lambda magnitude parameters (nonneg=True: we store |lambda|) ───
@@ -3562,12 +3583,12 @@ class Agent_NN_BCD:
         objective = cp.Minimize(
             p_rho_binary * obj_binary
             + p_rho_primal * _sum_scalar_terms(obj_primal_terms)
-            + p_rho_opt    * _sum_scalar_terms(obj_opt_terms)
+            + _sum_scalar_terms(obj_opt_terms)
         )
         problem = cp.Problem(objective, constraints)
 
         params = dict(
-            p_rho_primal=p_rho_primal, p_rho_opt=p_rho_opt, p_rho_binary=p_rho_binary,
+            p_rho_primal=p_rho_primal, p_rho_binary=p_rho_binary,
             p_lambda_pb=p_lambda_pb,
             p_lambda_pgl=p_lambda_pgl, p_lambda_pgu=p_lambda_pgu,
             p_lambda_xl=p_lambda_xl,   p_lambda_xu=p_lambda_xu,
@@ -3581,64 +3602,230 @@ class Agent_NN_BCD:
         vars_dict = {'pg': pg, 'x': x, 'coc': coc, 'cpower_expr': cpower_expr}
         return {'problem': problem, 'params': params, 'vars': vars_dict}
 
+    def _build_pg_cvxpy_numeric(self, sample_id: int,
+                                theta_values=None,
+                                zeta_values=None,
+                                union_analysis=None):
+        """Build the CVXPY PG-block with numeric objective weights.
+
+        CVXPY rejects products such as ``Parameter * abs(affine_expr)`` on some
+        versions.  The PG block changes lambda/rho weights every BCD iteration,
+        so for HiGHS we rebuild this LP with plain NumPy constants instead of
+        caching a parameterized objective.
+        """
+        Pd = np.asarray(self.active_set_data[sample_id]['pd_data'], dtype=float)
+        G = self._generator_incidence_matrix
+        PTDF = self._ptdf_matrix
+        branch_limit = self._branch_limit
+        a = (self.gencost[:, -2] / self.T_delta).reshape(self.ng, 1)
+        b = (self.gencost[:, -1] / self.T_delta).reshape(self.ng, 1)
+        start_cost = self.gencost[:, 1]
+        shut_cost = self.gencost[:, 2]
+        lam = self.lambda_[sample_id]
+        theta_values = theta_values or {}
+        zeta_values = zeta_values or {}
+        if union_analysis is None:
+            union_analysis = self._current_union_analysis
+
+        pg = cp.Variable((self.ng, self.T))
+        x = cp.Variable((self.ng, self.T))
+        coc = cp.Variable((self.ng, max(self.T - 1, 0)))
+        cpower = cp.Variable((self.ng, self.T), nonneg=True)
+        constraints = [pg >= 0, x >= 0, x <= 1]
+        if self.T > 1:
+            constraints.append(coc >= 0)
+
+        uc_const = _get_uc_matrix_from_sample(self.active_set_data[sample_id], self.ng, self.T)
+        if uc_const is None:
+            uc_const = np.asarray(self.x[sample_id], dtype=float)
+        else:
+            uc_const = np.asarray(uc_const, dtype=float)
+        obj_binary = cp.sum(cp.abs(x - uc_const))
+
+        pg_lower_expr = cp.multiply(self.gen[:, PMIN].reshape(self.ng, 1), x) - pg
+        pg_upper_expr = pg - cp.multiply(self.gen[:, PMAX].reshape(self.ng, 1), x)
+
+        obj_primal_terms = []
+        obj_opt_terms = []
+
+        w_pb = np.abs(lam['lambda_power_balance'])
+        pb_abs_list = []
+        for t in range(self.T):
+            pb_expr = cp.sum(pg[:, t]) - float(np.sum(Pd[:, t]))
+            pb_abs_list.append(cp.abs(pb_expr))
+            obj_primal_terms.append(pb_abs_list[-1])
+        obj_opt_terms.append(cp.sum(cp.multiply(w_pb, cp.hstack(pb_abs_list))))
+
+        obj_primal_terms.append(cp.sum(cp.pos(pg_lower_expr)))
+        obj_primal_terms.append(cp.sum(cp.pos(pg_upper_expr)))
+        obj_opt_terms.append(cp.sum(cp.multiply(np.abs(lam['lambda_pg_lower']), cp.abs(pg_lower_expr))))
+        obj_opt_terms.append(cp.sum(cp.multiply(np.abs(lam['lambda_pg_upper']), cp.abs(pg_upper_expr))))
+        obj_opt_terms.append(cp.sum(cp.multiply(np.abs(lam['lambda_x_lower']), x)))
+        obj_opt_terms.append(cp.sum(cp.multiply(np.abs(lam['lambda_x_upper']), 1 - x)))
+
+        if self.T > 1:
+            ru_expr = (
+                pg[:, 1:] - pg[:, :-1]
+                - cp.multiply(self.Ru.reshape(self.ng, 1), x[:, :-1])
+                - cp.multiply(self.Ru_co.reshape(self.ng, 1), 1 - x[:, :-1])
+            )
+            rd_expr = (
+                pg[:, :-1] - pg[:, 1:]
+                - cp.multiply(self.Rd.reshape(self.ng, 1), x[:, 1:])
+                - cp.multiply(self.Rd_co.reshape(self.ng, 1), 1 - x[:, 1:])
+            )
+            obj_primal_terms.append(cp.sum(cp.pos(ru_expr)))
+            obj_primal_terms.append(cp.sum(cp.pos(rd_expr)))
+            obj_opt_terms.append(cp.sum(cp.multiply(np.abs(lam['lambda_ramp_up']), cp.abs(ru_expr))))
+            obj_opt_terms.append(cp.sum(cp.multiply(np.abs(lam['lambda_ramp_down']), cp.abs(rd_expr))))
+
+        for g in range(self.ng):
+            for tau in range(1, self._min_up_horizon(g) + 1):
+                expr = x[g, 1:self.T - tau + 1] - x[g, :self.T - tau] - x[g, tau:]
+                obj_primal_terms.append(cp.sum(cp.pos(expr)))
+                weights = np.abs(lam['lambda_min_on'][g, tau - 1, :self.T - tau])
+                obj_opt_terms.append(cp.sum(cp.multiply(weights, cp.abs(expr))))
+            for tau in range(1, self._min_down_horizon(g) + 1):
+                expr = -x[g, 1:self.T - tau + 1] + x[g, :self.T - tau] - (1 - x[g, tau:])
+                obj_primal_terms.append(cp.sum(cp.pos(expr)))
+                weights = np.abs(lam['lambda_min_off'][g, tau - 1, :self.T - tau])
+                obj_opt_terms.append(cp.sum(cp.multiply(weights, cp.abs(expr))))
+
+        if self.T > 1:
+            sc_expr = cp.multiply(start_cost.reshape(self.ng, 1), x[:, 1:] - x[:, :-1]) - coc
+            shc_expr = cp.multiply(shut_cost.reshape(self.ng, 1), x[:, :-1] - x[:, 1:]) - coc
+            obj_primal_terms.append(cp.sum(cp.pos(sc_expr)))
+            obj_primal_terms.append(cp.sum(cp.pos(shc_expr)))
+            obj_opt_terms.append(cp.sum(cp.multiply(np.abs(lam['lambda_start_cost']), cp.abs(sc_expr))))
+            obj_opt_terms.append(cp.sum(cp.multiply(np.abs(lam['lambda_shut_cost']), cp.abs(shc_expr))))
+            obj_opt_terms.append(cp.sum(cp.multiply(np.abs(lam['lambda_coc_nonneg']), coc)))
+
+        for t in range(self.T):
+            flow = PTDF @ (G @ pg[:, t] - Pd[:, t])
+            dcpf_up = flow - branch_limit
+            dcpf_lo = -flow - branch_limit
+            obj_primal_terms.append(cp.sum(cp.pos(dcpf_up)))
+            obj_primal_terms.append(cp.sum(cp.pos(dcpf_lo)))
+            obj_opt_terms.append(cp.sum(cp.multiply(np.abs(lam['lambda_dcpf_upper'][:, t]), cp.abs(dcpf_up))))
+            obj_opt_terms.append(cp.sum(cp.multiply(np.abs(lam['lambda_dcpf_lower'][:, t]), cp.abs(dcpf_lo))))
+
+        if self.enable_theta_constraints and union_analysis and 'union_constraints' in union_analysis:
+            for constraint_info in union_analysis['union_constraints']:
+                branch_id = constraint_info['branch_id']
+                time_slot = constraint_info['time_slot']
+                lhs_expr = 0.0
+                for coeff_info in constraint_info['nonzero_pg_coefficients']:
+                    unit_id = coeff_info['unit_id']
+                    member_time = self._theta_member_time_index(constraint_info, coeff_info)
+                    theta_name = self._theta_var_name(branch_id, unit_id, member_time)
+                    lhs_expr += float(theta_values.get(theta_name, 0.0)) * x[unit_id, member_time]
+
+                rhs = float(theta_values.get(self._theta_rhs_name(branch_id, time_slot), 1.0))
+                direction = float(self._get_theta_constraint_direction(branch_id, time_slot))
+                residual = lhs_expr - rhs
+                obj_primal_terms.append(cp.pos(direction * residual))
+                if hasattr(self, 'mu') and sample_id < len(self.mu) and branch_id < self.nl:
+                    mu_weight = abs(float(self.mu[sample_id, branch_id, time_slot]))
+                else:
+                    mu_weight = float(getattr(self, 'dual_para_bound', 0.1))
+                obj_opt_terms.append(mu_weight * cp.abs(residual))
+
+        if self.enable_zeta_constraints and union_analysis and 'union_zeta_constraints' in union_analysis:
+            for constraint_info in union_analysis['union_zeta_constraints']:
+                unit_id = constraint_info['unit_id']
+                time_slot = constraint_info['time_slot']
+                zeta_name = self._zeta_var_name(unit_id, time_slot)
+                rhs_name = self._zeta_rhs_name(unit_id, time_slot)
+                residual = float(zeta_values.get(zeta_name, 0.0)) * x[unit_id, time_slot] - float(
+                    zeta_values.get(rhs_name, 1.0)
+                )
+                direction = float(self._get_zeta_constraint_direction(unit_id, time_slot))
+                obj_primal_terms.append(cp.pos(direction * residual))
+                if hasattr(self, 'ita') and sample_id < len(self.ita):
+                    ita_weight = abs(float(self.ita[sample_id, unit_id, time_slot]))
+                else:
+                    ita_weight = float(getattr(
+                        self,
+                        'ita_dual_floor_init',
+                        getattr(self, 'dual_para_bound', 0.1),
+                    ))
+                obj_opt_terms.append(ita_weight * cp.abs(residual))
+
+        cpower_expr = cp.multiply(a, pg) + cp.multiply(b, x)
+        constraints.append(cpower == cpower_expr)
+        obj_prox = self._build_pg_block_prox_expr_cvxpy(sample_id, pg, x, coc)
+        obj_primal = _sum_scalar_terms(obj_primal_terms)
+        obj_opt = _sum_scalar_terms(obj_opt_terms)
+        objective = cp.Minimize(
+            float(self.rho_binary) * obj_binary
+            + float(self.rho_primal) * obj_primal
+            + float(self.rho_opt) * obj_opt
+            + float(self.pg_block_prox_weight) * obj_prox
+        )
+        problem = cp.Problem(objective, constraints)
+        return {
+            'problem': problem,
+            'vars': {'pg': pg, 'x': x, 'coc': coc, 'cpower': cpower},
+            'objs': {
+                'obj_primal': obj_primal,
+                'obj_binary': obj_binary,
+                'obj_opt': obj_opt,
+                'obj_prox': obj_prox,
+            },
+        }
+
     def _iter_with_pg_block_cvxpy_highs(self, sample_id=0, theta_values=None, zeta_values=None, union_analysis=None):
         self._require_cvxpy_highs_main_backend()
         if union_analysis is None:
             union_analysis = self._current_union_analysis
 
-        # ── Persistent-problem cache ────────────────────────────────────────
-        # Each sample gets one CVXPY problem built with cp.Parameter.
-        # Subsequent calls update the parameter values and solve with warm_start
-        # (skips re-canonicalization; HiGHS hot-starts from the previous basis).
-        if not hasattr(self, '_pg_cvxpy_cache'):
-            self._pg_cvxpy_cache: dict = {}
-        if sample_id not in self._pg_cvxpy_cache:
-            self._pg_cvxpy_cache[sample_id] = self._build_pg_cvxpy_persistent(sample_id)
-
-        cache   = self._pg_cvxpy_cache[sample_id]
-        params  = cache['params']
+        cache = self._build_pg_cvxpy_numeric(
+            sample_id,
+            theta_values=theta_values,
+            zeta_values=zeta_values,
+            union_analysis=union_analysis,
+        )
         problem = cache['problem']
-        v       = cache['vars']
-
-        # ── Update parameter values ─────────────────────────────────────────
-        lam = self.lambda_[sample_id]
-        params['p_rho_primal'].value  = float(self.rho_primal)
-        params['p_rho_opt'].value     = float(self.rho_opt)
-        params['p_rho_binary'].value  = float(self.rho_binary)
-        params['p_lambda_pb'].value   = np.abs(lam['lambda_power_balance'])
-        params['p_lambda_pgl'].value  = np.abs(lam['lambda_pg_lower'])
-        params['p_lambda_pgu'].value  = np.abs(lam['lambda_pg_upper'])
-        params['p_lambda_xl'].value   = np.abs(lam['lambda_x_lower'])
-        params['p_lambda_xu'].value   = np.abs(lam['lambda_x_upper'])
-        params['p_lambda_dcu'].value  = np.abs(lam['lambda_dcpf_upper'])
-        params['p_lambda_dcl'].value  = np.abs(lam['lambda_dcpf_lower'])
-        params['p_lambda_mon'].value  = np.abs(lam['lambda_min_on'])
-        params['p_lambda_moff'].value = np.abs(lam['lambda_min_off'])
-        if self.T > 1:
-            params['p_lambda_ru'].value  = np.abs(lam['lambda_ramp_up'])
-            params['p_lambda_rd'].value  = np.abs(lam['lambda_ramp_down'])
-            params['p_lambda_sc'].value  = np.abs(lam['lambda_start_cost'])
-            params['p_lambda_shc'].value = np.abs(lam['lambda_shut_cost'])
-            params['p_lambda_coc'].value = np.abs(lam['lambda_coc_nonneg'])
-        if params['p_uc_matrix'] is not None:
-            params['p_uc_matrix'].value = np.asarray(self.x[sample_id], dtype=float)
-
-        # ── Solve (warm_start=True reuses canonicalized form + prior basis) ─
-        first_solve = (problem.value is None)
+        v = cache['vars']
+        objs = cache.get('objs', {})
         _solve_with_cvxpy_highs(
             problem, verbose=False,
             threads=self.bcd_highs_threads,
-            warm_start=(not first_solve),
+            warm_start=False,
         )
         if not _problem_is_optimal(problem):
-            print(f"❌ PG block cvxpy_highs failed, status={problem.status}", flush=True)
+            print(f"PG block cvxpy_highs failed, status={problem.status}", flush=True)
             return None, None, None, None
 
-        pg_sol     = np.asarray(v['pg'].value,           dtype=float)
-        x_sol      = np.asarray(v['x'].value,            dtype=float)
-        cpower_sol = np.asarray(v['cpower_expr'].value,  dtype=float)
-        coc_sol    = (np.asarray(v['coc'].value, dtype=float)
-                      if self.T > 1 else np.zeros((self.ng, 0), dtype=float))
+        pg_sol = np.asarray(v['pg'].value, dtype=float)
+        x_sol = np.asarray(v['x'].value, dtype=float)
+        cpower_sol = np.asarray(v['cpower'].value, dtype=float)
+        coc_sol = (
+            np.asarray(v['coc'].value, dtype=float)
+            if self.T > 1 else np.zeros((self.ng, 0), dtype=float)
+        )
+        if sample_id <= 2:
+            def _cvx_value(expr):
+                try:
+                    if expr is None:
+                        return 0.0
+                    value = getattr(expr, 'value', expr)
+                    if value is None:
+                        return 0.0
+                    return float(np.asarray(value, dtype=float).reshape(-1)[0])
+                except Exception:
+                    return 0.0
+
+            print(
+                f"pg_block, sample_id: {sample_id}, "
+                f"backend: cvxpy_highs, status: {problem.status}, "
+                f"obj_primal: {_cvx_value(objs.get('obj_primal')):.4f}, "
+                f"obj_binary: {_cvx_value(objs.get('obj_binary')):.4f}, "
+                f"obj_opt: {_cvx_value(objs.get('obj_opt')):.4f}, "
+                f"obj_prox: {_cvx_value(objs.get('obj_prox')):.4f}, "
+                f"objective: {float(problem.value):.4f}",
+                flush=True,
+            )
         return pg_sol, x_sol, cpower_sol, coc_sol
 
     def _iter_with_dual_block_cvxpy_highs(self, sample_id=0, theta_values=None, zeta_values=None, union_analysis=None):
@@ -4417,6 +4604,7 @@ class Agent_NN_BCD:
             GRB.MINIMIZE,
         )
         vars_dict['obj_opt'] = obj_opt
+        vars_dict['obj_prox'] = obj_prox
 
     # ------------------------------------------------------------------
 
@@ -4466,11 +4654,16 @@ class Agent_NN_BCD:
                 obj_binary_v = vars_dict['obj_binary'].getValue()
                 obj_opt_v = vars_dict.get('obj_opt', 0.0)
                 obj_opt_v = obj_opt_v.getValue() if hasattr(obj_opt_v, 'getValue') else float(obj_opt_v)
+                obj_prox_v = vars_dict.get('obj_prox', 0.0)
+                obj_prox_v = obj_prox_v.getValue() if hasattr(obj_prox_v, 'getValue') else float(obj_prox_v)
                 print(
                     f"pg_block, sample_id: {sample_id}, "
+                    f"backend: gurobi, status: {model.status}, "
                     f"obj_primal: {obj_primal_v:.4f}, "
                     f"obj_binary: {obj_binary_v:.4f}, "
-                    f"obj_opt: {obj_opt_v:.4f}",
+                    f"obj_opt: {obj_opt_v:.4f}, "
+                    f"obj_prox: {obj_prox_v:.4f}, "
+                    f"objective: {model.ObjVal:.4f}",
                     flush=True,
                 )
             return pg_sol, x_sol, cpower_sol, coc_sol

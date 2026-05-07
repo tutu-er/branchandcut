@@ -138,6 +138,10 @@ def main() -> None:
     rt.SURROGATE_DUAL_PREDICTOR_ONLY = False
     rt.BCD_MODEL_FILE = None
     rt.SURROGATE_MODEL_DIR = None
+    rt.BCD_PG_BLOCK_PROX_WEIGHT = 0.0
+    rt.BCD_DUAL_BLOCK_PROX_WEIGHT = 0.0
+    rt.SUBPROBLEM_PG_BLOCK_PROX_WEIGHT = 0.0
+    rt.SUBPROBLEM_DUAL_BLOCK_PROX_WEIGHT = 0.0
 
     base._configure_iterations(args.bcd_iter, args.sub_iter)
     _configure_strong_complex_dual_floors(args)
@@ -152,6 +156,13 @@ def main() -> None:
     print(
         f"bcd_backend={rt.BCD_LP_BACKEND} | bcd_workers={rt.N_WORKERS_BCD} | "
         f"gurobi_threads={rt.BCD_GUROBI_THREADS if rt.BCD_GUROBI_THREADS is not None else 'auto'}",
+        flush=True,
+    )
+    print(
+        f"quadratic_prox=off | bcd_pg_prox={rt.BCD_PG_BLOCK_PROX_WEIGHT} | "
+        f"bcd_dual_prox={rt.BCD_DUAL_BLOCK_PROX_WEIGHT} | "
+        f"sub_pg_prox={rt.SUBPROBLEM_PG_BLOCK_PROX_WEIGHT} | "
+        f"sub_dual_prox={rt.SUBPROBLEM_DUAL_BLOCK_PROX_WEIGHT}",
         flush=True,
     )
     print(
