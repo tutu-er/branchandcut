@@ -8,6 +8,7 @@ Examples
     python run_test_case14.py --samples 8
     python run_test_case14.py --fp
     python run_test_case14.py --model-dir result/surrogate_models/subproblem_models_case14_YYYYMMDD_HHMMSS
+    python run_test_case14.py --activity-only --main-activity
 """
 
 from __future__ import annotations
@@ -43,6 +44,10 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--fp", action="store_true", help="Run feasibility-pump testing.")
     p.add_argument("--disable-plots", action="store_true", help="Disable plot generation.")
     p.add_argument("--skip-activity", action="store_true", help="Skip surrogate dual/activity diagnostics.")
+    p.add_argument("--activity-only", action="store_true", help="Run only surrogate dual/activity diagnostics.")
+    p.add_argument("--main-activity", action="store_true", help="Also test main-model theta/zeta activity.")
+    p.add_argument("--main-activity-only", action="store_true", help="Run only main-model theta/zeta activity diagnostics.")
+    p.add_argument("--main-include-subproblem", action="store_true", help="Include subproblem rows in main activity CSVs.")
     p.add_argument("--activity-train-samples", type=int, default=32)
     p.add_argument("--activity-test-samples", type=int, default=16)
     p.add_argument("--activity-output-dir", type=str, default=None)
@@ -98,6 +103,15 @@ def _run_activity_check(args: argparse.Namespace) -> None:
         argv.extend(["--strategy", args.strategy])
     if args.unit_ids.strip().lower() not in ("", "all", "none"):
         argv.extend(["--units", args.unit_ids])
+    run_main_activity = args.main_activity or args.main_activity_only or bool(args.bcd_model)
+    if run_main_activity:
+        argv.append("--main-activity")
+        if args.bcd_model:
+            argv.extend(["--bcd-model", args.bcd_model])
+    if args.main_activity_only:
+        argv.append("--main-only")
+    if args.main_include_subproblem:
+        argv.append("--main-include-subproblem")
     if args.disable_plots:
         argv.append("--no-plots")
 
@@ -105,7 +119,9 @@ def _run_activity_check(args: argparse.Namespace) -> None:
     print(
         "case14 surrogate activity check | "
         f"train_samples={args.activity_train_samples} | "
-        f"test_samples={args.activity_test_samples} | output_dir={output_dir}",
+        f"test_samples={args.activity_test_samples} | "
+        f"main_activity={run_main_activity} | "
+        f"output_dir={output_dir}",
         flush=True,
     )
     print("=" * 72, flush=True)
@@ -138,20 +154,21 @@ def main() -> None:
     rt.USE_CASE3LITE_CUSTOM_FP = False
     rt.USE_CASE118_CUSTOM_FP = False
 
-    print("=" * 72, flush=True)
-    print(
-        "case14 test | "
-        f"mode={rt.MODE} | model_dir={rt.MODEL_DIR} | "
-        f"active_sets={rt.ACTIVE_SETS_FILE} | "
-        f"unit_ids={rt.UNIT_IDS if rt.UNIT_IDS is not None else 'all'} | "
-        f"samples={rt.TEST_SAMPLES} | sample_range={rt.SAMPLE_RANGE} | "
-        f"fp={rt.RUN_FP} | plots={not rt.RUN_TEST_DISABLE_PLOTS}",
-        flush=True,
-    )
-    print("=" * 72, flush=True)
+    if not args.activity_only:
+        print("=" * 72, flush=True)
+        print(
+            "case14 test | "
+            f"mode={rt.MODE} | model_dir={rt.MODEL_DIR} | "
+            f"active_sets={rt.ACTIVE_SETS_FILE} | "
+            f"unit_ids={rt.UNIT_IDS if rt.UNIT_IDS is not None else 'all'} | "
+            f"samples={rt.TEST_SAMPLES} | sample_range={rt.SAMPLE_RANGE} | "
+            f"fp={rt.RUN_FP} | plots={not rt.RUN_TEST_DISABLE_PLOTS}",
+            flush=True,
+        )
+        print("=" * 72, flush=True)
 
-    _ensure_bcd_imports()
-    rt.main()
+        _ensure_bcd_imports()
+        rt.main()
     if not args.skip_activity:
         _run_activity_check(args)
 

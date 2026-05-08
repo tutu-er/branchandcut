@@ -9,6 +9,7 @@ BCD迭代流程：pg块→dual块→NN反传→cal_viol，所有约束用软约�
 
 import sys
 import time
+import inspect
 from pathlib import Path
 from typing import Dict, Optional, Tuple
 
@@ -478,6 +479,8 @@ class JointLPTrainer:
         ita_lb = dual_para_bound if iter_number < dual_decay_round_ else 0
         mu = model.addVars(self.nl, self.T, lb=mu_lb, name='mu')
         ita = model.addVars(self.ng, self.T, lb=ita_lb, name='ita')
+        mu_abs = model.addVars(self.nl, self.T, lb=0, name='mu_abs')
+        ita_abs = model.addVars(self.ng, self.T, lb=0, name='ita_abs')
 
         # surrogate 对偶变量
         lambda_surr_var: Dict[int, list] = {}
@@ -495,12 +498,14 @@ class JointLPTrainer:
         deadband = 100
         for l in range(self.nl):
             for t in range(self.T):
-                model.addConstr(mu_max >= mu[l, t] - deadband)
-                model.addConstr(mu_max >= -mu[l, t] - deadband)
+                model.addConstr(mu_abs[l, t] >= mu[l, t], name=f'mu_abs_pos_{l}_{t}')
+                model.addConstr(mu_abs[l, t] >= -mu[l, t], name=f'mu_abs_neg_{l}_{t}')
+                model.addConstr(mu_max >= mu_abs[l, t] - deadband)
         for g in range(self.ng):
             for t in range(self.T):
-                model.addConstr(ita_max >= ita[g, t] - deadband)
-                model.addConstr(ita_max >= -ita[g, t] - deadband)
+                model.addConstr(ita_abs[g, t] >= ita[g, t], name=f'ita_abs_pos_{g}_{t}')
+                model.addConstr(ita_abs[g, t] >= -ita[g, t], name=f'ita_abs_neg_{g}_{t}')
+                model.addConstr(ita_max >= ita_abs[g, t] - deadband)
         penalty_factor = 0
         penal_mu = penalty_factor * mu_max
         penal_ita = penalty_factor * ita_max
@@ -719,15 +724,26 @@ class JointLPTrainer:
         # theta/zeta obj_opt（委托）
         if (agent.enable_theta_constraints and union_analysis
                 and 'union_constraints' in union_analysis and theta_values is not None):
-            model, obj_opt_para = agent._add_parametric_obj_dual_block(
-                model, x_arr, mu, sample_id, theta_values, union_analysis,
-                PTDF=PTDF, branch_limit=branch_limit)
+            theta_obj_fn = agent._add_parametric_obj_dual_block
+            if 'mu_abs' in inspect.signature(theta_obj_fn).parameters:
+                model, obj_opt_para = theta_obj_fn(
+                    model, x_arr, mu, mu_abs, sample_id, theta_values, union_analysis,
+                    PTDF=PTDF, branch_limit=branch_limit)
+            else:
+                model, obj_opt_para = theta_obj_fn(
+                    model, x_arr, mu, sample_id, theta_values, union_analysis,
+                    PTDF=PTDF, branch_limit=branch_limit)
             obj_opt += obj_opt_para
 
         if (agent.enable_zeta_constraints and union_analysis
                 and 'union_zeta_constraints' in union_analysis and zeta_values is not None):
-            model, obj_opt_para = agent._add_parametric_balance_power_obj_dual_block(
-                model, x_arr, ita, sample_id, zeta_values, union_analysis)
+            zeta_obj_fn = agent._add_parametric_balance_power_obj_dual_block
+            if 'ita_abs' in inspect.signature(zeta_obj_fn).parameters:
+                model, obj_opt_para = zeta_obj_fn(
+                    model, x_arr, ita, ita_abs, sample_id, zeta_values, union_analysis)
+            else:
+                model, obj_opt_para = zeta_obj_fn(
+                    model, x_arr, ita, sample_id, zeta_values, union_analysis)
             obj_opt += obj_opt_para
 
         # surrogate obj_opt
@@ -872,7 +888,7 @@ class JointLPTrainer:
                         trainer.mu[s] = lambda_surr_sol[g]
 
             # 3. 刷新迭代级张量缓存
-            if TORCH_AVAILABLE and hasattr(agent, 'device'):
+            if TORCH_AVAILABLE and hasattr(agent, 'device') and hasattr(agent, '_refresh_iter_tensor_cache'):
                 agent._refresh_iter_tensor_cache()
 
             # 4a. theta/zeta NN 更新

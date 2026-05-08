@@ -92,7 +92,7 @@ BCD_GAMMA_BASE = 1e-2
 # surrogate / both 模式：已训练 surrogate 模型目录（训练时输出的带时间戳路径）
 # 设为 None 则自动查找 result/surrogate_models/ 下最新的匹配目录
 # 环境变量 RUN_TEST_SURROGATE_MODEL_DIR 可覆盖本常量（agentic_fp_optimizer 会注入）
-MODEL_DIR = "result/surrogate_models/subproblem_models_case3lite_20260430_174643"
+MODEL_DIR = None
 # 可选：测试时注入外部 unit_predictor（当 MODEL_DIR 下缺少 unit_predictor.pth 时自动复制一份）  
 # 环境变量 RUN_TEST_UNIT_PREDICTOR_DIR 可覆盖本常量
 UNIT_PREDICTOR_DIR = None

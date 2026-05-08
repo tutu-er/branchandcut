@@ -2715,6 +2715,13 @@ class SubproblemSurrogateTrainer:
                  loss_ratio_reg: float = 1.0,
                  pg_block_prox_weight: float = 2e-2,
                  dual_block_prox_weight: float = 1e-2,
+                 single_mu_cap_penalty_weight: float = 0.0,
+                 single_mu_cap_initial_weight: float | None = None,
+                 single_mu_cap_final_weight: float | None = None,
+                 single_mu_cap_initial: float | None = None,
+                 single_mu_cap_final: float | None = None,
+                 single_mu_cap_start_round: int = 0,
+                 single_mu_cap_end_round: int = 0,
                  ignore_startup_shutdown_costs: bool = False,
                  unit_predictor: 'SingleUnitBinaryPredictorTrainer | None' = None,
                  use_unit_predictor: bool = False,
@@ -2913,6 +2920,27 @@ class SubproblemSurrogateTrainer:
         self.loss_ratio_reg = float(loss_ratio_reg)
         self.pg_block_prox_weight = max(float(pg_block_prox_weight), 0.0)
         self.dual_block_prox_weight = max(float(dual_block_prox_weight), 0.0)
+        single_mu_cap_weight_fallback = max(float(single_mu_cap_penalty_weight), 0.0)
+        self.single_mu_cap_initial_weight = (
+            0.0 if single_mu_cap_initial_weight is None
+            else max(float(single_mu_cap_initial_weight), 0.0)
+        )
+        self.single_mu_cap_final_weight = (
+            single_mu_cap_weight_fallback if single_mu_cap_final_weight is None
+            else max(float(single_mu_cap_final_weight), 0.0)
+        )
+        self.single_mu_cap_penalty_weight = self.single_mu_cap_final_weight
+        self.single_mu_cap_initial = (
+            None if single_mu_cap_initial is None else max(float(single_mu_cap_initial), 0.0)
+        )
+        self.single_mu_cap_final = (
+            None if single_mu_cap_final is None else max(float(single_mu_cap_final), 0.0)
+        )
+        self.single_mu_cap_start_round = max(int(single_mu_cap_start_round), 0)
+        self.single_mu_cap_end_round = max(
+            int(single_mu_cap_end_round),
+            self.single_mu_cap_start_round,
+        )
         self.ignore_startup_shutdown_costs = bool(ignore_startup_shutdown_costs)
         self.iter_number = 0
         self.x_cost_scale = 2.0
@@ -3527,6 +3555,77 @@ class SubproblemSurrogateTrainer:
             start = min(head, end)
             return (start, end)
         return (0, 0)
+
+    def _current_single_mu_cap(self) -> tuple[float | None, float]:
+        """Return the active soft cap for single-time surrogate duals."""
+        final_weight = max(
+            float(getattr(
+                self,
+                'single_mu_cap_final_weight',
+                getattr(self, 'single_mu_cap_penalty_weight', 0.0),
+            ) or 0.0),
+            0.0,
+        )
+        initial_weight = max(
+            float(getattr(self, 'single_mu_cap_initial_weight', 0.0) or 0.0),
+            0.0,
+        )
+        if initial_weight <= 0.0 and final_weight <= 0.0:
+            return None, 0.0
+        st, en = self._single_time_coupling_slice()
+        if st >= en:
+            return None, 0.0
+        initial = getattr(self, 'single_mu_cap_initial', None)
+        final = getattr(self, 'single_mu_cap_final', None)
+        if initial is None and final is None:
+            return None, 0.0
+        if initial is None:
+            initial = final
+        if final is None:
+            final = initial
+        start = max(int(getattr(self, 'single_mu_cap_start_round', 0) or 0), 0)
+        end = max(int(getattr(self, 'single_mu_cap_end_round', start) or start), start)
+        it = int(getattr(self, 'iter_number', 0) or 0)
+        if it < start:
+            return None, 0.0
+        frac = 1.0 if end <= start else min(max((it - start) / float(end - start), 0.0), 1.0)
+        cap = float(initial) + frac * (float(final) - float(initial))
+        weight = initial_weight + frac * (final_weight - initial_weight)
+        return max(cap, 0.0), weight
+
+    def _build_single_mu_cap_penalty_obj(self, model, mu_abs, vars_dict=None):
+        """Build/update Gurobi soft-cap penalty for the single-time mu tail."""
+        cap, weight = self._current_single_mu_cap()
+        if cap is None or weight <= 0.0:
+            return gp.LinExpr()
+        st, en = self._single_time_coupling_slice()
+        if st >= en:
+            return gp.LinExpr()
+
+        if vars_dict is None:
+            excess = model.addVars(range(st, en), lb=0.0, name='single_mu_cap_excess')
+            for k in range(st, en):
+                model.addConstr(excess[k] - mu_abs[k] >= -cap, name=f'single_mu_cap_{k}')
+            return weight * gp.quicksum(excess[k] for k in range(st, en))
+
+        excess = vars_dict.get('single_mu_cap_excess')
+        constrs = vars_dict.get('single_mu_cap_constrs')
+        if excess is None or constrs is None:
+            excess = model.addVars(range(st, en), lb=0.0, name='single_mu_cap_excess')
+            constrs = {}
+            for k in range(st, en):
+                constrs[k] = model.addConstr(
+                    excess[k] - mu_abs[k] >= -cap,
+                    name=f'single_mu_cap_{k}',
+                )
+            vars_dict['single_mu_cap_excess'] = excess
+            vars_dict['single_mu_cap_constrs'] = constrs
+            vars_dict['single_mu_cap_slice'] = (st, en)
+            model.update()
+        else:
+            for constr in constrs.values():
+                constr.RHS = -cap
+        return weight * gp.quicksum(excess[k] for k in range(st, en))
 
     def _single_time_k_for_t(self, slice_start: int, t: int) -> int:
         """single-time 段内第 t 个槽位对应的全局耦合约束下标 k（与 μ 向量切片对齐）。"""
@@ -5802,16 +5901,19 @@ class SubproblemSurrogateTrainer:
             lam_pgl, lam_pgu, lam_ru, lam_rd, lam_sc, lam_shc, lam_coc,
             lam_xu, lam_xl, lam_mon, lam_moff, mu, Ton, Toff,
         )
+        obj_single_mu_cap = self._build_single_mu_cap_penalty_obj(model, mu_abs, vars_dict)
 
         vars_dict['obj_opt'] = obj_opt
         vars_dict['obj_dual_prox'] = obj_dual_prox
+        vars_dict['obj_single_mu_cap'] = obj_single_mu_cap
 
         model.setObjective(
             self.rho_dual_pg  * vars_dict['obj_dual_pg']
             + self.rho_dual_x  * vars_dict['obj_dual_x']
             + self.rho_dual_coc* vars_dict['obj_dual_coc']
             + self.rho_opt     * obj_opt
-            + self.dual_block_prox_weight * obj_dual_prox,
+            + self.dual_block_prox_weight * obj_dual_prox
+            + obj_single_mu_cap,
             GRB.MINIMIZE,
         )
 
@@ -6211,12 +6313,14 @@ class SubproblemSurrogateTrainer:
             Ton,
             Toff,
         )
+        obj_single_mu_cap = self._build_single_mu_cap_penalty_obj(model, mu_abs)
         model.setObjective(
             self.rho_dual_pg * obj_dual_pg
             + self.rho_dual_x * obj_dual_x
             + self.rho_dual_coc * obj_dual_coc
             + self.rho_opt * obj_opt
-            + self.dual_block_prox_weight * obj_dual_prox,
+            + self.dual_block_prox_weight * obj_dual_prox
+            + obj_single_mu_cap,
             GRB.MINIMIZE
         )
         model.optimize()
@@ -7652,6 +7756,13 @@ class SubproblemSurrogateTrainer:
                 'loss_ratio_reg': self.loss_ratio_reg,
                 'pg_block_prox_weight': self.pg_block_prox_weight,
                 'dual_block_prox_weight': self.dual_block_prox_weight,
+                'single_mu_cap_penalty_weight': self.single_mu_cap_penalty_weight,
+                'single_mu_cap_initial_weight': self.single_mu_cap_initial_weight,
+                'single_mu_cap_final_weight': self.single_mu_cap_final_weight,
+                'single_mu_cap_initial': self.single_mu_cap_initial,
+                'single_mu_cap_final': self.single_mu_cap_final,
+                'single_mu_cap_start_round': self.single_mu_cap_start_round,
+                'single_mu_cap_end_round': self.single_mu_cap_end_round,
                 'template_rhs_jitter_scale': self.template_rhs_jitter_scale,
                 'template_rhs_reg_deadband': self.template_rhs_reg_deadband,
                 'coeff_reg_deadband': self.coeff_reg_deadband,
@@ -7977,6 +8088,58 @@ class SubproblemSurrogateTrainer:
                 float(state.get('dual_block_prox_weight', self.dual_block_prox_weight)),
                 0.0,
             )
+            self.single_mu_cap_penalty_weight = max(
+                float(state.get(
+                    'single_mu_cap_penalty_weight',
+                    getattr(self, 'single_mu_cap_penalty_weight', 0.0),
+                )),
+                0.0,
+            )
+            self.single_mu_cap_initial_weight = max(
+                float(state.get(
+                    'single_mu_cap_initial_weight',
+                    getattr(self, 'single_mu_cap_initial_weight', 0.0),
+                )),
+                0.0,
+            )
+            self.single_mu_cap_final_weight = max(
+                float(state.get(
+                    'single_mu_cap_final_weight',
+                    self.single_mu_cap_penalty_weight,
+                )),
+                0.0,
+            )
+            self.single_mu_cap_penalty_weight = self.single_mu_cap_final_weight
+            loaded_single_mu_cap_initial = state.get(
+                'single_mu_cap_initial',
+                getattr(self, 'single_mu_cap_initial', None),
+            )
+            loaded_single_mu_cap_final = state.get(
+                'single_mu_cap_final',
+                getattr(self, 'single_mu_cap_final', None),
+            )
+            self.single_mu_cap_initial = (
+                None if loaded_single_mu_cap_initial is None
+                else max(float(loaded_single_mu_cap_initial), 0.0)
+            )
+            self.single_mu_cap_final = (
+                None if loaded_single_mu_cap_final is None
+                else max(float(loaded_single_mu_cap_final), 0.0)
+            )
+            self.single_mu_cap_start_round = max(
+                int(state.get(
+                    'single_mu_cap_start_round',
+                    getattr(self, 'single_mu_cap_start_round', 0),
+                )),
+                0,
+            )
+            self.single_mu_cap_end_round = max(
+                int(state.get(
+                    'single_mu_cap_end_round',
+                    getattr(self, 'single_mu_cap_end_round', self.single_mu_cap_start_round),
+                )),
+                self.single_mu_cap_start_round,
+            )
             self.pg_cost_reg_deadband = state.get(
                 'pg_cost_reg_deadband',
                 self.pg_cost_reg_deadband,
@@ -8051,6 +8214,13 @@ def _load_surrogate_model_metadata(filepath: str, device=None) -> dict:
         'sign4_initial_scale': state.get('sign4_initial_scale'),
         'sign4_final_scale': state.get('sign4_final_scale'),
         'sign4_delay_rounds': state.get('sign4_delay_rounds'),
+        'single_mu_cap_penalty_weight': state.get('single_mu_cap_penalty_weight'),
+        'single_mu_cap_initial_weight': state.get('single_mu_cap_initial_weight'),
+        'single_mu_cap_final_weight': state.get('single_mu_cap_final_weight'),
+        'single_mu_cap_initial': state.get('single_mu_cap_initial'),
+        'single_mu_cap_final': state.get('single_mu_cap_final'),
+        'single_mu_cap_start_round': state.get('single_mu_cap_start_round'),
+        'single_mu_cap_end_round': state.get('single_mu_cap_end_round'),
         'surrogate_direction_signs': state.get('surrogate_direction_signs'),
         'nn_hidden_dims': state.get('nn_hidden_dims'),
         'pg_cost_hidden_dims': state.get('pg_cost_hidden_dims', state.get('nn_hidden_dims')),

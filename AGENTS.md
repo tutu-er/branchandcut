@@ -14,6 +14,11 @@ Run pytest tests:
 pytest tests/
 ```
 
+When testing this project locally, prefer the existing conda environment:
+```bash
+conda run -n poweropt python -m py_compile run_training.py
+```
+
 Run a single source module directly (most `src/` files have `if __name__ == '__main__'` sections):
 ```bash
 python src/uc_NN.py

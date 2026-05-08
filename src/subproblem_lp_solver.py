@@ -1526,6 +1526,15 @@ def solve_dual_block(
         )
         obj_opt_terms.append(abs(lhs - deltas[k]) * mu_abs[k])
 
+    single_mu_cap_penalty = 0.0
+    cap, cap_weight = trainer._current_single_mu_cap()
+    if cap is not None and cap_weight > 0.0:
+        st, en = trainer._single_time_coupling_slice()
+        if st < en:
+            single_mu_cap_excess = cp.Variable(en - st, nonneg=True)
+            constraints.append(single_mu_cap_excess >= mu_abs[st:en] - float(cap))
+            single_mu_cap_penalty = float(cap_weight) * cp.sum(single_mu_cap_excess)
+
     obj_dual_prox = _build_dual_block_prox_expr(
         trainer,
         sample_id,
@@ -1554,6 +1563,7 @@ def solve_dual_block(
         + trainer.rho_dual_coc * obj_dual_coc
         + trainer.rho_opt * obj_opt
         + trainer.dual_block_prox_weight * obj_dual_prox
+        + single_mu_cap_penalty
     )
     problem = cp.Problem(cp.Minimize(objective), constraints)
     try:

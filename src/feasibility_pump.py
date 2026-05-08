@@ -2545,13 +2545,28 @@ def solve_global_LP_relaxation(
                 _lhs = gp.LinExpr()
                 for _ci2 in _ci.get('nonzero_pg_coefficients', []):
                     _uid = _ci2['unit_id']
-                    _tname = f'theta_branch_{_bid}_unit_{_uid}_time_{_ts}'
+                    if hasattr(agent, '_theta_member_time_index'):
+                        _member_time = int(agent._theta_member_time_index(_ci, _ci2))
+                    else:
+                        _member_time = int(_ci2.get('time_index', _ts))
+                    if hasattr(agent, '_theta_var_name'):
+                        _tname = agent._theta_var_name(_bid, _uid, _member_time)
+                    else:
+                        _tname = f'theta_branch_{_bid}_unit_{_uid}_time_{_member_time}'
                     _coeff = float(_tv.get(_tname, 0.0))
-                    if abs(_coeff) > 1e-10 and _uid < ng and _ts < T:
-                        _lhs += _coeff * x[_uid, _ts]
-                _rhs_name = f'theta_rhs_branch_{_bid}_time_{_ts}'
+                    if abs(_coeff) > 1e-10 and _uid < ng and 0 <= _member_time < T:
+                        _lhs += _coeff * x[_uid, _member_time]
+                if hasattr(agent, '_theta_rhs_name'):
+                    _rhs_name = agent._theta_rhs_name(_bid, _ts)
+                else:
+                    _rhs_name = f'theta_rhs_branch_{_bid}_time_{_ts}'
                 _rhs = float(_tv.get(_rhs_name, 1.0))
-                expr = _lhs - _rhs
+                _direction = (
+                    float(agent._get_theta_constraint_direction(_bid, _ts))
+                    if hasattr(agent, '_get_theta_constraint_direction')
+                    else 1.0
+                )
+                expr = _direction * (_lhs - _rhs)
                 if stage['hard_bcd']:
                     model.addConstr(expr <= 0.0, name=f'theta_surr_{_bid}_{_ts}')
                 else:
@@ -2562,13 +2577,24 @@ def solve_global_LP_relaxation(
             for _zc in (_ua or {}).get('union_zeta_constraints', []):
                 _uid = _zc['unit_id']
                 _ts = _zc['time_slot']
-                _zname = f'zeta_unit_{_uid}_time_{_ts}'
+                if hasattr(agent, '_zeta_var_name'):
+                    _zname = agent._zeta_var_name(_uid, _ts)
+                else:
+                    _zname = f'zeta_unit_{_uid}_time_{_ts}'
                 _coeff = float(_zv.get(_zname, 0.0))
-                _rhs_name = f'zeta_rhs_unit_{_uid}_time_{_ts}'
+                if hasattr(agent, '_zeta_rhs_name'):
+                    _rhs_name = agent._zeta_rhs_name(_uid, _ts)
+                else:
+                    _rhs_name = f'zeta_rhs_unit_{_uid}_time_{_ts}'
                 _rhs = float(_zv.get(_rhs_name, 1.0))
                 if abs(_coeff) <= 1e-10 or _uid >= ng or _ts >= T:
                     continue
-                expr = _coeff * x[_uid, _ts] - _rhs
+                _direction = (
+                    float(agent._get_zeta_constraint_direction(_uid, _ts))
+                    if hasattr(agent, '_get_zeta_constraint_direction')
+                    else 1.0
+                )
+                expr = _direction * (_coeff * x[_uid, _ts] - _rhs)
                 if stage['hard_bcd']:
                     model.addConstr(expr <= 0.0, name=f'zeta_surr_{_uid}_{_ts}')
                 else:

@@ -38,6 +38,28 @@ SIGN4_DUAL_FLOOR = 5.00
 THETA_FLOOR_FRACTION = 0.40
 SIGN4_INDIVIDUAL_FRACTION = 0.50
 SIGN4_GROUP_FRACTION = 0.85
+SIGN4_DELAY_ROUNDS = 3
+SIGN4_CURRICULUM_ROUNDS = 24
+SIGN4_INITIAL_SCALE = 0.10
+SIGN4_FINAL_SCALE = 2.00
+SINGLE_MU_CAP_WEIGHT = 0.50
+SINGLE_MU_CAP_INITIAL_WEIGHT = 0.00
+SINGLE_MU_CAP_INITIAL = SIGN4_DUAL_FLOOR
+SINGLE_MU_CAP_FINAL = 1.00
+SINGLE_MU_CAP_START_FRACTION = SIGN4_INDIVIDUAL_FRACTION
+SINGLE_MU_CAP_END_FRACTION = SIGN4_GROUP_FRACTION
+
+# Subproblem [direct-NN-main]: full-batch over all samples; fewer epochs per BCD round.
+SUBPROBLEM_MAIN_DIRECT_BATCH_STRATEGY = "full-batch"
+SUBPROBLEM_MAIN_DIRECT_EPOCHS = 60
+
+# Subproblem [c_pg]: start from the first BCD round, but keep the inner
+# training lighter than the generic defaults for faster case3lite iteration.
+SUBPROBLEM_PG_COST_START_ROUND = 0
+SUBPROBLEM_PG_COST_NN_EPOCHS = 24
+SUBPROBLEM_C_PG_DIRECT_EPOCHS = 120
+SUBPROBLEM_C_PG_DIRECT_BATCH_STRATEGY = "full-batch"
+SUBPROBLEM_C_PG_DIRECT_BATCH_SIZE = 100
 
 
 def _parse_args() -> argparse.Namespace:
@@ -60,11 +82,45 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--theta-floor-frac", type=float, default=THETA_FLOOR_FRACTION)
     p.add_argument("--sign4-individual-frac", type=float, default=SIGN4_INDIVIDUAL_FRACTION)
     p.add_argument("--sign4-group-frac", type=float, default=SIGN4_GROUP_FRACTION)
+    p.add_argument("--sign4-delay-rounds", type=int, default=SIGN4_DELAY_ROUNDS)
+    p.add_argument("--sign4-curriculum-rounds", type=int, default=SIGN4_CURRICULUM_ROUNDS)
+    p.add_argument("--sign4-initial-scale", type=float, default=SIGN4_INITIAL_SCALE)
+    p.add_argument("--sign4-final-scale", type=float, default=SIGN4_FINAL_SCALE)
+    p.add_argument("--single-mu-cap-weight", type=float, default=SINGLE_MU_CAP_WEIGHT)
+    p.add_argument("--single-mu-cap-initial-weight", type=float, default=SINGLE_MU_CAP_INITIAL_WEIGHT)
+    p.add_argument("--single-mu-cap-final-weight", type=float, default=None)
+    p.add_argument("--single-mu-cap-initial", type=float, default=SINGLE_MU_CAP_INITIAL)
+    p.add_argument("--single-mu-cap-final", type=float, default=SINGLE_MU_CAP_FINAL)
+    p.add_argument("--single-mu-cap-start-frac", type=float, default=SINGLE_MU_CAP_START_FRACTION)
+    p.add_argument("--single-mu-cap-end-frac", type=float, default=SINGLE_MU_CAP_END_FRACTION)
+    p.add_argument("--c-pg-start-round", type=int, default=SUBPROBLEM_PG_COST_START_ROUND)
+    p.add_argument("--c-pg-nn-epochs", type=int, default=SUBPROBLEM_PG_COST_NN_EPOCHS)
+    p.add_argument("--c-pg-direct-epochs", type=int, default=SUBPROBLEM_C_PG_DIRECT_EPOCHS)
+    p.add_argument(
+        "--c-pg-direct-batch-strategy",
+        choices=("full-batch", "mini-batch"),
+        default=SUBPROBLEM_C_PG_DIRECT_BATCH_STRATEGY,
+    )
+    p.add_argument("--c-pg-direct-batch-size", type=int, default=SUBPROBLEM_C_PG_DIRECT_BATCH_SIZE)
+    p.add_argument("--unit-ids", type=str, default=None,
+                   help="Comma-separated unit ids to train, e.g. '0' or '0,2'.")
     return p.parse_args()
 
 
 def _clip_fraction(value: float) -> float:
     return min(max(float(value), 0.0), 1.0)
+
+
+def _parse_unit_ids(text: str | None) -> list[int] | None:
+    if text is None or str(text).strip() == "":
+        return None
+    unit_ids: list[int] = []
+    for part in str(text).split(","):
+        part = part.strip()
+        if not part:
+            continue
+        unit_ids.append(int(part))
+    return unit_ids or None
 
 
 def _configure_strong_complex_dual_floors(args: argparse.Namespace) -> None:
@@ -73,6 +129,8 @@ def _configure_strong_complex_dual_floors(args: argparse.Namespace) -> None:
     theta_floor_frac = _clip_fraction(args.theta_floor_frac)
     sign4_individual_frac = _clip_fraction(args.sign4_individual_frac)
     sign4_group_frac = max(sign4_individual_frac, _clip_fraction(args.sign4_group_frac))
+    single_cap_start_frac = _clip_fraction(args.single_mu_cap_start_frac)
+    single_cap_end_frac = max(single_cap_start_frac, _clip_fraction(args.single_mu_cap_end_frac))
 
     rt.BCD_MU_DUAL_FLOOR_INIT = max(0.0, float(args.theta_dual_floor))
     rt.BCD_ITA_DUAL_FLOOR_INIT = max(0.0, float(args.zeta_dual_floor))
@@ -85,12 +143,27 @@ def _configure_strong_complex_dual_floors(args: argparse.Namespace) -> None:
         rt.SUBPROBLEM_MU_DUAL_FLOOR_INDIVIDUAL_ROUND,
         round(sub_iter * sign4_group_frac),
     )
-    rt.SUBPROBLEM_SIGN4_DELAY_ROUNDS = 0
-    rt.SUBPROBLEM_SIGN4_CURRICULUM_ROUNDS = 0
-    rt.SUBPROBLEM_SIGN4_INITIAL_SCALE = 1.0
-    rt.SUBPROBLEM_SIGN4_FINAL_SCALE = 1.0
+    rt.SUBPROBLEM_SIGN4_DELAY_ROUNDS = max(0, int(args.sign4_delay_rounds))
+    rt.SUBPROBLEM_SIGN4_CURRICULUM_ROUNDS = max(0, int(args.sign4_curriculum_rounds))
+    rt.SUBPROBLEM_SIGN4_INITIAL_SCALE = max(0.0, float(args.sign4_initial_scale))
+    rt.SUBPROBLEM_SIGN4_FINAL_SCALE = max(0.0, float(args.sign4_final_scale))
     rt.SUBPROBLEM_SURROGATE_DELTA_REFERENCE_LIFT = True
     rt.SUBPROBLEM_SURROGATE_DELTA_REFERENCE_SCOPE = "sign4_only"
+    single_cap_final_weight = (
+        args.single_mu_cap_weight
+        if args.single_mu_cap_final_weight is None
+        else args.single_mu_cap_final_weight
+    )
+    rt.SUBPROBLEM_SINGLE_MU_CAP_PENALTY_WEIGHT = max(0.0, float(single_cap_final_weight))
+    rt.SUBPROBLEM_SINGLE_MU_CAP_INITIAL_WEIGHT = max(0.0, float(args.single_mu_cap_initial_weight))
+    rt.SUBPROBLEM_SINGLE_MU_CAP_FINAL_WEIGHT = max(0.0, float(single_cap_final_weight))
+    rt.SUBPROBLEM_SINGLE_MU_CAP_INITIAL = max(0.0, float(args.single_mu_cap_initial))
+    rt.SUBPROBLEM_SINGLE_MU_CAP_FINAL = max(0.0, float(args.single_mu_cap_final))
+    rt.SUBPROBLEM_SINGLE_MU_CAP_START_ROUND = max(0, round(sub_iter * single_cap_start_frac))
+    rt.SUBPROBLEM_SINGLE_MU_CAP_END_ROUND = max(
+        rt.SUBPROBLEM_SINGLE_MU_CAP_START_ROUND,
+        round(sub_iter * single_cap_end_frac),
+    )
 
 
 def main() -> None:
@@ -101,7 +174,7 @@ def main() -> None:
     rt.RUN_FP = False
     rt.ACTIVE_SETS_FILE = args.active_sets
     rt.MAX_SAMPLES = max(1, int(args.max_samples))
-    rt.UNIT_IDS = None
+    rt.UNIT_IDS = _parse_unit_ids(args.unit_ids)
 
     rt.DUAL_EPOCHS = base.DUAL_EPOCHS
     rt.UNIT_PREDICTOR_EPOCHS = base.UNIT_PREDICTOR_EPOCHS
@@ -146,11 +219,20 @@ def main() -> None:
     base._configure_iterations(args.bcd_iter, args.sub_iter)
     _configure_strong_complex_dual_floors(args)
 
+    rt.SUBPROBLEM_MAIN_DIRECT_BATCH_STRATEGY = SUBPROBLEM_MAIN_DIRECT_BATCH_STRATEGY
+    rt.SUBPROBLEM_MAIN_DIRECT_EPOCHS = max(1, int(SUBPROBLEM_MAIN_DIRECT_EPOCHS))
+    rt.SUBPROBLEM_PG_COST_START_ROUND = max(0, int(args.c_pg_start_round))
+    rt.SUBPROBLEM_PG_COST_NN_EPOCHS = max(1, int(args.c_pg_nn_epochs))
+    rt.SUBPROBLEM_C_PG_DIRECT_EPOCHS = max(1, int(args.c_pg_direct_epochs))
+    rt.SUBPROBLEM_C_PG_DIRECT_BATCH_STRATEGY = args.c_pg_direct_batch_strategy
+    rt.SUBPROBLEM_C_PG_DIRECT_BATCH_SIZE = max(1, int(args.c_pg_direct_batch_size))
+
     print("=" * 72, flush=True)
     print(
         f"case3lite strong-complex-dual-floor training | target={rt.MODE} | "
         f"max_samples={rt.MAX_SAMPLES} | bcd_iter={rt.BCD_MAX_ITER} | "
-        f"sub_iter={rt.SUBPROBLEM_MAX_ITER} | active_sets={rt.ACTIVE_SETS_FILE or 'auto-latest'}",
+        f"sub_iter={rt.SUBPROBLEM_MAX_ITER} | units={rt.UNIT_IDS or 'all'} | "
+        f"active_sets={rt.ACTIVE_SETS_FILE or 'auto-latest'}",
         flush=True,
     )
     print(
@@ -174,9 +256,37 @@ def main() -> None:
         flush=True,
     )
     print(
+        f"sign4_curriculum=delay {rt.SUBPROBLEM_SIGN4_DELAY_ROUNDS} rounds, "
+        f"scale {rt.SUBPROBLEM_SIGN4_INITIAL_SCALE}"
+        f"->{rt.SUBPROBLEM_SIGN4_FINAL_SCALE} over "
+        f"{rt.SUBPROBLEM_SIGN4_CURRICULUM_ROUNDS} rounds",
+        flush=True,
+    )
+    print(
+        f"single_mu_cap_weight={rt.SUBPROBLEM_SINGLE_MU_CAP_INITIAL_WEIGHT}"
+        f"->{rt.SUBPROBLEM_SINGLE_MU_CAP_FINAL_WEIGHT} | "
+        f"cap={rt.SUBPROBLEM_SINGLE_MU_CAP_INITIAL}->{rt.SUBPROBLEM_SINGLE_MU_CAP_FINAL} | "
+        f"rounds={rt.SUBPROBLEM_SINGLE_MU_CAP_START_ROUND}"
+        f"..{rt.SUBPROBLEM_SINGLE_MU_CAP_END_ROUND}",
+        flush=True,
+    )
+    print(
         f"unit_predictor={rt.USE_UNIT_PREDICTOR} | "
         f"load_path={rt.UNIT_PREDICTOR_LOAD_PATH or 'auto-latest'} | "
         f"auto_latest={rt.UNIT_PREDICTOR_AUTO_LATEST_STANDALONE}",
+        flush=True,
+    )
+    print(
+        f"subproblem direct-NN-main: batch_strategy={rt.SUBPROBLEM_MAIN_DIRECT_BATCH_STRATEGY}, "
+        f"epochs={rt.SUBPROBLEM_MAIN_DIRECT_EPOCHS}",
+        flush=True,
+    )
+    print(
+        f"subproblem c_pg: start_round={rt.SUBPROBLEM_PG_COST_START_ROUND}, "
+        f"nn_epochs={rt.SUBPROBLEM_PG_COST_NN_EPOCHS}, "
+        f"direct_epochs={rt.SUBPROBLEM_C_PG_DIRECT_EPOCHS}, "
+        f"direct_batch={rt.SUBPROBLEM_C_PG_DIRECT_BATCH_STRATEGY}/"
+        f"{rt.SUBPROBLEM_C_PG_DIRECT_BATCH_SIZE}",
         flush=True,
     )
     print("=" * 72, flush=True)

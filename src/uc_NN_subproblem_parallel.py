@@ -32,8 +32,6 @@ from typing import Dict, List, Optional
 from types import SimpleNamespace
 
 import numpy as np
-from scenario_utils import normalize_sample_arrays
-from pypower.ext2int import ext2int
 
 # ── 路径设置（worker 进程也需要能 import src.*）──────────────
 _SRC_DIR = Path(__file__).resolve().parent
@@ -42,7 +40,11 @@ for _p in [str(_SRC_DIR), str(_ROOT_DIR)]:
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
+from scenario_utils import normalize_sample_arrays
+from pypower.ext2int import ext2int
+
 from uc_NN_subproblem import (
+    CONSTRAINT_STRATEGY_ALL_SINGLE_TIME,
     CONSTRAINT_STRATEGY_ALL_TEMPLATES_SIGN4,
     CONSTRAINT_STRATEGY_ALL_TEMPLATES_SIGN4_PLUS_SINGLE,
     LP_BACKEND_CVXPY_HIGHS,
@@ -152,6 +154,13 @@ class ParallelSubproblemSurrogateTrainer(SubproblemSurrogateTrainer):
         loss_ratio_reg: float = 1.0,
         pg_block_prox_weight: float = 2e-2,
         dual_block_prox_weight: float = 1e-2,
+        single_mu_cap_penalty_weight: float = 0.0,
+        single_mu_cap_initial_weight: float | None = None,
+        single_mu_cap_final_weight: float | None = None,
+        single_mu_cap_initial: float | None = None,
+        single_mu_cap_final: float | None = None,
+        single_mu_cap_start_round: int = 0,
+        single_mu_cap_end_round: int = 0,
         ignore_startup_shutdown_costs: bool = False,
         unit_predictor=None,
         use_unit_predictor: bool = False,
@@ -233,6 +242,13 @@ class ParallelSubproblemSurrogateTrainer(SubproblemSurrogateTrainer):
             loss_ratio_reg=loss_ratio_reg,
             pg_block_prox_weight=pg_block_prox_weight,
             dual_block_prox_weight=dual_block_prox_weight,
+            single_mu_cap_penalty_weight=single_mu_cap_penalty_weight,
+            single_mu_cap_initial_weight=single_mu_cap_initial_weight,
+            single_mu_cap_final_weight=single_mu_cap_final_weight,
+            single_mu_cap_initial=single_mu_cap_initial,
+            single_mu_cap_final=single_mu_cap_final,
+            single_mu_cap_start_round=single_mu_cap_start_round,
+            single_mu_cap_end_round=single_mu_cap_end_round,
             ignore_startup_shutdown_costs=ignore_startup_shutdown_costs,
             unit_predictor=unit_predictor,
             use_unit_predictor=use_unit_predictor,
@@ -286,6 +302,13 @@ class ParallelSubproblemSurrogateTrainer(SubproblemSurrogateTrainer):
             'rho_dual_coc': float(self.rho_dual_coc),
             'pg_block_prox_weight': float(self.pg_block_prox_weight),
             'dual_block_prox_weight': float(self.dual_block_prox_weight),
+            'single_mu_cap_penalty_weight': float(getattr(self, 'single_mu_cap_penalty_weight', 0.0)),
+            'single_mu_cap_initial_weight': float(getattr(self, 'single_mu_cap_initial_weight', 0.0)),
+            'single_mu_cap_final_weight': float(getattr(self, 'single_mu_cap_final_weight', 0.0)),
+            'single_mu_cap_initial': getattr(self, 'single_mu_cap_initial', None),
+            'single_mu_cap_final': getattr(self, 'single_mu_cap_final', None),
+            'single_mu_cap_start_round': int(getattr(self, 'single_mu_cap_start_round', 0)),
+            'single_mu_cap_end_round': int(getattr(self, 'single_mu_cap_end_round', 0)),
             'num_coupling_constraints': int(self.num_coupling_constraints),
             'all_mode_group_size': int(self.all_mode_group_size),
             'constraint_generation_strategy': str(self.constraint_generation_strategy),
@@ -681,6 +704,55 @@ class _SampleWorkerTrainerProxy(SimpleNamespace):
     def _uses_group_mu_lower_bound(self) -> bool:
         return bool(self.use_group_mu_lower_bound)
 
+    def _single_time_coupling_slice(self) -> tuple[int, int]:
+        nc = int(self.num_coupling_constraints)
+        strategy = str(getattr(self, 'constraint_generation_strategy', '') or '')
+        if strategy == CONSTRAINT_STRATEGY_ALL_SINGLE_TIME:
+            end = min(int(self.T), nc)
+            return (0, end)
+        if strategy == CONSTRAINT_STRATEGY_ALL_TEMPLATES_SIGN4_PLUS_SINGLE:
+            head = int(self.all_mode_group_size) * max(int(self.T) - 2, 0)
+            end = min(head + int(self.T), nc)
+            start = min(head, end)
+            return (start, end)
+        return (0, 0)
+
+    def _current_single_mu_cap(self) -> tuple[float | None, float]:
+        final_weight = max(
+            float(getattr(
+                self,
+                'single_mu_cap_final_weight',
+                getattr(self, 'single_mu_cap_penalty_weight', 0.0),
+            ) or 0.0),
+            0.0,
+        )
+        initial_weight = max(
+            float(getattr(self, 'single_mu_cap_initial_weight', 0.0) or 0.0),
+            0.0,
+        )
+        if initial_weight <= 0.0 and final_weight <= 0.0:
+            return None, 0.0
+        st, en = self._single_time_coupling_slice()
+        if st >= en:
+            return None, 0.0
+        initial = getattr(self, 'single_mu_cap_initial', None)
+        final = getattr(self, 'single_mu_cap_final', None)
+        if initial is None and final is None:
+            return None, 0.0
+        if initial is None:
+            initial = final
+        if final is None:
+            final = initial
+        start = max(int(getattr(self, 'single_mu_cap_start_round', 0) or 0), 0)
+        end = max(int(getattr(self, 'single_mu_cap_end_round', start) or start), start)
+        it = int(getattr(self, 'iter_number', 0) or 0)
+        if it < start:
+            return None, 0.0
+        frac = 1.0 if end <= start else min(max((it - start) / float(end - start), 0.0), 1.0)
+        cap = float(initial) + frac * (float(final) - float(initial))
+        weight = initial_weight + frac * (final_weight - initial_weight)
+        return max(cap, 0.0), weight
+
     def _mu_floor_schedule_iter(self) -> int:
         """与 ``SubproblemSurrogateTrainer._mu_floor_schedule_iter`` 一致（worker 仅用标量快照）。"""
         delay = max(int(getattr(self, 'sign4_delay_rounds', 0) or 0), 0)
@@ -855,6 +927,13 @@ def _train_unit_worker(args: dict) -> dict:
     iter_delta_reg_deadband = args.get('iter_delta_reg_deadband', 0.10)
     pg_block_prox_weight = args.get('pg_block_prox_weight', 2e-2)
     dual_block_prox_weight = args.get('dual_block_prox_weight', 1e-2)
+    single_mu_cap_penalty_weight = args.get('single_mu_cap_penalty_weight', 0.0)
+    single_mu_cap_initial_weight = args.get('single_mu_cap_initial_weight')
+    single_mu_cap_final_weight = args.get('single_mu_cap_final_weight')
+    single_mu_cap_initial = args.get('single_mu_cap_initial')
+    single_mu_cap_final = args.get('single_mu_cap_final')
+    single_mu_cap_start_round = args.get('single_mu_cap_start_round', 0)
+    single_mu_cap_end_round = args.get('single_mu_cap_end_round', 0)
     sample_n_workers    = args.get('sample_n_workers', 4)
     use_sample_parallel = args.get('use_sample_parallel', True)
     lp_backend          = args.get('lp_backend', LP_BACKEND_GUROBI)
@@ -1006,6 +1085,13 @@ def _train_unit_worker(args: dict) -> dict:
             iter_delta_reg_deadband=iter_delta_reg_deadband,
             pg_block_prox_weight=pg_block_prox_weight,
             dual_block_prox_weight=dual_block_prox_weight,
+            single_mu_cap_penalty_weight=single_mu_cap_penalty_weight,
+            single_mu_cap_initial_weight=single_mu_cap_initial_weight,
+            single_mu_cap_final_weight=single_mu_cap_final_weight,
+            single_mu_cap_initial=single_mu_cap_initial,
+            single_mu_cap_final=single_mu_cap_final,
+            single_mu_cap_start_round=single_mu_cap_start_round,
+            single_mu_cap_end_round=single_mu_cap_end_round,
             unit_predictor=unit_predictor_obj,
             use_unit_predictor=effective_use_unit_predictor,
             predictor_warmup_rounds=predictor_warmup_rounds,
@@ -1083,6 +1169,13 @@ def _train_unit_worker(args: dict) -> dict:
             iter_delta_reg_deadband=iter_delta_reg_deadband,
             pg_block_prox_weight=pg_block_prox_weight,
             dual_block_prox_weight=dual_block_prox_weight,
+            single_mu_cap_penalty_weight=single_mu_cap_penalty_weight,
+            single_mu_cap_initial_weight=single_mu_cap_initial_weight,
+            single_mu_cap_final_weight=single_mu_cap_final_weight,
+            single_mu_cap_initial=single_mu_cap_initial,
+            single_mu_cap_final=single_mu_cap_final,
+            single_mu_cap_start_round=single_mu_cap_start_round,
+            single_mu_cap_end_round=single_mu_cap_end_round,
             unit_predictor=unit_predictor_obj,
             use_unit_predictor=effective_use_unit_predictor,
             predictor_warmup_rounds=predictor_warmup_rounds,
@@ -1314,6 +1407,13 @@ def train_all_surrogates_parallel(
     iter_delta_reg_deadband: float = 0.10,
     pg_block_prox_weight: float = 2e-2,
     dual_block_prox_weight: float = 1e-2,
+    single_mu_cap_penalty_weight: float = 0.0,
+    single_mu_cap_initial_weight: float | None = None,
+    single_mu_cap_final_weight: float | None = None,
+    single_mu_cap_initial: float | None = None,
+    single_mu_cap_final: float | None = None,
+    single_mu_cap_start_round: int = 0,
+    single_mu_cap_end_round: int = 0,
     constraint_generation_strategy: str = "sensitive",
     save_dir: Optional[str] = None,
     device=None,
@@ -1480,6 +1580,13 @@ def train_all_surrogates_parallel(
             'iter_delta_reg_deadband': iter_delta_reg_deadband,
             'pg_block_prox_weight': pg_block_prox_weight,
             'dual_block_prox_weight': dual_block_prox_weight,
+            'single_mu_cap_penalty_weight': single_mu_cap_penalty_weight,
+            'single_mu_cap_initial_weight': single_mu_cap_initial_weight,
+            'single_mu_cap_final_weight': single_mu_cap_final_weight,
+            'single_mu_cap_initial': single_mu_cap_initial,
+            'single_mu_cap_final': single_mu_cap_final,
+            'single_mu_cap_start_round': single_mu_cap_start_round,
+            'single_mu_cap_end_round': single_mu_cap_end_round,
             'constraint_generation_strategy': constraint_generation_strategy,
             'sample_n_workers':   sample_n_workers,
             'use_sample_parallel': use_sample_parallel,

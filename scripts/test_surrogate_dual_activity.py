@@ -63,6 +63,7 @@ try:
         _gurobi_status_name,
         _resolve_surrogate_constraint_layout,
         _solve_unit_LP_with_surrogate,
+        solve_global_LP_relaxation,
     )
     from src.scenario_utils import normalize_sample_arrays
     from src.uc_NN_subproblem import load_trained_models
@@ -74,6 +75,7 @@ except ImportError:
         _gurobi_status_name,
         _resolve_surrogate_constraint_layout,
         _solve_unit_LP_with_surrogate,
+        solve_global_LP_relaxation,
     )
     from scenario_utils import normalize_sample_arrays
     from uc_NN_subproblem import load_trained_models
@@ -95,6 +97,18 @@ def _latest_model_dir(case_name: str) -> Path:
     candidates = [p for p in candidates if list(p.glob("surrogate_unit_*.pth"))]
     if not candidates:
         raise FileNotFoundError(f"No subproblem model dir with surrogate_unit_*.pth found under {root} for {case_name}")
+    return candidates[0]
+
+
+def _latest_bcd_model_path(case_name: str) -> Path:
+    root = ROOT / "result" / "bcd_models"
+    candidates = sorted(
+        root.glob(f"bcd_model_{case_name}_*.pth"),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    if not candidates:
+        raise FileNotFoundError(f"No BCD model found under {root} for {case_name}")
     return candidates[0]
 
 
@@ -582,6 +596,172 @@ def aggregate_activity(rows: List[dict], train_mu_by_key: Dict[Tuple[int, int], 
     return out
 
 
+def _load_main_bcd_agent(ppc: dict, active_path: Path, bcd_model_path: Path, t_delta: float):
+    try:
+        from src.uc_NN_BCD import Agent_NN_BCD, load_active_set_from_json
+    except ImportError:
+        from uc_NN_BCD import Agent_NN_BCD, load_active_set_from_json
+
+    active_set_data = load_active_set_from_json(str(active_path))
+    agent = Agent_NN_BCD(ppc, active_set_data=active_set_data, T_delta=float(t_delta))
+    agent.load_model_parameters(str(bcd_model_path), restore_rho_state=False)
+    return agent
+
+
+def collect_main_model_activity_records(
+    ppc: dict,
+    trainers: Dict[int, object],
+    dual_predictor,
+    test_samples: List[dict],
+    agent,
+    t_delta: float,
+    include_subproblem_rows: bool = False,
+) -> Tuple[List[dict], List[dict]]:
+    rows: List[dict] = []
+    summaries: List[dict] = []
+    allowed_kinds = {"bcd_theta", "bcd_zeta"}
+    if include_subproblem_rows:
+        allowed_kinds.add("subproblem_surrogate")
+
+    for sample_pos, sample in enumerate(test_samples):
+        sample = normalize_sample_arrays(dict(sample))
+        sample_id = int(sample.get("sample_id", sample_pos))
+        print(f"[main-test] sample_pos={sample_pos}, sample_id={sample_id}", flush=True)
+        try:
+            lambda_val = dual_predictor.predict(sample)
+            _, stats = solve_global_LP_relaxation(
+                ppc,
+                sample,
+                float(t_delta),
+                trainers,
+                lambda_val,
+                agent=agent,
+                return_stats=True,
+            )
+        except Exception as exc:
+            summaries.append(
+                {
+                    "sample_pos": int(sample_pos),
+                    "sample_id": int(sample_id),
+                    "error": str(exc),
+                }
+            )
+            print(f"  main model activity failed: {exc}", flush=True)
+            continue
+
+        activity_rows = []
+        for row in stats.get("main_constraint_activity_rows", []) or []:
+            if str(row.get("kind")) not in allowed_kinds:
+                continue
+            out = {
+                "sample_pos": int(sample_pos),
+                "sample_id": int(sample_id),
+                **dict(row),
+            }
+            rows.append(out)
+            activity_rows.append(out)
+
+        summaries.append(
+            {
+                "sample_pos": int(sample_pos),
+                "sample_id": int(sample_id),
+                "stage_index": stats.get("stage_index"),
+                "stage_name": stats.get("stage_name"),
+                "status": stats.get("status"),
+                "status_name": stats.get("status_name"),
+                "runtime_sec": stats.get("runtime_sec"),
+                "objective": stats.get("objective"),
+                "num_main_activity_rows": int(len(activity_rows)),
+                "num_bcd_theta_rows": int(sum(1 for r in activity_rows if r.get("kind") == "bcd_theta")),
+                "num_bcd_zeta_rows": int(sum(1 for r in activity_rows if r.get("kind") == "bcd_zeta")),
+                "num_subproblem_rows": int(sum(1 for r in activity_rows if r.get("kind") == "subproblem_surrogate")),
+                "bcd_slack_sum": stats.get("bcd_slack_sum", 0.0),
+                "bcd_slack_max": stats.get("bcd_slack_max", 0.0),
+                "used_soft_bcd": stats.get("used_soft_bcd", False),
+                "used_fallback_stage": stats.get("used_fallback_stage", False),
+            }
+        )
+    return rows, summaries
+
+
+def aggregate_main_model_activity(rows: List[dict], active_tol: float, dual_tol: float) -> List[dict]:
+    grouped: Dict[Tuple[str, Optional[int], Optional[int], Optional[int], Optional[int]], List[dict]] = {}
+    for row in rows:
+        key = (
+            str(row.get("kind", "unknown")),
+            row.get("branch_id"),
+            row.get("unit_id"),
+            row.get("constraint_index"),
+            row.get("time_slot"),
+        )
+        grouped.setdefault(key, []).append(row)
+
+    out: List[dict] = []
+    for (kind, branch_id, unit_id, constraint_index, time_slot), items in sorted(
+        grouped.items(),
+        key=lambda kv: (
+            kv[0][0],
+            -1 if kv[0][1] is None else int(kv[0][1]),
+            -1 if kv[0][2] is None else int(kv[0][2]),
+            -1 if kv[0][3] is None else int(kv[0][3]),
+            -1 if kv[0][4] is None else int(kv[0][4]),
+        ),
+    ):
+        slacks = np.asarray([_safe_float(r.get("abs_row_slack")) for r in items], dtype=float)
+        duals = np.asarray([_safe_float(r.get("abs_dual")) for r in items], dtype=float)
+        relax = np.asarray([bool(r.get("is_relaxed", False)) for r in items], dtype=float)
+        out.append(
+            {
+                "kind": kind,
+                "branch_id": branch_id,
+                "unit_id": unit_id,
+                "constraint_index": constraint_index,
+                "time_slot": time_slot,
+                "n_rows": int(len(items)),
+                "row_active_rate": float(np.mean(slacks <= float(active_tol))) if slacks.size else float("nan"),
+                "dual_active_rate": float(np.mean(duals > float(dual_tol))) if duals.size else float("nan"),
+                "relaxed_rate": float(np.mean(relax)) if relax.size else float("nan"),
+                "abs_slack_mean": float(np.nanmean(slacks)) if slacks.size else float("nan"),
+                "abs_slack_median": float(np.nanmedian(slacks)) if slacks.size else float("nan"),
+                "abs_slack_max": float(np.nanmax(slacks)) if slacks.size else float("nan"),
+                "abs_dual_mean": float(np.nanmean(duals)) if duals.size else float("nan"),
+                "abs_dual_median": float(np.nanmedian(duals)) if duals.size else float("nan"),
+                "abs_dual_max": float(np.nanmax(duals)) if duals.size else float("nan"),
+            }
+        )
+    theta_rows = [
+        row for row in out
+        if str(row.get("kind")) == "bcd_theta"
+        and row.get("branch_id") is not None
+        and row.get("time_slot") is not None
+    ]
+    theta_keys = sorted({(int(row["branch_id"]), int(row["time_slot"])) for row in theta_rows})
+    theta_id_by_key = {key: idx for idx, key in enumerate(theta_keys)}
+    zeta_rows = [
+        row for row in out
+        if str(row.get("kind")) == "bcd_zeta"
+        and row.get("unit_id") is not None
+        and row.get("time_slot") is not None
+    ]
+    zeta_keys = sorted({(int(row["unit_id"]), int(row["time_slot"])) for row in zeta_rows})
+    zeta_id_by_key = {key: idx for idx, key in enumerate(zeta_keys)}
+    for row in out:
+        if str(row.get("kind")) == "bcd_theta" and row.get("branch_id") is not None and row.get("time_slot") is not None:
+            row["theta_constraint_id"] = theta_id_by_key[(int(row["branch_id"]), int(row["time_slot"]))]
+        if str(row.get("kind")) == "bcd_zeta" and row.get("unit_id") is not None and row.get("time_slot") is not None:
+            row["zeta_constraint_id"] = zeta_id_by_key[(int(row["unit_id"]), int(row["time_slot"]))]
+    return out
+
+
+def theta_activity_by_id_rows(main_aggregate_rows: List[dict]) -> List[dict]:
+    rows = [
+        row for row in main_aggregate_rows
+        if str(row.get("kind")) == "bcd_theta"
+        and row.get("theta_constraint_id") is not None
+    ]
+    return sorted(rows, key=lambda row: int(row["theta_constraint_id"]))
+
+
 def write_csv(path: Path, rows: List[dict]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     if not rows:
@@ -615,6 +795,181 @@ def _plot_heatmap(matrix: np.ndarray, title: str, path: Path, cbar_label: str) -
     fig.tight_layout()
     fig.savefig(path, dpi=180)
     plt.close(fig)
+
+
+def _plot_labeled_heatmap(
+    matrix: np.ndarray,
+    row_labels: List[int],
+    col_labels: List[int] | List[str],
+    title: str,
+    path: Path,
+    cbar_label: str,
+    xlabel: str,
+    ylabel: str,
+    cmap: str = "YlGnBu",
+) -> None:
+    if not MPL_AVAILABLE or matrix.size == 0:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fig_w = max(8, min(24, len(col_labels) * 0.42 + 2.5))
+    fig_h = max(4, min(18, len(row_labels) * 0.34 + 2.0))
+    fig, ax = plt.subplots(figsize=(fig_w, fig_h))
+    im = ax.imshow(matrix, aspect="auto", interpolation="nearest", cmap=cmap)
+    ax.set_title(title)
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(ylabel)
+    if len(col_labels) <= 60:
+        ax.set_xticks(np.arange(len(col_labels)))
+        ax.set_xticklabels([str(v) for v in col_labels], rotation=90 if len(col_labels) > 24 else 0)
+    if len(row_labels) <= 80:
+        ax.set_yticks(np.arange(len(row_labels)))
+        ax.set_yticklabels([str(v) for v in row_labels])
+    cbar = fig.colorbar(im, ax=ax)
+    cbar.set_label(cbar_label)
+    fig.tight_layout()
+    fig.savefig(path, dpi=180)
+    plt.close(fig)
+
+
+def _main_activity_matrix(
+    aggregate_rows: List[dict],
+    kind: str,
+    field: str,
+    row_field: str,
+) -> Tuple[np.ndarray, List[int], List[int]]:
+    selected = [
+        row for row in aggregate_rows
+        if str(row.get("kind")) == kind
+        and row.get(row_field) is not None
+        and row.get("time_slot") is not None
+    ]
+    if not selected:
+        return np.zeros((0, 0), dtype=float), [], []
+    row_labels = sorted({int(row[row_field]) for row in selected})
+    col_labels = sorted({int(row["time_slot"]) for row in selected})
+    row_to_idx = {value: idx for idx, value in enumerate(row_labels)}
+    col_to_idx = {value: idx for idx, value in enumerate(col_labels)}
+    matrix = np.full((len(row_labels), len(col_labels)), np.nan, dtype=float)
+    for row in selected:
+        matrix[row_to_idx[int(row[row_field])], col_to_idx[int(row["time_slot"])]] = _safe_float(row.get(field))
+    return matrix, row_labels, col_labels
+
+
+def _theta_activity_id_matrix(
+    aggregate_rows: List[dict],
+    field: str,
+) -> Tuple[np.ndarray, List[int], List[str]]:
+    selected = [
+        row for row in aggregate_rows
+        if str(row.get("kind")) == "bcd_theta"
+        and row.get("theta_constraint_id") is not None
+    ]
+    if not selected:
+        return np.zeros((0, 0), dtype=float), [], []
+    selected = sorted(selected, key=lambda row: int(row["theta_constraint_id"]))
+    row_labels = [int(row["theta_constraint_id"]) for row in selected]
+    matrix = np.asarray([[_safe_float(row.get(field))] for row in selected], dtype=float)
+    return matrix, row_labels, [field]
+
+
+def make_main_activity_plots(output_dir: Path, aggregate_rows: List[dict], sample_rows: List[dict]) -> None:
+    if not MPL_AVAILABLE or not aggregate_rows:
+        return
+    plot_dir = output_dir / "main_model_activity"
+    theta_by_id = theta_activity_by_id_rows(aggregate_rows)
+    if theta_by_id:
+        x = np.asarray([int(row["theta_constraint_id"]) for row in theta_by_id], dtype=int)
+        y = np.asarray([_safe_float(row.get("row_active_rate")) for row in theta_by_id], dtype=float)
+        labels = [f"b{int(row['branch_id'])},t{int(row['time_slot'])}" for row in theta_by_id]
+        fig_w = max(10, min(36, len(theta_by_id) * 0.22 + 3.0))
+        fig, ax = plt.subplots(figsize=(fig_w, 4.8))
+        ax.bar(x, y, width=0.86, color="#3182bd", alpha=0.86)
+        ax.set_title(f"Theta constraint activity rate by id (n={len(theta_by_id)})")
+        ax.set_xlabel("theta constraint id")
+        ax.set_ylabel("row active rate")
+        ax.set_ylim(0.0, 1.02)
+        ax.grid(True, axis="y", alpha=0.25)
+        if len(theta_by_id) <= 80:
+            ax.set_xticks(x)
+            ax.set_xticklabels(labels, rotation=90, fontsize=7)
+            ax.set_xlabel("theta constraint id (branch,time)")
+        fig.tight_layout()
+        plot_dir.mkdir(parents=True, exist_ok=True)
+        fig.savefig(plot_dir / "bcd_theta_activity_rate_by_constraint_id.png", dpi=180)
+        plt.close(fig)
+
+    plot_specs = [
+        ("row_active_rate", "row active rate", "active rate"),
+        ("dual_active_rate", "dual active rate", "dual active rate"),
+        ("relaxed_rate", "relaxation rate", "relaxed rate"),
+        ("abs_slack_mean", "mean absolute slack", "mean |slack|"),
+    ]
+    kind_specs = [
+        ("bcd_theta", "branch_id", "Theta main proxy", "branch id"),
+        ("bcd_zeta", "unit_id", "Zeta main proxy", "unit id"),
+    ]
+    for kind, row_field, title_prefix, ylabel in kind_specs:
+        for field, label, cbar in plot_specs:
+            if kind == "bcd_theta":
+                matrix, row_labels, col_labels = _theta_activity_id_matrix(aggregate_rows, field)
+                xlabel = ""
+                ylabel_for_plot = "theta constraint id"
+            else:
+                matrix, row_labels, col_labels = _main_activity_matrix(aggregate_rows, kind, field, row_field)
+                xlabel = "time slot"
+                ylabel_for_plot = ylabel
+            if matrix.size == 0:
+                continue
+            _plot_labeled_heatmap(
+                matrix,
+                row_labels,
+                col_labels,
+                f"{title_prefix} {label} by constraint id",
+                plot_dir / f"{kind}_{field}_by_id_heatmap.png",
+                cbar,
+                xlabel,
+                ylabel_for_plot,
+            )
+
+    if sample_rows:
+        for kind in ("bcd_theta", "bcd_zeta"):
+            selected = [row for row in sample_rows if str(row.get("kind")) == kind]
+            if not selected:
+                continue
+            samples = sorted({int(row.get("sample_pos", row.get("sample_id", -1))) for row in selected})
+            constraints = sorted({str(row.get("constraint_name", "")) for row in selected})
+            if not samples or not constraints:
+                continue
+            # Keep very large cases readable by plotting the first 160 named constraints.
+            constraints = constraints[:160]
+            sample_to_idx = {value: idx for idx, value in enumerate(samples)}
+            con_to_idx = {value: idx for idx, value in enumerate(constraints)}
+            matrix = np.full((len(samples), len(constraints)), np.nan, dtype=float)
+            for row in selected:
+                name = str(row.get("constraint_name", ""))
+                if name not in con_to_idx:
+                    continue
+                matrix[sample_to_idx[int(row.get("sample_pos", row.get("sample_id", -1)))], con_to_idx[name]] = (
+                    1.0 if bool(row.get("is_row_active_1e_6", False)) else 0.0
+                )
+            fig_w = max(9, min(30, len(constraints) * 0.22 + 2.5))
+            fig_h = max(4, min(14, len(samples) * 0.32 + 2.0))
+            fig, ax = plt.subplots(figsize=(fig_w, fig_h))
+            im = ax.imshow(matrix, aspect="auto", interpolation="nearest", cmap="viridis", vmin=0.0, vmax=1.0)
+            ax.set_title(f"{kind} active rows by sample and explicit constraint name")
+            ax.set_xlabel("constraint name")
+            ax.set_ylabel("sample position")
+            if len(constraints) <= 80:
+                ax.set_xticks(np.arange(len(constraints)))
+                ax.set_xticklabels(constraints, rotation=90, fontsize=7)
+            if len(samples) <= 80:
+                ax.set_yticks(np.arange(len(samples)))
+                ax.set_yticklabels([str(v) for v in samples])
+            cbar = fig.colorbar(im, ax=ax)
+            cbar.set_label("active row (1=yes)")
+            fig.tight_layout()
+            fig.savefig(plot_dir / f"{kind}_active_by_sample_constraint_name.png", dpi=180)
+            plt.close(fig)
 
 
 def make_plots(output_dir: Path, aggregate_rows: List[dict], test_rows: List[dict]) -> None:
@@ -685,6 +1040,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--case", default="case118", help="case name, default case118")
     parser.add_argument("--active-set-json", default=None, help="active-set JSON path; default auto")
     parser.add_argument("--model-dir", default=None, help="trained subproblem model directory; default latest")
+    parser.add_argument("--bcd-model", default=None, help="trained main BCD model path; default latest when --main-activity")
     parser.add_argument("--units", default=None, help="comma-separated unit ids; default all model units")
     parser.add_argument("--train-start", type=int, default=0, help="first sample used to initialize/load trainers")
     parser.add_argument("--train-samples", type=int, default=32, help="number of training samples to analyze")
@@ -725,6 +1081,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lp-backend", default=None, help="override subproblem LP backend")
     parser.add_argument("--strategy", default=None, help="override constraint generation strategy")
     parser.add_argument("--ignore-startup-shutdown-costs", action="store_true")
+    parser.add_argument("--main-activity", action="store_true", help="also test main-model theta/zeta proxy constraint activity")
+    parser.add_argument("--main-only", action="store_true", help="skip subproblem activity and run only main-model activity")
+    parser.add_argument(
+        "--main-include-subproblem",
+        action="store_true",
+        help="include subproblem surrogate rows from the global LP in main activity CSVs",
+    )
+    parser.add_argument("--main-dual-active-tol", type=float, default=1e-7)
     parser.add_argument("--output-dir", default=None)
     parser.add_argument("--no-plots", action="store_true")
     return parser.parse_args()
@@ -752,6 +1116,11 @@ def main() -> None:
     model_dir = Path(args.model_dir) if args.model_dir else _latest_model_dir(case_name)
     if not model_dir.is_absolute():
         model_dir = ROOT / model_dir
+    bcd_model_path = None
+    if args.main_activity or args.main_only:
+        bcd_model_path = Path(args.bcd_model) if args.bcd_model else _latest_bcd_model_path(case_name)
+        if not bcd_model_path.is_absolute():
+            bcd_model_path = ROOT / bcd_model_path
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_dir = Path(args.output_dir) if args.output_dir else ROOT / "result" / "model_tests" / f"{case_name}_dual_activity_{timestamp}"
@@ -762,6 +1131,8 @@ def main() -> None:
     print(f"case={case_name}", flush=True)
     print(f"active_set={active_path}", flush=True)
     print(f"model_dir={model_dir}", flush=True)
+    if bcd_model_path is not None:
+        print(f"bcd_model={bcd_model_path}", flush=True)
     print(f"output_dir={output_dir}", flush=True)
     print(
         "refresh="
@@ -803,36 +1174,71 @@ def main() -> None:
             f"available files={available[:20]}"
         )
 
-    train_rows, train_by_key = collect_training_mu_records(
-        trainers,
-        train_sample_limit=args.train_samples,
-        refresh_train_dual=bool(args.refresh_train_dual),
-        refresh_mode=str(args.refresh_mode),
-        refresh_nn_epochs=int(resolved_refresh_nn_epochs),
-        refresh_pg_cost_nn_epochs=resolved_refresh_pg_cost_nn_epochs,
-        refresh_total_max_iter=args.refresh_total_max_iter,
-        mu_active_tol=float(args.mu_active_tol),
-    )
-    test_rows, solve_summaries = collect_test_activity_records(
-        trainers,
-        dual_predictor,
-        test_samples,
-        train_by_key,
-        active_tol=float(args.active_tol),
-        violation_tol=float(args.violation_tol),
-    )
-    aggregate_rows = aggregate_activity(test_rows, train_by_key)
+    train_rows: List[dict] = []
+    train_by_key: Dict[Tuple[int, int], dict] = {}
+    test_rows: List[dict] = []
+    solve_summaries: List[dict] = []
+    aggregate_rows: List[dict] = []
+    if not args.main_only:
+        train_rows, train_by_key = collect_training_mu_records(
+            trainers,
+            train_sample_limit=args.train_samples,
+            refresh_train_dual=bool(args.refresh_train_dual),
+            refresh_mode=str(args.refresh_mode),
+            refresh_nn_epochs=int(resolved_refresh_nn_epochs),
+            refresh_pg_cost_nn_epochs=resolved_refresh_pg_cost_nn_epochs,
+            refresh_total_max_iter=args.refresh_total_max_iter,
+            mu_active_tol=float(args.mu_active_tol),
+        )
+        test_rows, solve_summaries = collect_test_activity_records(
+            trainers,
+            dual_predictor,
+            test_samples,
+            train_by_key,
+            active_tol=float(args.active_tol),
+            violation_tol=float(args.violation_tol),
+        )
+        aggregate_rows = aggregate_activity(test_rows, train_by_key)
+
+    main_rows: List[dict] = []
+    main_summaries: List[dict] = []
+    main_aggregate_rows: List[dict] = []
+    if args.main_activity or args.main_only:
+        if bcd_model_path is None:
+            raise RuntimeError("--main-activity requires a BCD model")
+        print(f"[main] loading BCD agent from {bcd_model_path}", flush=True)
+        main_agent = _load_main_bcd_agent(ppc, active_path, bcd_model_path, args.t_delta)
+        main_rows, main_summaries = collect_main_model_activity_records(
+            ppc,
+            trainers,
+            dual_predictor,
+            test_samples,
+            main_agent,
+            t_delta=float(args.t_delta),
+            include_subproblem_rows=bool(args.main_include_subproblem),
+        )
+        main_aggregate_rows = aggregate_main_model_activity(
+            main_rows,
+            active_tol=float(args.active_tol),
+            dual_tol=float(args.main_dual_active_tol),
+        )
 
     write_csv(output_dir / "training_mu_by_constraint.csv", train_rows)
     write_csv(output_dir / "test_activity_by_sample_constraint.csv", test_rows)
     write_csv(output_dir / "test_solve_summary.csv", solve_summaries)
     write_csv(output_dir / "aggregate_constraint_activity.csv", aggregate_rows)
+    write_csv(output_dir / "main_model_activity_by_sample_row.csv", main_rows)
+    write_csv(output_dir / "main_model_solve_summary.csv", main_summaries)
+    write_csv(output_dir / "main_model_activity_summary.csv", main_aggregate_rows)
+    main_theta_by_id_rows = theta_activity_by_id_rows(main_aggregate_rows)
+    write_csv(output_dir / "main_model_theta_activity_by_constraint_id.csv", main_theta_by_id_rows)
     with open(output_dir / "summary.json", "w", encoding="utf-8") as f:
         json.dump(
             {
                 "case": case_name,
                 "active_set_json": str(active_path),
                 "model_dir": str(model_dir),
+                "bcd_model": str(bcd_model_path) if bcd_model_path is not None else None,
                 "n_train_samples": len(train_samples),
                 "n_test_samples": len(test_samples),
                 "unit_ids": sorted(int(u) for u in trainers.keys()),
@@ -844,6 +1250,17 @@ def main() -> None:
                 "n_training_rows": len(train_rows),
                 "n_test_rows": len(test_rows),
                 "n_aggregate_rows": len(aggregate_rows),
+                "main_activity": bool(args.main_activity or args.main_only),
+                "main_only": bool(args.main_only),
+                "n_main_rows": len(main_rows),
+                "n_main_summary_rows": len(main_summaries),
+                "n_main_aggregate_rows": len(main_aggregate_rows),
+                "n_main_theta_constraints": len(main_theta_by_id_rows),
+                "main_row_active_rate_mean": (
+                    float(np.nanmean([row["row_active_rate"] for row in main_aggregate_rows]))
+                    if main_aggregate_rows
+                    else float("nan")
+                ),
                 "test_active_rate_after_relax_mean": (
                     float(np.nanmean([row["test_active_rate_after_relax"] for row in aggregate_rows]))
                     if aggregate_rows
@@ -862,11 +1279,15 @@ def main() -> None:
 
     if not args.no_plots:
         make_plots(output_dir, aggregate_rows, test_rows)
+        make_main_activity_plots(output_dir, main_aggregate_rows, main_rows)
 
     print("\nDone.", flush=True)
     print(f"  training rows: {len(train_rows)}", flush=True)
     print(f"  test rows: {len(test_rows)}", flush=True)
     print(f"  aggregate rows: {len(aggregate_rows)}", flush=True)
+    print(f"  main rows: {len(main_rows)}", flush=True)
+    print(f"  main aggregate rows: {len(main_aggregate_rows)}", flush=True)
+    print(f"  main theta constraints: {len(main_theta_by_id_rows)}", flush=True)
     print(f"  output: {output_dir}", flush=True)
 
 
