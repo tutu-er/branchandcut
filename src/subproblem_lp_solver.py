@@ -1631,7 +1631,8 @@ def solve_dual_block(
                 f"obj_dual_coc: {obj_dual_coc_v:.6f}, "
                 f"obj_dual: {obj_dual_v:.6f}, "
                 f"obj_opt: {obj_opt_v:.6f}, "
-                f"obj_dual_prox: {obj_dual_prox_v:.6f}"
+                f"obj_dual_prox: {obj_dual_prox_v:.6f}, "
+                f"single_mu_cap_weight: {float(cap_weight):.6f}"
             )
             if defer_log:
                 trainer._deferred_lp_block_log = line

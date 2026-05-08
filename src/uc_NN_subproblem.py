@@ -3593,6 +3593,48 @@ class SubproblemSurrogateTrainer:
         weight = initial_weight + frac * (final_weight - initial_weight)
         return max(cap, 0.0), weight
 
+    def _log_single_mu_cap_status(
+        self,
+        prefix: str,
+        raw_mu_values: np.ndarray | None = None,
+        final_mu_values: np.ndarray | None = None,
+    ) -> None:
+        """Print per-round diagnostics for the single-time mu soft-cap schedule."""
+        st, en = self._single_time_coupling_slice()
+        cap, weight = self._current_single_mu_cap()
+        if st >= en:
+            print(f"{prefix}[dual-mu] single_cap=unavailable slice={st}:{en}", flush=True)
+            return
+
+        def _stats(values: np.ndarray | None) -> tuple[float, float, int]:
+            if values is None:
+                return 0.0, 0.0, 0
+            arr = np.asarray(values, dtype=float)
+            if arr.ndim == 1:
+                arr = arr.reshape(1, -1)
+            if arr.size == 0 or arr.shape[-1] < en:
+                return 0.0, 0.0, 0
+            vals = np.abs(arr[:, st:en].reshape(-1))
+            if vals.size == 0:
+                return 0.0, 0.0, 0
+            max_abs = float(np.max(vals))
+            mean_abs = float(np.mean(vals))
+            if cap is None:
+                return max_abs, mean_abs, 0
+            return max_abs, mean_abs, int(np.sum(vals > float(cap) + 1e-7))
+
+        raw_max, raw_mean, raw_exceed = _stats(raw_mu_values)
+        final_source = self.mu if final_mu_values is None else final_mu_values
+        final_max, _final_mean, final_exceed = _stats(final_source)
+        state = "active" if cap is not None and weight > 0.0 else "inactive"
+        cap_text = "None" if cap is None else f"{cap:.6f}"
+        print(
+            f"{prefix}[dual-mu] single_cap={state} cap={cap_text} weight={weight:.6f} "
+            f"slice={st}:{en} raw_max={raw_max:.6f} raw_mean={raw_mean:.6f} "
+            f"raw_exceed={raw_exceed} final_max={final_max:.6f} final_exceed={final_exceed}",
+            flush=True,
+        )
+
     def _build_single_mu_cap_penalty_obj(self, model, mu_abs, vars_dict=None):
         """Build/update Gurobi soft-cap penalty for the single-time mu tail."""
         cap, weight = self._current_single_mu_cap()
@@ -6013,6 +6055,7 @@ class SubproblemSurrogateTrainer:
                 obj_d = obj_dp + obj_dx + obj_dc
                 obj_o = float(vars_dict['obj_opt'].getValue())
                 obj_px = float(vars_dict['obj_dual_prox'].getValue())
+                _single_cap, single_cap_weight = self._current_single_mu_cap()
                 self._emit_subproblem_block_log(
                     sample_id,
                     f"[Unit-{self.unit_id}] dual_block, sample_id: {sample_id}, "
@@ -6022,7 +6065,8 @@ class SubproblemSurrogateTrainer:
                     f"obj_dual_coc: {obj_dc:.6f}, "
                     f"obj_dual: {obj_d:.6f}, "
                     f"obj_opt: {obj_o:.6f}, "
-                    f"obj_dual_prox: {obj_px:.6f}",
+                    f"obj_dual_prox: {obj_px:.6f}, "
+                    f"single_mu_cap_weight: {single_cap_weight:.6f}",
                 )
             return lambda_inherent_sol, mu_sol
         else:
@@ -6348,6 +6392,7 @@ class SubproblemSurrogateTrainer:
 
             # 与 primal_block / cvxpy solve_dual_block 一致：每个机组仅打印前 3 个样本
             if sample_id <= 2:
+                _single_cap, single_cap_weight = self._current_single_mu_cap()
                 print(
                     f"[Unit-{self.unit_id}] dual_block, sample_id: {sample_id}, "
                     f"status: optimal, "
@@ -6356,7 +6401,8 @@ class SubproblemSurrogateTrainer:
                     f"obj_dual_coc: {obj_dual_coc.getValue():.6f}, "
                     f"obj_dual: {obj_dual.getValue():.6f}, "
                     f"obj_opt: {(obj_opt.getValue() if hasattr(obj_opt, 'getValue') else obj_opt):.6f}, "
-                    f"obj_dual_prox: {(obj_dual_prox.getValue() if hasattr(obj_dual_prox, 'getValue') else 0.0):.6f}",
+                    f"obj_dual_prox: {(obj_dual_prox.getValue() if hasattr(obj_dual_prox, 'getValue') else 0.0):.6f}, "
+                    f"single_mu_cap_weight: {single_cap_weight:.6f}",
                     flush=True,
                 )
 
@@ -7390,6 +7436,7 @@ class SubproblemSurrogateTrainer:
                         direction_signs=direction_signs,
                     )
             self._invalidate_loss_tensor_cache()
+            self._log_single_mu_cap_status(log_u, raw_mu_solutions[solved_mask], self.mu[solved_mask])
             
             _z = lambda v: v if abs(v) >= 1e-12 else 0.0
             nn_metrics_pre = self.cal_nn_logging_components()

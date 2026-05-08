@@ -527,11 +527,20 @@ class ParallelSubproblemSurrogateTrainer(SubproblemSurrogateTrainer):
                     print(line, flush=True)
 
             # 顺序写入状态
+            raw_mu_solutions = np.zeros((self.n_samples, self.num_coupling_constraints), dtype=float)
+            solved_mask = np.zeros(self.n_samples, dtype=bool)
             for s in range(self.n_samples):
                 lambda_inherent_sol, mu_sol = dual_results[s]
                 if lambda_inherent_sol is not None:
                     self.lambda_inherent[s] = lambda_inherent_sol
+                    raw_mu_solutions[s] = mu_sol
+                    solved_mask[s] = True
                     self.mu[s] = self._apply_mu_lower_bound_policy(mu_sol, lb_mu)
+            self._log_single_mu_cap_status(
+                prefix,
+                raw_mu_solutions[solved_mask],
+                self.mu[solved_mask],
+            )
 
             _z = lambda v: v if abs(v) >= 1e-12 else 0.0
             nn_metrics_pre = self.cal_nn_logging_components()

@@ -76,6 +76,17 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--unit-predictor", type=str, default=UNIT_PREDICTOR_LOAD_PATH)
     p.add_argument("--no-unit-predictor", action="store_true")
     p.add_argument("--no-auto-latest-unit-predictor", action="store_true")
+    p.add_argument(
+        "--surrogate-model-dir",
+        type=str,
+        default=None,
+        help="Directory containing trained dual_predictor/unit_predictor/surrogate_unit_*.pth checkpoints.",
+    )
+    p.add_argument(
+        "--skip-existing-units",
+        action="store_true",
+        help="When resuming from --surrogate-model-dir, copy existing surrogate_unit_*.pth and train only missing units.",
+    )
     p.add_argument("--theta-dual-floor", type=float, default=THETA_DUAL_FLOOR)
     p.add_argument("--zeta-dual-floor", type=float, default=ZETA_DUAL_FLOOR)
     p.add_argument("--sign4-dual-floor", type=float, default=SIGN4_DUAL_FLOOR)
@@ -210,7 +221,9 @@ def main() -> None:
     rt.UNIT_PREDICTOR_LOAD_METADATA_CONFIG = True
     rt.SURROGATE_DUAL_PREDICTOR_ONLY = False
     rt.BCD_MODEL_FILE = None
-    rt.SURROGATE_MODEL_DIR = None
+    rt.SURROGATE_MODEL_DIR = args.surrogate_model_dir
+    rt.SURROGATE_CONTINUE_TRAINING = bool(args.surrogate_model_dir)
+    rt.SURROGATE_SKIP_EXISTING_UNITS = bool(args.skip_existing_units)
     rt.BCD_PG_BLOCK_PROX_WEIGHT = 0.0
     rt.BCD_DUAL_BLOCK_PROX_WEIGHT = 0.0
     rt.SUBPROBLEM_PG_BLOCK_PROX_WEIGHT = 0.0
@@ -274,6 +287,12 @@ def main() -> None:
         f"unit_predictor={rt.USE_UNIT_PREDICTOR} | "
         f"load_path={rt.UNIT_PREDICTOR_LOAD_PATH or 'auto-latest'} | "
         f"auto_latest={rt.UNIT_PREDICTOR_AUTO_LATEST_STANDALONE}",
+        flush=True,
+    )
+    print(
+        f"surrogate_resume={rt.SURROGATE_CONTINUE_TRAINING} | "
+        f"model_dir={rt.SURROGATE_MODEL_DIR or 'none'} | "
+        f"skip_existing_units={rt.SURROGATE_SKIP_EXISTING_UNITS}",
         flush=True,
     )
     print(
