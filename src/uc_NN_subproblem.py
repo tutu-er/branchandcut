@@ -6614,7 +6614,7 @@ class SubproblemSurrogateTrainer:
             )
             reg_loss = reg_loss + self.pg_cost_softbound_weight * torch.sum(excess * excess)
         reg_loss = reg_loss * self._c_pg_reg_loss_scale
-        dual_pg_term = self.loss_ratio_dual_pg * self.rho_dual_pg * obj_dual_pg
+        dual_pg_term = self.loss_ratio_dual_pg * obj_dual_pg
         reg_term = self.loss_ratio_reg * reg_loss
         loss = dual_pg_term + reg_term
         if not return_components:
