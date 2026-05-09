@@ -42,6 +42,18 @@ SIGN4_DELAY_ROUNDS = 3
 SIGN4_CURRICULUM_ROUNDS = 24
 SIGN4_INITIAL_SCALE = 0.10
 SIGN4_FINAL_SCALE = 2.00
+THETA_STAGE_LIMITS = "6,12,20"
+THETA_STAGE_FRACTIONS = "0.25,0.25,0.50"
+THETA_CURRICULUM_DELAY_ROUNDS = 3
+THETA_CURRICULUM_ROUNDS = 24
+THETA_INITIAL_SCALE = 0.10
+THETA_FINAL_SCALE = 2.00
+ZETA_ITA_CAP_WEIGHT = 2.00
+ZETA_ITA_CAP_INITIAL_WEIGHT = 0.00
+ZETA_ITA_CAP_INITIAL = THETA_DUAL_FLOOR
+ZETA_ITA_CAP_FINAL = 0.00
+ZETA_ITA_CAP_START_FRACTION = 0.25
+ZETA_ITA_CAP_END_FRACTION = 0.55
 SINGLE_MU_CAP_WEIGHT = 2.00
 SINGLE_MU_CAP_INITIAL_WEIGHT = 0.00
 SINGLE_MU_CAP_INITIAL = SIGN4_DUAL_FLOOR
@@ -97,6 +109,19 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--sign4-curriculum-rounds", type=int, default=SIGN4_CURRICULUM_ROUNDS)
     p.add_argument("--sign4-initial-scale", type=float, default=SIGN4_INITIAL_SCALE)
     p.add_argument("--sign4-final-scale", type=float, default=SIGN4_FINAL_SCALE)
+    p.add_argument("--theta-stage-limits", type=str, default=THETA_STAGE_LIMITS)
+    p.add_argument("--theta-stage-fracs", type=str, default=THETA_STAGE_FRACTIONS)
+    p.add_argument("--theta-curriculum-delay-rounds", type=int, default=THETA_CURRICULUM_DELAY_ROUNDS)
+    p.add_argument("--theta-curriculum-rounds", type=int, default=THETA_CURRICULUM_ROUNDS)
+    p.add_argument("--theta-initial-scale", type=float, default=THETA_INITIAL_SCALE)
+    p.add_argument("--theta-final-scale", type=float, default=THETA_FINAL_SCALE)
+    p.add_argument("--zeta-ita-cap-weight", type=float, default=ZETA_ITA_CAP_WEIGHT)
+    p.add_argument("--zeta-ita-cap-initial-weight", type=float, default=ZETA_ITA_CAP_INITIAL_WEIGHT)
+    p.add_argument("--zeta-ita-cap-final-weight", type=float, default=None)
+    p.add_argument("--zeta-ita-cap-initial", type=float, default=ZETA_ITA_CAP_INITIAL)
+    p.add_argument("--zeta-ita-cap-final", type=float, default=ZETA_ITA_CAP_FINAL)
+    p.add_argument("--zeta-ita-cap-start-frac", type=float, default=ZETA_ITA_CAP_START_FRACTION)
+    p.add_argument("--zeta-ita-cap-end-frac", type=float, default=ZETA_ITA_CAP_END_FRACTION)
     p.add_argument("--single-mu-cap-weight", type=float, default=SINGLE_MU_CAP_WEIGHT)
     p.add_argument("--single-mu-cap-initial-weight", type=float, default=SINGLE_MU_CAP_INITIAL_WEIGHT)
     p.add_argument("--single-mu-cap-final-weight", type=float, default=None)
@@ -134,6 +159,29 @@ def _parse_unit_ids(text: str | None) -> list[int] | None:
     return unit_ids or None
 
 
+def _parse_csv_numbers(text: str | None, cast=float) -> list:
+    if text is None or str(text).strip() == "":
+        return []
+    return [cast(part.strip()) for part in str(text).split(",") if part.strip()]
+
+
+def _build_theta_training_stages(bcd_iter: int, limits_text: str, fracs_text: str) -> list[dict] | None:
+    limits = [max(1, int(v)) for v in _parse_csv_numbers(limits_text, int)]
+    if not limits:
+        return None
+    fracs = [_clip_fraction(v) for v in _parse_csv_numbers(fracs_text, float)]
+    if len(fracs) != len(limits) or sum(fracs) <= 0:
+        fracs = [1.0 / len(limits)] * len(limits)
+    total = sum(fracs)
+    fracs = [v / total for v in fracs]
+    durations = [max(1, round(bcd_iter * frac)) for frac in fracs]
+    durations[-1] = max(1, bcd_iter - sum(durations[:-1]))
+    return [
+        {"max_constraints_per_time_slot": limit, "iterations": duration}
+        for limit, duration in zip(limits, durations)
+    ]
+
+
 def _configure_strong_complex_dual_floors(args: argparse.Namespace) -> None:
     bcd_iter = max(1, int(args.bcd_iter))
     sub_iter = max(1, int(args.sub_iter))
@@ -142,11 +190,42 @@ def _configure_strong_complex_dual_floors(args: argparse.Namespace) -> None:
     sign4_group_frac = max(sign4_individual_frac, _clip_fraction(args.sign4_group_frac))
     single_cap_start_frac = _clip_fraction(args.single_mu_cap_start_frac)
     single_cap_end_frac = max(single_cap_start_frac, _clip_fraction(args.single_mu_cap_end_frac))
+    zeta_cap_start_frac = _clip_fraction(args.zeta_ita_cap_start_frac)
+    zeta_cap_end_frac = max(zeta_cap_start_frac, _clip_fraction(args.zeta_ita_cap_end_frac))
 
     rt.BCD_MU_DUAL_FLOOR_INIT = max(0.0, float(args.theta_dual_floor))
     rt.BCD_ITA_DUAL_FLOOR_INIT = max(0.0, float(args.zeta_dual_floor))
     rt.DUAL_DECAY_ROUND = max(1, round(bcd_iter * theta_floor_frac))
     rt.BCD_DUAL_SIGN_RELAX_INTERVAL = 4
+    rt.BCD_THETA_TRAINING_STAGES = _build_theta_training_stages(
+        bcd_iter,
+        args.theta_stage_limits,
+        args.theta_stage_fracs,
+    )
+    if rt.BCD_THETA_TRAINING_STAGES:
+        rt.BCD_MAX_THETA_CONSTRAINTS_PER_TIME_SLOT = max(
+            int(stage["max_constraints_per_time_slot"])
+            for stage in rt.BCD_THETA_TRAINING_STAGES
+        )
+    rt.BCD_THETA_CURRICULUM_DELAY_ROUNDS = max(0, int(args.theta_curriculum_delay_rounds))
+    rt.BCD_THETA_CURRICULUM_ROUNDS = max(0, int(args.theta_curriculum_rounds))
+    rt.BCD_THETA_INITIAL_SCALE = max(0.0, float(args.theta_initial_scale))
+    rt.BCD_THETA_FINAL_SCALE = max(0.0, float(args.theta_final_scale))
+    zeta_cap_final_weight = (
+        args.zeta_ita_cap_weight
+        if args.zeta_ita_cap_final_weight is None
+        else args.zeta_ita_cap_final_weight
+    )
+    rt.BCD_ZETA_ITA_CAP_PENALTY_WEIGHT = max(0.0, float(zeta_cap_final_weight))
+    rt.BCD_ZETA_ITA_CAP_INITIAL_WEIGHT = max(0.0, float(args.zeta_ita_cap_initial_weight))
+    rt.BCD_ZETA_ITA_CAP_FINAL_WEIGHT = max(0.0, float(zeta_cap_final_weight))
+    rt.BCD_ZETA_ITA_CAP_INITIAL = max(0.0, float(args.zeta_ita_cap_initial))
+    rt.BCD_ZETA_ITA_CAP_FINAL = max(0.0, float(args.zeta_ita_cap_final))
+    rt.BCD_ZETA_ITA_CAP_START_ROUND = max(0, round(bcd_iter * zeta_cap_start_frac))
+    rt.BCD_ZETA_ITA_CAP_END_ROUND = max(
+        rt.BCD_ZETA_ITA_CAP_START_ROUND,
+        round(bcd_iter * zeta_cap_end_frac),
+    )
 
     rt.SUBPROBLEM_MU_DUAL_FLOOR_INIT = max(0.0, float(args.sign4_dual_floor))
     rt.SUBPROBLEM_MU_DUAL_FLOOR_INDIVIDUAL_ROUND = max(0, round(sub_iter * sign4_individual_frac))
@@ -266,6 +345,21 @@ def main() -> None:
         f"sign4_floor={rt.SUBPROBLEM_MU_DUAL_FLOOR_INIT} "
         f"individual_until={rt.SUBPROBLEM_MU_DUAL_FLOOR_INDIVIDUAL_ROUND}, "
         f"group_until={rt.SUBPROBLEM_MU_DUAL_FLOOR_DECAY_ROUND}",
+        flush=True,
+    )
+    print(
+        f"theta_stages={rt.BCD_THETA_TRAINING_STAGES} | "
+        f"theta_curriculum=delay {rt.BCD_THETA_CURRICULUM_DELAY_ROUNDS}, "
+        f"scale {rt.BCD_THETA_INITIAL_SCALE}->{rt.BCD_THETA_FINAL_SCALE} over "
+        f"{rt.BCD_THETA_CURRICULUM_ROUNDS} rounds",
+        flush=True,
+    )
+    print(
+        f"zeta_ita_cap_weight={rt.BCD_ZETA_ITA_CAP_INITIAL_WEIGHT}"
+        f"->{rt.BCD_ZETA_ITA_CAP_FINAL_WEIGHT} | "
+        f"cap={rt.BCD_ZETA_ITA_CAP_INITIAL}->{rt.BCD_ZETA_ITA_CAP_FINAL} | "
+        f"rounds={rt.BCD_ZETA_ITA_CAP_START_ROUND}"
+        f"..{rt.BCD_ZETA_ITA_CAP_END_ROUND}",
         flush=True,
     )
     print(

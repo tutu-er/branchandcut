@@ -53,6 +53,14 @@ def _parse_args() -> argparse.Namespace:
                    default=strong.SINGLE_MU_CAP_START_FRACTION)
     p.add_argument("--single-mu-cap-end-frac", type=float,
                    default=strong.SINGLE_MU_CAP_END_FRACTION)
+    p.add_argument("--c-pg-start-round", type=int, default=strong.SUBPROBLEM_PG_COST_START_ROUND)
+    p.add_argument("--c-pg-nn-epochs", type=int, default=strong.SUBPROBLEM_PG_COST_NN_EPOCHS)
+    p.add_argument("--c-pg-direct-epochs", type=int,
+                   default=strong.SUBPROBLEM_C_PG_DIRECT_EPOCHS)
+    p.add_argument("--c-pg-direct-batch-strategy", choices=("full-batch", "mini-batch"),
+                   default=strong.SUBPROBLEM_C_PG_DIRECT_BATCH_STRATEGY)
+    p.add_argument("--c-pg-direct-batch-size", type=int,
+                   default=strong.SUBPROBLEM_C_PG_DIRECT_BATCH_SIZE)
     return p.parse_args()
 
 
@@ -89,6 +97,17 @@ def main() -> None:
     args.bcd_iter = int(getattr(rt, "BCD_MAX_ITER", getattr(rt, "MAX_ITER", 1)) or 1)
     args.sub_iter = int(getattr(rt, "SUBPROBLEM_MAX_ITER", getattr(rt, "MAX_ITER", 1)) or 1)
     strong._configure_strong_complex_dual_floors(args)
+    rt.BCD_PG_BLOCK_PROX_WEIGHT = 0.0
+    rt.BCD_DUAL_BLOCK_PROX_WEIGHT = 0.0
+    rt.SUBPROBLEM_PG_BLOCK_PROX_WEIGHT = 0.0
+    rt.SUBPROBLEM_DUAL_BLOCK_PROX_WEIGHT = 0.0
+    rt.SUBPROBLEM_MAIN_DIRECT_BATCH_STRATEGY = strong.SUBPROBLEM_MAIN_DIRECT_BATCH_STRATEGY
+    rt.SUBPROBLEM_MAIN_DIRECT_EPOCHS = max(1, int(strong.SUBPROBLEM_MAIN_DIRECT_EPOCHS))
+    rt.SUBPROBLEM_PG_COST_START_ROUND = max(0, int(args.c_pg_start_round))
+    rt.SUBPROBLEM_PG_COST_NN_EPOCHS = max(1, int(args.c_pg_nn_epochs))
+    rt.SUBPROBLEM_C_PG_DIRECT_EPOCHS = max(1, int(args.c_pg_direct_epochs))
+    rt.SUBPROBLEM_C_PG_DIRECT_BATCH_STRATEGY = args.c_pg_direct_batch_strategy
+    rt.SUBPROBLEM_C_PG_DIRECT_BATCH_SIZE = max(1, int(args.c_pg_direct_batch_size))
 
     print("=" * 72, flush=True)
     print(f"run_training_case118_strong_complex_dual_floor.py -> target={args.target}", flush=True)
@@ -107,6 +126,26 @@ def main() -> None:
         f"cap={rt.SUBPROBLEM_SINGLE_MU_CAP_INITIAL}->{rt.SUBPROBLEM_SINGLE_MU_CAP_FINAL} | "
         f"rounds={rt.SUBPROBLEM_SINGLE_MU_CAP_START_ROUND}"
         f"..{rt.SUBPROBLEM_SINGLE_MU_CAP_END_ROUND}",
+        flush=True,
+    )
+    print(
+        f"quadratic_prox=off | bcd_pg_prox={rt.BCD_PG_BLOCK_PROX_WEIGHT} | "
+        f"bcd_dual_prox={rt.BCD_DUAL_BLOCK_PROX_WEIGHT} | "
+        f"sub_pg_prox={rt.SUBPROBLEM_PG_BLOCK_PROX_WEIGHT} | "
+        f"sub_dual_prox={rt.SUBPROBLEM_DUAL_BLOCK_PROX_WEIGHT}",
+        flush=True,
+    )
+    print(
+        f"subproblem direct-NN-main: batch_strategy={rt.SUBPROBLEM_MAIN_DIRECT_BATCH_STRATEGY}, "
+        f"epochs={rt.SUBPROBLEM_MAIN_DIRECT_EPOCHS}",
+        flush=True,
+    )
+    print(
+        f"subproblem c_pg: start_round={rt.SUBPROBLEM_PG_COST_START_ROUND}, "
+        f"nn_epochs={rt.SUBPROBLEM_PG_COST_NN_EPOCHS}, "
+        f"direct_epochs={rt.SUBPROBLEM_C_PG_DIRECT_EPOCHS}, "
+        f"direct_batch={rt.SUBPROBLEM_C_PG_DIRECT_BATCH_STRATEGY}/"
+        f"{rt.SUBPROBLEM_C_PG_DIRECT_BATCH_SIZE}",
         flush=True,
     )
     if args.target == "subproblem_bcd":

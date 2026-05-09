@@ -538,6 +538,10 @@ class Agent_NN_BCD:
         external_sparse_templates=None,
         lambda_init_strategy: str = "lp_relaxation",
         max_theta_constraints_per_time_slot: int = 10,
+        theta_curriculum_rounds: int = 0,
+        theta_initial_scale: float = 1.0,
+        theta_final_scale: float = 1.0,
+        theta_curriculum_delay_rounds: int = 0,
         theta_hot_start_strategy: str = "dcpf_relative",
         zeta_hot_start_strategy: str = "zero",
         theta_gaussian_std: float = 0.01,
@@ -559,6 +563,13 @@ class Agent_NN_BCD:
         gamma_base: float = 1e-2,
         mu_dual_floor_init: float = 0.1,
         ita_dual_floor_init: float = 0.1,
+        zeta_ita_cap_penalty_weight: float = 0.0,
+        zeta_ita_cap_initial_weight: float | None = None,
+        zeta_ita_cap_final_weight: float | None = None,
+        zeta_ita_cap_initial: float | None = None,
+        zeta_ita_cap_final: float | None = None,
+        zeta_ita_cap_start_round: int = 0,
+        zeta_ita_cap_end_round: int = 0,
         dual_sign_relax_interval: int | None = None,
         lp_backend: str = LP_BACKEND_GUROBI,
         gurobi_threads: int | None = None,
@@ -603,6 +614,17 @@ class Agent_NN_BCD:
         self.dual_para_bound_quit_iteration = 50
         self.mu_dual_floor_init = float(mu_dual_floor_init)
         self.ita_dual_floor_init = float(ita_dual_floor_init)
+        self.zeta_ita_cap_penalty_weight = max(float(zeta_ita_cap_penalty_weight or 0.0), 0.0)
+        self.zeta_ita_cap_initial_weight = (
+            None if zeta_ita_cap_initial_weight is None else max(float(zeta_ita_cap_initial_weight), 0.0)
+        )
+        self.zeta_ita_cap_final_weight = (
+            None if zeta_ita_cap_final_weight is None else max(float(zeta_ita_cap_final_weight), 0.0)
+        )
+        self.zeta_ita_cap_initial = None if zeta_ita_cap_initial is None else max(float(zeta_ita_cap_initial), 0.0)
+        self.zeta_ita_cap_final = None if zeta_ita_cap_final is None else max(float(zeta_ita_cap_final), 0.0)
+        self.zeta_ita_cap_start_round = max(int(zeta_ita_cap_start_round), 0)
+        self.zeta_ita_cap_end_round = max(int(zeta_ita_cap_end_round), self.zeta_ita_cap_start_round)
         if dual_sign_relax_interval is None:
             self.dual_sign_relax_interval = 2
         else:
@@ -623,6 +645,10 @@ class Agent_NN_BCD:
         self.gurobi_optimality_tol = 1e-5
         self.gurobi_int_feas_tol = 1e-5
         self.max_theta_constraints_per_time_slot = int(max_theta_constraints_per_time_slot)
+        self.theta_curriculum_rounds = max(int(theta_curriculum_rounds), 0)
+        self.theta_initial_scale = max(float(theta_initial_scale), 0.0)
+        self.theta_final_scale = max(float(theta_final_scale), 0.0)
+        self.theta_curriculum_delay_rounds = max(int(theta_curriculum_delay_rounds), 0)
         
         # 约束违反惩罚项的权重和epsilon参数
         self.constraint_violation_weight = 0
@@ -2975,6 +3001,51 @@ class Agent_NN_BCD:
         delayed['union_constraints'] = []
         return delayed
 
+    def _current_theta_curriculum_scale(self) -> float:
+        delay = max(int(getattr(self, 'theta_curriculum_delay_rounds', 0) or 0), 0)
+        current_iter = max(int(getattr(self, 'iter_number', 0) or 0), 0)
+        if current_iter < delay:
+            return 0.0
+        start_scale = max(float(getattr(self, 'theta_initial_scale', 1.0) or 0.0), 0.0)
+        final_scale = max(float(getattr(self, 'theta_final_scale', 1.0) or 0.0), 0.0)
+        rounds = max(int(getattr(self, 'theta_curriculum_rounds', 0) or 0), 0)
+        if rounds <= 0:
+            return final_scale
+        frac = min(max((current_iter - delay) / max(rounds, 1), 0.0), 1.0)
+        return start_scale + frac * (final_scale - start_scale)
+
+    def _current_zeta_ita_cap(self) -> tuple[float | None, float]:
+        base_weight = max(float(getattr(self, 'zeta_ita_cap_penalty_weight', 0.0) or 0.0), 0.0)
+        initial_weight = getattr(self, 'zeta_ita_cap_initial_weight', None)
+        final_weight = getattr(self, 'zeta_ita_cap_final_weight', None)
+        if initial_weight is None:
+            initial_weight = base_weight
+        if final_weight is None:
+            final_weight = base_weight
+        initial_weight = max(float(initial_weight or 0.0), 0.0)
+        final_weight = max(float(final_weight or 0.0), 0.0)
+
+        initial_cap = getattr(self, 'zeta_ita_cap_initial', None)
+        final_cap = getattr(self, 'zeta_ita_cap_final', None)
+        if initial_cap is None and final_cap is None:
+            return None, 0.0
+        if initial_cap is None:
+            initial_cap = final_cap
+        if final_cap is None:
+            final_cap = initial_cap
+
+        start_round = max(int(getattr(self, 'zeta_ita_cap_start_round', 0) or 0), 0)
+        end_round = max(int(getattr(self, 'zeta_ita_cap_end_round', start_round) or start_round), start_round)
+        current_iter = max(int(getattr(self, 'iter_number', 0) or 0), 0)
+        if end_round <= start_round:
+            frac = 1.0 if current_iter >= start_round else 0.0
+        else:
+            frac = min(max((current_iter - start_round) / (end_round - start_round), 0.0), 1.0)
+
+        cap = float(initial_cap) + frac * (float(final_cap) - float(initial_cap))
+        weight = initial_weight + frac * (final_weight - initial_weight)
+        return max(cap, 0.0), max(weight, 0.0)
+
     def add_theta_variables_for_branches(self, union_analysis=None):
         """为参数化约束添加theta变量（参考uc_NN.py）"""
         if union_analysis is None:
@@ -3709,7 +3780,8 @@ class Agent_NN_BCD:
             obj_opt_terms.append(cp.sum(cp.multiply(np.abs(lam['lambda_dcpf_upper'][:, t]), cp.abs(dcpf_up))))
             obj_opt_terms.append(cp.sum(cp.multiply(np.abs(lam['lambda_dcpf_lower'][:, t]), cp.abs(dcpf_lo))))
 
-        if self.enable_theta_constraints and union_analysis and 'union_constraints' in union_analysis:
+        theta_scale = self._current_theta_curriculum_scale()
+        if theta_scale > 0 and self.enable_theta_constraints and union_analysis and 'union_constraints' in union_analysis:
             for constraint_info in union_analysis['union_constraints']:
                 branch_id = constraint_info['branch_id']
                 time_slot = constraint_info['time_slot']
@@ -3718,9 +3790,9 @@ class Agent_NN_BCD:
                     unit_id = coeff_info['unit_id']
                     member_time = self._theta_member_time_index(constraint_info, coeff_info)
                     theta_name = self._theta_var_name(branch_id, unit_id, member_time)
-                    lhs_expr += float(theta_values.get(theta_name, 0.0)) * x[unit_id, member_time]
+                    lhs_expr += theta_scale * float(theta_values.get(theta_name, 0.0)) * x[unit_id, member_time]
 
-                rhs = float(theta_values.get(self._theta_rhs_name(branch_id, time_slot), 1.0))
+                rhs = theta_scale * float(theta_values.get(self._theta_rhs_name(branch_id, time_slot), 1.0))
                 direction = float(self._get_theta_constraint_direction(branch_id, time_slot))
                 residual = lhs_expr - rhs
                 obj_primal_terms.append(cp.pos(direction * residual))
@@ -3953,12 +4025,20 @@ class Agent_NN_BCD:
                 constraints.append(ita_abs >= ita_floor)
             else:
                 constraints.append(ita >= ita_floor)
+        zeta_cap_penalty_obj = gp.LinExpr()
+        zeta_cap, zeta_cap_weight = self._current_zeta_ita_cap()
+        zeta_cap_penalty = 0.0
+        if zeta_cap is not None and zeta_cap_weight > 0:
+            zeta_ita_excess = cp.Variable((self.ng, self.T), nonneg=True)
+            constraints.append(zeta_ita_excess >= ita_abs - float(zeta_cap))
+            zeta_cap_penalty = float(zeta_cap_weight) * cp.sum(zeta_ita_excess)
 
         # ================================================================
         # KKT stationarity expressions
         # ================================================================
         tv = theta_values or {}
         zv = zeta_values or {}
+        theta_scale = self._current_theta_curriculum_scale()
 
         # -- pg stationarity: cost_g/T - lambda_pb[t] - lambda_pgl + lambda_pgu
         #                     + ramp terms + PTDF_G^T (lambda_dcu - lambda_dcl) --
@@ -4006,7 +4086,7 @@ class Agent_NN_BCD:
                     Ton=Ton, Toff=Toff,
                 )
                 # theta contributions: direction * theta_val * mu[bid, ts]
-                if self.enable_theta_constraints and union_analysis and 'union_constraints' in union_analysis:
+                if theta_scale > 0 and self.enable_theta_constraints and union_analysis and 'union_constraints' in union_analysis:
                     for ci in union_analysis['union_constraints']:
                         bid  = ci['branch_id']
                         ts   = ci['time_slot']
@@ -4017,7 +4097,7 @@ class Agent_NN_BCD:
                             if uid != g or mt != t:
                                 continue
                             tname = self._theta_var_name(bid, uid, mt)
-                            theta_val = float(tv.get(tname, 0.0))
+                            theta_val = theta_scale * float(tv.get(tname, 0.0))
                             if bid < self.nl and abs(theta_val) > 1e-12:
                                 de = de + direc * theta_val * mu[bid, ts]
                 # zeta contributions: direction * zeta_val * ita[uid, ts]
@@ -4126,18 +4206,18 @@ class Agent_NN_BCD:
                     opt_terms.append(dcl_v * lambda_dcl[l, t])
 
         # theta/zeta parametric constraint violations × mu_abs / ita_abs
-        if self.enable_theta_constraints and union_analysis and 'union_constraints' in union_analysis:
+        if theta_scale > 0 and self.enable_theta_constraints and union_analysis and 'union_constraints' in union_analysis:
             for ci in union_analysis['union_constraints']:
                 bid = ci['branch_id']
                 ts  = ci['time_slot']
                 rhs_name = self._theta_rhs_name(bid, ts)
-                rhs  = float(tv.get(rhs_name, 1.0))
+                rhs  = theta_scale * float(tv.get(rhs_name, 1.0))
                 lhs  = 0.0
                 for coeff_info in ci['nonzero_pg_coefficients']:
                     uid   = coeff_info['unit_id']
                     mt    = self._theta_member_time_index(ci, coeff_info)
                     tname = self._theta_var_name(bid, uid, mt)
-                    lhs  += float(tv.get(tname, 0.0)) * float(x_arr[uid, mt])
+                    lhs  += theta_scale * float(tv.get(tname, 0.0)) * float(x_arr[uid, mt])
                 para_abs = abs(lhs - rhs)
                 if para_abs > 1e-10:
                     if bid < self.nl:
@@ -4229,6 +4309,7 @@ class Agent_NN_BCD:
             + self.rho_dual_x  * obj_dual_x
             + self.rho_dual_coc* obj_dual_coc
             + self.rho_opt     * obj_opt
+            + zeta_cap_penalty
             + self.dual_block_prox_weight * obj_prox
         )
         problem = cp.Problem(objective, constraints)
@@ -4746,6 +4827,8 @@ class Agent_NN_BCD:
         ita    = model.addVars(self.ng, self.T, lb=ita_lb, name='ita')
         mu_abs = model.addVars(self.nl, self.T, lb=0,      name='mu_abs')
         ita_abs= model.addVars(self.ng, self.T, lb=0,      name='ita_abs')
+        zeta_ita_cap_excess = model.addVars(self.ng, self.T, lb=0, name='zeta_ita_cap_excess')
+        zeta_ita_cap_constrs = {}
         mu_max = model.addVar(lb=0, name='mu_max')
         ita_max= model.addVar(lb=0, name='ita_max')
         deadband = 100
@@ -4769,6 +4852,10 @@ class Agent_NN_BCD:
                         model.addConstr(ita_abs[g,t] >= self.ita_dual_floor_init, name=f'ita_abs_lb_{g}_{t}')
                     else:
                         model.addConstr(ita[g,t] >= self.ita_dual_floor_init, name=f'ita_lb_{g}_{t}')
+                zeta_ita_cap_constrs[g, t] = model.addConstr(
+                    zeta_ita_cap_excess[g, t] - ita_abs[g, t] >= 0.0,
+                    name=f'zeta_ita_cap_excess_lb_{g}_{t}',
+                )
                 model.addConstr(ita_max >= ita_abs[g,t] - deadband, name=f'ita_max_{g}_{t}')
 
         PTDF_G = self._ptdf_g
@@ -4904,6 +4991,8 @@ class Agent_NN_BCD:
             'lambda_dcpf_upper': lambda_dcpf_upper, 'lambda_dcpf_lower': lambda_dcpf_lower,
             'lambda_x_upper': lambda_x_upper,   'lambda_x_lower': lambda_x_lower,
             'mu': mu, 'ita': ita, 'mu_abs': mu_abs, 'ita_abs': ita_abs,
+            'zeta_ita_cap_excess': zeta_ita_cap_excess,
+            'zeta_ita_cap_constrs': zeta_ita_cap_constrs,
             'mu_max': mu_max, 'ita_max': ita_max,
             'lambda_pb_abs': lambda_pb_abs,
             'obj_dual_pg': obj_dual_pg, 'obj_dual_x': obj_dual_x, 'obj_dual_coc': obj_dual_coc,
@@ -4917,11 +5006,12 @@ class Agent_NN_BCD:
         """通过 chgCoeff 更新 x 驻点约束中 theta/zeta 的 mu/ita 系数。"""
         tv = theta_values or {}
         zv = zeta_values or {}
+        theta_scale = self._current_theta_curriculum_scale()
         for info in dual_x_theta_terms:
             c_pos = info['c_pos']
             c_neg = info['c_neg']
             for mu_var, direction, tname in info['theta_terms']:
-                theta = float(tv.get(tname, 0.0))
+                theta = theta_scale * float(tv.get(tname, 0.0))
                 # de includes direction*theta*mu[b,t]
                 # abs_v >= de  →  coeff of mu in LHS: -direction*theta
                 model.chgCoeff(c_pos, mu_var, -direction * theta)
@@ -5043,18 +5133,19 @@ class Agent_NN_BCD:
         # theta/zeta obj_opt 项（用 self.x[s] 标量计算 lhs - rhs）
         tv = theta_values or {}
         zv = zeta_values or {}
-        if self.enable_theta_constraints and union_analysis and 'union_constraints' in union_analysis:
+        theta_scale = self._current_theta_curriculum_scale()
+        if theta_scale > 0 and self.enable_theta_constraints and union_analysis and 'union_constraints' in union_analysis:
             for ci in union_analysis['union_constraints']:
                 bid = ci['branch_id']
                 ts  = ci['time_slot']
                 rhs_name = self._theta_rhs_name(bid, ts)
-                rhs = float(tv.get(rhs_name, 1.0))
+                rhs = theta_scale * float(tv.get(rhs_name, 1.0))
                 lhs = 0.0
                 for coeff_info in ci['nonzero_pg_coefficients']:
                     uid  = coeff_info['unit_id']
                     mt   = self._theta_member_time_index(ci, coeff_info)
                     tname = self._theta_var_name(bid, uid, mt)
-                    theta = float(tv.get(tname, 0.0))
+                    theta = theta_scale * float(tv.get(tname, 0.0))
                     lhs  += theta * float(self.x[sample_id, uid, mt])
                 para_abs = abs(lhs - rhs)
                 if para_abs > 1e-10:
@@ -5076,6 +5167,17 @@ class Agent_NN_BCD:
                     obj_opt += para_abs * ita_abs[uid, ts]
 
         # 3. Prox 项（QP）
+        zeta_cap, zeta_cap_weight = self._current_zeta_ita_cap()
+        if zeta_cap is not None:
+            for constr in vars_dict.get('zeta_ita_cap_constrs', {}).values():
+                constr.RHS = -float(zeta_cap)
+            if zeta_cap_weight > 0:
+                zeta_ita_cap_excess = vars_dict.get('zeta_ita_cap_excess')
+                if zeta_ita_cap_excess is not None:
+                    for g in range(self.ng):
+                        for t in range(self.T):
+                            zeta_cap_penalty_obj += float(zeta_cap_weight) * zeta_ita_cap_excess[g, t]
+
         obj_dual_prox = self._build_dual_block_prox_obj(
             model, sample_id,
             lam_pb, lam_pgl, lam_pgu, lam_ru, lam_rd,
@@ -5092,6 +5194,7 @@ class Agent_NN_BCD:
             + self.rho_dual_x  * vars_dict['obj_dual_x']
             + self.rho_dual_coc* vars_dict['obj_dual_coc']
             + self.rho_opt     * obj_opt
+            + zeta_cap_penalty_obj
             + self.dual_block_prox_weight * obj_dual_prox
             + penal_mu + penal_ita,
             GRB.MINIMIZE,
@@ -6739,12 +6842,13 @@ class Agent_NN_BCD:
         _default_mu = self._default_mu_tensor
 
         # 计算theta相关的参数化约束损失（使用预处理缓存，无字符串格式化）
+        theta_constraint_scale = self._current_theta_curriculum_scale()
         for branch_id, time_slot, _ctype, coeff_list, rhs_idx in self._cached_theta_constraints:
             lhs_expr = 0.0
             for unit_id, member_time, theta_idx in coeff_list:
-                lhs_expr = lhs_expr + theta_tensor[theta_idx] * x[unit_id, member_time]
+                lhs_expr = lhs_expr + theta_constraint_scale * theta_tensor[theta_idx] * x[unit_id, member_time]
 
-            theta_rhs = theta_tensor[rhs_idx] if rhs_idx >= 0 else _one
+            theta_rhs = theta_constraint_scale * (theta_tensor[rhs_idx] if rhs_idx >= 0 else _one)
 
             direction = self._get_theta_constraint_direction(branch_id, time_slot)
             violation = direction * (lhs_expr - theta_rhs)
@@ -6797,7 +6901,7 @@ class Agent_NN_BCD:
 
                 # 参数化约束的对偶贡献（theta相关）——使用查找表，O(1) 替代全量扫描
                 for theta_idx, branch_id, anchor_time in self._dual_theta_lookup.get((g, t), []):
-                    theta = theta_tensor[theta_idx]
+                    theta = theta_constraint_scale * theta_tensor[theta_idx]
                     direction = self._get_theta_constraint_direction(branch_id, anchor_time)
                     if branch_id < self.nl:
                         dual_expr = dual_expr + direction * theta * mu[branch_id, anchor_time]
@@ -6931,7 +7035,7 @@ class Agent_NN_BCD:
                     
                     # 直接获取theta变量值
                     theta_name = self._theta_var_name(branch_id, unit_id, member_time)
-                    theta = theta_values.get(theta_name, 0.0)
+                    theta = self._current_theta_curriculum_scale() * theta_values.get(theta_name, 0.0)
                     
                     # 直接使用theta值作为系数
                     parametric_coeff = original_coeff + theta
@@ -6942,7 +7046,7 @@ class Agent_NN_BCD:
                 # 构建右端项 - 从theta_values字典中获取
                 theta_rhs_name = self._theta_rhs_name(branch_id, time_slot)
                 if theta_rhs_name in theta_values:
-                    parametric_rhs = theta_values[theta_rhs_name]
+                    parametric_rhs = self._current_theta_curriculum_scale() * theta_values[theta_rhs_name]
                 else:
                     parametric_rhs = 1.0  # 默认值
 
@@ -7091,7 +7195,7 @@ class Agent_NN_BCD:
                     
                     # 直接获取theta变量值（不再使用多项式）
                     theta_name = self._theta_var_name(branch_id, unit_id, member_time)
-                    theta = theta_values.get(theta_name, 0.0)
+                    theta = self._current_theta_curriculum_scale() * theta_values.get(theta_name, 0.0)
                     
                     # 直接使用theta值作为系数
                     parametric_coeff = original_coeff + theta
@@ -7102,7 +7206,7 @@ class Agent_NN_BCD:
                 # 构建右端项 - 从theta_values字典中获取
                 theta_rhs_name = self._theta_rhs_name(branch_id, time_slot)
                 if theta_values is not None and theta_rhs_name in theta_values:
-                    parametric_rhs = theta_values[theta_rhs_name]
+                    parametric_rhs = self._current_theta_curriculum_scale() * theta_values[theta_rhs_name]
                 else:
                     parametric_rhs = 1.0  # 默认值
 
@@ -7198,7 +7302,7 @@ class Agent_NN_BCD:
                     
                     # 直接获取theta变量值（不再使用多项式）
                     theta_name = self._theta_var_name(branch_id, unit_id, member_time)
-                    theta = theta_values.get(theta_name, 0.0)
+                    theta = self._current_theta_curriculum_scale() * theta_values.get(theta_name, 0.0)
                     
                     # 直接使用theta值作为系数
                     parametric_coeff = original_coeff + theta
@@ -7303,7 +7407,7 @@ class Agent_NN_BCD:
                     
                     # 直接获取theta变量值
                     theta_name = self._theta_var_name(branch_id, unit_id, member_time)
-                    theta = theta_values.get(theta_name, 0.0)
+                    theta = self._current_theta_curriculum_scale() * theta_values.get(theta_name, 0.0)
                     
                     # 直接使用theta值作为系数
                     parametric_coeff = original_coeff + theta
@@ -7314,7 +7418,7 @@ class Agent_NN_BCD:
                 # 构建右端项
                 theta_rhs_name = self._theta_rhs_name(branch_id, time_slot)
                 if theta_rhs_name in theta_values:
-                    parametric_rhs = theta_values[theta_rhs_name]
+                    parametric_rhs = self._current_theta_curriculum_scale() * theta_values[theta_rhs_name]
                 else:
                     parametric_rhs = 1.0  # 默认值
 

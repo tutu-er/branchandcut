@@ -258,6 +258,10 @@ BCD_NN_SMOOTH_ABS_EPS = 1e-5
 BCD_RESTORE_RHO_FROM_CHECKPOINT = False
 BCD_MAX_THETA_CONSTRAINTS_PER_TIME_SLOT = 20
 BCD_THETA_TRAINING_STAGES = None
+BCD_THETA_CURRICULUM_ROUNDS = 0
+BCD_THETA_INITIAL_SCALE = 1.0
+BCD_THETA_FINAL_SCALE = 1.0
+BCD_THETA_CURRICULUM_DELAY_ROUNDS = 0
 BCD_USE_UNIT_PREDICTOR = USE_UNIT_PREDICTOR
 BCD_UNIT_PREDICTOR_WARMUP_ROUNDS = round(BCD_MAX_ITER * 0.10)
 BCD_THETA_CONSTRAINT_DELAY_ROUNDS = round(BCD_MAX_ITER * 0.10)
@@ -266,6 +270,13 @@ DUAL_DECAY_ROUND = round(BCD_MAX_ITER/8)
 BCD_DUAL_SIGN_RELAX_INTERVAL = 4
 BCD_MU_DUAL_FLOOR_INIT = 0
 BCD_ITA_DUAL_FLOOR_INIT = 0
+BCD_ZETA_ITA_CAP_PENALTY_WEIGHT = 0.0
+BCD_ZETA_ITA_CAP_INITIAL_WEIGHT = None
+BCD_ZETA_ITA_CAP_FINAL_WEIGHT = None
+BCD_ZETA_ITA_CAP_INITIAL = None
+BCD_ZETA_ITA_CAP_FINAL = None
+BCD_ZETA_ITA_CAP_START_ROUND = 0
+BCD_ZETA_ITA_CAP_END_ROUND = 0
 SUBPROBLEM_RHO_PRIMAL_INIT = 1e-1
 SUBPROBLEM_RHO_DUAL_INIT = 1e-3
 SUBPROBLEM_RHO_DUAL_PG_INIT = 1e-1
@@ -1916,6 +1927,10 @@ def run_bcd(ppc, all_samples: list, T_DELTA, MAX_ITER, bcd_model_dir,
             lambda_init_strategy: str = 'lp_relaxation',
             max_theta_constraints_per_time_slot: int = 10,
             theta_training_stages=None,
+            theta_curriculum_rounds: int = 0,
+            theta_initial_scale: float = 1.0,
+            theta_final_scale: float = 1.0,
+            theta_curriculum_delay_rounds: int = 0,
             theta_hot_start_strategy: str = 'dcpf_relative',
             zeta_hot_start_strategy: str = 'zero',
             theta_gaussian_std: float = 0.01,
@@ -1965,6 +1980,13 @@ def run_bcd(ppc, all_samples: list, T_DELTA, MAX_ITER, bcd_model_dir,
             gamma_base: float = 1e-2,
             mu_dual_floor_init: float = 0.1,
             ita_dual_floor_init: float = 0.1,
+            zeta_ita_cap_penalty_weight: float = 0.0,
+            zeta_ita_cap_initial_weight: float | None = None,
+            zeta_ita_cap_final_weight: float | None = None,
+            zeta_ita_cap_initial: float | None = None,
+            zeta_ita_cap_final: float | None = None,
+            zeta_ita_cap_start_round: int = 0,
+            zeta_ita_cap_end_round: int = 0,
             iter_delta_reg_weight: float = BCD_ITER_DELTA_REG_WEIGHT,
             iter_delta_reg_deadband: float = BCD_ITER_DELTA_REG_DEADBAND,
             nn_size: str = 'medium',
@@ -2027,6 +2049,22 @@ def run_bcd(ppc, all_samples: list, T_DELTA, MAX_ITER, bcd_model_dir,
     )
     if theta_training_stages:
         log(f"theta staged training: {theta_training_stages}")
+    if theta_curriculum_rounds or theta_curriculum_delay_rounds or theta_initial_scale != 1.0 or theta_final_scale != 1.0:
+        log(
+            f"theta curriculum: delay={theta_curriculum_delay_rounds}, "
+            f"rounds={theta_curriculum_rounds}, scale={theta_initial_scale}->{theta_final_scale}"
+        )
+    if (
+        (zeta_ita_cap_penalty_weight or 0.0) > 0.0
+        or (zeta_ita_cap_initial_weight or 0.0) > 0.0
+        or (zeta_ita_cap_final_weight or 0.0) > 0.0
+    ):
+        log(
+            f"zeta ita soft-cap: weight={zeta_ita_cap_initial_weight if zeta_ita_cap_initial_weight is not None else zeta_ita_cap_penalty_weight}"
+            f"->{zeta_ita_cap_final_weight if zeta_ita_cap_final_weight is not None else zeta_ita_cap_penalty_weight}, "
+            f"cap={zeta_ita_cap_initial}->{zeta_ita_cap_final}, "
+            f"rounds={zeta_ita_cap_start_round}->{zeta_ita_cap_end_round}"
+        )
     if n_workers <= 1:
         log(f"Initializing serial Agent_NN_BCD, max_iter={MAX_ITER}")
     else:
@@ -2106,6 +2144,10 @@ def run_bcd(ppc, all_samples: list, T_DELTA, MAX_ITER, bcd_model_dir,
             external_sparse_templates=external_sparse_templates,
             lambda_init_strategy=lambda_init_strategy,
             max_theta_constraints_per_time_slot=max_theta_constraints_per_time_slot,
+            theta_curriculum_rounds=theta_curriculum_rounds,
+            theta_initial_scale=theta_initial_scale,
+            theta_final_scale=theta_final_scale,
+            theta_curriculum_delay_rounds=theta_curriculum_delay_rounds,
             theta_hot_start_strategy=theta_hot_start_strategy,
             zeta_hot_start_strategy=zeta_hot_start_strategy,
             theta_gaussian_std=theta_gaussian_std,
@@ -2127,6 +2169,13 @@ def run_bcd(ppc, all_samples: list, T_DELTA, MAX_ITER, bcd_model_dir,
             gamma_base=gamma_base,
             mu_dual_floor_init=mu_dual_floor_init,
             ita_dual_floor_init=ita_dual_floor_init,
+            zeta_ita_cap_penalty_weight=zeta_ita_cap_penalty_weight,
+            zeta_ita_cap_initial_weight=zeta_ita_cap_initial_weight,
+            zeta_ita_cap_final_weight=zeta_ita_cap_final_weight,
+            zeta_ita_cap_initial=zeta_ita_cap_initial,
+            zeta_ita_cap_final=zeta_ita_cap_final,
+            zeta_ita_cap_start_round=zeta_ita_cap_start_round,
+            zeta_ita_cap_end_round=zeta_ita_cap_end_round,
             dual_sign_relax_interval=DUAL_SIGN_RELAX_INTERVAL,
             nn_hidden_dims=nn_hidden_dims,
             nn_learning_rate=nn_learning_rate,
@@ -2155,6 +2204,10 @@ def run_bcd(ppc, all_samples: list, T_DELTA, MAX_ITER, bcd_model_dir,
             bcd_highs_threads=bcd_highs_threads,
             lambda_init_strategy=lambda_init_strategy,
             max_theta_constraints_per_time_slot=max_theta_constraints_per_time_slot,
+            theta_curriculum_rounds=theta_curriculum_rounds,
+            theta_initial_scale=theta_initial_scale,
+            theta_final_scale=theta_final_scale,
+            theta_curriculum_delay_rounds=theta_curriculum_delay_rounds,
             theta_hot_start_strategy=theta_hot_start_strategy,
             zeta_hot_start_strategy=zeta_hot_start_strategy,
             theta_gaussian_std=theta_gaussian_std,
@@ -2176,6 +2229,13 @@ def run_bcd(ppc, all_samples: list, T_DELTA, MAX_ITER, bcd_model_dir,
             gamma_base=gamma_base,
             mu_dual_floor_init=mu_dual_floor_init,
             ita_dual_floor_init=ita_dual_floor_init,
+            zeta_ita_cap_penalty_weight=zeta_ita_cap_penalty_weight,
+            zeta_ita_cap_initial_weight=zeta_ita_cap_initial_weight,
+            zeta_ita_cap_final_weight=zeta_ita_cap_final_weight,
+            zeta_ita_cap_initial=zeta_ita_cap_initial,
+            zeta_ita_cap_final=zeta_ita_cap_final,
+            zeta_ita_cap_start_round=zeta_ita_cap_start_round,
+            zeta_ita_cap_end_round=zeta_ita_cap_end_round,
             dual_sign_relax_interval=DUAL_SIGN_RELAX_INTERVAL,
             nn_hidden_dims=nn_hidden_dims,
             nn_learning_rate=nn_learning_rate,
@@ -2706,6 +2766,10 @@ def main():
     BCD_NN_SMOOTH_ABS_EPS_VALUE = BCD_NN_SMOOTH_ABS_EPS
     BCD_MAX_THETA_CONSTRAINTS_PER_TIME_SLOT_VALUE = BCD_MAX_THETA_CONSTRAINTS_PER_TIME_SLOT
     BCD_THETA_TRAINING_STAGES_VALUE = BCD_THETA_TRAINING_STAGES
+    BCD_THETA_CURRICULUM_ROUNDS_VALUE = BCD_THETA_CURRICULUM_ROUNDS
+    BCD_THETA_INITIAL_SCALE_VALUE = BCD_THETA_INITIAL_SCALE
+    BCD_THETA_FINAL_SCALE_VALUE = BCD_THETA_FINAL_SCALE
+    BCD_THETA_CURRICULUM_DELAY_ROUNDS_VALUE = BCD_THETA_CURRICULUM_DELAY_ROUNDS
     BCD_USE_UNIT_PREDICTOR_VALUE = BCD_USE_UNIT_PREDICTOR
     BCD_UNIT_PREDICTOR_WARMUP_ROUNDS_VALUE = BCD_UNIT_PREDICTOR_WARMUP_ROUNDS
     BCD_THETA_CONSTRAINT_DELAY_ROUNDS_VALUE = BCD_THETA_CONSTRAINT_DELAY_ROUNDS
@@ -2716,6 +2780,13 @@ def main():
     BCD_GAMMA_BASE_VALUE = BCD_GAMMA_BASE
     BCD_MU_DUAL_FLOOR_INIT_VALUE = BCD_MU_DUAL_FLOOR_INIT
     BCD_ITA_DUAL_FLOOR_INIT_VALUE = BCD_ITA_DUAL_FLOOR_INIT
+    BCD_ZETA_ITA_CAP_PENALTY_WEIGHT_VALUE = BCD_ZETA_ITA_CAP_PENALTY_WEIGHT
+    BCD_ZETA_ITA_CAP_INITIAL_WEIGHT_VALUE = BCD_ZETA_ITA_CAP_INITIAL_WEIGHT
+    BCD_ZETA_ITA_CAP_FINAL_WEIGHT_VALUE = BCD_ZETA_ITA_CAP_FINAL_WEIGHT
+    BCD_ZETA_ITA_CAP_INITIAL_VALUE = BCD_ZETA_ITA_CAP_INITIAL
+    BCD_ZETA_ITA_CAP_FINAL_VALUE = BCD_ZETA_ITA_CAP_FINAL
+    BCD_ZETA_ITA_CAP_START_ROUND_VALUE = BCD_ZETA_ITA_CAP_START_ROUND
+    BCD_ZETA_ITA_CAP_END_ROUND_VALUE = BCD_ZETA_ITA_CAP_END_ROUND
     BCD_DUAL_SIGN_RELAX_INTERVAL_VALUE = BCD_DUAL_SIGN_RELAX_INTERVAL
     BCD_PG_BLOCK_PROX_WEIGHT_VALUE = BCD_PG_BLOCK_PROX_WEIGHT
     BCD_DUAL_BLOCK_PROX_WEIGHT_VALUE = BCD_DUAL_BLOCK_PROX_WEIGHT
@@ -2899,6 +2970,10 @@ def main():
                     lambda_init_strategy=BCD_LAMBDA_INIT_STRATEGY_VALUE,
                     max_theta_constraints_per_time_slot=BCD_MAX_THETA_CONSTRAINTS_PER_TIME_SLOT_VALUE,
                     theta_training_stages=BCD_THETA_TRAINING_STAGES_VALUE,
+                    theta_curriculum_rounds=BCD_THETA_CURRICULUM_ROUNDS_VALUE,
+                    theta_initial_scale=BCD_THETA_INITIAL_SCALE_VALUE,
+                    theta_final_scale=BCD_THETA_FINAL_SCALE_VALUE,
+                    theta_curriculum_delay_rounds=BCD_THETA_CURRICULUM_DELAY_ROUNDS_VALUE,
                     theta_hot_start_strategy=THETA_WARM_START_STRATEGY,
                     zeta_hot_start_strategy=ZETA_WARM_START_STRATEGY,
                     theta_gaussian_std=THETA_WARM_START_GAUSSIAN_STD,
@@ -2948,6 +3023,13 @@ def main():
                     gamma_base=BCD_GAMMA_BASE_VALUE,
                     mu_dual_floor_init=BCD_MU_DUAL_FLOOR_INIT_VALUE,
                     ita_dual_floor_init=BCD_ITA_DUAL_FLOOR_INIT_VALUE,
+                    zeta_ita_cap_penalty_weight=BCD_ZETA_ITA_CAP_PENALTY_WEIGHT_VALUE,
+                    zeta_ita_cap_initial_weight=BCD_ZETA_ITA_CAP_INITIAL_WEIGHT_VALUE,
+                    zeta_ita_cap_final_weight=BCD_ZETA_ITA_CAP_FINAL_WEIGHT_VALUE,
+                    zeta_ita_cap_initial=BCD_ZETA_ITA_CAP_INITIAL_VALUE,
+                    zeta_ita_cap_final=BCD_ZETA_ITA_CAP_FINAL_VALUE,
+                    zeta_ita_cap_start_round=BCD_ZETA_ITA_CAP_START_ROUND_VALUE,
+                    zeta_ita_cap_end_round=BCD_ZETA_ITA_CAP_END_ROUND_VALUE,
                     iter_delta_reg_weight=BCD_ITER_DELTA_REG_WEIGHT,
                     iter_delta_reg_deadband=BCD_ITER_DELTA_REG_DEADBAND,
                     nn_size=BCD_NN_SIZE_VALUE,
@@ -3422,6 +3504,10 @@ def main():
                     lambda_init_strategy=BCD_LAMBDA_INIT_STRATEGY_VALUE,
                     max_theta_constraints_per_time_slot=BCD_MAX_THETA_CONSTRAINTS_PER_TIME_SLOT_VALUE,
                     theta_training_stages=BCD_THETA_TRAINING_STAGES_VALUE,
+                    theta_curriculum_rounds=BCD_THETA_CURRICULUM_ROUNDS_VALUE,
+                    theta_initial_scale=BCD_THETA_INITIAL_SCALE_VALUE,
+                    theta_final_scale=BCD_THETA_FINAL_SCALE_VALUE,
+                    theta_curriculum_delay_rounds=BCD_THETA_CURRICULUM_DELAY_ROUNDS_VALUE,
                     theta_hot_start_strategy=THETA_WARM_START_STRATEGY,
                     zeta_hot_start_strategy=ZETA_WARM_START_STRATEGY,
                     theta_gaussian_std=THETA_WARM_START_GAUSSIAN_STD,
@@ -3471,6 +3557,13 @@ def main():
                     gamma_base=BCD_GAMMA_BASE_VALUE,
                     mu_dual_floor_init=BCD_MU_DUAL_FLOOR_INIT_VALUE,
                     ita_dual_floor_init=BCD_ITA_DUAL_FLOOR_INIT_VALUE,
+                    zeta_ita_cap_penalty_weight=BCD_ZETA_ITA_CAP_PENALTY_WEIGHT_VALUE,
+                    zeta_ita_cap_initial_weight=BCD_ZETA_ITA_CAP_INITIAL_WEIGHT_VALUE,
+                    zeta_ita_cap_final_weight=BCD_ZETA_ITA_CAP_FINAL_WEIGHT_VALUE,
+                    zeta_ita_cap_initial=BCD_ZETA_ITA_CAP_INITIAL_VALUE,
+                    zeta_ita_cap_final=BCD_ZETA_ITA_CAP_FINAL_VALUE,
+                    zeta_ita_cap_start_round=BCD_ZETA_ITA_CAP_START_ROUND_VALUE,
+                    zeta_ita_cap_end_round=BCD_ZETA_ITA_CAP_END_ROUND_VALUE,
                     iter_delta_reg_weight=BCD_ITER_DELTA_REG_WEIGHT,
                     iter_delta_reg_deadband=BCD_ITER_DELTA_REG_DEADBAND,
                     pg_block_prox_weight=BCD_PG_BLOCK_PROX_WEIGHT_VALUE,

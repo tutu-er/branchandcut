@@ -19,6 +19,7 @@
 """
 
 from __future__ import annotations
+import argparse
 from datetime import datetime
 from pathlib import Path
 
@@ -37,6 +38,35 @@ def _parse_hidden_dims(text: str) -> list[int] | None:
     if not raw:
         return None
     return [int(x) for x in raw]
+
+
+def _parse_unit_ids(text: str | None) -> list[int] | None:
+    if text is None or str(text).strip() == "":
+        return None
+    return [int(p.strip()) for p in str(text).split(",") if p.strip()]
+
+
+def _resolve_checkpoint_path(path_value: str | None) -> str | None:
+    """Resolve a checkpoint file, run directory, or LATEST.txt pointer."""
+    if path_value is None or str(path_value).strip() == "":
+        return None
+    p = Path(str(path_value).strip())
+    if not p.is_absolute():
+        p = Path(__file__).resolve().parent / p
+    if p.is_dir():
+        latest = p / "LATEST.txt"
+        if latest.is_file():
+            text = latest.read_text(encoding="utf-8").strip()
+            if text:
+                q = Path(text)
+                return str(q if q.is_absolute() else (Path(__file__).resolve().parent / q))
+        return str(p / "unit_predictor.pth")
+    if p.name.upper() == "LATEST.TXT" and p.is_file():
+        text = p.read_text(encoding="utf-8").strip()
+        if text:
+            q = Path(text)
+            return str(q if q.is_absolute() else (Path(__file__).resolve().parent / q))
+    return str(p)
 
 
 def _train_val_split(items: list, *, val_ratio: float, seed: int) -> tuple[list, list]:
@@ -460,6 +490,75 @@ def main() -> None:
     validation_top_k = 12
     target_mse = 0.05
     train_eval_threshold_sweep = True
+    out_dir_override: str | None = None
+
+    # CLI overrides. Leaving an option unset preserves the script-top config
+    # above, so this file remains usable in the old "edit main()" style.
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--active-sets", type=str, default=None)
+    parser.add_argument("--max-samples", type=int, default=None)
+    parser.add_argument("--unit-ids", type=str, default=None, help="comma-separated unit ids; default keeps script config")
+    parser.add_argument("--load-path", type=str, default=None, help="unit_predictor.pth, a run dir, or a LATEST.txt file")
+    parser.add_argument("--eval-only", action="store_true", help="load and evaluate only; skip all training stages and saving")
+    parser.add_argument("--val-ratio", type=float, default=None)
+    parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument("--print-all-validation", action="store_true")
+    parser.add_argument("--validation-top-k", type=int, default=None)
+    parser.add_argument("--target-mse", type=float, default=None)
+    parser.add_argument("--no-threshold-sweep", action="store_true")
+    parser.add_argument("--out-dir", type=str, default=None)
+    parser.add_argument("--net", choices=("mlp", "resmlp", "tconv", "tcn", "tcn_shared_film"), default=None)
+    parser.add_argument("--hidden-dims", type=str, default=None)
+    parser.add_argument("--tcn-channels", type=int, default=None)
+    parser.add_argument("--tcn-depth", type=int, default=None)
+    parser.add_argument("--dropout", type=float, default=None)
+    parser.add_argument("--lr", type=float, default=None)
+    parser.add_argument("--weight-decay", type=float, default=None)
+    parser.add_argument("--batch-size", type=int, default=None)
+    parser.add_argument("--use-all-samples-as-train", dest="use_all_samples_as_train", action="store_true", default=None)
+    parser.add_argument("--train-val-split", dest="use_all_samples_as_train", action="store_false")
+    args = parser.parse_args()
+
+    if args.max_samples is not None:
+        max_samples = args.max_samples
+    if args.unit_ids is not None:
+        unit_ids = _parse_unit_ids(args.unit_ids)
+    if args.load_path is not None:
+        load_path = _resolve_checkpoint_path(args.load_path)
+    if args.eval_only:
+        stages = []
+    if args.val_ratio is not None:
+        val_ratio = args.val_ratio
+    if args.seed is not None:
+        seed = args.seed
+    if args.print_all_validation:
+        print_all_validation = True
+    if args.validation_top_k is not None:
+        validation_top_k = args.validation_top_k
+    if args.target_mse is not None:
+        target_mse = args.target_mse
+    if args.no_threshold_sweep:
+        train_eval_threshold_sweep = False
+    if args.out_dir is not None:
+        out_dir_override = args.out_dir
+    if args.net is not None:
+        net_variant = args.net
+    if args.hidden_dims is not None:
+        hidden_dims = _parse_hidden_dims(args.hidden_dims)
+    if args.tcn_channels is not None:
+        tcn_channels = args.tcn_channels
+    if args.tcn_depth is not None:
+        tcn_depth = args.tcn_depth
+    if args.dropout is not None:
+        dropout = args.dropout
+    if args.lr is not None:
+        lr = args.lr
+    if args.weight_decay is not None:
+        weight_decay = args.weight_decay
+    if args.batch_size is not None:
+        batch_size = args.batch_size
+    if args.use_all_samples_as_train is not None:
+        use_all_samples_as_train = args.use_all_samples_as_train
 
     # 输出目录：None=使用默认时间戳目录
     out_dir_override: str | None = None
@@ -467,6 +566,8 @@ def main() -> None:
     # 使用 case118 的 active set 配置（与主入口一致）
     rt.CASE_NAME = "case118"
     rt.ACTIVE_SETS_FILE = case118_cfg.CASE118_ACTIVE_SET_JSON
+    if args.active_sets is not None:
+        rt.ACTIVE_SETS_FILE = args.active_sets
     rt.MAX_SAMPLES = None
 
     rt.ensure_bcd_modules_imported()
@@ -520,6 +621,7 @@ def main() -> None:
         device=None,
     )
     if load_path is not None:
+        load_path = _resolve_checkpoint_path(load_path)
         predictor.load(load_path)
 
     _nv = str(net_variant).strip().lower()
@@ -540,6 +642,11 @@ def main() -> None:
             flush=True,
         )
         print("-" * 60, flush=True)
+
+    if not stages:
+        print("=" * 60, flush=True)
+        print("[UnitPredictor] no training stages configured; evaluation only", flush=True)
+        print("=" * 60, flush=True)
 
     for stage in stages:
         stage_shuffle = bool(stage.get("shuffle", shuffle))
@@ -681,13 +788,16 @@ def main() -> None:
                 )
             print("-" * 60, flush=True)
 
-    predictor.save(str(save_path))
+    if stages:
+        predictor.save(str(save_path))
 
-    # 额外写一个“最新”指针文件，方便其它脚本引用
-    latest_path = out_dir / "LATEST.txt"
-    latest_path.write_text(str(save_path).replace("\\", "/"), encoding="utf-8")
+        # 额外写一个“最新”指针文件，方便其它脚本引用
+        latest_path = out_dir / "LATEST.txt"
+        latest_path.write_text(str(save_path).replace("\\", "/"), encoding="utf-8")
 
-    print(f"✓ UnitPredictor 已保存: {save_path}", flush=True)
+        print(f"✓ UnitPredictor 已保存: {save_path}", flush=True)
+    else:
+        print("UnitPredictor evaluation-only run; checkpoint was not re-saved.", flush=True)
     if predictor is not None:
         print(f"  out_dir={out_dir}", flush=True)
         print(f"  unit_ids={unit_ids!r}", flush=True)
@@ -738,4 +848,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
