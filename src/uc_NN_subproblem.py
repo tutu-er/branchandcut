@@ -3647,7 +3647,7 @@ class SubproblemSurrogateTrainer:
         if vars_dict is None:
             excess = model.addVars(range(st, en), lb=0.0, name='single_mu_cap_excess')
             for k in range(st, en):
-                model.addConstr(excess[k] - mu_abs[k] >= -cap, name=f'single_mu_cap_{k}')
+                model.addConstr(excess[k] >= mu_abs[k] - cap, name=f'single_mu_cap_{k}')
             return weight * gp.quicksum(excess[k] for k in range(st, en))
 
         excess = vars_dict.get('single_mu_cap_excess')
@@ -3657,7 +3657,7 @@ class SubproblemSurrogateTrainer:
             constrs = {}
             for k in range(st, en):
                 constrs[k] = model.addConstr(
-                    excess[k] - mu_abs[k] >= -cap,
+                    excess[k] >= mu_abs[k] - cap,
                     name=f'single_mu_cap_{k}',
                 )
             vars_dict['single_mu_cap_excess'] = excess

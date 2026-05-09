@@ -22,7 +22,7 @@ from pathlib import Path
 CASE_NAME = "case3lite"
 MODE = "surrogate"  # use "both" to also evaluate a BCD checkpoint
 ACTIVE_SETS_FILE = "result/active_set/active_sets_case3lite_T24_n1000_20260403_180137.json"
-MODEL_DIR: str | None = None
+MODEL_DIR: str | None = "result/surrogate_models/subproblem_models_case3lite_20260508_223657"
 BCD_MODEL_PATH: str | None = None
 TEST_SAMPLES = 10
 SAMPLE_RANGE = "0:100"
