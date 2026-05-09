@@ -6944,50 +6944,69 @@ class SubproblemSurrogateTrainer:
             for epoch in range(num_epochs):
                 epoch_loss = 0.0
                 self._surr_pg_cost_optimizer.zero_grad()
-                batch_count = 0
                 sample_indices = np.arange(self.n_samples, dtype=int)
                 if resolved_shuffle and self.n_samples > 1:
                     np.random.shuffle(sample_indices)
 
-                for sample_pos, sample_id in enumerate(sample_indices):
-                    batch_start = (sample_pos // resolved_batch_size) * resolved_batch_size
-                    actual_batch_size = min(resolved_batch_size, self.n_samples - batch_start)
+                for batch_start in range(0, self.n_samples, resolved_batch_size):
+                    batch_ids = sample_indices[batch_start: batch_start + resolved_batch_size]
+                    batch_losses = []
 
-                    features = self._extract_features(sample_id)
-                    features_tensor = torch.tensor(
-                        features,
-                        dtype=torch.float32,
-                        device=self.device,
-                    ).unsqueeze(0)
+                    for sample_id in batch_ids:
+                        features = self._extract_features(int(sample_id))
+                        features_tensor = torch.tensor(
+                            features,
+                            dtype=torch.float32,
+                            device=self.device,
+                        ).unsqueeze(0)
 
-                    pg_costs_out = self.surrogate_net.forward_pg_cost(features_tensor)
-                    pg_costs_tensor = self._gate_pg_cost_tensor(
-                        pg_costs_out.squeeze(0)[:self.T]
-                    )
+                        pg_costs_out = self.surrogate_net.forward_pg_cost(features_tensor)
+                        pg_costs_tensor = self._gate_pg_cost_tensor(
+                            pg_costs_out.squeeze(0)[:self.T]
+                        )
 
-                    loss = self.loss_function_c_pg_differentiable(
-                        sample_id,
-                        pg_costs_tensor,
-                        self.device,
-                    )
+                        batch_losses.append(
+                            self.loss_function_c_pg_differentiable(
+                                int(sample_id),
+                                pg_costs_tensor,
+                                self.device,
+                            )
+                        )
                     # 难样本加权：按当前样本 loss 大小提升其梯度权重（mean≈1，clip 防止爆炸）
+                    # Relative hard-sample weighting keeps mean batch scale stable.
                     if self.pg_cost_use_sample_weights and self.pg_cost_sample_weight_power > 0:
                         with torch.no_grad():
-                            w = float(max(loss.detach().cpu().item(), 0.0)) ** float(self.pg_cost_sample_weight_power)
-                            w = min(max(w, 1e-6), float(self.pg_cost_sample_weight_clip))
-                        loss = loss * float(w)
-                    (loss / actual_batch_size).backward()
-                    epoch_loss += loss.detach().cpu().item()
-                    batch_count += 1
+                            detached = torch.stack([
+                                torch.clamp(loss.detach(), min=0.0)
+                                for loss in batch_losses
+                            ])
+                            mean_loss = torch.clamp(torch.mean(detached), min=1e-12)
+                            weights = torch.pow(
+                                detached / mean_loss,
+                                float(self.pg_cost_sample_weight_power),
+                            )
+                            weights = torch.clamp(
+                                weights,
+                                min=1e-6,
+                                max=float(self.pg_cost_sample_weight_clip),
+                            )
+                        batch_loss = torch.stack([
+                            loss * weights[idx]
+                            for idx, loss in enumerate(batch_losses)
+                        ]).sum()
+                    else:
+                        batch_loss = torch.stack(batch_losses).sum()
 
-                    if batch_count == resolved_batch_size or sample_pos == self.n_samples - 1:
-                        torch.nn.utils.clip_grad_norm_(
-                            self._pg_network_parameters(),
-                            max_norm=1.0,
-                        )
-                        self._surr_pg_cost_optimizer.step()
-                        self._surr_pg_cost_optimizer.zero_grad()
-                        batch_count = 0
+                    raw_batch_loss = sum(float(loss.detach().cpu().item()) for loss in batch_losses)
+                    (batch_loss / max(1, len(batch_ids))).backward()
+                    epoch_loss += raw_batch_loss
+
+                    torch.nn.utils.clip_grad_norm_(
+                        self._pg_network_parameters(),
+                        max_norm=1.0,
+                    )
+                    self._surr_pg_cost_optimizer.step()
+                    self._surr_pg_cost_optimizer.zero_grad()
 
                 if self._surr_pg_cost_scheduler is not None:
                     self._surr_pg_cost_scheduler.step()

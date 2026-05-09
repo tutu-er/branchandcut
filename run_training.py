@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 训练脚本（多模式）
@@ -1747,6 +1747,8 @@ def run_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS,
             if trainer_checkpoint_path.exists():
                 log(f"继续训练 surrogate checkpoint: {trainer_checkpoint_path}")
                 trainer.load(str(trainer_checkpoint_path))
+                trainer.nn_smooth_abs_eps = max(0.0, float(subproblem_nn_smooth_abs_eps))
+                trainer.pg_cost_smooth_abs_eps = max(0.0, float(pg_cost_smooth_abs_eps))
         if logger is not None:
             trainer.logger = logger
         trainer.iter(

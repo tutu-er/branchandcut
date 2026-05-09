@@ -20,7 +20,7 @@ BCD_MAX_ITER = base.BCD_MAX_ITER
 SUBPROBLEM_MAX_ITER = base.SUBPROBLEM_MAX_ITER
 DUAL_EPOCHS = base.DUAL_EPOCHS
 UNIT_PREDICTOR_EPOCHS = base.UNIT_PREDICTOR_EPOCHS
-NN_EPOCHS = base.NN_EPOCHS
+NN_EPOCHS = strong.NN_EPOCHS
 N_WORKERS_SAMPLE = base.N_WORKERS_SAMPLE
 N_WORKERS_UNIT = base.N_WORKERS_UNIT
 N_WORKERS_BCD = base.N_WORKERS_BCD
@@ -89,7 +89,12 @@ def _parse_args() -> argparse.Namespace:
                    default=strong.SINGLE_MU_CAP_START_FRACTION)
     p.add_argument("--single-mu-cap-end-frac", type=float,
                    default=strong.SINGLE_MU_CAP_END_FRACTION)
-    p.add_argument("--c-pg-start-round", type=int, default=strong.SUBPROBLEM_PG_COST_START_ROUND)
+    p.add_argument(
+        "--c-pg-start-round",
+        type=int,
+        default=strong.SUBPROBLEM_PG_COST_START_ROUND,
+        help="Override c_pg start round. Default: inherit the base case schedule.",
+    )
     p.add_argument("--c-pg-nn-epochs", type=int, default=strong.SUBPROBLEM_PG_COST_NN_EPOCHS)
     p.add_argument("--c-pg-direct-epochs", type=int,
                    default=strong.SUBPROBLEM_C_PG_DIRECT_EPOCHS)
@@ -154,7 +159,8 @@ def main() -> None:
     strong._configure_strong_complex_dual_floors(args)
     rt.SUBPROBLEM_MAIN_DIRECT_BATCH_STRATEGY = strong.SUBPROBLEM_MAIN_DIRECT_BATCH_STRATEGY
     rt.SUBPROBLEM_MAIN_DIRECT_EPOCHS = max(1, int(strong.SUBPROBLEM_MAIN_DIRECT_EPOCHS))
-    rt.SUBPROBLEM_PG_COST_START_ROUND = max(0, int(args.c_pg_start_round))
+    if args.c_pg_start_round is not None:
+        rt.SUBPROBLEM_PG_COST_START_ROUND = max(0, int(args.c_pg_start_round))
     rt.SUBPROBLEM_PG_COST_NN_EPOCHS = max(1, int(args.c_pg_nn_epochs))
     rt.SUBPROBLEM_C_PG_DIRECT_EPOCHS = max(1, int(args.c_pg_direct_epochs))
     rt.SUBPROBLEM_C_PG_DIRECT_BATCH_STRATEGY = args.c_pg_direct_batch_strategy
@@ -199,6 +205,7 @@ def main() -> None:
         f"..{rt.SUBPROBLEM_SINGLE_MU_CAP_END_ROUND}",
         flush=True,
     )
+    print(f"subproblem NN-main: epochs={rt.NN_EPOCHS}", flush=True)
     print("=" * 72, flush=True)
     rt.main()
 

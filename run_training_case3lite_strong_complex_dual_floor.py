@@ -57,17 +57,18 @@ ZETA_ITA_CAP_END_FRACTION = 0.55
 SINGLE_MU_CAP_WEIGHT = 2.00
 SINGLE_MU_CAP_INITIAL_WEIGHT = 0.00
 SINGLE_MU_CAP_INITIAL = SIGN4_DUAL_FLOOR
-SINGLE_MU_CAP_FINAL = 0.00
+SINGLE_MU_CAP_FINAL = 1.00
 SINGLE_MU_CAP_START_FRACTION = 0.25
 SINGLE_MU_CAP_END_FRACTION = 0.55
 
 # Subproblem [direct-NN-main]: full-batch over all samples; fewer epochs per BCD round.
+NN_EPOCHS = 20
 SUBPROBLEM_MAIN_DIRECT_BATCH_STRATEGY = "full-batch"
 SUBPROBLEM_MAIN_DIRECT_EPOCHS = 60
 
-# Subproblem [c_pg]: start from the first BCD round, but keep the inner
-# training lighter than the generic defaults for faster case3lite iteration.
-SUBPROBLEM_PG_COST_START_ROUND = 0
+# Subproblem [c_pg]: by default, inherit the base case schedule
+# (case3lite/case14/case30lite use about 1/4 of the subproblem BCD rounds).
+SUBPROBLEM_PG_COST_START_ROUND: int | None = None
 SUBPROBLEM_PG_COST_NN_EPOCHS = 24
 SUBPROBLEM_C_PG_DIRECT_EPOCHS = 120
 SUBPROBLEM_C_PG_DIRECT_BATCH_STRATEGY = "full-batch"
@@ -129,7 +130,12 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--single-mu-cap-final", type=float, default=SINGLE_MU_CAP_FINAL)
     p.add_argument("--single-mu-cap-start-frac", type=float, default=SINGLE_MU_CAP_START_FRACTION)
     p.add_argument("--single-mu-cap-end-frac", type=float, default=SINGLE_MU_CAP_END_FRACTION)
-    p.add_argument("--c-pg-start-round", type=int, default=SUBPROBLEM_PG_COST_START_ROUND)
+    p.add_argument(
+        "--c-pg-start-round",
+        type=int,
+        default=SUBPROBLEM_PG_COST_START_ROUND,
+        help="Override c_pg start round. Default: inherit the base case schedule.",
+    )
     p.add_argument("--c-pg-nn-epochs", type=int, default=SUBPROBLEM_PG_COST_NN_EPOCHS)
     p.add_argument("--c-pg-direct-epochs", type=int, default=SUBPROBLEM_C_PG_DIRECT_EPOCHS)
     p.add_argument(
@@ -140,6 +146,18 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--c-pg-direct-batch-size", type=int, default=SUBPROBLEM_C_PG_DIRECT_BATCH_SIZE)
     p.add_argument("--unit-ids", type=str, default=None,
                    help="Comma-separated unit ids to train, e.g. '0' or '0,2'.")
+    p.add_argument(
+        "--nn-smooth-abs-eps",
+        type=float,
+        default=0.0,
+        help="Subproblem differentiable loss smooth-|x| eps (0 => exact torch.abs). Default 0 for this preset.",
+    )
+    p.add_argument(
+        "--pg-cost-smooth-abs-eps",
+        type=float,
+        default=0.0,
+        help="c_pg branch smooth-|x| eps (0 => exact torch.abs). Default 0 for this preset.",
+    )
     return p.parse_args()
 
 
@@ -310,7 +328,7 @@ def main() -> None:
     rt.UNIT_PREDICTOR_LOSS_WEIGHT_TV_FLOOR = 0.08
     rt.UNIT_PREDICTOR_TV_FLOOR_SCALE = 0.80
 
-    rt.NN_EPOCHS = base.NN_EPOCHS
+    rt.NN_EPOCHS = NN_EPOCHS
     rt.N_WORKERS_SAMPLE = max(1, int(args.sample_workers))
     rt.N_WORKERS_SUBPROBLEM = rt.N_WORKERS_SAMPLE
     rt.N_WORKERS_UNIT = base.N_WORKERS_UNIT
@@ -333,13 +351,16 @@ def main() -> None:
     rt.BCD_DUAL_BLOCK_PROX_WEIGHT = 0.0
     rt.SUBPROBLEM_PG_BLOCK_PROX_WEIGHT = 0.0
     rt.SUBPROBLEM_DUAL_BLOCK_PROX_WEIGHT = 0.0
+    rt.SUBPROBLEM_NN_SMOOTH_ABS_EPS = max(0.0, float(args.nn_smooth_abs_eps))
+    rt.SUBPROBLEM_PG_COST_SMOOTH_ABS_EPS = max(0.0, float(args.pg_cost_smooth_abs_eps))
 
     base._configure_iterations(args.bcd_iter, args.sub_iter)
     _configure_strong_complex_dual_floors(args)
 
     rt.SUBPROBLEM_MAIN_DIRECT_BATCH_STRATEGY = SUBPROBLEM_MAIN_DIRECT_BATCH_STRATEGY
     rt.SUBPROBLEM_MAIN_DIRECT_EPOCHS = max(1, int(SUBPROBLEM_MAIN_DIRECT_EPOCHS))
-    rt.SUBPROBLEM_PG_COST_START_ROUND = max(0, int(args.c_pg_start_round))
+    if args.c_pg_start_round is not None:
+        rt.SUBPROBLEM_PG_COST_START_ROUND = max(0, int(args.c_pg_start_round))
     rt.SUBPROBLEM_PG_COST_NN_EPOCHS = max(1, int(args.c_pg_nn_epochs))
     rt.SUBPROBLEM_C_PG_DIRECT_EPOCHS = max(1, int(args.c_pg_direct_epochs))
     rt.SUBPROBLEM_C_PG_DIRECT_BATCH_STRATEGY = args.c_pg_direct_batch_strategy
@@ -365,6 +386,12 @@ def main() -> None:
         f"sub_dual_prox={rt.SUBPROBLEM_DUAL_BLOCK_PROX_WEIGHT}",
         flush=True,
     )
+    print(
+        f"subproblem_smooth_abs: nn_eps={rt.SUBPROBLEM_NN_SMOOTH_ABS_EPS}, "
+        f"pg_cost_eps={rt.SUBPROBLEM_PG_COST_SMOOTH_ABS_EPS}",
+        flush=True,
+    )
+    print(f"subproblem NN-main: epochs={rt.NN_EPOCHS}", flush=True)
     print(
         f"theta_floor={rt.BCD_MU_DUAL_FLOOR_INIT} until round {rt.DUAL_DECAY_ROUND} | "
         f"zeta_floor={rt.BCD_ITA_DUAL_FLOOR_INIT} | "

@@ -32,10 +32,10 @@ CASE_NAME = train_base.CASE_NAME
 MODE = "surrogate"  # use "both" to also evaluate a BCD checkpoint
 # 与训练相同：None 表示在 run_test / activity 脚本内按 case 自动选取最新 active_set JSON
 ACTIVE_SETS_FILE = train_base.ACTIVE_SETS_FILE
-MODEL_DIR: str | None = "result/surrogate_models/subproblem_models_case3lite_20260509_134006"
+MODEL_DIR: str | None = "result/surrogate_models/subproblem_models_case3lite_20260509_190031"
 BCD_MODEL_PATH: str | None = None
-TEST_SAMPLES = train_base.MAX_SAMPLES
-SAMPLE_RANGE = f"0:{train_base.MAX_SAMPLES}"
+TEST_SAMPLES = 10
+SAMPLE_RANGE = f"0:10"
 SURROGATE_CONSTRAINT_STRATEGY = train_base.SURROGATE_CONSTRAINT_STRATEGY
 SUBPROBLEM_LP_BACKEND = train_base.SUBPROBLEM_LP_BACKEND
 # 与 run_training.py 中子问题默认一致（避免 run_test 模块默认 False 再走 mismatch 回退）
