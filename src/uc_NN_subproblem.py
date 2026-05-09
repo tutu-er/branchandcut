@@ -6055,7 +6055,11 @@ class SubproblemSurrogateTrainer:
                 obj_d = obj_dp + obj_dx + obj_dc
                 obj_o = float(vars_dict['obj_opt'].getValue())
                 obj_px = float(vars_dict['obj_dual_prox'].getValue())
-                _single_cap, single_cap_weight = self._current_single_mu_cap()
+                obj_single_mu_cap = vars_dict.get('obj_single_mu_cap', 0.0)
+                if hasattr(obj_single_mu_cap, 'getValue'):
+                    single_mu_cap_obj = float(obj_single_mu_cap.getValue())
+                else:
+                    single_mu_cap_obj = float(obj_single_mu_cap or 0.0)
                 self._emit_subproblem_block_log(
                     sample_id,
                     f"[Unit-{self.unit_id}] dual_block, sample_id: {sample_id}, "
@@ -6066,7 +6070,7 @@ class SubproblemSurrogateTrainer:
                     f"obj_dual: {obj_d:.6f}, "
                     f"obj_opt: {obj_o:.6f}, "
                     f"obj_dual_prox: {obj_px:.6f}, "
-                    f"single_mu_cap_weight: {single_cap_weight:.6f}",
+                    f"obj_single_mu_cap: {single_mu_cap_obj:.6f}",
                 )
             return lambda_inherent_sol, mu_sol
         else:
@@ -6392,7 +6396,10 @@ class SubproblemSurrogateTrainer:
 
             # 与 primal_block / cvxpy solve_dual_block 一致：每个机组仅打印前 3 个样本
             if sample_id <= 2:
-                _single_cap, single_cap_weight = self._current_single_mu_cap()
+                if hasattr(obj_single_mu_cap, 'getValue'):
+                    single_mu_cap_obj = float(obj_single_mu_cap.getValue())
+                else:
+                    single_mu_cap_obj = float(obj_single_mu_cap or 0.0)
                 print(
                     f"[Unit-{self.unit_id}] dual_block, sample_id: {sample_id}, "
                     f"status: optimal, "
@@ -6402,7 +6409,7 @@ class SubproblemSurrogateTrainer:
                     f"obj_dual: {obj_dual.getValue():.6f}, "
                     f"obj_opt: {(obj_opt.getValue() if hasattr(obj_opt, 'getValue') else obj_opt):.6f}, "
                     f"obj_dual_prox: {(obj_dual_prox.getValue() if hasattr(obj_dual_prox, 'getValue') else 0.0):.6f}, "
-                    f"single_mu_cap_weight: {single_cap_weight:.6f}",
+                    f"obj_single_mu_cap: {single_mu_cap_obj:.6f}",
                     flush=True,
                 )
 
