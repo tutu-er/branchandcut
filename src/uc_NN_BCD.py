@@ -5167,6 +5167,7 @@ class Agent_NN_BCD:
                     obj_opt += para_abs * ita_abs[uid, ts]
 
         # 3. Prox 项（QP）
+        zeta_cap_penalty_obj = gp.LinExpr()
         zeta_cap, zeta_cap_weight = self._current_zeta_ita_cap()
         if zeta_cap is not None:
             for constr in vars_dict.get('zeta_ita_cap_constrs', {}).values():
