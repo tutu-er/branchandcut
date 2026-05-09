@@ -45,6 +45,7 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--bcd-iter", type=int, default=BCD_MAX_ITER)
     p.add_argument("--sub-iter", type=int, default=SUBPROBLEM_MAX_ITER)
     p.add_argument("--sample-workers", type=int, default=N_WORKERS_SAMPLE)
+    p.add_argument("--unit-workers", type=int, default=N_WORKERS_UNIT)
     p.add_argument("--bcd-workers", type=int, default=N_WORKERS_BCD)
     p.add_argument("--bcd-backend", choices=("gurobi", "cvxpy_highs"), default=BCD_LP_BACKEND)
     p.add_argument("--gurobi-threads", type=int, default=BCD_GUROBI_THREADS)
@@ -131,7 +132,7 @@ def main() -> None:
     rt.NN_EPOCHS = NN_EPOCHS
     rt.N_WORKERS_SAMPLE = max(1, int(args.sample_workers))
     rt.N_WORKERS_SUBPROBLEM = rt.N_WORKERS_SAMPLE
-    rt.N_WORKERS_UNIT = N_WORKERS_UNIT
+    rt.N_WORKERS_UNIT = max(1, int(args.unit_workers))
     rt.N_WORKERS_BCD = max(1, int(args.bcd_workers))
     rt.SUBPROBLEM_LP_BACKEND = SUBPROBLEM_LP_BACKEND
     rt.BCD_LP_BACKEND = args.bcd_backend
