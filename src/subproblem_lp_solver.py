@@ -1622,6 +1622,7 @@ def solve_dual_block(
             obj_dual_v = obj_dual_pg_v + obj_dual_x_v + obj_dual_coc_v
             obj_opt_v = _term_solved_value(obj_opt)
             obj_dual_prox_v = _term_solved_value(obj_dual_prox)
+            obj_single_mu_cap_v = _term_solved_value(single_mu_cap_penalty)
             status = getattr(problem, "status", None)
             line = (
                 f"[Unit-{g}] dual_block, sample_id: {display_sample_id}, "
@@ -1632,7 +1633,7 @@ def solve_dual_block(
                 f"obj_dual: {obj_dual_v:.6f}, "
                 f"obj_opt: {obj_opt_v:.6f}, "
                 f"obj_dual_prox: {obj_dual_prox_v:.6f}, "
-                f"single_mu_cap_weight: {float(cap_weight):.6f}"
+                f"obj_single_mu_cap: {obj_single_mu_cap_v:.6f}"
             )
             if defer_log:
                 trainer._deferred_lp_block_log = line
