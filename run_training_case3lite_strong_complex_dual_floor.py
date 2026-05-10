@@ -89,6 +89,12 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--bcd-workers", type=int, default=N_WORKERS_BCD)
     p.add_argument("--bcd-backend", choices=("gurobi", "cvxpy_highs"), default=BCD_LP_BACKEND)
     p.add_argument("--gurobi-threads", type=int, default=BCD_GUROBI_THREADS)
+    p.add_argument(
+        "--bcd-model",
+        type=str,
+        default=None,
+        help="Existing main BCD .pth checkpoint to continue training from.",
+    )
     p.add_argument("--unit-predictor", type=str, default=UNIT_PREDICTOR_LOAD_PATH)
     p.add_argument("--no-unit-predictor", action="store_true")
     p.add_argument("--no-auto-latest-unit-predictor", action="store_true")
@@ -346,7 +352,8 @@ def main() -> None:
     rt.UNIT_PREDICTOR_AUTO_LATEST_STANDALONE = not bool(args.no_auto_latest_unit_predictor)
     rt.UNIT_PREDICTOR_LOAD_METADATA_CONFIG = True
     rt.SURROGATE_DUAL_PREDICTOR_ONLY = False
-    rt.BCD_MODEL_FILE = None
+    rt.BCD_MODEL_FILE = args.bcd_model
+    rt.BCD_CONTINUE_TRAINING = bool(args.bcd_model)
     rt.SURROGATE_MODEL_DIR = args.surrogate_model_dir
     rt.SURROGATE_CONTINUE_TRAINING = bool(args.surrogate_model_dir)
     rt.SURROGATE_SKIP_EXISTING_UNITS = bool(args.skip_existing_units)
@@ -380,6 +387,11 @@ def main() -> None:
     print(
         f"bcd_backend={rt.BCD_LP_BACKEND} | bcd_workers={rt.N_WORKERS_BCD} | "
         f"gurobi_threads={rt.BCD_GUROBI_THREADS if rt.BCD_GUROBI_THREADS is not None else 'auto'}",
+        flush=True,
+    )
+    print(
+        f"bcd_resume={rt.BCD_CONTINUE_TRAINING} | "
+        f"model_file={rt.BCD_MODEL_FILE or 'none'}",
         flush=True,
     )
     print(
