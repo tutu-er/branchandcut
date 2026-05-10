@@ -1470,7 +1470,8 @@ class Agent_NN_BCD:
         lambda_sol = []
         print(
             f"[BCD:init] Starting initial LP/MILP solves for {self.n_samples} samples "
-            f"(backend={self._lp_backend}, gurobi_threads={self.gurobi_threads})",
+            f"(backend={self._lp_backend}, gurobi_threads={self.gurobi_threads}, "
+            f"highs_threads={self.bcd_highs_threads})",
             flush=True,
         )
 
@@ -4025,7 +4026,6 @@ class Agent_NN_BCD:
                 constraints.append(ita_abs >= ita_floor)
             else:
                 constraints.append(ita >= ita_floor)
-        zeta_cap_penalty_obj = gp.LinExpr()
         zeta_cap, zeta_cap_weight = self._current_zeta_ita_cap()
         zeta_cap_penalty = 0.0
         if zeta_cap is not None and zeta_cap_weight > 0:
@@ -4350,9 +4350,33 @@ class Agent_NN_BCD:
         ita_sol = _v(ita)
 
         if sample_id <= 2:
+            def _cvx_value(expr):
+                try:
+                    if expr is None:
+                        return 0.0
+                    value = getattr(expr, 'value', expr)
+                    if value is None:
+                        return 0.0
+                    return float(np.asarray(value, dtype=float).reshape(-1)[0])
+                except Exception:
+                    return 0.0
+
+            obj_dual_v = (
+                _cvx_value(obj_dual_pg)
+                + _cvx_value(obj_dual_x)
+                + _cvx_value(obj_dual_coc)
+            )
             print(
-                f"[BCD][cvxpy_highs] dual_block sample_id={sample_id}, "
-                f"status={problem.status}",
+                f"dual_block, sample_id: {sample_id}, backend: cvxpy_highs, "
+                f"status: {problem.status}, "
+                f"obj_dual_pg: {_cvx_value(obj_dual_pg):.4f}, "
+                f"obj_dual_x: {_cvx_value(obj_dual_x):.4f}, "
+                f"obj_dual_coc: {_cvx_value(obj_dual_coc):.4f}, "
+                f"obj_dual: {obj_dual_v:.4f}, "
+                f"obj_opt: {_cvx_value(obj_opt):.4f}, "
+                f"obj_prox: {_cvx_value(obj_prox):.4f}, "
+                f"zeta_cap_penalty: {_cvx_value(zeta_cap_penalty):.4f}, "
+                f"objective: {float(problem.value):.4f}",
                 flush=True,
             )
         return lambda_sol, mu_sol, ita_sol

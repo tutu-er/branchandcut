@@ -180,7 +180,8 @@ class ParallelAgent_NN_BCD(Agent_NN_BCD):
         print(
             f"[ParallelBCD] Start parallel BCD (n_workers={self.n_workers}, "
             f"max_iter={max_iter}, backend={self._lp_backend}, "
-            f"gurobi_threads={self.gurobi_threads})",
+            f"gurobi_threads={self.gurobi_threads}, "
+            f"highs_threads={self.bcd_highs_threads})",
             flush=True,
         )
 
@@ -253,6 +254,9 @@ class ParallelAgent_NN_BCD(Agent_NN_BCD):
             if not pg_block_ok:
                 print("[ParallelBCD] Some PG subproblems failed; continue", flush=True)
 
+            sign_relax_round = self._is_dual_sign_relaxation_round()
+            mu_floor = self.mu_dual_floor_init if self._is_dual_floor_active() else 0.0
+            ita_floor = self.ita_dual_floor_init if self._is_dual_floor_active() else 0.0
             dual_results: Dict[int, tuple] = {}
             with ThreadPoolExecutor(max_workers=self.n_workers) as executor:
                 future_to_sid = {
@@ -274,6 +278,9 @@ class ParallelAgent_NN_BCD(Agent_NN_BCD):
                         dual_results[sid] = (None, None, None)
 
             dual_block_ok = True
+            raw_mu_solutions = np.zeros((self.n_samples, self.nl, self.T), dtype=float)
+            raw_ita_solutions = np.zeros((self.n_samples, self.ng, self.T), dtype=float)
+            solved_mask = np.zeros(self.n_samples, dtype=bool)
             for sid in range(self.n_samples):
                 lambda_sol, mu_sol, ita_sol = dual_results[sid]
                 if lambda_sol is None or mu_sol is None:
@@ -281,8 +288,34 @@ class ParallelAgent_NN_BCD(Agent_NN_BCD):
                     dual_block_ok = False
                     continue
                 self.lambda_[sid] = lambda_sol
-                self.mu[sid, :, :] = np.where(np.abs(mu_sol) < eps, 0, mu_sol)
-                self.ita[sid, :, :] = np.where(np.abs(ita_sol) < eps, 0, ita_sol)
+                raw_mu_solutions[sid] = mu_sol
+                raw_ita_solutions[sid] = ita_sol
+                solved_mask[sid] = True
+
+            if sign_relax_round and np.any(solved_mask):
+                self.theta_constraint_direction_signs = self._resolve_direction_signs_from_signed_duals(
+                    raw_mu_solutions[solved_mask],
+                    self.theta_constraint_direction_signs,
+                )
+                self.zeta_constraint_direction_signs = self._resolve_direction_signs_from_signed_duals(
+                    raw_ita_solutions[solved_mask],
+                    self.zeta_constraint_direction_signs,
+                )
+            for sid in range(self.n_samples):
+                if not solved_mask[sid]:
+                    continue
+                mu_signed = self._finalize_signed_dual_values(
+                    raw_mu_solutions[sid],
+                    self.theta_constraint_direction_signs,
+                    mu_floor,
+                )
+                ita_signed = self._finalize_signed_dual_values(
+                    raw_ita_solutions[sid],
+                    self.zeta_constraint_direction_signs,
+                    ita_floor,
+                )
+                self.mu[sid, :, :] = np.where(np.abs(mu_signed) < eps, 0, mu_signed)
+                self.ita[sid, :, :] = np.where(np.abs(ita_signed) < eps, 0, ita_signed)
 
             if not dual_block_ok:
                 print("[ParallelBCD] Some dual subproblems failed; continue", flush=True)
