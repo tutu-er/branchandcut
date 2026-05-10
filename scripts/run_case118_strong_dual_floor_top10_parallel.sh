@@ -88,7 +88,7 @@ run_unit() {
   local unit="$1"
   local log_file="$LOG_DIR/unit_${unit}.log"
   local cmd=(
-    conda run -n "$CONDA_ENV" python run_training_case118_strong_complex_dual_floor.py
+    conda run --no-capture-output -n "$CONDA_ENV" python -u run_training_case118_strong_complex_dual_floor.py
     --target subproblem_bcd
     --solve-preset server
     --active-sets "$ACTIVE_SETS"

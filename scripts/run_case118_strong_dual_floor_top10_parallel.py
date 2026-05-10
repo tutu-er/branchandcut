@@ -70,9 +70,11 @@ def build_command(args: argparse.Namespace, unit: int) -> list[str]:
     return [
         "conda",
         "run",
+        "--no-capture-output",
         "-n",
         str(args.conda_env),
         "python",
+        "-u",
         "run_training_case118_strong_complex_dual_floor.py",
         "--target",
         "subproblem_bcd",
