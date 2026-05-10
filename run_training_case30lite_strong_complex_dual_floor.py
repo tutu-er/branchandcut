@@ -91,6 +91,14 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--single-mu-cap-end-frac", type=float,
                    default=strong.SINGLE_MU_CAP_END_FRACTION)
     p.add_argument(
+        "--override-loaded-single-mu-cap",
+        action="store_true",
+        help=(
+            "When --retrain-existing loads surrogate_unit_*.pth, reapply the "
+            "single-mu-cap command-line schedule instead of keeping the checkpoint values."
+        ),
+    )
+    p.add_argument(
         "--c-pg-start-round",
         type=int,
         default=strong.SUBPROBLEM_PG_COST_START_ROUND,
@@ -158,6 +166,7 @@ def main() -> None:
 
     base._configure_iterations(args.bcd_iter, args.sub_iter)
     strong._configure_strong_complex_dual_floors(args)
+    rt.SUBPROBLEM_OVERRIDE_LOADED_SINGLE_MU_CAP = bool(args.override_loaded_single_mu_cap)
     rt.SUBPROBLEM_MAIN_DIRECT_BATCH_STRATEGY = strong.SUBPROBLEM_MAIN_DIRECT_BATCH_STRATEGY
     rt.SUBPROBLEM_MAIN_DIRECT_EPOCHS = max(1, int(strong.SUBPROBLEM_MAIN_DIRECT_EPOCHS))
     if args.c_pg_start_round is not None:

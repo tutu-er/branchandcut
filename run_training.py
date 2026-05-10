@@ -408,6 +408,7 @@ SUBPROBLEM_SINGLE_MU_CAP_INITIAL = None
 SUBPROBLEM_SINGLE_MU_CAP_FINAL = None
 SUBPROBLEM_SINGLE_MU_CAP_START_ROUND = 0
 SUBPROBLEM_SINGLE_MU_CAP_END_ROUND = 0
+SUBPROBLEM_OVERRIDE_LOADED_SINGLE_MU_CAP = False
 
 SUBPROBLEM_SOLVER_PATH_PREPENDED = False
 def _bootstrap_runtime_environment() -> None:
@@ -1015,6 +1016,7 @@ def run_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS,
                   single_mu_cap_final: float | None = SUBPROBLEM_SINGLE_MU_CAP_FINAL,
                   single_mu_cap_start_round: int = SUBPROBLEM_SINGLE_MU_CAP_START_ROUND,
                   single_mu_cap_end_round: int = SUBPROBLEM_SINGLE_MU_CAP_END_ROUND,
+                  override_loaded_single_mu_cap: bool = SUBPROBLEM_OVERRIDE_LOADED_SINGLE_MU_CAP,
                   iter_delta_reg_weight: float = SUBPROBLEM_ITER_DELTA_REG_WEIGHT,
                   iter_delta_reg_deadband: float = SUBPROBLEM_ITER_DELTA_REG_DEADBAND,
                   dual_predictor_only: bool = False,
@@ -1070,6 +1072,30 @@ def run_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS,
     """V3 代理约束训练（样本级并行），返回 (dual_predictor, trainers)。"""
     import os
     from pypower.ext2int import ext2int
+
+    def _apply_runtime_single_mu_cap_config(trainer) -> None:
+        trainer.single_mu_cap_initial_weight = (
+            0.0 if single_mu_cap_initial_weight is None
+            else max(float(single_mu_cap_initial_weight), 0.0)
+        )
+        final_weight = (
+            single_mu_cap_penalty_weight
+            if single_mu_cap_final_weight is None
+            else single_mu_cap_final_weight
+        )
+        trainer.single_mu_cap_final_weight = max(float(final_weight), 0.0)
+        trainer.single_mu_cap_penalty_weight = trainer.single_mu_cap_final_weight
+        trainer.single_mu_cap_initial = (
+            None if single_mu_cap_initial is None else max(float(single_mu_cap_initial), 0.0)
+        )
+        trainer.single_mu_cap_final = (
+            None if single_mu_cap_final is None else max(float(single_mu_cap_final), 0.0)
+        )
+        trainer.single_mu_cap_start_round = max(int(single_mu_cap_start_round), 0)
+        trainer.single_mu_cap_end_round = max(
+            int(single_mu_cap_end_round),
+            trainer.single_mu_cap_start_round,
+        )
 
     def _resolve_unit_predictor_load_path(text: str | None) -> str | None:
         if text is None:
@@ -1749,6 +1775,17 @@ def run_surrogate(ppc, all_samples, T_DELTA, UNIT_IDS,
                 trainer.load(str(trainer_checkpoint_path))
                 trainer.nn_smooth_abs_eps = max(0.0, float(subproblem_nn_smooth_abs_eps))
                 trainer.pg_cost_smooth_abs_eps = max(0.0, float(pg_cost_smooth_abs_eps))
+                if bool(override_loaded_single_mu_cap):
+                    _apply_runtime_single_mu_cap_config(trainer)
+                    log(
+                        "override loaded single_mu_cap: "
+                        f"weight={trainer.single_mu_cap_initial_weight}"
+                        f"->{trainer.single_mu_cap_final_weight}, "
+                        f"cap={trainer.single_mu_cap_initial}"
+                        f"->{trainer.single_mu_cap_final}, "
+                        f"rounds={trainer.single_mu_cap_start_round}"
+                        f"..{trainer.single_mu_cap_end_round}"
+                    )
         if logger is not None:
             trainer.logger = logger
         trainer.iter(
@@ -2874,6 +2911,7 @@ def main():
     SUBPROBLEM_SINGLE_MU_CAP_FINAL_VALUE = SUBPROBLEM_SINGLE_MU_CAP_FINAL
     SUBPROBLEM_SINGLE_MU_CAP_START_ROUND_VALUE = SUBPROBLEM_SINGLE_MU_CAP_START_ROUND
     SUBPROBLEM_SINGLE_MU_CAP_END_ROUND_VALUE = SUBPROBLEM_SINGLE_MU_CAP_END_ROUND
+    SUBPROBLEM_OVERRIDE_LOADED_SINGLE_MU_CAP_VALUE = SUBPROBLEM_OVERRIDE_LOADED_SINGLE_MU_CAP
 
     # 创建训练指标收集器
     logger = TrainingLogger()
@@ -3201,6 +3239,7 @@ def main():
                     single_mu_cap_final=SUBPROBLEM_SINGLE_MU_CAP_FINAL_VALUE,
                     single_mu_cap_start_round=SUBPROBLEM_SINGLE_MU_CAP_START_ROUND_VALUE,
                     single_mu_cap_end_round=SUBPROBLEM_SINGLE_MU_CAP_END_ROUND_VALUE,
+                    override_loaded_single_mu_cap=SUBPROBLEM_OVERRIDE_LOADED_SINGLE_MU_CAP_VALUE,
                     iter_delta_reg_weight=SUBPROBLEM_ITER_DELTA_REG_WEIGHT,
                     iter_delta_reg_deadband=SUBPROBLEM_ITER_DELTA_REG_DEADBAND,
                     dual_predictor_only=SURROGATE_DUAL_PREDICTOR_ONLY,
@@ -3676,6 +3715,7 @@ def main():
                     single_mu_cap_final=SUBPROBLEM_SINGLE_MU_CAP_FINAL_VALUE,
                     single_mu_cap_start_round=SUBPROBLEM_SINGLE_MU_CAP_START_ROUND_VALUE,
                     single_mu_cap_end_round=SUBPROBLEM_SINGLE_MU_CAP_END_ROUND_VALUE,
+                    override_loaded_single_mu_cap=SUBPROBLEM_OVERRIDE_LOADED_SINGLE_MU_CAP_VALUE,
                     iter_delta_reg_weight=SUBPROBLEM_ITER_DELTA_REG_WEIGHT,
                     iter_delta_reg_deadband=SUBPROBLEM_ITER_DELTA_REG_DEADBAND,
                     dual_predictor_only=False,
