@@ -616,10 +616,18 @@ def collect_main_model_activity_records(
     agent,
     t_delta: float,
     include_subproblem_rows: bool = False,
+    bcd_proxy_scope: str = "both",
 ) -> Tuple[List[dict], List[dict]]:
     rows: List[dict] = []
     summaries: List[dict] = []
-    allowed_kinds = {"bcd_theta", "bcd_zeta"}
+    scope = str(bcd_proxy_scope or "both").strip().lower()
+    if scope not in {"both", "theta", "zeta", "none"}:
+        raise ValueError(f"Unsupported bcd_proxy_scope={bcd_proxy_scope!r}")
+    allowed_kinds = set()
+    if scope in {"both", "theta"}:
+        allowed_kinds.add("bcd_theta")
+    if scope in {"both", "zeta"}:
+        allowed_kinds.add("bcd_zeta")
     if include_subproblem_rows:
         allowed_kinds.add("subproblem_surrogate")
 
@@ -641,6 +649,7 @@ def collect_main_model_activity_records(
                 trainers,
                 lambda_val,
                 agent=agent,
+                bcd_proxy_scope=scope,
                 return_stats=True,
             )
         except Exception as exc:
@@ -680,6 +689,9 @@ def collect_main_model_activity_records(
                 "num_bcd_theta_rows": int(sum(1 for r in activity_rows if r.get("kind") == "bcd_theta")),
                 "num_bcd_zeta_rows": int(sum(1 for r in activity_rows if r.get("kind") == "bcd_zeta")),
                 "num_subproblem_rows": int(sum(1 for r in activity_rows if r.get("kind") == "subproblem_surrogate")),
+                "bcd_proxy_scope": scope,
+                "num_bcd_theta_constraints": stats.get("num_bcd_theta_constraints"),
+                "num_bcd_zeta_constraints": stats.get("num_bcd_zeta_constraints"),
                 "bcd_slack_sum": stats.get("bcd_slack_sum", 0.0),
                 "bcd_slack_max": stats.get("bcd_slack_max", 0.0),
                 "used_soft_bcd": stats.get("used_soft_bcd", False),
@@ -1089,6 +1101,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--main-activity", action="store_true", help="also test main-model theta/zeta proxy constraint activity")
     parser.add_argument("--main-only", action="store_true", help="skip subproblem activity and run only main-model activity")
     parser.add_argument(
+        "--main-bcd-proxy-scope",
+        choices=("both", "theta", "zeta", "none"),
+        default="both",
+        help="which BCD main proxy constraints to add during main activity solves",
+    )
+    parser.add_argument(
         "--main-include-subproblem",
         action="store_true",
         help=(
@@ -1145,6 +1163,7 @@ def main() -> None:
     print(f"case={case_name}", flush=True)
     print(f"active_set={active_path}", flush=True)
     print(f"activity_modes: subproblem={run_subproblem_activity}, main={run_main_activity}, main_include_subproblem={bool(args.main_include_subproblem)}", flush=True)
+    print(f"main_bcd_proxy_scope={args.main_bcd_proxy_scope}", flush=True)
     if model_dir is not None:
         print(f"model_dir={model_dir}", flush=True)
     else:
@@ -1239,6 +1258,7 @@ def main() -> None:
             main_agent,
             t_delta=float(args.t_delta),
             include_subproblem_rows=bool(args.main_include_subproblem),
+            bcd_proxy_scope=str(args.main_bcd_proxy_scope),
         )
         main_aggregate_rows = aggregate_main_model_activity(
             main_rows,
@@ -1265,6 +1285,7 @@ def main() -> None:
                 "run_subproblem_activity": bool(run_subproblem_activity),
                 "run_main_activity": bool(run_main_activity),
                 "main_include_subproblem": bool(args.main_include_subproblem),
+                "main_bcd_proxy_scope": str(args.main_bcd_proxy_scope),
                 "n_train_samples": len(train_samples),
                 "n_test_samples": len(test_samples),
                 "unit_ids": sorted(int(u) for u in trainers.keys()),

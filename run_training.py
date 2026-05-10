@@ -2267,6 +2267,7 @@ def run_bcd(ppc, all_samples: list, T_DELTA, MAX_ITER, bcd_model_dir,
             str(load_model_path),
             restore_rho_state=restore_rho_from_checkpoint,
         )
+        agent.theta_constraint_delay_rounds = max(int(theta_constraint_delay_rounds), 0)
     if logger is not None:
         agent.logger = logger
     agent.iter(

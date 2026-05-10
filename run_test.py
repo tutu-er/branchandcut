@@ -101,6 +101,7 @@ UNIT_PREDICTOR_DIR = None
 # 设为 None 则自动查找 result/bcd_models/ 下最新的匹配文件
 # 环境变量 RUN_TEST_BCD_MODEL_PATH 可覆盖本常量
 BCD_MODEL_PATH = None
+BCD_PROXY_SCOPE = "both"  # "both", "theta", "zeta", or "none"
 
 # 绘图开关：在自动化评估（如 agentic_fp_optimizer）中建议禁用绘图以避免空数据导致的 matplotlib 崩溃
 # - 设环境变量 RUN_TEST_DISABLE_PLOTS=1 可跳过所有 plot_* 调用
@@ -225,6 +226,20 @@ if MODE in ('surrogate', 'both'):
 # ──────────────────────── 工具函数 ────────────────────────
 
 
+def _ensure_global_lp_imports() -> None:
+    """Lazily import global LP helpers for wrapper-selected modes."""
+    global solve_global_LP_relaxation, solve_global_LP_relaxation_without_surrogate
+    if "solve_global_LP_relaxation" in globals() and "solve_global_LP_relaxation_without_surrogate" in globals():
+        return
+    from feasibility_pump import (
+        solve_global_LP_relaxation as _solve_global_LP_relaxation,
+        solve_global_LP_relaxation_without_surrogate as _solve_global_LP_relaxation_without_surrogate,
+    )
+
+    solve_global_LP_relaxation = _solve_global_LP_relaxation
+    solve_global_LP_relaxation_without_surrogate = _solve_global_LP_relaxation_without_surrogate
+
+
 def log(msg: str) -> None:
     ts = datetime.now().strftime("%H:%M:%S")
     print(f"[{ts}] {msg}", flush=True)
@@ -271,11 +286,13 @@ def _write_run_test_report(report_dir: Path, report: dict) -> Path | None:
             f"- test_samples: {report.get('test_samples')}",
             f"- run_fp: {report.get('run_fp')}",
             f"- subproblem_milp: {report.get('run_subproblem_milp_test')}",
+            f"- bcd_proxy_scope: {report.get('bcd_proxy_scope')}",
             f"- plots_enabled: {not bool(report.get('disable_plots'))}",
         ]
         lp_summary = report.get("lp_compare_summary") or {}
         if lp_summary:
             lines.extend(["", "## LP Compare", ""])
+            lines.append(f"- bcd_proxy_scope: {lp_summary.get('bcd_proxy_scope')}")
             for key in (
                 "global_base_lp",
                 "global_all_proxy_lp",
@@ -2087,7 +2104,8 @@ def _save_global_main_constraint_activity(rows: list[dict], fig_dir: Path, case_
 
 def run_lp_compare_test(ppc, all_samples: list, dual_predictor, trainers: dict,
                         T_DELTA: float, n_test: int,
-                        fig_dir: Path, agent=None) -> list:
+                        fig_dir: Path, agent=None,
+                        bcd_proxy_scope: str = "both") -> list:
     """求解全局 LP 松弛，与真实解对比并绘图，返�?(x_LP, x_true) 列表�?
 
     此函数在可行性泵之前运行，评�?LP 松弛解的质量�?
@@ -2108,7 +2126,11 @@ def run_lp_compare_test(ppc, all_samples: list, dual_predictor, trainers: dict,
     test_n = min(n_test, len(all_samples))
     log_section(f"LP 松弛解质量评估 | samples={test_n}")
 
-    log("LP compare types: global_base_lp=no proxy; global_all_proxy_lp=subproblem proxy + BCD theta/zeta when agent is provided")
+    bcd_proxy_scope = str(bcd_proxy_scope or "both").strip().lower()
+    if bcd_proxy_scope not in {"both", "theta", "zeta", "none"}:
+        raise ValueError(f"Unsupported bcd_proxy_scope={bcd_proxy_scope!r}")
+    bcd_scope_label = "none" if agent is None else bcd_proxy_scope
+    log(f"LP compare types: global_base_lp=no proxy; global_all_proxy_lp=subproblem proxy + BCD scope={bcd_scope_label}")
     log("LP compare types: unit_subproblem_lp=independent unit subproblems; global_subproblem_proxy_lp=global LP with subproblem proxy only")
     x_LP_plain_list, x_LP_surr_list, x_true_list = [], [], []
     x_LP_subproblem_proxy_list, x_subproblem_lp_list = [], []
@@ -2133,6 +2155,7 @@ def run_lp_compare_test(ppc, all_samples: list, dual_predictor, trainers: dict,
                 trainers,
                 lambda_val,
                 agent=agent,
+                bcd_proxy_scope=bcd_proxy_scope,
                 return_stats=True,
             )
             if agent is None:
@@ -2260,6 +2283,7 @@ def run_lp_compare_test(ppc, all_samples: list, dual_predictor, trainers: dict,
 
     lp_compare_summary = {
         "n_samples": int(len(global_surr_stats_rows)),
+        "bcd_proxy_scope": str(bcd_proxy_scope),
         "global_base_lp": _metric_summary("global_base"),
         "global_all_proxy_lp": {
             "mean_l1": _mean_or_none(row.get("l1_to_true") for row in global_surr_stats_rows),
@@ -3317,7 +3341,8 @@ def summarize_fp_economicity(
 def analyse_lp_distance(agent, test_n: int, fig_dir: Path,
                         case_name: str, ppc=None, all_samples=None,
                         dual_predictor=None, trainers=None,
-                        T_DELTA: float | None = None) -> None:
+                        T_DELTA: float | None = None,
+                        bcd_proxy_scope: str = "both") -> None:
     """计算并对比标�?LP 松弛 vs 含代理约�?LP 与最优解的距离�?
 
     对每个样本求解两�?LP，计�?L1 距离和舍�?Hamming 距离�?
@@ -3348,12 +3373,15 @@ def analyse_lp_distance(agent, test_n: int, fig_dir: Path,
         ppc is not None and all_samples is not None and dual_predictor is not None
         and trainers is not None and T_DELTA is not None
     )
-    comparison_name = "Global all-proxy LP" if use_joint_surrogate else "BCD theta/zeta LP"
-    comparison_short = "global_all_proxy" if use_joint_surrogate else "bcd_theta_zeta"
+    bcd_proxy_scope = str(bcd_proxy_scope or "both").strip().lower()
+    if bcd_proxy_scope not in {"both", "theta", "zeta", "none"}:
+        raise ValueError(f"Unsupported bcd_proxy_scope={bcd_proxy_scope!r}")
+    comparison_name = "Global all-proxy LP" if use_joint_surrogate else f"BCD scope={bcd_proxy_scope} LP"
+    comparison_short = "global_all_proxy" if use_joint_surrogate else f"bcd_{bcd_proxy_scope}"
     comparison_file_tag = "surrogate" if use_joint_surrogate else "bcd"
     log(
         "distance types: global_base_lp=Agent LP without theta/zeta; "
-        f"{comparison_short}={comparison_name}"
+        f"{comparison_short}={comparison_name}; bcd_proxy_scope={bcd_proxy_scope}"
     )
 
     for i in range(n):
@@ -3368,7 +3396,23 @@ def analyse_lp_distance(agent, test_n: int, fig_dir: Path,
             pd_data = sample['pd_data']
             lambda_val = dual_predictor.predict(sample)
             x_surr = solve_global_LP_relaxation(
-                ppc, sample, T_DELTA, trainers, lambda_val, agent=agent
+                ppc, sample, T_DELTA, trainers, lambda_val, agent=agent,
+                bcd_proxy_scope=bcd_proxy_scope,
+            )
+        elif bcd_proxy_scope != "both":
+            _ensure_global_lp_imports()
+            sample = agent.active_set_data[i]
+            ppc_for_lp = ppc if ppc is not None else getattr(agent, "ppc", None)
+            if ppc_for_lp is None:
+                raise RuntimeError("ppc is required for bcd_proxy_scope other than 'both'")
+            x_surr = solve_global_LP_relaxation(
+                ppc_for_lp,
+                sample,
+                agent.T_delta,
+                {},
+                np.zeros((0,), dtype=float),
+                agent=agent,
+                bcd_proxy_scope=bcd_proxy_scope,
             )
         else:
             sol_surr = agent.solve_LP_with_theta_constraints(i)
@@ -3439,10 +3483,13 @@ def analyse_lp_distance(agent, test_n: int, fig_dir: Path,
 def test_bcd(ppc, data_file: Path, bcd_model_path: str,
              MAX_SAMPLES, T_DELTA: float, fig_dir: Path,
              sample_range: tuple[int, int] | None = None,
-             test_samples: int = TEST_SAMPLES_DEFAULT) -> None:
+             test_samples: int = TEST_SAMPLES_DEFAULT,
+             bcd_proxy_scope: str = "both") -> None:
     """加载 BCD 模型，初始化 agent，报告参数统计，绘图，并分析 LP 距离。"""
     log_section(f"加载 BCD 模型 | path={bcd_model_path}")
     log("说明: bcd 模式只分析 `Standard LP` 与 `BCD LP`，不加载 surrogate 模型，也不运行 FP 恢复整数解。")
+
+    log(f"BCD proxy scope: {bcd_proxy_scope}")
 
     agent = _load_bcd_agent(
         ppc,
@@ -3457,7 +3504,7 @@ def test_bcd(ppc, data_file: Path, bcd_model_path: str,
     log_section("生成 BCD 分析图表")
     plot_bcd_analysis(agent, fig_dir, CASE_NAME)
 
-    analyse_lp_distance(agent, test_samples, fig_dir, CASE_NAME)
+    analyse_lp_distance(agent, test_samples, fig_dir, CASE_NAME, ppc=ppc, bcd_proxy_scope=bcd_proxy_scope)
 
     log("BCD 测试完成")
 
@@ -3547,8 +3594,11 @@ def test_both(ppc, data_file: Path, all_samples: list, T_DELTA: float,
         log(f"── Step 4/4  LP 松弛解质量评估（仅分析，不运行 FP；{fp_gate_reason}）")
     else:
         log("── Step 4/4  LP 松弛解质量评估（RUN_FP=False）")
-    lp_compare_result = run_lp_compare_test(ppc, all_samples, dual_predictor, trainers,
-                                            T_DELTA, test_samples, fig_dir, agent=agent)
+    lp_compare_result = run_lp_compare_test(
+        ppc, all_samples, dual_predictor, trainers,
+        T_DELTA, test_samples, fig_dir, agent=agent,
+        bcd_proxy_scope=BCD_PROXY_SCOPE,
+    )
     if RUN_SUBPROBLEM_MILP_TEST:
         run_subproblem_milp_test(
             ppc,
@@ -3561,7 +3611,7 @@ def test_both(ppc, data_file: Path, all_samples: list, T_DELTA: float,
     analyse_lp_distance(
         agent, test_samples, fig_dir, CASE_NAME,
         ppc=ppc, all_samples=all_samples, dual_predictor=dual_predictor,
-        trainers=trainers, T_DELTA=T_DELTA,
+        trainers=trainers, T_DELTA=T_DELTA, bcd_proxy_scope=BCD_PROXY_SCOPE,
     )
 
     if RUN_FP and can_run_fp:
@@ -3630,6 +3680,7 @@ def main():
         "unit_ids": UNIT_IDS,
         "run_fp": bool(RUN_FP),
         "run_subproblem_milp_test": bool(RUN_SUBPROBLEM_MILP_TEST),
+        "bcd_proxy_scope": str(BCD_PROXY_SCOPE),
         "disable_plots": bool(RUN_TEST_DISABLE_PLOTS),
         "surrogate_constraint_strategy": SURROGATE_CONSTRAINT_STRATEGY,
         "subproblem_ignore_startup_shutdown_costs": bool(SUBPROBLEM_IGNORE_STARTUP_SHUTDOWN_COSTS),
@@ -3770,6 +3821,7 @@ def main():
                 fig_dir,
                 sample_range=sample_range,
                 test_samples=test_samples,
+                bcd_proxy_scope=BCD_PROXY_SCOPE,
             )
 
         elif MODE == 'both':

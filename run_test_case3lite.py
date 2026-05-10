@@ -82,9 +82,25 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--activity-only", action="store_true", help="Run only surrogate dual/activity diagnostics.")
     p.add_argument("--main-activity-only", action="store_true", help="Run only main-model theta/zeta activity diagnostics.")
     p.add_argument(
+        "--bcd-proxy-scope",
+        choices=("both", "theta", "zeta", "none"),
+        default="both",
+        help="Which BCD main proxy constraints to add in BCD/surrogate LP and main activity tests.",
+    )
+    p.add_argument(
+        "--bcd-theta-only",
+        action="store_true",
+        help="Shortcut for --bcd-proxy-scope theta.",
+    )
+    p.add_argument(
         "--activity-main-include-subproblem",
         action="store_true",
         help="For main activity, also load subproblem models and include subproblem surrogate rows.",
+    )
+    p.add_argument(
+        "--activity-main-theta-only",
+        action="store_true",
+        help="Backward-compatible shortcut for --bcd-proxy-scope theta.",
     )
     p.add_argument("--activity-train-start", type=int, default=0)
     p.add_argument("--activity-train-samples", type=int, default=ACTIVITY_TRAIN_SAMPLES_DEFAULT)
@@ -183,6 +199,7 @@ def _run_activity_check(args: argparse.Namespace) -> None:
         argv.extend(["--lp-backend", args.activity_lp_backend])
     if not args.skip_main_activity:
         argv.append("--main-activity")
+        argv.extend(["--main-bcd-proxy-scope", args.bcd_proxy_scope])
         if args.bcd_model:
             argv.extend(["--bcd-model", args.bcd_model])
     if args.main_activity_only:
@@ -215,6 +232,7 @@ def _run_activity_check(args: argparse.Namespace) -> None:
         f"test={args.activity_test_start}:{args.activity_test_samples} | "
         f"main_activity={not args.skip_main_activity} | "
         f"main_include_subproblem={bool(args.activity_main_include_subproblem)} | "
+        f"main_bcd_proxy_scope={args.bcd_proxy_scope} | "
         f"lp_backend={args.activity_lp_backend or '(script default)'} | "
         f"output_dir={output_dir}",
         flush=True,
@@ -232,6 +250,8 @@ def _run_activity_check(args: argparse.Namespace) -> None:
 def main() -> None:
     global rt
     args = _parse_args()
+    if args.bcd_theta_only or args.activity_main_theta_only:
+        args.bcd_proxy_scope = "theta"
 
     if not args.activity_only:
         import run_test as rt_module
@@ -242,6 +262,7 @@ def main() -> None:
         rt.ACTIVE_SETS_FILE = args.active_sets
         rt.MODEL_DIR = args.model_dir
         rt.BCD_MODEL_PATH = args.bcd_model
+        rt.BCD_PROXY_SCOPE = args.bcd_proxy_scope
         rt.SURROGATE_CONSTRAINT_STRATEGY = args.strategy
         rt.SUBPROBLEM_IGNORE_STARTUP_SHUTDOWN_COSTS = SUBPROBLEM_IGNORE_STARTUP_SHUTDOWN_COSTS
         rt.UNIT_IDS = _parse_unit_ids(args.unit_ids)
@@ -266,6 +287,7 @@ def main() -> None:
             f"subproblem_ignore_startup_shutdown={SUBPROBLEM_IGNORE_STARTUP_SHUTDOWN_COSTS} | "
             f"fp={rt.RUN_FP} | custom_fp={rt.USE_CASE3LITE_CUSTOM_FP} | "
             f"subproblem_milp={rt.RUN_SUBPROBLEM_MILP_TEST} | "
+            f"bcd_proxy_scope={rt.BCD_PROXY_SCOPE} | "
             f"plots={not rt.RUN_TEST_DISABLE_PLOTS}",
             flush=True,
         )

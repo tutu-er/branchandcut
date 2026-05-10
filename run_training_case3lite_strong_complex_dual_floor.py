@@ -121,6 +121,12 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--sign4-final-scale", type=float, default=SIGN4_FINAL_SCALE)
     p.add_argument("--theta-stage-limits", type=str, default=THETA_STAGE_LIMITS)
     p.add_argument("--theta-stage-fracs", type=str, default=THETA_STAGE_FRACTIONS)
+    p.add_argument(
+        "--theta-delay-rounds",
+        type=int,
+        default=None,
+        help="Main BCD theta-constraint delay rounds. Use 0 to enable theta constraints from the first BCD iteration.",
+    )
     p.add_argument("--theta-curriculum-delay-rounds", type=int, default=THETA_CURRICULUM_DELAY_ROUNDS)
     p.add_argument("--theta-curriculum-rounds", type=int, default=THETA_CURRICULUM_ROUNDS)
     p.add_argument("--theta-initial-scale", type=float, default=THETA_INITIAL_SCALE)
@@ -365,6 +371,8 @@ def main() -> None:
     rt.SUBPROBLEM_PG_COST_SMOOTH_ABS_EPS = max(0.0, float(args.pg_cost_smooth_abs_eps))
 
     base._configure_iterations(args.bcd_iter, args.sub_iter)
+    if args.theta_delay_rounds is not None:
+        rt.BCD_THETA_CONSTRAINT_DELAY_ROUNDS = max(0, int(args.theta_delay_rounds))
     _configure_strong_complex_dual_floors(args)
 
     rt.SUBPROBLEM_MAIN_DIRECT_BATCH_STRATEGY = SUBPROBLEM_MAIN_DIRECT_BATCH_STRATEGY
@@ -417,6 +425,7 @@ def main() -> None:
     )
     print(
         f"theta_stages={rt.BCD_THETA_TRAINING_STAGES} | "
+        f"theta_delay={rt.BCD_THETA_CONSTRAINT_DELAY_ROUNDS} | "
         f"theta_curriculum=delay {rt.BCD_THETA_CURRICULUM_DELAY_ROUNDS}, "
         f"scale {rt.BCD_THETA_INITIAL_SCALE}->{rt.BCD_THETA_FINAL_SCALE} over "
         f"{rt.BCD_THETA_CURRICULUM_ROUNDS} rounds",

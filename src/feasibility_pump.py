@@ -2224,6 +2224,7 @@ def solve_global_LP_relaxation(
     agent=None,
     sparse_library: Optional[SparseSurrogateLibrary] = None,
     sparse_x_template_library: Optional[SparseConstraintTemplateLibrary] = None,
+    bcd_proxy_scope: str = "both",
     return_stats: bool = False,
 ) -> np.ndarray | Tuple[np.ndarray, Dict[str, Any]]:
     """
@@ -2265,6 +2266,11 @@ def solve_global_LP_relaxation(
     last_status = None
     stage_stats: List[Dict[str, Any]] = []
     stages = _build_surrogate_relaxation_stages()
+    bcd_proxy_scope_norm = str(bcd_proxy_scope or "both").strip().lower()
+    if bcd_proxy_scope_norm not in {"both", "theta", "zeta", "none"}:
+        raise ValueError(f"Unsupported bcd_proxy_scope={bcd_proxy_scope!r}")
+    add_bcd_theta = bcd_proxy_scope_norm in {"both", "theta"}
+    add_bcd_zeta = bcd_proxy_scope_norm in {"both", "zeta"}
 
     def _safe_attr(_model, _name: str, _default=None):
         try:
@@ -2310,6 +2316,7 @@ def solve_global_LP_relaxation(
             "num_subproblem_strict_slacks": int(len(subproblem_strict_slacks)),
             "num_bcd_theta_slacks": int(len(bcd_theta_slacks)),
             "num_bcd_zeta_slacks": int(len(bcd_zeta_slacks)),
+            "bcd_proxy_scope": bcd_proxy_scope_norm,
             "surrogate_soft_preferred_penalty_factor": float(
                 SURROGATE_RELAXATION_PREFERRED_PENALTY_FACTOR
             ),
@@ -2609,76 +2616,78 @@ def solve_global_LP_relaxation(
             _ua = getattr(agent, '_current_union_analysis', None)
             _tv, _zv = _infer_agent_theta_zeta(agent, sample, pd_matrix)
 
-            for _ci in (_ua or {}).get('union_constraints', []):
-                _bid = _ci['branch_id']
-                _ts = _ci['time_slot']
-                _lhs = gp.LinExpr()
-                for _ci2 in _ci.get('nonzero_pg_coefficients', []):
-                    _uid = _ci2['unit_id']
-                    if hasattr(agent, '_theta_member_time_index'):
-                        _member_time = int(agent._theta_member_time_index(_ci, _ci2))
+            if add_bcd_theta:
+                for _ci in (_ua or {}).get('union_constraints', []):
+                    _bid = _ci['branch_id']
+                    _ts = _ci['time_slot']
+                    _lhs = gp.LinExpr()
+                    for _ci2 in _ci.get('nonzero_pg_coefficients', []):
+                        _uid = _ci2['unit_id']
+                        if hasattr(agent, '_theta_member_time_index'):
+                            _member_time = int(agent._theta_member_time_index(_ci, _ci2))
+                        else:
+                            _member_time = int(_ci2.get('time_index', _ts))
+                        if hasattr(agent, '_theta_var_name'):
+                            _tname = agent._theta_var_name(_bid, _uid, _member_time)
+                        else:
+                            _tname = f'theta_branch_{_bid}_unit_{_uid}_time_{_member_time}'
+                        _coeff = float(_tv.get(_tname, 0.0))
+                        if abs(_coeff) > 1e-10 and _uid < ng and 0 <= _member_time < T:
+                            _lhs += _coeff * x[_uid, _member_time]
+                    if hasattr(agent, '_theta_rhs_name'):
+                        _rhs_name = agent._theta_rhs_name(_bid, _ts)
                     else:
-                        _member_time = int(_ci2.get('time_index', _ts))
-                    if hasattr(agent, '_theta_var_name'):
-                        _tname = agent._theta_var_name(_bid, _uid, _member_time)
-                    else:
-                        _tname = f'theta_branch_{_bid}_unit_{_uid}_time_{_member_time}'
-                    _coeff = float(_tv.get(_tname, 0.0))
-                    if abs(_coeff) > 1e-10 and _uid < ng and 0 <= _member_time < T:
-                        _lhs += _coeff * x[_uid, _member_time]
-                if hasattr(agent, '_theta_rhs_name'):
-                    _rhs_name = agent._theta_rhs_name(_bid, _ts)
-                else:
-                    _rhs_name = f'theta_rhs_branch_{_bid}_time_{_ts}'
-                _rhs = float(_tv.get(_rhs_name, 1.0))
-                _direction = (
-                    float(agent._get_theta_constraint_direction(_bid, _ts))
-                    if hasattr(agent, '_get_theta_constraint_direction')
-                    else 1.0
-                )
-                expr = _direction * (_lhs - _rhs)
-                if stage['hard_bcd']:
-                    model.addConstr(expr <= 0.0, name=f'theta_surr_{_bid}_{_ts}')
-                else:
-                    _slack = model.addVar(lb=0, name=f'theta_slack_{_bid}_{_ts}')
-                    model.addConstr(expr <= _slack, name=f'theta_surr_{_bid}_{_ts}')
-                    bcd_slacks.append(_slack)
-                    bcd_theta_slacks.append(_slack)
-                    weighted_bcd_slacks.append(
-                        (_slack, SURROGATE_RELAXATION_PREFERRED_PENALTY_FACTOR)
+                        _rhs_name = f'theta_rhs_branch_{_bid}_time_{_ts}'
+                    _rhs = float(_tv.get(_rhs_name, 1.0))
+                    _direction = (
+                        float(agent._get_theta_constraint_direction(_bid, _ts))
+                        if hasattr(agent, '_get_theta_constraint_direction')
+                        else 1.0
                     )
+                    expr = _direction * (_lhs - _rhs)
+                    if stage['hard_bcd']:
+                        model.addConstr(expr <= 0.0, name=f'theta_surr_{_bid}_{_ts}')
+                    else:
+                        _slack = model.addVar(lb=0, name=f'theta_slack_{_bid}_{_ts}')
+                        model.addConstr(expr <= _slack, name=f'theta_surr_{_bid}_{_ts}')
+                        bcd_slacks.append(_slack)
+                        bcd_theta_slacks.append(_slack)
+                        weighted_bcd_slacks.append(
+                            (_slack, SURROGATE_RELAXATION_PREFERRED_PENALTY_FACTOR)
+                        )
 
-            for _zc in (_ua or {}).get('union_zeta_constraints', []):
-                _uid = _zc['unit_id']
-                _ts = _zc['time_slot']
-                if hasattr(agent, '_zeta_var_name'):
-                    _zname = agent._zeta_var_name(_uid, _ts)
-                else:
-                    _zname = f'zeta_unit_{_uid}_time_{_ts}'
-                _coeff = float(_zv.get(_zname, 0.0))
-                if hasattr(agent, '_zeta_rhs_name'):
-                    _rhs_name = agent._zeta_rhs_name(_uid, _ts)
-                else:
-                    _rhs_name = f'zeta_rhs_unit_{_uid}_time_{_ts}'
-                _rhs = float(_zv.get(_rhs_name, 1.0))
-                if abs(_coeff) <= 1e-10 or _uid >= ng or _ts >= T:
-                    continue
-                _direction = (
-                    float(agent._get_zeta_constraint_direction(_uid, _ts))
-                    if hasattr(agent, '_get_zeta_constraint_direction')
-                    else 1.0
-                )
-                expr = _direction * (_coeff * x[_uid, _ts] - _rhs)
-                if stage['hard_bcd']:
-                    model.addConstr(expr <= 0.0, name=f'zeta_surr_{_uid}_{_ts}')
-                else:
-                    _slack = model.addVar(lb=0, name=f'zeta_slack_{_uid}_{_ts}')
-                    model.addConstr(expr <= _slack, name=f'zeta_surr_{_uid}_{_ts}')
-                    bcd_slacks.append(_slack)
-                    bcd_zeta_slacks.append(_slack)
-                    weighted_bcd_slacks.append(
-                        (_slack, SURROGATE_RELAXATION_STRICT_PENALTY_FACTOR)
+            if add_bcd_zeta:
+                for _zc in (_ua or {}).get('union_zeta_constraints', []):
+                    _uid = _zc['unit_id']
+                    _ts = _zc['time_slot']
+                    if hasattr(agent, '_zeta_var_name'):
+                        _zname = agent._zeta_var_name(_uid, _ts)
+                    else:
+                        _zname = f'zeta_unit_{_uid}_time_{_ts}'
+                    _coeff = float(_zv.get(_zname, 0.0))
+                    if hasattr(agent, '_zeta_rhs_name'):
+                        _rhs_name = agent._zeta_rhs_name(_uid, _ts)
+                    else:
+                        _rhs_name = f'zeta_rhs_unit_{_uid}_time_{_ts}'
+                    _rhs = float(_zv.get(_rhs_name, 1.0))
+                    if abs(_coeff) <= 1e-10 or _uid >= ng or _ts >= T:
+                        continue
+                    _direction = (
+                        float(agent._get_zeta_constraint_direction(_uid, _ts))
+                        if hasattr(agent, '_get_zeta_constraint_direction')
+                        else 1.0
                     )
+                    expr = _direction * (_coeff * x[_uid, _ts] - _rhs)
+                    if stage['hard_bcd']:
+                        model.addConstr(expr <= 0.0, name=f'zeta_surr_{_uid}_{_ts}')
+                    else:
+                        _slack = model.addVar(lb=0, name=f'zeta_slack_{_uid}_{_ts}')
+                        model.addConstr(expr <= _slack, name=f'zeta_surr_{_uid}_{_ts}')
+                        bcd_slacks.append(_slack)
+                        bcd_zeta_slacks.append(_slack)
+                        weighted_bcd_slacks.append(
+                            (_slack, SURROGATE_RELAXATION_STRICT_PENALTY_FACTOR)
+                        )
 
         soft_slacks = subproblem_slacks + bcd_slacks
         add_sparse_parameterized_constraints(
