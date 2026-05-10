@@ -2739,9 +2739,10 @@ def solve_global_LP_relaxation(
             return x_sol
 
         if stage_index < len(stages):
+            # ASCII-only: avoids mojibake on Windows consoles not using UTF-8
             print(
-                f"  全局 LP 阶段 {stage['name']} 不可�?(status={model.status})，尝试下一阶段",
-                flush=True
+                f"  [global_LP] stage={stage['name']} infeasible (status={model.status}); try next stage",
+                flush=True,
             )
 
     print(f"  警告: 全局 LP 松弛求解失败 (status={last_status})，返回零矩阵", flush=True)
@@ -3113,12 +3114,12 @@ def check_uc_feasibility(
     if model.status == GRB.OPTIMAL:
         total_slack = model.ObjVal
         if total_slack > tol:
-            return False, f"功率平衡不可�? 总松弛量={total_slack:.4f} MW"
+            return False, f"功率平衡不可行：总松弛量={total_slack:.4f} MW"
         return True, "可行"
 
     if model.status == GRB.INFEASIBLE and _dc_lines_added:
         return False, "DC flow constraints are infeasible"
-    return False, f"可行�?LP 求解失败: status={model.status}"
+    return False, f"功率平衡与爬坡 LP 求解失败: status={model.status}"
 
 
 # ========================== Step 4：可行性泵主循�?==========================

@@ -8,7 +8,7 @@ Examples
     python run_test_case14.py --samples 8
     python run_test_case14.py --fp
     python run_test_case14.py --model-dir result/surrogate_models/subproblem_models_case14_YYYYMMDD_HHMMSS
-    python run_test_case14.py --activity-only --main-activity
+    python run_test_case14.py --activity-only --main-activity-only
 """
 
 from __future__ import annotations
@@ -45,6 +45,7 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--fp", action="store_true", help="Run feasibility-pump testing.")
     p.add_argument("--disable-plots", action="store_true", help="Disable plot generation.")
     p.add_argument("--skip-activity", action="store_true", help="Skip surrogate dual/activity diagnostics.")
+    p.add_argument("--skip-main-activity", action="store_true", help="Do not test main-model theta/zeta activity.")
     p.add_argument("--activity-only", action="store_true", help="Run only surrogate dual/activity diagnostics.")
     p.add_argument("--main-activity", action="store_true", help="Also test main-model theta/zeta activity.")
     p.add_argument("--main-activity-only", action="store_true", help="Run only main-model theta/zeta activity diagnostics.")
@@ -104,7 +105,12 @@ def _run_activity_check(args: argparse.Namespace) -> None:
         argv.extend(["--strategy", args.strategy])
     if args.unit_ids.strip().lower() not in ("", "all", "none"):
         argv.extend(["--units", args.unit_ids])
-    run_main_activity = args.main_activity or args.main_activity_only or bool(args.bcd_model)
+    run_main_activity = (
+        not args.skip_main_activity
+        or args.main_activity
+        or args.main_activity_only
+        or bool(args.bcd_model)
+    )
     if run_main_activity:
         argv.append("--main-activity")
         if args.bcd_model:

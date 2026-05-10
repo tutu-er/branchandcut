@@ -13,6 +13,7 @@ Examples
     python run_test_case3lite.py --samples 8
     python run_test_case3lite.py --fp
     python run_test_case3lite.py --model-dir result/surrogate_models/subproblem_models_case3lite_YYYYMMDD_HHMMSS
+    python run_test_case3lite.py --subproblem-milp --samples 3 --skip-activity
     python run_test_case3lite.py --activity-only --refresh-train-dual
     python run_test_case3lite.py --activity-only --main-activity-only
 """
@@ -29,13 +30,13 @@ import run_training_case3lite_strong_complex_dual_floor as train_strong
 
 
 CASE_NAME = train_base.CASE_NAME
-MODE = "surrogate"  # use "both" to also evaluate a BCD checkpoint
+MODE = "surrogate"  # use "bcd" for only BCD or "both" to evaluate BCD + surrogate
 # 与训练相同：None 表示在 run_test / activity 脚本内按 case 自动选取最新 active_set JSON
 ACTIVE_SETS_FILE = train_base.ACTIVE_SETS_FILE
 MODEL_DIR: str | None = "result/surrogate_models/subproblem_models_case3lite_20260509_190031"
 BCD_MODEL_PATH: str | None = None
-TEST_SAMPLES = 10
-SAMPLE_RANGE = f"0:10"
+TEST_SAMPLES = 100
+SAMPLE_RANGE = f"0:100"
 SURROGATE_CONSTRAINT_STRATEGY = train_base.SURROGATE_CONSTRAINT_STRATEGY
 SUBPROBLEM_LP_BACKEND = train_base.SUBPROBLEM_LP_BACKEND
 # 与 run_training.py 中子问题默认一致（避免 run_test 模块默认 False 再走 mismatch 回退）
@@ -45,12 +46,17 @@ REFRESH_NN_EPOCHS_DEFAULT = train_base.NN_EPOCHS
 REFRESH_PG_COST_NN_EPOCHS_DEFAULT = train_strong.SUBPROBLEM_PG_COST_NN_EPOCHS
 ACTIVITY_TRAIN_SAMPLES_DEFAULT = train_base.MAX_SAMPLES
 
+# These defaults used to be hidden in mojibake comments. Keep them explicit so
+# the entrypoint can run without depending on run_test globals.
+SUBPROBLEM_IGNORE_STARTUP_SHUTDOWN_COSTS = bool(rt_train.SUBPROBLEM_IGNORE_STARTUP_SHUTDOWN_COSTS)
+REFRESH_NN_EPOCHS_DEFAULT = train_base.NN_EPOCHS
+
 rt = None
 
 
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--mode", choices=("surrogate", "both"), default=MODE)
+    p.add_argument("--mode", choices=("surrogate", "bcd", "both"), default=MODE)
     p.add_argument(
         "--active-sets",
         type=str,
@@ -65,11 +71,21 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--strategy", type=str, default=SURROGATE_CONSTRAINT_STRATEGY)
     p.add_argument("--fp", action="store_true", help="Run feasibility-pump testing.")
     p.add_argument("--no-custom-fp", action="store_true", help="Disable the case3lite custom FP path when --fp is used.")
+    p.add_argument(
+        "--subproblem-milp",
+        action="store_true",
+        help="Also compare each loaded unit surrogate subproblem as LP vs MILP.",
+    )
     p.add_argument("--disable-plots", action="store_true", help="Disable plot generation.")
     p.add_argument("--skip-activity", action="store_true", help="Skip surrogate dual/activity diagnostics.")
     p.add_argument("--skip-main-activity", action="store_true", help="Do not test main-model theta/zeta activity.")
     p.add_argument("--activity-only", action="store_true", help="Run only surrogate dual/activity diagnostics.")
     p.add_argument("--main-activity-only", action="store_true", help="Run only main-model theta/zeta activity diagnostics.")
+    p.add_argument(
+        "--activity-main-include-subproblem",
+        action="store_true",
+        help="For main activity, also load subproblem models and include subproblem surrogate rows.",
+    )
     p.add_argument("--activity-train-start", type=int, default=0)
     p.add_argument("--activity-train-samples", type=int, default=ACTIVITY_TRAIN_SAMPLES_DEFAULT)
     p.add_argument("--activity-test-start", type=int, default=0)
@@ -101,7 +117,7 @@ def _parse_unit_ids(value: str) -> list[int] | None:
 
 def _ensure_bcd_imports() -> None:
     global rt
-    if rt.MODE != "both":
+    if rt.MODE not in ("bcd", "both"):
         return
     if getattr(rt, "Agent_NN_BCD", None) is not None:
         return
@@ -139,8 +155,6 @@ def _run_activity_check(args: argparse.Namespace) -> None:
         argv.extend(["--active-set-json", args.active_sets])
     argv.extend(
         [
-            "--model-dir",
-            args.model_dir,
             "--train-start",
             str(max(0, int(args.activity_train_start))),
             "--train-samples",
@@ -159,6 +173,8 @@ def _run_activity_check(args: argparse.Namespace) -> None:
             str(output_dir),
         ]
     )
+    if args.model_dir:
+        argv.extend(["--model-dir", args.model_dir])
     if str(args.strategy).strip().lower() != "auto":
         argv.extend(["--strategy", args.strategy])
     if args.unit_ids.strip().lower() not in ("", "all", "none"):
@@ -171,6 +187,8 @@ def _run_activity_check(args: argparse.Namespace) -> None:
             argv.extend(["--bcd-model", args.bcd_model])
     if args.main_activity_only:
         argv.append("--main-only")
+    if args.activity_main_include_subproblem:
+        argv.append("--main-include-subproblem")
     if args.disable_plots:
         argv.append("--no-plots")
     if args.refresh_train_dual:
@@ -196,6 +214,7 @@ def _run_activity_check(args: argparse.Namespace) -> None:
         f"train={args.activity_train_start}:{args.activity_train_samples} | "
         f"test={args.activity_test_start}:{args.activity_test_samples} | "
         f"main_activity={not args.skip_main_activity} | "
+        f"main_include_subproblem={bool(args.activity_main_include_subproblem)} | "
         f"lp_backend={args.activity_lp_backend or '(script default)'} | "
         f"output_dir={output_dir}",
         flush=True,
@@ -231,7 +250,7 @@ def main() -> None:
         rt.TEST_SAMPLES = max(1, int(args.samples))
         rt.TEST_SAMPLES_DEFAULT = rt.TEST_SAMPLES
         rt.RUN_FP = bool(args.fp)
-        rt.RUN_SUBPROBLEM_MILP_TEST = False
+        rt.RUN_SUBPROBLEM_MILP_TEST = bool(args.subproblem_milp)
         rt.RUN_TEST_DISABLE_PLOTS = bool(args.disable_plots)
         rt.USE_CASE3LITE_CUSTOM_FP = bool(args.fp) and not bool(args.no_custom_fp)
         rt.USE_CASE118_CUSTOM_FP = False
@@ -246,6 +265,7 @@ def main() -> None:
             f"strategy={rt.SURROGATE_CONSTRAINT_STRATEGY} | "
             f"subproblem_ignore_startup_shutdown={SUBPROBLEM_IGNORE_STARTUP_SHUTDOWN_COSTS} | "
             f"fp={rt.RUN_FP} | custom_fp={rt.USE_CASE3LITE_CUSTOM_FP} | "
+            f"subproblem_milp={rt.RUN_SUBPROBLEM_MILP_TEST} | "
             f"plots={not rt.RUN_TEST_DISABLE_PLOTS}",
             flush=True,
         )
@@ -255,14 +275,7 @@ def main() -> None:
         rt.main()
 
     if not args.skip_activity:
-        if not args.model_dir:
-            msg = "activity 需要 --model-dir（或与训练对齐后在文件顶部设置 MODEL_DIR）"
-            if args.activity_only:
-                print(f"错误: {msg}", flush=True)
-                raise SystemExit(1)
-            print(f"skip activity: {msg}", flush=True)
-        else:
-            _run_activity_check(args)
+        _run_activity_check(args)
 
 
 if __name__ == "__main__":

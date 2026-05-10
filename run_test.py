@@ -243,6 +243,76 @@ def log_rule(char: str = "-", width: int = SECTION_WIDTH) -> None:
     print("\n" + char * width)
 
 
+def _write_run_test_report(report_dir: Path, report: dict) -> Path | None:
+    """Write a compact run index for this invocation."""
+    try:
+        report_dir.mkdir(parents=True, exist_ok=True)
+        case_name = str(report.get("case", "unknown"))
+        timestamp = str(report.get("timestamp") or datetime.now().strftime("%Y%m%d_%H%M%S"))
+        stem = f"run_test_{case_name}_{timestamp}"
+        json_path = report_dir / f"{stem}.json"
+        md_path = report_dir / f"{stem}.md"
+        latest_path = report_dir / "LATEST.md"
+
+        json_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+
+        lines = [
+            f"# run_test {case_name}",
+            "",
+            f"- status: {report.get('status')}",
+            f"- mode: {report.get('mode')}",
+            f"- timestamp: {timestamp}",
+            f"- elapsed_sec: {report.get('elapsed_sec')}",
+            f"- active_set: {report.get('active_set_json')}",
+            f"- surrogate_model_dir: {report.get('surrogate_model_dir')}",
+            f"- bcd_model: {report.get('bcd_model')}",
+            f"- sample_range: {report.get('sample_range')}",
+            f"- eval_samples: {report.get('eval_samples')}",
+            f"- test_samples: {report.get('test_samples')}",
+            f"- run_fp: {report.get('run_fp')}",
+            f"- subproblem_milp: {report.get('run_subproblem_milp_test')}",
+            f"- plots_enabled: {not bool(report.get('disable_plots'))}",
+        ]
+        lp_summary = report.get("lp_compare_summary") or {}
+        if lp_summary:
+            lines.extend(["", "## LP Compare", ""])
+            for key in (
+                "global_base_lp",
+                "global_all_proxy_lp",
+                "global_subproblem_proxy_lp",
+                "unit_subproblem_lp",
+            ):
+                item = lp_summary.get(key) or {}
+                lines.append(
+                    f"- {key}: mean_l1={item.get('mean_l1')}, "
+                    f"mean_hamming={item.get('mean_hamming')}, "
+                    f"mean_integrality_gap={item.get('mean_integrality_gap')}"
+                )
+            similarity = lp_summary.get("similarity") or {}
+            if similarity:
+                lines.append("")
+                lines.append("## LP Similarity")
+                lines.append("")
+                for key, item in similarity.items():
+                    item = item or {}
+                    lines.append(
+                        f"- {key}: exact_same={item.get('exact_same')}/{item.get('n')}, "
+                        f"rounded_same={item.get('rounded_same')}/{item.get('n')}, "
+                        f"mean_l1={item.get('mean_l1')}"
+                    )
+        if report.get("error"):
+            lines.extend(["", "## Error", "", str(report.get("error"))])
+        lines.extend(["", f"JSON: {json_path}"])
+        text = "\n".join(lines) + "\n"
+        md_path.write_text(text, encoding="utf-8")
+        latest_path.write_text(text, encoding="utf-8")
+        log(f"run report written: {md_path}")
+        return md_path
+    except Exception as exc:
+        log(f"warning: failed to write run report: {exc}")
+        return None
+
+
 def _fmt_sample_tag(index: int, total: int, pd_shape) -> str:
     return f"样本 {index + 1}/{total} | pd_shape={tuple(pd_shape)}"
 
@@ -260,6 +330,16 @@ def _fmt_masked_commitment_metrics(label: str, metrics: dict) -> str:
 def _fmt_distance_metrics(label: str, l1: float, hamming: int | None) -> str:
     hamming_text = "n/a" if hamming is None else str(hamming)
     return f"{label}: L1={l1:.4f} | Hamming={hamming_text}"
+
+
+def _fmt_lp_metric(label: str, metrics: dict) -> str:
+    hamming = metrics.get("hamming")
+    h_text = "n/a" if hamming is None else str(hamming)
+    l1 = float(metrics.get("l1", float("nan")))
+    integ = float(metrics.get("integrality_gap", float("nan")))
+    cov = metrics.get("coverage_ratio")
+    cov_text = "" if cov is None or float(cov) >= 0.999999 else f", cov={float(cov):.2f}"
+    return f"{label}: L1={l1:.2f}, H={h_text}, I={integ:.4f}{cov_text}"
 
 
 def _log_solution_similarity_summary(
@@ -281,13 +361,20 @@ def _log_solution_similarity_summary(
     for lhs, rhs in zip(lhs_list[:n], rhs_list[:n]):
         lhs_arr = np.asarray(lhs, dtype=float)
         rhs_arr = np.asarray(rhs, dtype=float)
-        diff = np.abs(lhs_arr - rhs_arr)
+        valid_mask = np.isfinite(lhs_arr) & np.isfinite(rhs_arr)
+        if not np.any(valid_mask):
+            continue
+        diff = np.abs(lhs_arr[valid_mask] - rhs_arr[valid_mask])
         l1_diffs.append(float(np.sum(diff)))
         max_diffs.append(float(np.max(diff)))
         if np.all(diff <= tol):
             exact_same += 1
-        if np.array_equal((lhs_arr >= 0.5).astype(int), (rhs_arr >= 0.5).astype(int)):
+        if np.array_equal((lhs_arr[valid_mask] >= 0.5).astype(int), (rhs_arr[valid_mask] >= 0.5).astype(int)):
             rounded_same += 1
+
+    if not l1_diffs:
+        log(f"{lhs_name} vs {rhs_name}: no overlapping finite entries")
+        return
 
     log(
         f"{lhs_name} vs {rhs_name}: exact_same={exact_same}/{n}, "
@@ -299,6 +386,47 @@ def _log_solution_similarity_summary(
             f"警告: {lhs_name} 与 {rhs_name} 在当前样本上完全相同。"
             f"这通常表示附加约束/惩罚没有实际改变 LP 解。"
         )
+
+
+def _solution_similarity_dict(lhs_list: list[np.ndarray], rhs_list: list[np.ndarray], tol: float = 1e-8) -> dict:
+    n = min(len(lhs_list), len(rhs_list))
+    if n == 0:
+        return {"n": 0}
+    exact_same = 0
+    rounded_same = 0
+    l1_diffs = []
+    max_diffs = []
+    for lhs, rhs in zip(lhs_list[:n], rhs_list[:n]):
+        lhs_arr = np.asarray(lhs, dtype=float)
+        rhs_arr = np.asarray(rhs, dtype=float)
+        valid_mask = np.isfinite(lhs_arr) & np.isfinite(rhs_arr)
+        if not np.any(valid_mask):
+            continue
+        diff = np.abs(lhs_arr[valid_mask] - rhs_arr[valid_mask])
+        l1_diffs.append(float(np.sum(diff)))
+        max_diffs.append(float(np.max(diff)))
+        if np.all(diff <= tol):
+            exact_same += 1
+        if np.array_equal((lhs_arr[valid_mask] >= 0.5).astype(int), (rhs_arr[valid_mask] >= 0.5).astype(int)):
+            rounded_same += 1
+    if not l1_diffs:
+        return {"n": int(n), "finite_pairs": 0}
+    return {
+        "n": int(n),
+        "finite_pairs": int(len(l1_diffs)),
+        "exact_same": int(exact_same),
+        "rounded_same": int(rounded_same),
+        "mean_l1": float(np.mean(l1_diffs)),
+        "max_abs": float(np.max(max_diffs)),
+    }
+
+
+def _mean_or_none(values) -> float | None:
+    arr = np.asarray(list(values), dtype=float)
+    arr = arr[np.isfinite(arr)]
+    if arr.size == 0:
+        return None
+    return float(np.mean(arr))
 
 
 def _resolve_surrogate_display_layout(trainer, sample: dict | None, n_constraints: int):
@@ -1980,7 +2108,10 @@ def run_lp_compare_test(ppc, all_samples: list, dual_predictor, trainers: dict,
     test_n = min(n_test, len(all_samples))
     log_section(f"LP 松弛解质量评估 | samples={test_n}")
 
+    log("LP compare types: global_base_lp=no proxy; global_all_proxy_lp=subproblem proxy + BCD theta/zeta when agent is provided")
+    log("LP compare types: unit_subproblem_lp=independent unit subproblems; global_subproblem_proxy_lp=global LP with subproblem proxy only")
     x_LP_plain_list, x_LP_surr_list, x_true_list = [], [], []
+    x_LP_subproblem_proxy_list, x_subproblem_lp_list = [], []
     global_surr_stats_rows: list[dict] = []
     global_main_activity_rows: list[dict] = []
     first_plot_payload = None
@@ -2004,6 +2135,19 @@ def run_lp_compare_test(ppc, all_samples: list, dual_predictor, trainers: dict,
                 agent=agent,
                 return_stats=True,
             )
+            if agent is None:
+                x_lp_subproblem_proxy = x_lp_surr
+                subproblem_proxy_stats = solve_stats
+            else:
+                x_lp_subproblem_proxy, subproblem_proxy_stats = solve_global_LP_relaxation(
+                    ppc,
+                    sample,
+                    T_DELTA,
+                    trainers,
+                    lambda_val,
+                    agent=None,
+                    return_stats=True,
+                )
         except Exception as e:
             log(f"  LP 求解失败: {e}")
             continue
@@ -2011,13 +2155,14 @@ def run_lp_compare_test(ppc, all_samples: list, dual_predictor, trainers: dict,
         x_true = _extract_true_solution(sample, x_lp_surr.shape)
         x_sub = _build_subproblem_commitment_matrix(sample, lambda_val, trainers, x_true.shape)
 
-        x_lp_plain_rounded = (x_lp_plain >= 0.5).astype(int)
-        x_lp_surr_rounded = (x_lp_surr >= 0.5).astype(int)
-        hamming_plain = int(np.sum(x_lp_plain_rounded != x_true.astype(int)))
-        hamming_surr = int(np.sum(x_lp_surr_rounded != x_true.astype(int)))
-        l1_surr = float(np.sum(np.abs(x_lp_surr - x_true)))
-        integ_plain = float(np.mean(np.minimum(x_lp_plain, 1.0 - x_lp_plain)))
-        integ_surr = float(np.mean(np.minimum(x_lp_surr, 1.0 - x_lp_surr)))
+        plain_metrics = _compute_commitment_distance_metrics_with_mask(x_lp_plain, x_true)
+        all_proxy_metrics = _compute_commitment_distance_metrics_with_mask(x_lp_surr, x_true)
+        unit_subproblem_metrics = _compute_commitment_distance_metrics_with_mask(x_sub, x_true)
+        subproblem_proxy_metrics = _compute_commitment_distance_metrics_with_mask(x_lp_subproblem_proxy, x_true)
+        hamming_plain = plain_metrics["hamming"]
+        hamming_surr = all_proxy_metrics["hamming"]
+        l1_surr = all_proxy_metrics["l1"]
+        integ_surr = all_proxy_metrics["integrality_gap"]
         stats_row = dict(solve_stats or {})
         activity_rows = list(stats_row.pop("main_constraint_activity_rows", []) or [])
         for activity_row in activity_rows:
@@ -2029,20 +2174,41 @@ def run_lp_compare_test(ppc, all_samples: list, dual_predictor, trainers: dict,
         stats_row.pop("all_stage_attempts", None)
         stats_row.update({
             "sample_index": int(i),
+            "solve_type": "global_all_proxy_lp",
+            "global_base_l1_to_true": float(plain_metrics["l1"]),
+            "global_base_hamming_to_true": hamming_plain,
+            "global_base_integrality_gap": float(plain_metrics["integrality_gap"]),
             "integrality_gap": float(integ_surr),
             "l1_to_true": float(l1_surr),
             "hamming_to_true": int(hamming_surr),
+            "unit_subproblem_l1_to_true": float(unit_subproblem_metrics["l1"]),
+            "unit_subproblem_hamming_to_true": unit_subproblem_metrics["hamming"],
+            "unit_subproblem_integrality_gap": float(unit_subproblem_metrics["integrality_gap"]),
+            "unit_subproblem_coverage_ratio": float(unit_subproblem_metrics["coverage_ratio"]),
+            "global_subproblem_proxy_l1_to_true": float(subproblem_proxy_metrics["l1"]),
+            "global_subproblem_proxy_hamming_to_true": subproblem_proxy_metrics["hamming"],
+            "global_subproblem_proxy_integrality_gap": float(subproblem_proxy_metrics["integrality_gap"]),
+            "global_subproblem_proxy_stage_name": (subproblem_proxy_stats or {}).get("stage_name"),
+            "global_subproblem_proxy_runtime_sec": (subproblem_proxy_stats or {}).get("runtime_sec"),
         })
         global_surr_stats_rows.append(stats_row)
         log(
-            f"  LP: integ={integ_plain:.4f} | Hamming={hamming_plain} | "
-            f"Surrogate LP: integ={integ_surr:.4f} | Hamming={hamming_surr} | "
-            f"runtime={float(stats_row.get('runtime_sec', float('nan'))):.4f}s | "
-            f"stage={stats_row.get('stage_name', 'n/a')}"
+            "  dist | "
+            + " | ".join(
+                [
+                    _fmt_lp_metric("global_base_lp", plain_metrics),
+                    _fmt_lp_metric("global_all_proxy_lp", all_proxy_metrics),
+                    _fmt_lp_metric("unit_subproblem_lp", unit_subproblem_metrics),
+                    _fmt_lp_metric("global_subproblem_proxy_lp", subproblem_proxy_metrics),
+                    f"stage={stats_row.get('stage_name', 'n/a')}",
+                ]
+            )
         )
 
         x_LP_plain_list.append(x_lp_plain)
         x_LP_surr_list.append(x_lp_surr)
+        x_LP_subproblem_proxy_list.append(x_lp_subproblem_proxy)
+        x_subproblem_lp_list.append(x_sub)
         x_true_list.append(x_true)
         if first_plot_payload is None:
             first_plot_payload = (i, x_true, x_lp_plain, x_lp_surr, x_sub)
@@ -2056,8 +2222,21 @@ def run_lp_compare_test(ppc, all_samples: list, dual_predictor, trainers: dict,
         _log_solution_similarity_summary(
             "Standard LP",
             x_LP_plain_list,
-            "Surrogate LP",
+            "Global all-proxy LP",
             x_LP_surr_list,
+        )
+        if agent is not None:
+            _log_solution_similarity_summary(
+                "Global all-proxy LP",
+                x_LP_surr_list,
+                "Global subproblem-proxy LP",
+                x_LP_subproblem_proxy_list,
+            )
+        _log_solution_similarity_summary(
+            "Global subproblem-proxy LP",
+            x_LP_subproblem_proxy_list,
+            "Unit subproblem LP",
+            x_subproblem_lp_list,
         )
         plot_lp_vs_true(x_LP_plain_list, x_true_list, fig_dir, CASE_NAME)
         if first_plot_payload is not None:
@@ -2072,7 +2251,39 @@ def run_lp_compare_test(ppc, all_samples: list, dual_predictor, trainers: dict,
     _save_global_surrogate_solve_stats(global_surr_stats_rows, fig_dir, CASE_NAME)
     _save_global_main_constraint_activity(global_main_activity_rows, fig_dir, CASE_NAME)
 
-    return list(zip(x_LP_plain_list, x_LP_surr_list, x_true_list))
+    def _metric_summary(prefix: str) -> dict:
+        return {
+            "mean_l1": _mean_or_none(row.get(f"{prefix}_l1_to_true") for row in global_surr_stats_rows),
+            "mean_hamming": _mean_or_none(row.get(f"{prefix}_hamming_to_true") for row in global_surr_stats_rows),
+            "mean_integrality_gap": _mean_or_none(row.get(f"{prefix}_integrality_gap") for row in global_surr_stats_rows),
+        }
+
+    lp_compare_summary = {
+        "n_samples": int(len(global_surr_stats_rows)),
+        "global_base_lp": _metric_summary("global_base"),
+        "global_all_proxy_lp": {
+            "mean_l1": _mean_or_none(row.get("l1_to_true") for row in global_surr_stats_rows),
+            "mean_hamming": _mean_or_none(row.get("hamming_to_true") for row in global_surr_stats_rows),
+            "mean_integrality_gap": _mean_or_none(row.get("integrality_gap") for row in global_surr_stats_rows),
+        },
+        "unit_subproblem_lp": _metric_summary("unit_subproblem"),
+        "global_subproblem_proxy_lp": _metric_summary("global_subproblem_proxy"),
+        "similarity": {
+            "global_base_vs_global_all_proxy": _solution_similarity_dict(x_LP_plain_list, x_LP_surr_list),
+            "global_all_proxy_vs_global_subproblem_proxy": _solution_similarity_dict(
+                x_LP_surr_list,
+                x_LP_subproblem_proxy_list,
+            ),
+            "global_subproblem_proxy_vs_unit_subproblem": _solution_similarity_dict(
+                x_LP_subproblem_proxy_list,
+                x_subproblem_lp_list,
+            ),
+        },
+    }
+    return {
+        "solutions": list(zip(x_LP_plain_list, x_LP_surr_list, x_true_list)),
+        "summary": lp_compare_summary,
+    }
 
 
 def run_subproblem_milp_test(
@@ -2329,7 +2540,7 @@ def run_fp_test(ppc, all_samples: list, dual_predictor, trainers: dict,
 def test_surrogate(ppc, all_samples: list, T_DELTA: float,
                    model_dir: str, unit_ids, fig_dir: Path,
                    scenario_bank: list | None = None,
-                   constraint_generation_strategy: str | None = None) -> None:
+                   constraint_generation_strategy: str | None = None) -> dict:
     """加载 surrogate 模型，打印参数摘要，绘图，并可选运行 FP。"""
     log_section(f"加载 surrogate 模型 | dir={model_dir}")
     log("说明: surrogate 模式分析 `Standard LP` 与 `Surrogate LP`，并可选运行 FP 恢复整数解。")
@@ -2369,8 +2580,8 @@ def test_surrogate(ppc, all_samples: list, T_DELTA: float,
         log_section(f"LP 松弛解质量评估 | mode=仅分析 | reason={fp_gate_reason}")
     else:
         log_section("LP 松弛解质量评估 | mode=RUN_FP=False")
-    run_lp_compare_test(ppc, all_samples, dual_predictor, trainers,
-                        T_DELTA, TEST_SAMPLES, fig_dir)
+    lp_compare_result = run_lp_compare_test(ppc, all_samples, dual_predictor, trainers,
+                                            T_DELTA, TEST_SAMPLES, fig_dir)
     if RUN_SUBPROBLEM_MILP_TEST:
         run_subproblem_milp_test(
             ppc,
@@ -2410,6 +2621,7 @@ def test_surrogate(ppc, all_samples: list, T_DELTA: float,
         CASE_NAME,
         fp_results=fp_results,
     )
+    return {"lp_compare": lp_compare_result.get("summary", {})}
 
 
 def _print_bcd_stats(agent) -> None:
@@ -2464,6 +2676,13 @@ def _collect_bcd_param_values(agent, prefix: str) -> np.ndarray:
 def _load_bcd_agent(ppc, data_file: Path, bcd_model_path: str,
                     MAX_SAMPLES, T_DELTA: float, sample_range: tuple[int, int] | None = None):
     """加载 BCD 数据并恢复 Agent_NN_BCD 模型参数，返回 agent。"""
+    global Agent_NN_BCD, load_active_set_from_json
+    if "Agent_NN_BCD" not in globals() or "load_active_set_from_json" not in globals():
+        from uc_NN_BCD import Agent_NN_BCD as _Agent_NN_BCD, load_active_set_from_json as _load_active_set_from_json
+
+        Agent_NN_BCD = _Agent_NN_BCD
+        load_active_set_from_json = _load_active_set_from_json
+
     model_path = Path(bcd_model_path)
     if not model_path.exists():
         log(f"错误: BCD 模型文件不存在: {bcd_model_path}")
@@ -3129,9 +3348,13 @@ def analyse_lp_distance(agent, test_n: int, fig_dir: Path,
         ppc is not None and all_samples is not None and dual_predictor is not None
         and trainers is not None and T_DELTA is not None
     )
-    comparison_name = "Surrogate LP" if use_joint_surrogate else "BCD LP"
-    comparison_short = "surr" if use_joint_surrogate else "bcd"
+    comparison_name = "Global all-proxy LP" if use_joint_surrogate else "BCD theta/zeta LP"
+    comparison_short = "global_all_proxy" if use_joint_surrogate else "bcd_theta_zeta"
     comparison_file_tag = "surrogate" if use_joint_surrogate else "bcd"
+    log(
+        "distance types: global_base_lp=Agent LP without theta/zeta; "
+        f"{comparison_short}={comparison_name}"
+    )
 
     for i in range(n):
         sol_lp = agent.solve_LP_without_theta_constraints(i)
@@ -3174,7 +3397,7 @@ def analyse_lp_distance(agent, test_n: int, fig_dir: Path,
         x_opt_list.append(x_opt)
 
         log(f"  样本 {i}: L1(LP)={d_lp:.2f}  L1({comparison_short})={d_surr:.2f}  "
-            f"Hamming(LP)={h_lp}  Hamming({comparison_short})={h_surr}")
+            f"H(global_base_lp)={h_lp}  H({comparison_short})={h_surr}")
 
     if not valid_ids:
         log("没有有效样本，跳过分析")
@@ -3245,7 +3468,7 @@ def test_both(ppc, data_file: Path, all_samples: list, T_DELTA: float,
               sample_range: tuple[int, int] | None = None,
               test_samples: int = TEST_SAMPLES_DEFAULT,
               scenario_bank: list | None = None,
-              constraint_generation_strategy: str | None = None) -> None:
+              constraint_generation_strategy: str | None = None) -> dict:
     """联合加载 BCD + surrogate 模型，以全体代理约束评估解质量，可选运�?FP�?
 
     流程�?
@@ -3324,8 +3547,8 @@ def test_both(ppc, data_file: Path, all_samples: list, T_DELTA: float,
         log(f"── Step 4/4  LP 松弛解质量评估（仅分析，不运行 FP；{fp_gate_reason}）")
     else:
         log("── Step 4/4  LP 松弛解质量评估（RUN_FP=False）")
-    run_lp_compare_test(ppc, all_samples, dual_predictor, trainers,
-                        T_DELTA, test_samples, fig_dir, agent=agent)
+    lp_compare_result = run_lp_compare_test(ppc, all_samples, dual_predictor, trainers,
+                                            T_DELTA, test_samples, fig_dir, agent=agent)
     if RUN_SUBPROBLEM_MILP_TEST:
         run_subproblem_milp_test(
             ppc,
@@ -3375,6 +3598,7 @@ def test_both(ppc, data_file: Path, all_samples: list, T_DELTA: float,
         agent=agent,
         fp_results=fp_results,
     )
+    return {"lp_compare": lp_compare_result.get("summary", {})}
 
 
 # ──────────────────────── 主函数 ────────────────────────
@@ -3382,6 +3606,7 @@ def test_both(ppc, data_file: Path, all_samples: list, T_DELTA: float,
 
 def main():
     start_time = time.time()
+    run_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
     print("=" * SECTION_WIDTH)
     print(f"run_test.py | mode={MODE} | case={CASE_NAME}")
@@ -3393,6 +3618,22 @@ def main():
     result_dir = Path(__file__).parent / 'result' / 'active_set'
     fig_dir    = Path(__file__).parent / 'result' / 'figures'
     fig_dir.mkdir(parents=True, exist_ok=True)
+    report_dir = Path(__file__).parent / 'result' / 'model_tests' / 'run_test_reports'
+    run_report = {
+        "timestamp": run_timestamp,
+        "status": "running",
+        "case": CASE_NAME,
+        "mode": MODE,
+        "sample_range": SAMPLE_RANGE,
+        "max_samples": MAX_SAMPLES,
+        "test_samples": test_samples,
+        "unit_ids": UNIT_IDS,
+        "run_fp": bool(RUN_FP),
+        "run_subproblem_milp_test": bool(RUN_SUBPROBLEM_MILP_TEST),
+        "disable_plots": bool(RUN_TEST_DISABLE_PLOTS),
+        "surrogate_constraint_strategy": SURROGATE_CONSTRAINT_STRATEGY,
+        "subproblem_ignore_startup_shutdown_costs": bool(SUBPROBLEM_IGNORE_STARTUP_SHUTDOWN_COSTS),
+    }
     log(f"图像输出目录: {fig_dir}")
 
     # ── 加载 PyPower 案例 ────────────────────────────────
@@ -3404,6 +3645,7 @@ def main():
     ppc = get_case_ppc(CASE_NAME)
     n_units = ppc['gen'].shape[0]
     n_buses = ppc['bus'].shape[0]
+    run_report.update({"n_units": int(n_units), "n_buses": int(n_buses)})
     log(f"case summary | units={n_units} | buses={n_buses}")
 
     # ── 查找数据文件 ─────────────────────────────────────
@@ -3424,6 +3666,7 @@ def main():
         sys.exit(1)
 
     # ── 自动发现模型路径（当顶部配置为 None 时） ────────────
+    run_report["active_set_json"] = str(data_file)
     resolved_model_dir = MODEL_DIR
     resolved_bcd_path = BCD_MODEL_PATH
     # 外部脚本（如 agentic_fp_optimizer）可通过环境变量固定某次训练输出目录，无需改本文件顶部常量
@@ -3483,6 +3726,12 @@ def main():
         sys.exit(1)
 
     # ── 执行模式分支 ─────────────────────────────────────
+    run_report["surrogate_model_dir"] = (
+        None if resolved_model_dir is None else str((Path(__file__).parent / resolved_model_dir).resolve())
+    )
+    run_report["bcd_model"] = (
+        None if resolved_bcd_path is None else str((Path(__file__).parent / resolved_bcd_path).resolve())
+    )
     try:
         if MODE == 'surrogate':
             full_samples = load_json_data(data_file)
@@ -3496,15 +3745,22 @@ def main():
                 f"scenario_bank={len(full_samples)}"
             )
 
+            run_report.update({
+                "T": int(T_from_data),
+                "eval_samples": int(len(all_samples)),
+                "scenario_bank_samples": int(len(full_samples)),
+            })
             model_dir = str((Path(__file__).parent / resolved_model_dir).resolve())
-            test_surrogate(
+            test_result = test_surrogate(
                 ppc, all_samples, T_DELTA, model_dir, UNIT_IDS, fig_dir,
                 scenario_bank=full_samples,
                 constraint_generation_strategy=SURROGATE_CONSTRAINT_STRATEGY,
             )
+            run_report["lp_compare_summary"] = (test_result or {}).get("lp_compare")
 
         elif MODE == 'bcd':
             bcd_path = str((Path(__file__).parent / resolved_bcd_path).resolve())
+            run_report["bcd_model"] = bcd_path
             test_bcd(
                 ppc,
                 data_file,
@@ -3528,13 +3784,19 @@ def main():
                 f"scenario_bank={len(full_samples)}"
             )
 
+            run_report.update({
+                "T": int(T_from_data),
+                "eval_samples": int(len(all_samples)),
+                "scenario_bank_samples": int(len(full_samples)),
+            })
             model_dir  = str((Path(__file__).parent / resolved_model_dir).resolve())
             bcd_path   = str((Path(__file__).parent / resolved_bcd_path).resolve())
-            test_both(ppc, data_file, all_samples, T_DELTA,
-                      model_dir, bcd_path, MAX_SAMPLES, UNIT_IDS, fig_dir,
-                      sample_range=sample_range, test_samples=test_samples,
-                      scenario_bank=full_samples,
-                      constraint_generation_strategy=SURROGATE_CONSTRAINT_STRATEGY)
+            test_result = test_both(ppc, data_file, all_samples, T_DELTA,
+                                    model_dir, bcd_path, MAX_SAMPLES, UNIT_IDS, fig_dir,
+                                    sample_range=sample_range, test_samples=test_samples,
+                                    scenario_bank=full_samples,
+                                    constraint_generation_strategy=SURROGATE_CONSTRAINT_STRATEGY)
+            run_report["lp_compare_summary"] = (test_result or {}).get("lp_compare")
 
         else:
             log(f"未知模式: '{MODE}'，可选 'surrogate' | 'bcd' | 'both'")
@@ -3542,12 +3804,24 @@ def main():
 
     except Exception as e:
         log(f"执行失败: {e}")
+        total_time = time.time() - start_time
+        run_report.update({
+            "status": "failed",
+            "elapsed_sec": round(float(total_time), 3),
+            "error": str(e),
+        })
+        _write_run_test_report(report_dir, run_report)
         import traceback
         traceback.print_exc()
         sys.exit(1)
 
     # ── 汇总 ─────────────────────────────────────────────
     total_time = time.time() - start_time
+    run_report.update({
+        "status": "success",
+        "elapsed_sec": round(float(total_time), 3),
+    })
+    _write_run_test_report(report_dir, run_report)
     log_section(f"完成 | mode={MODE} | elapsed_min={total_time / 60:.1f}")
 
 

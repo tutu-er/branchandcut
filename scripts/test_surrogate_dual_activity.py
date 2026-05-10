@@ -628,7 +628,12 @@ def collect_main_model_activity_records(
         sample_id = int(sample.get("sample_id", sample_pos))
         print(f"[main-test] sample_pos={sample_pos}, sample_id={sample_id}", flush=True)
         try:
-            lambda_val = dual_predictor.predict(sample)
+            if trainers:
+                if dual_predictor is None:
+                    raise RuntimeError("Subproblem trainers require a dual predictor for main activity")
+                lambda_val = dual_predictor.predict(sample)
+            else:
+                lambda_val = np.zeros((0,), dtype=float)
             _, stats = solve_global_LP_relaxation(
                 ppc,
                 sample,
@@ -1086,7 +1091,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--main-include-subproblem",
         action="store_true",
-        help="include subproblem surrogate rows from the global LP in main activity CSVs",
+        help=(
+            "load subproblem models and include their rows in main-problem activity CSVs; "
+            "without this flag, --main-only loads only the BCD model"
+        ),
     )
     parser.add_argument("--main-dual-active-tol", type=float, default=1e-7)
     parser.add_argument("--output-dir", default=None)
@@ -1097,6 +1105,10 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     case_name = str(args.case)
+    run_main_activity = bool(args.main_activity or args.main_only)
+    run_subproblem_activity = not bool(args.main_only)
+    main_needs_subproblem = bool(run_main_activity and args.main_include_subproblem)
+    need_subproblem_models = bool(run_subproblem_activity or main_needs_subproblem)
     resolved_refresh_nn_epochs = args.refresh_nn_epochs
     if resolved_refresh_nn_epochs is None:
         if case_name == "case118":
@@ -1113,11 +1125,13 @@ def main() -> None:
     active_path = Path(args.active_set_json) if args.active_set_json else _default_active_set_json(case_name)
     if not active_path.is_absolute():
         active_path = ROOT / active_path
-    model_dir = Path(args.model_dir) if args.model_dir else _latest_model_dir(case_name)
-    if not model_dir.is_absolute():
-        model_dir = ROOT / model_dir
+    model_dir = None
+    if need_subproblem_models:
+        model_dir = Path(args.model_dir) if args.model_dir else _latest_model_dir(case_name)
+        if not model_dir.is_absolute():
+            model_dir = ROOT / model_dir
     bcd_model_path = None
-    if args.main_activity or args.main_only:
+    if run_main_activity:
         bcd_model_path = Path(args.bcd_model) if args.bcd_model else _latest_bcd_model_path(case_name)
         if not bcd_model_path.is_absolute():
             bcd_model_path = ROOT / bcd_model_path
@@ -1130,7 +1144,11 @@ def main() -> None:
     print("surrogate dual/activity model test", flush=True)
     print(f"case={case_name}", flush=True)
     print(f"active_set={active_path}", flush=True)
-    print(f"model_dir={model_dir}", flush=True)
+    print(f"activity_modes: subproblem={run_subproblem_activity}, main={run_main_activity}, main_include_subproblem={bool(args.main_include_subproblem)}", flush=True)
+    if model_dir is not None:
+        print(f"model_dir={model_dir}", flush=True)
+    else:
+        print("model_dir=(not loaded; pure BCD main activity)", flush=True)
     if bcd_model_path is not None:
         print(f"bcd_model={bcd_model_path}", flush=True)
     print(f"output_dir={output_dir}", flush=True)
@@ -1154,32 +1172,37 @@ def main() -> None:
         raise ValueError("No test samples selected")
 
     unit_ids = _parse_unit_ids(args.units)
-    dual_predictor, trainers = load_trained_models(
-        ppc,
-        train_samples,
-        args.t_delta,
-        str(model_dir),
-        unit_ids=unit_ids,
-        lp_backend=args.lp_backend,
-        constraint_generation_strategy=args.strategy,
-        ignore_startup_shutdown_costs=(True if args.ignore_startup_shutdown_costs else None),
-        case_name=case_name,
-    )
-    if not trainers:
-        requested = "all available units" if unit_ids is None else ",".join(str(u) for u in unit_ids)
-        available = sorted(p.name for p in model_dir.glob("surrogate_unit_*.pth"))
-        raise RuntimeError(
-            "No surrogate trainers were loaded. "
-            f"requested units={requested}; model_dir={model_dir}; "
-            f"available files={available[:20]}"
+    dual_predictor = None
+    trainers: Dict[int, object] = {}
+    if need_subproblem_models:
+        if model_dir is None:
+            raise RuntimeError("Subproblem activity requires --model-dir or an auto-discoverable model directory")
+        dual_predictor, trainers = load_trained_models(
+            ppc,
+            train_samples,
+            args.t_delta,
+            str(model_dir),
+            unit_ids=unit_ids,
+            lp_backend=args.lp_backend,
+            constraint_generation_strategy=args.strategy,
+            ignore_startup_shutdown_costs=(True if args.ignore_startup_shutdown_costs else None),
+            case_name=case_name,
         )
+        if not trainers:
+            requested = "all available units" if unit_ids is None else ",".join(str(u) for u in unit_ids)
+            available = sorted(p.name for p in model_dir.glob("surrogate_unit_*.pth"))
+            raise RuntimeError(
+                "No surrogate trainers were loaded. "
+                f"requested units={requested}; model_dir={model_dir}; "
+                f"available files={available[:20]}"
+            )
 
     train_rows: List[dict] = []
     train_by_key: Dict[Tuple[int, int], dict] = {}
     test_rows: List[dict] = []
     solve_summaries: List[dict] = []
     aggregate_rows: List[dict] = []
-    if not args.main_only:
+    if run_subproblem_activity:
         train_rows, train_by_key = collect_training_mu_records(
             trainers,
             train_sample_limit=args.train_samples,
@@ -1203,7 +1226,7 @@ def main() -> None:
     main_rows: List[dict] = []
     main_summaries: List[dict] = []
     main_aggregate_rows: List[dict] = []
-    if args.main_activity or args.main_only:
+    if run_main_activity:
         if bcd_model_path is None:
             raise RuntimeError("--main-activity requires a BCD model")
         print(f"[main] loading BCD agent from {bcd_model_path}", flush=True)
@@ -1237,8 +1260,11 @@ def main() -> None:
             {
                 "case": case_name,
                 "active_set_json": str(active_path),
-                "model_dir": str(model_dir),
+                "model_dir": str(model_dir) if model_dir is not None else None,
                 "bcd_model": str(bcd_model_path) if bcd_model_path is not None else None,
+                "run_subproblem_activity": bool(run_subproblem_activity),
+                "run_main_activity": bool(run_main_activity),
+                "main_include_subproblem": bool(args.main_include_subproblem),
                 "n_train_samples": len(train_samples),
                 "n_test_samples": len(test_samples),
                 "unit_ids": sorted(int(u) for u in trainers.keys()),
