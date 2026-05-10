@@ -24,7 +24,7 @@ from scripts import test_surrogate_dual_activity as activity
 CASE_NAME = "case30lite"
 MODE = "surrogate"  # use "both" to also evaluate a BCD checkpoint
 ACTIVE_SETS_FILE = "result/active_set/active_sets_case30lite_T24_n500_20260503_233729.json"
-MODEL_DIR = "result/surrogate_models/subproblem_models_case30lite_20260506_001858"
+MODEL_DIR = "result/surrogate_models/subproblem_models_case30lite_20260510_013315"
 BCD_MODEL_PATH: str | None = None
 TEST_SAMPLES = 12
 SAMPLE_RANGE = "0:120"

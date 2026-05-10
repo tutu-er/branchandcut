@@ -1689,6 +1689,7 @@ def _solve_unit_surrogate_model(
             )
 
         surrogate_slacks = []
+        weighted_surrogate_slacks: List[Tuple[Any, float]] = []
         surrogate_rows = []
         for k, t_k in enumerate(timestep_map):
             a = float(alphas[k])
@@ -1711,6 +1712,12 @@ def _solve_unit_surrogate_model(
                 slack_var = model.addVar(lb=0, name=f'surr_slack_{k}')
                 model.addConstr(expr <= slack_var, name=f'surr_{k}')
                 surrogate_slacks.append(slack_var)
+                penalty_factor = (
+                    SURROGATE_RELAXATION_PREFERRED_PENALTY_FACTOR
+                    if _is_sign4_surrogate_constraint(trainer, k)
+                    else SURROGATE_RELAXATION_STRICT_PENALTY_FACTOR
+                )
+                weighted_surrogate_slacks.append((slack_var, penalty_factor))
             else:
                 model.addConstr(expr <= 0.0, name=f'surr_{k}')
             surrogate_rows.append({
@@ -1730,8 +1737,10 @@ def _solve_unit_surrogate_model(
         if pg_costs is not None:
             obj += gp.quicksum(float(pg_costs[t]) * pg[t] for t in range(min(T, len(pg_costs))))
         obj -= gp.quicksum(float(lambda_unit[t]) * pg[t] for t in range(T))
-        if surrogate_slacks:
-            obj += float(surrogate_soft_penalty) * gp.quicksum(surrogate_slacks)
+        obj += _surrogate_relaxation_penalty_expr(
+            surrogate_soft_penalty,
+            weighted_surrogate_slacks,
+        )
         model.setObjective(obj, GRB.MINIMIZE)
         model.optimize()
 
@@ -1741,6 +1750,16 @@ def _solve_unit_surrogate_model(
             'binary_x': bool(binary_x),
             'used_soft_surrogate': bool(use_soft_surrogate),
             'surrogate_soft_penalty': float(surrogate_soft_penalty) if use_soft_surrogate else None,
+            'surrogate_soft_preferred_penalty_factor': (
+                float(SURROGATE_RELAXATION_PREFERRED_PENALTY_FACTOR)
+                if use_soft_surrogate
+                else None
+            ),
+            'surrogate_soft_strict_penalty_factor': (
+                float(SURROGATE_RELAXATION_STRICT_PENALTY_FACTOR)
+                if use_soft_surrogate
+                else None
+            ),
             'n_surrogate_constraints': int(len(surrogate_rows)),
         }
 
@@ -2118,6 +2137,34 @@ def identify_trusted_mask(
 
 DEFAULT_SURROGATE_PENALTY = 1e8
 DEFAULT_UNIT_SURROGATE_SOFT_PENALTY = 1e8
+SURROGATE_RELAXATION_PREFERRED_PENALTY_FACTOR = 1e-1
+SURROGATE_RELAXATION_STRICT_PENALTY_FACTOR = 1.0
+
+
+def _is_sign4_surrogate_constraint(
+    trainer: Optional['SubproblemSurrogateTrainer'],
+    constraint_index: int,
+) -> bool:
+    """Return True for the sign4 head block in all-template surrogate layouts."""
+    strategy = normalize_constraint_generation_strategy(
+        getattr(trainer, 'constraint_generation_strategy', 'sensitive') or 'sensitive'
+    )
+    if strategy == CONSTRAINT_STRATEGY_ALL_TEMPLATES_SIGN4:
+        return True
+    if strategy == CONSTRAINT_STRATEGY_ALL_TEMPLATES_SIGN4_PLUS_SINGLE:
+        T = int(getattr(trainer, 'T', 0) or 0)
+        group_size = max(int(getattr(trainer, 'all_mode_group_size', 4) or 4), 1)
+        sign4_count = group_size * max(T - 2, 0)
+        return int(constraint_index) < sign4_count
+    return False
+
+
+def _surrogate_relaxation_penalty_expr(base_penalty: float, weighted_slacks: List[Tuple[Any, float]]):
+    if not weighted_slacks:
+        return 0.0
+    return float(base_penalty) * gp.quicksum(
+        float(factor) * slack for slack, factor in weighted_slacks
+    )
 
 
 def _gurobi_status_name(status: Optional[int]) -> str:
@@ -2259,6 +2306,16 @@ def solve_global_LP_relaxation(
             "num_base_constraints": int(max(0, n_total - n_proxy)),
             "num_subproblem_slacks": int(len(subproblem_slacks)),
             "num_bcd_slacks": int(len(bcd_slacks)),
+            "num_subproblem_sign4_slacks": int(len(subproblem_sign4_slacks)),
+            "num_subproblem_strict_slacks": int(len(subproblem_strict_slacks)),
+            "num_bcd_theta_slacks": int(len(bcd_theta_slacks)),
+            "num_bcd_zeta_slacks": int(len(bcd_zeta_slacks)),
+            "surrogate_soft_preferred_penalty_factor": float(
+                SURROGATE_RELAXATION_PREFERRED_PENALTY_FACTOR
+            ),
+            "surrogate_soft_strict_penalty_factor": float(
+                SURROGATE_RELAXATION_STRICT_PENALTY_FACTOR
+            ),
             "hard_subproblem": bool(_stage["hard_subproblem"]),
             "hard_bcd": bool(_stage["hard_bcd"]),
             "used_soft_subproblem": not bool(_stage["hard_subproblem"]),
@@ -2428,7 +2485,13 @@ def solve_global_LP_relaxation(
         cpower = model.addVars(ng, T, lb=0, name='cpower')
         coc = model.addVars(ng, T - 1, lb=0, name='coc')
         subproblem_slacks: list = []
+        subproblem_sign4_slacks: list = []
+        subproblem_strict_slacks: list = []
         bcd_slacks: list = []
+        bcd_theta_slacks: list = []
+        bcd_zeta_slacks: list = []
+        weighted_subproblem_slacks: List[Tuple[Any, float]] = []
+        weighted_bcd_slacks: List[Tuple[Any, float]] = []
         aux_obj = gp.LinExpr()
 
         for t in range(T):
@@ -2519,6 +2582,13 @@ def solve_global_LP_relaxation(
                         slack_k = model.addVar(lb=0, name=f'g{g}_surr_slack_{k}')
                         model.addConstr(expr <= slack_k, name=f'g{g}_surr_{k}')
                         subproblem_slacks.append(slack_k)
+                        if _is_sign4_surrogate_constraint(trainers[g], k):
+                            subproblem_sign4_slacks.append(slack_k)
+                            penalty_factor = SURROGATE_RELAXATION_PREFERRED_PENALTY_FACTOR
+                        else:
+                            subproblem_strict_slacks.append(slack_k)
+                            penalty_factor = SURROGATE_RELAXATION_STRICT_PENALTY_FACTOR
+                        weighted_subproblem_slacks.append((slack_k, penalty_factor))
 
         try:
             _PTDF, ptdf_g, branch_limit, active_lines = _build_ptdf_data(ppc_int)
@@ -2573,6 +2643,10 @@ def solve_global_LP_relaxation(
                     _slack = model.addVar(lb=0, name=f'theta_slack_{_bid}_{_ts}')
                     model.addConstr(expr <= _slack, name=f'theta_surr_{_bid}_{_ts}')
                     bcd_slacks.append(_slack)
+                    bcd_theta_slacks.append(_slack)
+                    weighted_bcd_slacks.append(
+                        (_slack, SURROGATE_RELAXATION_PREFERRED_PENALTY_FACTOR)
+                    )
 
             for _zc in (_ua or {}).get('union_zeta_constraints', []):
                 _uid = _zc['unit_id']
@@ -2601,6 +2675,10 @@ def solve_global_LP_relaxation(
                     _slack = model.addVar(lb=0, name=f'zeta_slack_{_uid}_{_ts}')
                     model.addConstr(expr <= _slack, name=f'zeta_surr_{_uid}_{_ts}')
                     bcd_slacks.append(_slack)
+                    bcd_zeta_slacks.append(_slack)
+                    weighted_bcd_slacks.append(
+                        (_slack, SURROGATE_RELAXATION_STRICT_PENALTY_FACTOR)
+                    )
 
         soft_slacks = subproblem_slacks + bcd_slacks
         add_sparse_parameterized_constraints(
@@ -2625,9 +2703,15 @@ def solve_global_LP_relaxation(
         problem_obj = uc_obj + aux_obj
         full_obj = problem_obj
         if subproblem_slacks:
-            full_obj += stage['penalty_subproblem'] * gp.quicksum(subproblem_slacks)
+            full_obj += _surrogate_relaxation_penalty_expr(
+                stage['penalty_subproblem'],
+                weighted_subproblem_slacks,
+            )
         if bcd_slacks:
-            full_obj += stage['penalty_bcd'] * gp.quicksum(bcd_slacks)
+            full_obj += _surrogate_relaxation_penalty_expr(
+                stage['penalty_bcd'],
+                weighted_bcd_slacks,
+            )
         model.setObjective(full_obj, GRB.MINIMIZE)
         model.optimize()
 
