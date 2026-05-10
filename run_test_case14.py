@@ -25,6 +25,7 @@ CASE_NAME = "case14"
 MODE = "surrogate"  # use "both" to also evaluate a BCD checkpoint
 ACTIVE_SETS_FILE = "result/active_set/active_sets_case14_T24_n600_20260503_222929.json"
 # MODEL_DIR = "result/surrogate_models/subproblem_models_case14_20260506_001828"
+# Default: 20260510 checkpoint (current eval choice).
 MODEL_DIR = "result/surrogate_models/subproblem_models_case14_20260510_013340"
 # MODEL_DIR = "result/surrogate_models/subproblem_models_case14_20260509_215957"
 BCD_MODEL_PATH: str | None = None
