@@ -37,7 +37,21 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--bcd-iter", type=int, default=BCD_MAX_ITER)
     p.add_argument("--sub-iter", type=int, default=SUBPROBLEM_MAX_ITER)
     p.add_argument("--sample-workers", type=int, default=N_WORKERS_SAMPLE)
+    p.add_argument("--unit-ids", type=str, default=None,
+                   help="Comma-separated unit ids to train, e.g. '1' or '0,2'.")
     return p.parse_args()
+
+
+def _parse_unit_ids(text: str | None) -> list[int] | None:
+    if text is None or not str(text).strip():
+        return None
+    unit_ids: list[int] = []
+    for item in str(text).split(","):
+        item = item.strip()
+        if not item:
+            continue
+        unit_ids.append(int(item))
+    return unit_ids or None
 
 
 def _configure_iterations(bcd_iter: int, sub_iter: int) -> None:
@@ -63,7 +77,7 @@ def main() -> None:
     rt.SURROGATE_CONTINUE_TRAINING = bool(args.resume_dir)
     rt.SURROGATE_SKIP_EXISTING_UNITS = bool(args.resume_dir) and not bool(args.retrain_existing)
     rt.MAX_SAMPLES = max(1, int(args.max_samples))
-    rt.UNIT_IDS = None
+    rt.UNIT_IDS = _parse_unit_ids(args.unit_ids)
     rt.DUAL_EPOCHS = DUAL_EPOCHS
     rt.UNIT_PREDICTOR_EPOCHS = UNIT_PREDICTOR_EPOCHS
     rt.UNIT_PREDICTOR_BATCH_SIZE = 64
@@ -99,6 +113,7 @@ def main() -> None:
     print(
         f"case30lite training | target={rt.MODE} | max_samples={rt.MAX_SAMPLES} | "
         f"bcd_iter={rt.BCD_MAX_ITER} | sub_iter={rt.SUBPROBLEM_MAX_ITER} | "
+        f"units={rt.UNIT_IDS or 'all'} | "
         f"active_sets={rt.ACTIVE_SETS_FILE or 'auto-latest'} | "
         f"resume_dir={rt.SURROGATE_MODEL_DIR or '(none)'} | "
         f"skip_existing={rt.SURROGATE_SKIP_EXISTING_UNITS}",
