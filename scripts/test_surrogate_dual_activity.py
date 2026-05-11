@@ -61,6 +61,7 @@ try:
     from src.feasibility_pump import (
         _extract_unit_lambda,
         _gurobi_status_name,
+        _is_sign4_surrogate_constraint,
         _resolve_surrogate_constraint_layout,
         _solve_unit_LP_with_surrogate,
         solve_global_LP_relaxation,
@@ -73,6 +74,7 @@ except ImportError:
     from feasibility_pump import (
         _extract_unit_lambda,
         _gurobi_status_name,
+        _is_sign4_surrogate_constraint,
         _resolve_surrogate_constraint_layout,
         _solve_unit_LP_with_surrogate,
         solve_global_LP_relaxation,
@@ -356,6 +358,7 @@ def collect_training_mu_records(
     refresh_pg_cost_nn_epochs: Optional[int],
     refresh_total_max_iter: Optional[int],
     mu_active_tol: float,
+    surrogate_constraint_scope: str = "all",
 ) -> Tuple[List[dict], Dict[Tuple[int, int], dict]]:
     rows: List[dict] = []
     by_key: Dict[Tuple[int, int], dict] = {}
@@ -391,6 +394,8 @@ def collect_training_mu_records(
         if mu_source.ndim != 2:
             continue
         for k in range(mu_source.shape[1]):
+            if not _allow_surrogate_constraint_by_scope(trainer, k, surrogate_constraint_scope):
+                continue
             vals = mu_source[:, k]
             stats = _summarize_array(vals, mu_active_tol)
             row = {
@@ -410,6 +415,7 @@ def _solve_test_unit_with_rhs_relaxation(
     lambda_val,
     active_tol: float,
     violation_tol: float,
+    surrogate_constraint_scope: str = "all",
 ) -> Tuple[List[dict], dict]:
     unit_id = int(trainer.unit_id)
     T = int(trainer.T)
@@ -426,6 +432,7 @@ def _solve_test_unit_with_rhs_relaxation(
         costs=costs,
         pg_costs=pg_costs,
         scenario_sample=sample,
+        surrogate_constraint_scope=surrogate_constraint_scope,
     )
 
     deltas_relaxed = np.asarray(deltas, dtype=float).copy()
@@ -449,6 +456,7 @@ def _solve_test_unit_with_rhs_relaxation(
         costs=costs,
         pg_costs=pg_costs,
         scenario_sample=sample,
+        surrogate_constraint_scope=surrogate_constraint_scope,
     )
 
     first_by_k = {int(row["k"]): row for row in first_rows}
@@ -456,6 +464,8 @@ def _solve_test_unit_with_rhs_relaxation(
     records: List[dict] = []
     for row in second_rows:
         k = int(row["k"])
+        if not _allow_surrogate_constraint_by_scope(trainer, k, surrogate_constraint_scope):
+            continue
         first = first_by_k.get(k, {})
         lhs_second = _safe_float(row.get("lhs"))
         rhs_second = _safe_float(row.get("rhs"))
@@ -511,6 +521,7 @@ def collect_test_activity_records(
     train_mu_by_key: Dict[Tuple[int, int], dict],
     active_tol: float,
     violation_tol: float,
+    surrogate_constraint_scope: str = "all",
 ) -> Tuple[List[dict], List[dict]]:
     rows: List[dict] = []
     summaries: List[dict] = []
@@ -527,6 +538,7 @@ def collect_test_activity_records(
                     lambda_val,
                     active_tol=active_tol,
                     violation_tol=violation_tol,
+                    surrogate_constraint_scope=surrogate_constraint_scope,
                 )
             except Exception as exc:
                 summaries.append(
@@ -596,6 +608,22 @@ def aggregate_activity(rows: List[dict], train_mu_by_key: Dict[Tuple[int, int], 
     return out
 
 
+def _normalize_surrogate_constraint_scope(scope: str | None) -> str:
+    scope_norm = str(scope or "all").strip().lower().replace("-", "_")
+    aliases = {"": "all", "full": "all", "all_constraints": "all", "sign4_only": "sign4", "sign_4": "sign4"}
+    scope_norm = aliases.get(scope_norm, scope_norm)
+    if scope_norm not in {"all", "sign4"}:
+        raise ValueError(f"Unsupported surrogate_constraint_scope={scope!r}")
+    return scope_norm
+
+
+def _allow_surrogate_constraint_by_scope(trainer, constraint_index: int, scope: str | None) -> bool:
+    scope_norm = _normalize_surrogate_constraint_scope(scope)
+    if scope_norm == "all":
+        return True
+    return _is_sign4_surrogate_constraint(trainer, constraint_index)
+
+
 def _load_main_bcd_agent(ppc: dict, active_path: Path, bcd_model_path: Path, t_delta: float):
     try:
         from src.uc_NN_BCD import Agent_NN_BCD, load_active_set_from_json
@@ -617,6 +645,7 @@ def collect_main_model_activity_records(
     t_delta: float,
     include_subproblem_rows: bool = False,
     bcd_proxy_scope: str = "both",
+    surrogate_constraint_scope: str = "all",
 ) -> Tuple[List[dict], List[dict]]:
     rows: List[dict] = []
     summaries: List[dict] = []
@@ -649,6 +678,7 @@ def collect_main_model_activity_records(
                 trainers,
                 lambda_val,
                 agent=agent,
+                surrogate_constraint_scope=surrogate_constraint_scope,
                 bcd_proxy_scope=scope,
                 return_stats=True,
             )
@@ -1097,6 +1127,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--violation-tol", type=float, default=1e-7)
     parser.add_argument("--lp-backend", default=None, help="override subproblem LP backend")
     parser.add_argument("--strategy", default=None, help="override constraint generation strategy")
+    parser.add_argument(
+        "--surrogate-constraint-scope",
+        choices=("all", "sign4"),
+        default="all",
+        help="which surrogate subproblem constraints to solve/analyze",
+    )
     parser.add_argument("--ignore-startup-shutdown-costs", action="store_true")
     parser.add_argument("--main-activity", action="store_true", help="also test main-model theta/zeta proxy constraint activity")
     parser.add_argument("--main-only", action="store_true", help="skip subproblem activity and run only main-model activity")
@@ -1163,6 +1199,7 @@ def main() -> None:
     print(f"case={case_name}", flush=True)
     print(f"active_set={active_path}", flush=True)
     print(f"activity_modes: subproblem={run_subproblem_activity}, main={run_main_activity}, main_include_subproblem={bool(args.main_include_subproblem)}", flush=True)
+    print(f"surrogate_constraint_scope={args.surrogate_constraint_scope}", flush=True)
     print(f"main_bcd_proxy_scope={args.main_bcd_proxy_scope}", flush=True)
     if model_dir is not None:
         print(f"model_dir={model_dir}", flush=True)
@@ -1231,6 +1268,7 @@ def main() -> None:
             refresh_pg_cost_nn_epochs=resolved_refresh_pg_cost_nn_epochs,
             refresh_total_max_iter=args.refresh_total_max_iter,
             mu_active_tol=float(args.mu_active_tol),
+            surrogate_constraint_scope=str(args.surrogate_constraint_scope),
         )
         test_rows, solve_summaries = collect_test_activity_records(
             trainers,
@@ -1239,6 +1277,7 @@ def main() -> None:
             train_by_key,
             active_tol=float(args.active_tol),
             violation_tol=float(args.violation_tol),
+            surrogate_constraint_scope=str(args.surrogate_constraint_scope),
         )
         aggregate_rows = aggregate_activity(test_rows, train_by_key)
 
@@ -1259,6 +1298,7 @@ def main() -> None:
             t_delta=float(args.t_delta),
             include_subproblem_rows=bool(args.main_include_subproblem),
             bcd_proxy_scope=str(args.main_bcd_proxy_scope),
+            surrogate_constraint_scope=str(args.surrogate_constraint_scope),
         )
         main_aggregate_rows = aggregate_main_model_activity(
             main_rows,
@@ -1282,6 +1322,7 @@ def main() -> None:
                 "active_set_json": str(active_path),
                 "model_dir": str(model_dir) if model_dir is not None else None,
                 "bcd_model": str(bcd_model_path) if bcd_model_path is not None else None,
+                "surrogate_constraint_scope": str(args.surrogate_constraint_scope),
                 "run_subproblem_activity": bool(run_subproblem_activity),
                 "run_main_activity": bool(run_main_activity),
                 "main_include_subproblem": bool(args.main_include_subproblem),

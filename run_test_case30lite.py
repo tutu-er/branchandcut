@@ -42,6 +42,17 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--sample-range", type=str, default=SAMPLE_RANGE)
     p.add_argument("--unit-ids", type=str, default="all", help="'all' or comma-separated ids, e.g. 0,1,2")
     p.add_argument("--strategy", type=str, default=SURROGATE_CONSTRAINT_STRATEGY)
+    p.add_argument(
+        "--surrogate-constraint-scope",
+        choices=("all", "sign4"),
+        default="all",
+        help="Which surrogate subproblem constraints to apply in LP and activity tests.",
+    )
+    p.add_argument(
+        "--surrogate-sign4-only",
+        action="store_true",
+        help="Shortcut for --surrogate-constraint-scope sign4.",
+    )
     p.add_argument("--fp", action="store_true", help="Run feasibility-pump testing.")
     p.add_argument("--disable-plots", action="store_true", help="Disable plot generation.")
     p.add_argument("--skip-activity", action="store_true", help="Skip surrogate dual/activity diagnostics.")
@@ -103,6 +114,7 @@ def _run_activity_check(args: argparse.Namespace) -> None:
     ]
     if str(args.strategy).strip().lower() != "auto":
         argv.extend(["--strategy", args.strategy])
+    argv.extend(["--surrogate-constraint-scope", args.surrogate_constraint_scope])
     if args.unit_ids.strip().lower() not in ("", "all", "none"):
         argv.extend(["--units", args.unit_ids])
     run_main_activity = (
@@ -127,6 +139,7 @@ def _run_activity_check(args: argparse.Namespace) -> None:
         "case30lite surrogate activity check | "
         f"train_samples={args.activity_train_samples} | "
         f"test_samples={args.activity_test_samples} | "
+        f"surrogate_constraint_scope={args.surrogate_constraint_scope} | "
         f"main_activity={run_main_activity} | "
         f"output_dir={output_dir}",
         flush=True,
@@ -143,12 +156,15 @@ def _run_activity_check(args: argparse.Namespace) -> None:
 
 def main() -> None:
     args = _parse_args()
+    if args.surrogate_sign4_only:
+        args.surrogate_constraint_scope = "sign4"
 
     rt.CASE_NAME = CASE_NAME
     rt.MODE = args.mode
     rt.ACTIVE_SETS_FILE = args.active_sets
     rt.MODEL_DIR = args.model_dir
     rt.BCD_MODEL_PATH = args.bcd_model
+    rt.SURROGATE_CONSTRAINT_SCOPE = args.surrogate_constraint_scope
     rt.SURROGATE_CONSTRAINT_STRATEGY = args.strategy
     rt.UNIT_IDS = _parse_unit_ids(args.unit_ids)
     rt.MAX_SAMPLES = None
@@ -169,6 +185,7 @@ def main() -> None:
             f"active_sets={rt.ACTIVE_SETS_FILE} | "
             f"unit_ids={rt.UNIT_IDS if rt.UNIT_IDS is not None else 'all'} | "
             f"samples={rt.TEST_SAMPLES} | sample_range={rt.SAMPLE_RANGE} | "
+            f"surrogate_constraint_scope={rt.SURROGATE_CONSTRAINT_SCOPE} | "
             f"fp={rt.RUN_FP} | plots={not rt.RUN_TEST_DISABLE_PLOTS}",
             flush=True,
         )

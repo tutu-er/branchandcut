@@ -36,6 +36,17 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--test-samples", type=int, default=10)
     p.add_argument("--sample-range", type=str, default="0:100")
     p.add_argument("--unit-ids", type=str, default="all", help="'all' or comma-separated ids, e.g. 0,1,2")
+    p.add_argument(
+        "--surrogate-constraint-scope",
+        choices=("all", "sign4"),
+        default="all",
+        help="Which surrogate subproblem constraints to apply in LP tests.",
+    )
+    p.add_argument(
+        "--surrogate-sign4-only",
+        action="store_true",
+        help="Shortcut for --surrogate-constraint-scope sign4.",
+    )
     p.add_argument("--no-fp", action="store_true", help="Skip feasibility-pump testing.")
     p.add_argument("--disable-plots", action="store_true")
     return p.parse_args()
@@ -50,6 +61,8 @@ def _parse_unit_ids(value: str) -> list[int] | None:
 
 def main() -> None:
     args = _parse_args()
+    if args.surrogate_sign4_only:
+        args.surrogate_constraint_scope = "sign4"
 
     model_dir = Path(args.model_dir) if args.model_dir else _latest_path(
         ROOT / "result" / "surrogate_models",
@@ -69,6 +82,7 @@ def main() -> None:
     rt.MODEL_DIR = _rel_or_none(model_dir)
     rt.ACTIVE_SETS_FILE = _rel_or_none(active_sets)
     rt.UNIT_IDS = _parse_unit_ids(args.unit_ids)
+    rt.SURROGATE_CONSTRAINT_SCOPE = args.surrogate_constraint_scope
     rt.TEST_SAMPLES = max(1, int(args.test_samples))
     rt.TEST_SAMPLES_DEFAULT = rt.TEST_SAMPLES
     rt.SAMPLE_RANGE = args.sample_range
@@ -81,6 +95,7 @@ def main() -> None:
         f"model_dir={rt.MODEL_DIR or 'auto-latest'} | "
         f"active_sets={rt.ACTIVE_SETS_FILE or 'auto-latest'} | "
         f"unit_ids={rt.UNIT_IDS if rt.UNIT_IDS is not None else 'all'} | "
+        f"surrogate_constraint_scope={rt.SURROGATE_CONSTRAINT_SCOPE} | "
         f"test_samples={rt.TEST_SAMPLES} | fp={rt.RUN_FP}",
         flush=True,
     )

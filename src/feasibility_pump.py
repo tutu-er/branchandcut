@@ -1519,6 +1519,7 @@ def _add_surrogate_constraints(
     prefix: str = '',
     trainer: Optional['SubproblemSurrogateTrainer'] = None,
     sample: Optional[dict] = None,
+    surrogate_constraint_scope: str = "all",
 ) -> None:
     """
     �?Gurobi 模型添加 V3 三时段代理约束�?
@@ -1542,7 +1543,10 @@ def _add_surrogate_constraints(
         T,
         len(alphas),
     )
+    scope_norm = _normalize_surrogate_constraint_scope(surrogate_constraint_scope)
     for k, t_k in enumerate(timestep_map):
+        if not _allow_surrogate_constraint_by_scope(trainer, k, scope_norm):
+            continue
         a, b, c, r = float(alphas[k]), float(betas[k]), float(gammas[k]), float(deltas[k])
         if abs(a) > 1e-10 or abs(b) > 1e-10 or abs(c) > 1e-10:
             model.addConstr(
@@ -1612,6 +1616,7 @@ def _solve_unit_surrogate_model(
     scenario_sample: Optional[dict] = None,
     surrogate_soft_penalty: float = 1e8,
     binary_x: bool = False,
+    surrogate_constraint_scope: str = "all",
 ) -> Tuple[np.ndarray, int, dict]:
     """
     求解单机组子问题 LP（使�?V3 三时段代理约束）�?
@@ -1635,6 +1640,7 @@ def _solve_unit_surrogate_model(
         T,
         len(alphas),
     )
+    scope_norm = _normalize_surrogate_constraint_scope(surrogate_constraint_scope)
 
     def _solve_once(use_soft_surrogate: bool) -> Tuple[np.ndarray, int, dict]:
         model_name = 'unit_milp_surrogate' if binary_x else 'unit_lp_surrogate'
@@ -1692,6 +1698,8 @@ def _solve_unit_surrogate_model(
         weighted_surrogate_slacks: List[Tuple[Any, float]] = []
         surrogate_rows = []
         for k, t_k in enumerate(timestep_map):
+            if not _allow_surrogate_constraint_by_scope(trainer, k, scope_norm):
+                continue
             a = float(alphas[k])
             b = float(betas[k])
             c = float(gammas[k])
@@ -1842,6 +1850,7 @@ def _solve_unit_LP_with_surrogate(
     pg_costs: Optional[np.ndarray] = None,
     scenario_sample: Optional[dict] = None,
     surrogate_soft_penalty: float = 1e8,
+    surrogate_constraint_scope: str = "all",
 ) -> Tuple[np.ndarray, int, dict]:
     """Solve the surrogate subproblem with relaxed commitment variables."""
     return _solve_unit_surrogate_model(
@@ -1856,6 +1865,7 @@ def _solve_unit_LP_with_surrogate(
         scenario_sample=scenario_sample,
         surrogate_soft_penalty=surrogate_soft_penalty,
         binary_x=False,
+        surrogate_constraint_scope=surrogate_constraint_scope,
     )
 
 
@@ -1870,6 +1880,7 @@ def _solve_unit_MILP_with_surrogate(
     pg_costs: Optional[np.ndarray] = None,
     scenario_sample: Optional[dict] = None,
     surrogate_soft_penalty: float = 1e8,
+    surrogate_constraint_scope: str = "all",
 ) -> Tuple[np.ndarray, int, dict]:
     """Solve the surrogate subproblem with binary commitment variables."""
     return _solve_unit_surrogate_model(
@@ -1884,6 +1895,7 @@ def _solve_unit_MILP_with_surrogate(
         scenario_sample=scenario_sample,
         surrogate_soft_penalty=surrogate_soft_penalty,
         binary_x=True,
+        surrogate_constraint_scope=surrogate_constraint_scope,
     )
 
 
@@ -2159,6 +2171,33 @@ def _is_sign4_surrogate_constraint(
     return False
 
 
+def _normalize_surrogate_constraint_scope(scope: str | None) -> str:
+    scope_norm = str(scope or "all").strip().lower().replace("-", "_")
+    aliases = {
+        "": "all",
+        "both": "all",
+        "full": "all",
+        "all_constraints": "all",
+        "sign4_only": "sign4",
+        "sign_4": "sign4",
+    }
+    scope_norm = aliases.get(scope_norm, scope_norm)
+    if scope_norm not in {"all", "sign4"}:
+        raise ValueError(f"Unsupported surrogate_constraint_scope={scope!r}; expected 'all' or 'sign4'")
+    return scope_norm
+
+
+def _allow_surrogate_constraint_by_scope(
+    trainer: Optional['SubproblemSurrogateTrainer'],
+    constraint_index: int,
+    scope: str | None,
+) -> bool:
+    scope_norm = _normalize_surrogate_constraint_scope(scope)
+    if scope_norm == "all":
+        return True
+    return _is_sign4_surrogate_constraint(trainer, constraint_index)
+
+
 def _surrogate_relaxation_penalty_expr(base_penalty: float, weighted_slacks: List[Tuple[Any, float]]):
     if not weighted_slacks:
         return 0.0
@@ -2224,6 +2263,7 @@ def solve_global_LP_relaxation(
     agent=None,
     sparse_library: Optional[SparseSurrogateLibrary] = None,
     sparse_x_template_library: Optional[SparseConstraintTemplateLibrary] = None,
+    surrogate_constraint_scope: str = "all",
     bcd_proxy_scope: str = "both",
     return_stats: bool = False,
 ) -> np.ndarray | Tuple[np.ndarray, Dict[str, Any]]:
@@ -2269,6 +2309,7 @@ def solve_global_LP_relaxation(
     bcd_proxy_scope_norm = str(bcd_proxy_scope or "both").strip().lower()
     if bcd_proxy_scope_norm not in {"both", "theta", "zeta", "none"}:
         raise ValueError(f"Unsupported bcd_proxy_scope={bcd_proxy_scope!r}")
+    surrogate_constraint_scope_norm = _normalize_surrogate_constraint_scope(surrogate_constraint_scope)
     add_bcd_theta = bcd_proxy_scope_norm in {"both", "theta"}
     add_bcd_zeta = bcd_proxy_scope_norm in {"both", "zeta"}
 
@@ -2305,6 +2346,7 @@ def solve_global_LP_relaxation(
             "num_constraints": n_total,
             "num_nonzeros": int(_safe_attr(_model, "NumNZs", 0) or 0),
             "num_proxy_constraints": n_proxy,
+            "surrogate_constraint_scope": surrogate_constraint_scope_norm,
             "num_subproblem_surrogate_constraints": int(n_subproblem),
             "num_bcd_theta_constraints": int(n_theta),
             "num_bcd_zeta_constraints": int(n_zeta),
@@ -2568,6 +2610,12 @@ def solve_global_LP_relaxation(
                     len(alphas),
                 )
                 for k, t_k in enumerate(timestep_map):
+                    if not _allow_surrogate_constraint_by_scope(
+                        trainers[g],
+                        k,
+                        surrogate_constraint_scope_norm,
+                    ):
+                        continue
                     a = float(alphas[k])
                     b = float(betas[k])
                     c = float(gammas[k])

@@ -73,6 +73,7 @@ MODE      = 'surrogate'
 RUN_FP    = True       # surrogate / both 模式：是否运行可行性泵测试
 CASE_NAME = 'case3lite'   # 'case3' / 'case3lite' / 'case14' / 'case30' / 'case30lite' / 'case30lite_perturbed' / 'case39' / 'case118'
 SURROGATE_CONSTRAINT_STRATEGY = 'auto'  # 'auto' / 'sensitive' / 'all' / 'all_templates_sign4' / 'all_single_time'
+SURROGATE_CONSTRAINT_SCOPE = "all"  # "all" or "sign4"
 SUBPROBLEM_IGNORE_STARTUP_SHUTDOWN_COSTS = False
 BCD_LAMBDA_INIT_STRATEGY = 'lp_relaxation'   # 'lp_relaxation' / 'ed_on_x_opt'
 THETA_HOT_START_STRATEGY = 'dcpf_relative'   # 'dcpf_relative' / 'gaussian'
@@ -287,12 +288,14 @@ def _write_run_test_report(report_dir: Path, report: dict) -> Path | None:
             f"- run_fp: {report.get('run_fp')}",
             f"- subproblem_milp: {report.get('run_subproblem_milp_test')}",
             f"- bcd_proxy_scope: {report.get('bcd_proxy_scope')}",
+            f"- surrogate_constraint_scope: {report.get('surrogate_constraint_scope')}",
             f"- plots_enabled: {not bool(report.get('disable_plots'))}",
         ]
         lp_summary = report.get("lp_compare_summary") or {}
         if lp_summary:
             lines.extend(["", "## LP Compare", ""])
             lines.append(f"- bcd_proxy_scope: {lp_summary.get('bcd_proxy_scope')}")
+            lines.append(f"- surrogate_constraint_scope: {lp_summary.get('surrogate_constraint_scope')}")
             for key in (
                 "global_base_lp",
                 "global_all_proxy_lp",
@@ -1689,6 +1692,7 @@ def _build_subproblem_commitment_matrix(
     trainers: dict,
     shape: tuple[int, int],
     solve_milp: bool = False,
+    surrogate_constraint_scope: str = "all",
 ) -> np.ndarray:
     """逐机组求解 surrogate 子问题，并拼成 `(ng, T)` 启停矩阵。"""
     ng, T = shape
@@ -1720,6 +1724,7 @@ def _build_subproblem_commitment_matrix(
                 costs=costs,
                 pg_costs=pg_costs,
                 scenario_sample=sample,
+                surrogate_constraint_scope=surrogate_constraint_scope,
             )
             if status_unit == GRB.OPTIMAL:
                 x_sub[unit_idx, :min(T, x_unit.shape[0])] = x_unit[:T]
@@ -2105,7 +2110,8 @@ def _save_global_main_constraint_activity(rows: list[dict], fig_dir: Path, case_
 def run_lp_compare_test(ppc, all_samples: list, dual_predictor, trainers: dict,
                         T_DELTA: float, n_test: int,
                         fig_dir: Path, agent=None,
-                        bcd_proxy_scope: str = "both") -> list:
+                        bcd_proxy_scope: str = "both",
+                        surrogate_constraint_scope: str = "all") -> list:
     """求解全局 LP 松弛，与真实解对比并绘图，返�?(x_LP, x_true) 列表�?
 
     此函数在可行性泵之前运行，评�?LP 松弛解的质量�?
@@ -2130,7 +2136,10 @@ def run_lp_compare_test(ppc, all_samples: list, dual_predictor, trainers: dict,
     if bcd_proxy_scope not in {"both", "theta", "zeta", "none"}:
         raise ValueError(f"Unsupported bcd_proxy_scope={bcd_proxy_scope!r}")
     bcd_scope_label = "none" if agent is None else bcd_proxy_scope
-    log(f"LP compare types: global_base_lp=no proxy; global_all_proxy_lp=subproblem proxy + BCD scope={bcd_scope_label}")
+    log(
+        "LP compare types: global_base_lp=no proxy; "
+        f"global_all_proxy_lp=subproblem scope={surrogate_constraint_scope} + BCD scope={bcd_scope_label}"
+    )
     log("LP compare types: unit_subproblem_lp=independent unit subproblems; global_subproblem_proxy_lp=global LP with subproblem proxy only")
     x_LP_plain_list, x_LP_surr_list, x_true_list = [], [], []
     x_LP_subproblem_proxy_list, x_subproblem_lp_list = [], []
@@ -2155,6 +2164,7 @@ def run_lp_compare_test(ppc, all_samples: list, dual_predictor, trainers: dict,
                 trainers,
                 lambda_val,
                 agent=agent,
+                surrogate_constraint_scope=surrogate_constraint_scope,
                 bcd_proxy_scope=bcd_proxy_scope,
                 return_stats=True,
             )
@@ -2169,6 +2179,7 @@ def run_lp_compare_test(ppc, all_samples: list, dual_predictor, trainers: dict,
                     trainers,
                     lambda_val,
                     agent=None,
+                    surrogate_constraint_scope=surrogate_constraint_scope,
                     return_stats=True,
                 )
         except Exception as e:
@@ -2176,7 +2187,13 @@ def run_lp_compare_test(ppc, all_samples: list, dual_predictor, trainers: dict,
             continue
 
         x_true = _extract_true_solution(sample, x_lp_surr.shape)
-        x_sub = _build_subproblem_commitment_matrix(sample, lambda_val, trainers, x_true.shape)
+        x_sub = _build_subproblem_commitment_matrix(
+            sample,
+            lambda_val,
+            trainers,
+            x_true.shape,
+            surrogate_constraint_scope=surrogate_constraint_scope,
+        )
 
         plain_metrics = _compute_commitment_distance_metrics_with_mask(x_lp_plain, x_true)
         all_proxy_metrics = _compute_commitment_distance_metrics_with_mask(x_lp_surr, x_true)
@@ -2284,6 +2301,7 @@ def run_lp_compare_test(ppc, all_samples: list, dual_predictor, trainers: dict,
     lp_compare_summary = {
         "n_samples": int(len(global_surr_stats_rows)),
         "bcd_proxy_scope": str(bcd_proxy_scope),
+        "surrogate_constraint_scope": str(surrogate_constraint_scope),
         "global_base_lp": _metric_summary("global_base"),
         "global_all_proxy_lp": {
             "mean_l1": _mean_or_none(row.get("l1_to_true") for row in global_surr_stats_rows),
@@ -2605,7 +2623,8 @@ def test_surrogate(ppc, all_samples: list, T_DELTA: float,
     else:
         log_section("LP 松弛解质量评估 | mode=RUN_FP=False")
     lp_compare_result = run_lp_compare_test(ppc, all_samples, dual_predictor, trainers,
-                                            T_DELTA, TEST_SAMPLES, fig_dir)
+                                            T_DELTA, TEST_SAMPLES, fig_dir,
+                                            surrogate_constraint_scope=SURROGATE_CONSTRAINT_SCOPE)
     if RUN_SUBPROBLEM_MILP_TEST:
         run_subproblem_milp_test(
             ppc,
@@ -3159,6 +3178,7 @@ def summarize_lp_surrogate_fp_totals(
                 trainers,
                 lambda_val,
                 agent=agent,
+                surrogate_constraint_scope=SURROGATE_CONSTRAINT_SCOPE,
             )
         except Exception as exc:
             log(f"样本 {i + 1}/{n} | LP / Surrogate 求解失败，跳过: {exc}")
@@ -3342,7 +3362,8 @@ def analyse_lp_distance(agent, test_n: int, fig_dir: Path,
                         case_name: str, ppc=None, all_samples=None,
                         dual_predictor=None, trainers=None,
                         T_DELTA: float | None = None,
-                        bcd_proxy_scope: str = "both") -> None:
+                        bcd_proxy_scope: str = "both",
+                        surrogate_constraint_scope: str = "all") -> None:
     """计算并对比标�?LP 松弛 vs 含代理约�?LP 与最优解的距离�?
 
     对每个样本求解两�?LP，计�?L1 距离和舍�?Hamming 距离�?
@@ -3397,6 +3418,7 @@ def analyse_lp_distance(agent, test_n: int, fig_dir: Path,
             lambda_val = dual_predictor.predict(sample)
             x_surr = solve_global_LP_relaxation(
                 ppc, sample, T_DELTA, trainers, lambda_val, agent=agent,
+                surrogate_constraint_scope=surrogate_constraint_scope,
                 bcd_proxy_scope=bcd_proxy_scope,
             )
         elif bcd_proxy_scope != "both":
@@ -3598,6 +3620,7 @@ def test_both(ppc, data_file: Path, all_samples: list, T_DELTA: float,
         ppc, all_samples, dual_predictor, trainers,
         T_DELTA, test_samples, fig_dir, agent=agent,
         bcd_proxy_scope=BCD_PROXY_SCOPE,
+        surrogate_constraint_scope=SURROGATE_CONSTRAINT_SCOPE,
     )
     if RUN_SUBPROBLEM_MILP_TEST:
         run_subproblem_milp_test(
@@ -3612,6 +3635,7 @@ def test_both(ppc, data_file: Path, all_samples: list, T_DELTA: float,
         agent, test_samples, fig_dir, CASE_NAME,
         ppc=ppc, all_samples=all_samples, dual_predictor=dual_predictor,
         trainers=trainers, T_DELTA=T_DELTA, bcd_proxy_scope=BCD_PROXY_SCOPE,
+        surrogate_constraint_scope=SURROGATE_CONSTRAINT_SCOPE,
     )
 
     if RUN_FP and can_run_fp:
@@ -3683,6 +3707,7 @@ def main():
         "bcd_proxy_scope": str(BCD_PROXY_SCOPE),
         "disable_plots": bool(RUN_TEST_DISABLE_PLOTS),
         "surrogate_constraint_strategy": SURROGATE_CONSTRAINT_STRATEGY,
+        "surrogate_constraint_scope": str(SURROGATE_CONSTRAINT_SCOPE),
         "subproblem_ignore_startup_shutdown_costs": bool(SUBPROBLEM_IGNORE_STARTUP_SHUTDOWN_COSTS),
     }
     log(f"图像输出目录: {fig_dir}")
