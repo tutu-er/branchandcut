@@ -651,6 +651,31 @@ class ParallelSubproblemSurrogateTrainer(SubproblemSurrogateTrainer):
                 flush=True,
             )
             # 与非并行版一致；带机组前缀便于机组级多进程 stdout 交错时辨认
+            logger = getattr(self, 'logger', None)
+            if logger is not None:
+                nn_loss = getattr(self, '_last_surr_nn_loss', None)
+                logger.log_surrogate_iter(
+                    unit_id=self.unit_id,
+                    iter=i,
+                    obj_primal=obj_primal,
+                    obj_dual=obj_dual,
+                    obj_opt=obj_opt,
+                    rho_primal=self.rho_primal,
+                    rho_dual=self.rho_dual,
+                    rho_opt=self.rho_opt,
+                    obj_dual_pg=obj_dual_pg,
+                    obj_dual_x=obj_dual_x,
+                    obj_dual_coc=obj_dual_coc,
+                    rho_dual_pg=self.rho_dual_pg,
+                    rho_dual_x=self.rho_dual_x,
+                    rho_dual_coc=self.rho_dual_coc,
+                    alpha_mean=float(np.mean(self.alpha_values)),
+                    beta_mean=float(np.mean(self.beta_values)),
+                    gamma_mean=float(np.mean(self.gamma_values)),
+                    delta_mean=float(np.mean(self.delta_values)),
+                    mu_mean=float(np.mean(self.mu)),
+                    nn_loss=nn_loss,
+                )
             print(f"{prefix} " + "-" * 40, flush=True)
 
         print(f"{prefix} ✓ 样本级并行训练完成", flush=True)
