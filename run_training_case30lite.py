@@ -39,6 +39,34 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--sample-workers", type=int, default=N_WORKERS_SAMPLE)
     p.add_argument("--unit-ids", type=str, default=None,
                    help="Comma-separated unit ids to train, e.g. '1' or '0,2'.")
+    p.add_argument(
+        "--no-unit-predictor",
+        action="store_true",
+        help="Disable unit commitment predictor (no warm-start heuristic in subproblem/BCD).",
+    )
+    p.add_argument(
+        "--vanilla-subproblem",
+        action="store_true",
+        help=(
+            "Disable common subproblem-side heuristics: μ dual floor schedule, predictor "
+            "warmup rounds, surrogate δ reference lift, delayed c_pg branch start, "
+            "sign4 delay/curriculum; also clear BCD-side predictor warmup / theta delay."
+        ),
+    )
+    p.add_argument(
+        "--nn-no-direct",
+        action="store_true",
+        help=(
+            "Set subproblem main + c_pg direct-target pretrain epochs to 0 "
+            "(no direct-NN warm-start; BCD inner NN epochs unchanged)."
+        ),
+    )
+    p.add_argument(
+        "--metrics-tag",
+        type=str,
+        default=None,
+        help="Optional tag: result/training_metrics_<case>_<tag>_<timestamp>.json (e.g. control).",
+    )
     return p.parse_args()
 
 
@@ -109,14 +137,41 @@ def main() -> None:
 
     _configure_iterations(args.bcd_iter, args.sub_iter)
 
+    if args.no_unit_predictor:
+        rt.USE_UNIT_PREDICTOR = False
+        rt.BCD_USE_UNIT_PREDICTOR = False
+    if args.vanilla_subproblem:
+        rt.SUBPROBLEM_PREDICTOR_WARMUP_ROUNDS = 0
+        rt.SUBPROBLEM_MU_DUAL_FLOOR_INIT = 0.0
+        rt.SUBPROBLEM_MU_DUAL_FLOOR_INDIVIDUAL_ROUND = 0
+        rt.SUBPROBLEM_MU_DUAL_FLOOR_DECAY_ROUND = 0
+        rt.SUBPROBLEM_PG_COST_START_ROUND = 0
+        rt.SUBPROBLEM_SURROGATE_DELTA_REFERENCE_LIFT = False
+        rt.SUBPROBLEM_SIGN4_CURRICULUM_ROUNDS = 0
+        rt.SUBPROBLEM_SIGN4_DELAY_ROUNDS = 0
+        rt.SUBPROBLEM_SIGN4_INITIAL_SCALE = 1.0
+        rt.SUBPROBLEM_SIGN4_FINAL_SCALE = 1.0
+        rt.BCD_THETA_CONSTRAINT_DELAY_ROUNDS = 0
+        rt.BCD_UNIT_PREDICTOR_WARMUP_ROUNDS = 0
+
+    if args.nn_no_direct:
+        rt.SUBPROBLEM_MAIN_DIRECT_EPOCHS = 0
+        rt.SUBPROBLEM_C_PG_DIRECT_EPOCHS = 0
+
+    rt.METRICS_NAME_TAG = (args.metrics_tag or "").strip()
+
     print("=" * 72, flush=True)
     print(
         f"case30lite training | target={rt.MODE} | max_samples={rt.MAX_SAMPLES} | "
         f"bcd_iter={rt.BCD_MAX_ITER} | sub_iter={rt.SUBPROBLEM_MAX_ITER} | "
         f"units={rt.UNIT_IDS or 'all'} | "
+        f"no_unit_predictor={bool(args.no_unit_predictor)} | "
+        f"vanilla_subproblem={bool(args.vanilla_subproblem)} | "
+        f"nn_no_direct={bool(args.nn_no_direct)} | "
+        f"metrics_tag={rt.METRICS_NAME_TAG or '(none)'} | "
         f"active_sets={rt.ACTIVE_SETS_FILE or 'auto-latest'} | "
         f"resume_dir={rt.SURROGATE_MODEL_DIR or '(none)'} | "
-        f"skip_existing={rt.SURROGATE_SKIP_EXISTING_UNITS}",
+        f"skip_existing={rt.SURPROGATE_SKIP_EXISTING_UNITS}",
         flush=True,
     )
     print("=" * 72, flush=True)

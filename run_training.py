@@ -204,6 +204,8 @@ SURROGATE_CONTINUE_TRAINING = False
 SURROGATE_SKIP_EXISTING_UNITS = False
 # surrogate 模式：为 True 时只训练/微调 dual_predictor（写出 dual_predictor.pth），跳过各机组子问题代理
 SURROGATE_DUAL_PREDICTOR_ONLY = False
+# 若非空，则 metrics JSON 文件名为 training_metrics_<CASE_NAME>_<METRICS_NAME_TAG>_<timestamp>.json
+METRICS_NAME_TAG: str = ""
 SPARSE_TOP_K_VARIABLES = 20
 SPARSE_MAX_GROUPS = 5
 SPARSE_GROUP_SIZE = 3
@@ -3803,7 +3805,25 @@ def main():
 
     # ── 保存指标 & 生成图表 ────────────────────────────────
     figures_dir = Path(__file__).parent / 'result' / 'figures'
-    metrics_path = Path(__file__).parent / 'result' / f'training_metrics_{CASE_NAME}_{timestamp}.json'
+    _metrics_tag_raw = str(globals().get("METRICS_NAME_TAG", "") or "").strip()
+    if _metrics_tag_raw:
+        import re as _re_mtag
+        _metrics_tag_safe = _re_mtag.sub(r"\s+", "_", _metrics_tag_raw)
+        _metrics_tag_safe = _re_mtag.sub(r'[<>:"/\\|?*\x00-\x1f]', "", _metrics_tag_safe)[:80].strip(
+            "_"
+        )
+        if _metrics_tag_safe:
+            metrics_path = (
+                Path(__file__).parent
+                / "result"
+                / f"training_metrics_{CASE_NAME}_{_metrics_tag_safe}_{timestamp}.json"
+            )
+        else:
+            metrics_path = (
+                Path(__file__).parent / "result" / f"training_metrics_{CASE_NAME}_{timestamp}.json"
+            )
+    else:
+        metrics_path = Path(__file__).parent / "result" / f"training_metrics_{CASE_NAME}_{timestamp}.json"
     try:
         logger.save(metrics_path)
         log(f"训练指标已保存: {metrics_path}")
