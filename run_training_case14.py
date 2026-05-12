@@ -54,7 +54,8 @@ def _parse_args() -> argparse.Namespace:
         help=(
             "Disable common subproblem-side heuristics: μ dual floor schedule, predictor "
             "warmup rounds, surrogate δ reference lift, delayed c_pg branch start, "
-            "sign4 delay/curriculum; also clear BCD-side predictor warmup / theta delay."
+            "sign4 delay/curriculum; also clear BCD-side predictor warmup / theta delay; "
+            "sets c_pg NN epochs to 4 unless --pg-cost-nn-epochs is given."
         ),
     )
     p.add_argument(
@@ -70,6 +71,15 @@ def _parse_args() -> argparse.Namespace:
         type=str,
         default=None,
         help="Optional tag: result/training_metrics_<case>_<tag>_<timestamp>.json (e.g. control).",
+    )
+    p.add_argument(
+        "--pg-cost-nn-epochs",
+        type=int,
+        default=None,
+        help=(
+            "Subproblem c_pg branch NN epochs per BCD iteration "
+            "(default: 4 when --vanilla-subproblem, else run_training default e.g. 64)."
+        ),
     )
     return p.parse_args()
 
@@ -157,6 +167,10 @@ def main() -> None:
         rt.SUBPROBLEM_SIGN4_FINAL_SCALE = 1.0
         rt.BCD_THETA_CONSTRAINT_DELAY_ROUNDS = 0
         rt.BCD_UNIT_PREDICTOR_WARMUP_ROUNDS = 0
+        rt.SUBPROBLEM_PG_COST_NN_EPOCHS = 4
+
+    if args.pg_cost_nn_epochs is not None:
+        rt.SUBPROBLEM_PG_COST_NN_EPOCHS = max(0, int(args.pg_cost_nn_epochs))
 
     if args.nn_no_direct:
         rt.SUBPROBLEM_MAIN_DIRECT_EPOCHS = 0
@@ -172,6 +186,7 @@ def main() -> None:
         f"no_unit_predictor={bool(args.no_unit_predictor)} | "
         f"vanilla_subproblem={bool(args.vanilla_subproblem)} | "
         f"nn_no_direct={bool(args.nn_no_direct)} | "
+        f"pg_cost_nn_epochs={rt.SUBPROBLEM_PG_COST_NN_EPOCHS} | "
         f"metrics_tag={rt.METRICS_NAME_TAG or '(none)'} | "
         f"active_sets={rt.ACTIVE_SETS_FILE or 'auto-latest'} | "
         f"resume_dir={rt.SURROGATE_MODEL_DIR or '(none)'} | "
