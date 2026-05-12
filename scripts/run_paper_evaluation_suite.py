@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """Run and collect the paper evaluation suite.
 
-This script orchestrates the three recommended tests for case14, case30lite,
+This script orchestrates the recommended tests for case14, case30lite,
 and case3lite:
 
   A. Surrogate-only
   B. BCD + surrogate
-  C. BCD + surrogate + feasibility pump
+
+Test C (BCD + surrogate + feasibility pump) is opt-in via --with-fp.
 
 For each run it copies the overwritten run_test outputs into a stable
 experiment directory, then builds consolidated CSV files and a few paper-ready
@@ -18,6 +19,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -85,7 +87,12 @@ CASES: tuple[CaseConfig, ...] = (
 )
 
 
-def _run_specs(selected_cases: set[str] | None, selected_tests: set[str] | None) -> list[RunSpec]:
+def _run_specs(
+    selected_cases: set[str] | None,
+    selected_tests: set[str] | None,
+    *,
+    with_fp: bool,
+) -> list[RunSpec]:
     specs: list[RunSpec] = []
     for case in CASES:
         if selected_cases and case.name not in selected_cases:
@@ -95,6 +102,8 @@ def _run_specs(selected_cases: set[str] | None, selected_tests: set[str] | None)
             RunSpec("B_bcd_surrogate", case, "bcd_surrogate", "both", False),
             RunSpec("C_bcd_surrogate_fp", case, "bcd_surrogate_fp", "both", True),
         ]
+        if not with_fp:
+            candidates = [c for c in candidates if not c.run_fp]
         for spec in candidates:
             test_key = spec.run_id.split("_", 1)[0].lower()
             if selected_tests and test_key not in selected_tests:
@@ -237,18 +246,33 @@ def _safe_int(value) -> int | None:
         return None
 
 
+def _lookup_lp_metric_block(lp_summary: dict, *keys: str) -> dict:
+    """Resolve lp_compare_summary block; supports legacy *_proxy_lp keys."""
+    for key in keys:
+        block = lp_summary.get(key)
+        if isinstance(block, dict):
+            return block
+    return {}
+
+
 def _add_lp_summary_rows(report: dict, spec: RunSpec, rows: list[dict]) -> None:
     lp_summary = report.get("lp_compare_summary") or {}
     n_units = _safe_int(report.get("n_units"))
     horizon = _safe_int(report.get("T"))
     denom = (n_units or 0) * (horizon or 0)
-    for method_key, method_name in (
-        ("global_base_lp", "lp_relaxation"),
-        ("global_subproblem_proxy_lp", "surrogate_lp_summary"),
-        ("global_all_proxy_lp", "all_proxy_lp_summary"),
-        ("unit_subproblem_lp", "unit_subproblem_lp_summary"),
+    for method_keys, method_name in (
+        (("global_base_lp",), "lp_relaxation"),
+        (
+            ("global_subproblem_surrogate_lp", "global_subproblem_proxy_lp"),
+            "surrogate_lp_summary",
+        ),
+        (
+            ("global_all_surrogate_lp", "global_all_proxy_lp"),
+            "all_surrogate_lp_summary",
+        ),
+        (("unit_subproblem_lp",), "unit_subproblem_lp_summary"),
     ):
-        item = lp_summary.get(method_key) or {}
+        item = _lookup_lp_metric_block(lp_summary, *method_keys)
         hamming = _safe_float(item.get("mean_hamming"))
         rows.append(
             {
@@ -353,6 +377,15 @@ def _collect_run_outputs(
     return enriched, summary, report_path
 
 
+def _boxplot_compatible(ax, data: list, tick_labels_: list[str]) -> None:
+    """Matplotlib 3.9+ uses tick_labels=; older versions use labels=."""
+    kwargs = dict(showfliers=False, patch_artist=True)
+    try:
+        ax.boxplot(data, tick_labels=tick_labels_, **kwargs)
+    except TypeError:
+        ax.boxplot(data, labels=tick_labels_, **kwargs)
+
+
 def _plot_metric_boxplots(sample_rows: list[dict], output_dir: Path) -> None:
     plot_dir = output_dir / "figures"
     plot_dir.mkdir(parents=True, exist_ok=True)
@@ -386,7 +419,7 @@ def _plot_metric_boxplots(sample_rows: list[dict], output_dir: Path) -> None:
                     data.append(vals)
                     labels.append(method_labels[method])
             if data:
-                ax.boxplot(data, labels=labels, showfliers=False, patch_artist=True)
+                _boxplot_compatible(ax, data, labels)
                 for idx, vals in enumerate(data, start=1):
                     x = np.full(len(vals), idx, dtype=float)
                     jitter = np.linspace(-0.08, 0.08, len(vals)) if len(vals) > 1 else np.array([0.0])
@@ -415,7 +448,8 @@ def run_suite(args: argparse.Namespace) -> None:
 
     selected_cases = set(args.cases.split(",")) if args.cases else None
     selected_tests = set(args.tests.lower().split(",")) if args.tests else None
-    specs = _run_specs(selected_cases, selected_tests)
+    with_fp = bool(args.with_fp) or ("c" in (selected_tests or set()))
+    specs = _run_specs(selected_cases, selected_tests, with_fp=with_fp)
     if not specs:
         raise SystemExit("No run specs selected.")
 
@@ -435,10 +469,15 @@ def run_suite(args: argparse.Namespace) -> None:
             continue
 
         started_at = datetime.now().timestamp()
+        child_env = os.environ.copy()
+        child_env.setdefault("PYTHONIOENCODING", "utf-8")
         proc = subprocess.run(
             cmd,
             cwd=ROOT,
+            env=child_env,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             check=False,
@@ -496,6 +535,7 @@ def run_suite(args: argparse.Namespace) -> None:
         "output_dir": str(output_dir),
         "with_activity": bool(args.with_activity),
         "runs": [summary for summary in run_summaries],
+        "with_fp": bool(with_fp),
     }
     (output_dir / "manifest.json").write_text(
         json.dumps(manifest, ensure_ascii=False, indent=2),
@@ -515,6 +555,11 @@ def main() -> None:
     parser.add_argument("--tests", default=None, help="Comma-separated test filter: a,b,c.")
     parser.add_argument("--with-activity", action="store_true", help="Do not pass --skip-activity to case runners.")
     parser.add_argument("--dry-run", action="store_true", help="Print commands without running them.")
+    parser.add_argument(
+        "--with-fp",
+        action="store_true",
+        help="Run test C (BCD+surrogate+feasibility pump). Implied when --tests includes c.",
+    )
     args = parser.parse_args()
     run_suite(args)
 

@@ -296,15 +296,26 @@ def _write_run_test_report(report_dir: Path, report: dict) -> Path | None:
             lines.extend(["", "## LP Compare", ""])
             lines.append(f"- bcd_proxy_scope: {lp_summary.get('bcd_proxy_scope')}")
             lines.append(f"- surrogate_constraint_scope: {lp_summary.get('surrogate_constraint_scope')}")
-            for key in (
-                "global_base_lp",
-                "global_all_proxy_lp",
-                "global_subproblem_proxy_lp",
-                "unit_subproblem_lp",
-            ):
-                item = lp_summary.get(key) or {}
+            lp_compare_md_blocks = (
+                ("global_base_lp", ("global_base_lp",)),
+                ("global_all_surrogate_lp", ("global_all_surrogate_lp", "global_all_proxy_lp")),
+                (
+                    "global_subproblem_surrogate_lp",
+                    ("global_subproblem_surrogate_lp", "global_subproblem_proxy_lp"),
+                ),
+                ("unit_subproblem_lp", ("unit_subproblem_lp",)),
+            )
+            for display_key, aliases in lp_compare_md_blocks:
+                item: dict = {}
+                for ak in aliases:
+                    cand = lp_summary.get(ak)
+                    if isinstance(cand, dict) and cand:
+                        item = cand
+                        break
+                if not item:
+                    item = lp_summary.get(display_key) or {}
                 lines.append(
-                    f"- {key}: mean_l1={item.get('mean_l1')}, "
+                    f"- {display_key}: mean_l1={item.get('mean_l1')}, "
                     f"mean_hamming={item.get('mean_hamming')}, "
                     f"mean_integrality_gap={item.get('mean_integrality_gap')}"
                 )
@@ -2137,10 +2148,13 @@ def run_lp_compare_test(ppc, all_samples: list, dual_predictor, trainers: dict,
         raise ValueError(f"Unsupported bcd_proxy_scope={bcd_proxy_scope!r}")
     bcd_scope_label = "none" if agent is None else bcd_proxy_scope
     log(
-        "LP compare types: global_base_lp=no proxy; "
-        f"global_all_proxy_lp=subproblem scope={surrogate_constraint_scope} + BCD scope={bcd_scope_label}"
+        "LP compare types: global_base_lp=no surrogate constraints; "
+        f"global_all_surrogate_lp=subproblem scope={surrogate_constraint_scope} + BCD scope={bcd_scope_label}"
     )
-    log("LP compare types: unit_subproblem_lp=independent unit subproblems; global_subproblem_proxy_lp=global LP with subproblem proxy only")
+    log(
+        "LP compare types: unit_subproblem_lp=independent unit subproblems; "
+        "global_subproblem_surrogate_lp=global LP with subproblem surrogates only"
+    )
     x_LP_plain_list, x_LP_surr_list, x_true_list = [], [], []
     x_LP_subproblem_proxy_list, x_subproblem_lp_list = [], []
     global_surr_stats_rows: list[dict] = []
@@ -2196,13 +2210,13 @@ def run_lp_compare_test(ppc, all_samples: list, dual_predictor, trainers: dict,
         )
 
         plain_metrics = _compute_commitment_distance_metrics_with_mask(x_lp_plain, x_true)
-        all_proxy_metrics = _compute_commitment_distance_metrics_with_mask(x_lp_surr, x_true)
+        joint_surrogate_lp_metrics = _compute_commitment_distance_metrics_with_mask(x_lp_surr, x_true)
         unit_subproblem_metrics = _compute_commitment_distance_metrics_with_mask(x_sub, x_true)
-        subproblem_proxy_metrics = _compute_commitment_distance_metrics_with_mask(x_lp_subproblem_proxy, x_true)
+        subproblem_surrogate_metrics = _compute_commitment_distance_metrics_with_mask(x_lp_subproblem_proxy, x_true)
         hamming_plain = plain_metrics["hamming"]
-        hamming_surr = all_proxy_metrics["hamming"]
-        l1_surr = all_proxy_metrics["l1"]
-        integ_surr = all_proxy_metrics["integrality_gap"]
+        hamming_surr = joint_surrogate_lp_metrics["hamming"]
+        l1_surr = joint_surrogate_lp_metrics["l1"]
+        integ_surr = joint_surrogate_lp_metrics["integrality_gap"]
         stats_row = dict(solve_stats or {})
         activity_rows = list(stats_row.pop("main_constraint_activity_rows", []) or [])
         for activity_row in activity_rows:
@@ -2214,7 +2228,7 @@ def run_lp_compare_test(ppc, all_samples: list, dual_predictor, trainers: dict,
         stats_row.pop("all_stage_attempts", None)
         stats_row.update({
             "sample_index": int(i),
-            "solve_type": "global_all_proxy_lp",
+            "solve_type": "global_all_surrogate_lp",
             "global_base_l1_to_true": float(plain_metrics["l1"]),
             "global_base_hamming_to_true": hamming_plain,
             "global_base_integrality_gap": float(plain_metrics["integrality_gap"]),
@@ -2225,11 +2239,11 @@ def run_lp_compare_test(ppc, all_samples: list, dual_predictor, trainers: dict,
             "unit_subproblem_hamming_to_true": unit_subproblem_metrics["hamming"],
             "unit_subproblem_integrality_gap": float(unit_subproblem_metrics["integrality_gap"]),
             "unit_subproblem_coverage_ratio": float(unit_subproblem_metrics["coverage_ratio"]),
-            "global_subproblem_proxy_l1_to_true": float(subproblem_proxy_metrics["l1"]),
-            "global_subproblem_proxy_hamming_to_true": subproblem_proxy_metrics["hamming"],
-            "global_subproblem_proxy_integrality_gap": float(subproblem_proxy_metrics["integrality_gap"]),
-            "global_subproblem_proxy_stage_name": (subproblem_proxy_stats or {}).get("stage_name"),
-            "global_subproblem_proxy_runtime_sec": (subproblem_proxy_stats or {}).get("runtime_sec"),
+            "global_subproblem_surrogate_l1_to_true": float(subproblem_surrogate_metrics["l1"]),
+            "global_subproblem_surrogate_hamming_to_true": subproblem_surrogate_metrics["hamming"],
+            "global_subproblem_surrogate_integrality_gap": float(subproblem_surrogate_metrics["integrality_gap"]),
+            "global_subproblem_surrogate_stage_name": (subproblem_proxy_stats or {}).get("stage_name"),
+            "global_subproblem_surrogate_runtime_sec": (subproblem_proxy_stats or {}).get("runtime_sec"),
         })
         global_surr_stats_rows.append(stats_row)
         log(
@@ -2237,9 +2251,9 @@ def run_lp_compare_test(ppc, all_samples: list, dual_predictor, trainers: dict,
             + " | ".join(
                 [
                     _fmt_lp_metric("global_base_lp", plain_metrics),
-                    _fmt_lp_metric("global_all_proxy_lp", all_proxy_metrics),
+                    _fmt_lp_metric("global_all_surrogate_lp", joint_surrogate_lp_metrics),
                     _fmt_lp_metric("unit_subproblem_lp", unit_subproblem_metrics),
-                    _fmt_lp_metric("global_subproblem_proxy_lp", subproblem_proxy_metrics),
+                    _fmt_lp_metric("global_subproblem_surrogate_lp", subproblem_surrogate_metrics),
                     f"stage={stats_row.get('stage_name', 'n/a')}",
                 ]
             )
@@ -2262,18 +2276,18 @@ def run_lp_compare_test(ppc, all_samples: list, dual_predictor, trainers: dict,
         _log_solution_similarity_summary(
             "Standard LP",
             x_LP_plain_list,
-            "Global all-proxy LP",
+            "Global all-surrogate LP",
             x_LP_surr_list,
         )
         if agent is not None:
             _log_solution_similarity_summary(
-                "Global all-proxy LP",
+                "Global all-surrogate LP",
                 x_LP_surr_list,
-                "Global subproblem-proxy LP",
+                "Global subproblem-surrogate LP",
                 x_LP_subproblem_proxy_list,
             )
         _log_solution_similarity_summary(
-            "Global subproblem-proxy LP",
+            "Global subproblem-surrogate LP",
             x_LP_subproblem_proxy_list,
             "Unit subproblem LP",
             x_subproblem_lp_list,
@@ -2303,20 +2317,20 @@ def run_lp_compare_test(ppc, all_samples: list, dual_predictor, trainers: dict,
         "bcd_proxy_scope": str(bcd_proxy_scope),
         "surrogate_constraint_scope": str(surrogate_constraint_scope),
         "global_base_lp": _metric_summary("global_base"),
-        "global_all_proxy_lp": {
+        "global_all_surrogate_lp": {
             "mean_l1": _mean_or_none(row.get("l1_to_true") for row in global_surr_stats_rows),
             "mean_hamming": _mean_or_none(row.get("hamming_to_true") for row in global_surr_stats_rows),
             "mean_integrality_gap": _mean_or_none(row.get("integrality_gap") for row in global_surr_stats_rows),
         },
         "unit_subproblem_lp": _metric_summary("unit_subproblem"),
-        "global_subproblem_proxy_lp": _metric_summary("global_subproblem_proxy"),
+        "global_subproblem_surrogate_lp": _metric_summary("global_subproblem_surrogate"),
         "similarity": {
-            "global_base_vs_global_all_proxy": _solution_similarity_dict(x_LP_plain_list, x_LP_surr_list),
-            "global_all_proxy_vs_global_subproblem_proxy": _solution_similarity_dict(
+            "global_base_vs_global_all_surrogate": _solution_similarity_dict(x_LP_plain_list, x_LP_surr_list),
+            "global_all_surrogate_vs_global_subproblem_surrogate": _solution_similarity_dict(
                 x_LP_surr_list,
                 x_LP_subproblem_proxy_list,
             ),
-            "global_subproblem_proxy_vs_unit_subproblem": _solution_similarity_dict(
+            "global_subproblem_surrogate_vs_unit_subproblem": _solution_similarity_dict(
                 x_LP_subproblem_proxy_list,
                 x_subproblem_lp_list,
             ),
@@ -3397,8 +3411,8 @@ def analyse_lp_distance(agent, test_n: int, fig_dir: Path,
     bcd_proxy_scope = str(bcd_proxy_scope or "both").strip().lower()
     if bcd_proxy_scope not in {"both", "theta", "zeta", "none"}:
         raise ValueError(f"Unsupported bcd_proxy_scope={bcd_proxy_scope!r}")
-    comparison_name = "Global all-proxy LP" if use_joint_surrogate else f"BCD scope={bcd_proxy_scope} LP"
-    comparison_short = "global_all_proxy" if use_joint_surrogate else f"bcd_{bcd_proxy_scope}"
+    comparison_name = "Global all-surrogate LP" if use_joint_surrogate else f"BCD scope={bcd_proxy_scope} LP"
+    comparison_short = "global_all_surrogate" if use_joint_surrogate else f"bcd_{bcd_proxy_scope}"
     comparison_file_tag = "surrogate" if use_joint_surrogate else "bcd"
     log(
         "distance types: global_base_lp=Agent LP without theta/zeta; "
