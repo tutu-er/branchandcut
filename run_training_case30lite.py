@@ -171,7 +171,7 @@ def main() -> None:
         f"metrics_tag={rt.METRICS_NAME_TAG or '(none)'} | "
         f"active_sets={rt.ACTIVE_SETS_FILE or 'auto-latest'} | "
         f"resume_dir={rt.SURROGATE_MODEL_DIR or '(none)'} | "
-        f"skip_existing={rt.SURPROGATE_SKIP_EXISTING_UNITS}",
+        f"skip_existing={rt.SURROGATE_SKIP_EXISTING_UNITS}",
         flush=True,
     )
     print("=" * 72, flush=True)
