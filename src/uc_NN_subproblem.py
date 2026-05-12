@@ -7895,6 +7895,12 @@ class SubproblemSurrogateTrainer:
         try:
             for sample_id in range(self.n_samples):
                 features = np.asarray(self._extract_features(sample_id), dtype=np.float64).reshape(-1)
+                lam_raw = self.lambda_vals[sample_id] if self.lambda_vals is not None else None
+                lam_list = (
+                    None
+                    if lam_raw is None
+                    else np.asarray(lam_raw, dtype=float).reshape(-1).tolist()
+                )
                 li = self.lambda_inherent[sample_id]
                 li_cpg = None
                 pg_const_t = self._pg_stationarity_const_np(sample_id).astype(float).tolist()
@@ -7928,7 +7934,7 @@ class SubproblemSurrogateTrainer:
                     {
                         "sample_id": int(sample_id),
                         "features": features.astype(float).tolist(),
-                        "lambda_vals": lam.astype(float).tolist(),
+                        "lambda_vals": lam_list,
                         "lambda_inherent_is_none": li is None,
                         "lambda_inherent_c_pg": li_cpg,
                         "pg_const_per_t": pg_const_t,
