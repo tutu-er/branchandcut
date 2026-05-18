@@ -19,10 +19,19 @@ def _load_json(path: Path) -> dict:
 
 
 def _pick_metric_sections(metrics: dict) -> dict[str, list[dict]]:
+    """顶层 list[dict] 与一层嵌套（如 surrogate/机组编号）均可识别。"""
     sections: dict[str, list[dict]] = {}
     for name, value in metrics.items():
         if isinstance(value, list) and value and isinstance(value[0], dict):
             sections[name] = value
+        elif isinstance(value, dict):
+            for subname, subvalue in value.items():
+                if (
+                    isinstance(subvalue, list)
+                    and subvalue
+                    and isinstance(subvalue[0], dict)
+                ):
+                    sections[f"{name}/{subname}"] = subvalue
     return sections
 
 

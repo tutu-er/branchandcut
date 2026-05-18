@@ -36,6 +36,7 @@ dummy_subproblem_mod.SubproblemSurrogateTrainer = object
 dummy_subproblem_mod.CONSTRAINT_STRATEGY_ALL = 'all'
 dummy_subproblem_mod.CONSTRAINT_STRATEGY_ALL_SINGLE_TIME = 'all_single_time'
 dummy_subproblem_mod.CONSTRAINT_STRATEGY_ALL_TEMPLATES_SIGN4 = 'all_templates_sign4'
+dummy_subproblem_mod.CONSTRAINT_STRATEGY_ALL_TEMPLATES_SIGN4_PLUS_SINGLE = 'all_templates_sign4_plus_single'
 dummy_subproblem_mod.SURROGATE_SINGLE_TIME_OFFSETS = (0,)
 dummy_subproblem_mod.SURROGATE_TRIPLE_WINDOW_OFFSETS = (0, 1, 2)
 dummy_subproblem_mod.normalize_constraint_generation_strategy = (
@@ -56,6 +57,22 @@ def _resolve_constraint_offsets_from_trainer(trainer, sample_id, n_constraints):
     default = (0,) if getattr(trainer, 'constraint_generation_strategy', '') == 'all_single_time' else (0, 1, 2)
     return [default] * n_constraints
 dummy_subproblem_mod.resolve_constraint_offsets_from_trainer = _resolve_constraint_offsets_from_trainer
+def _select_constraint_layout(x_row, strategy='sensitive', max_constraints=None, **kwargs):
+    horizon = len(x_row)
+    if strategy == 'all_single_time':
+        timesteps = list(range(horizon))
+        offsets = [(0,)] * horizon
+    elif strategy == 'all_templates_sign4':
+        timesteps = [t for t in range(max(horizon - 2, 0)) for _ in range(4)]
+        offsets = [(0, 1, 2)] * len(timesteps)
+    else:
+        timesteps = list(range(max(horizon - 2, 0)))
+        offsets = [(0, 1, 2)] * len(timesteps)
+    if max_constraints is not None:
+        timesteps = timesteps[:max_constraints]
+        offsets = offsets[:max_constraints]
+    return timesteps, offsets
+dummy_subproblem_mod.select_constraint_layout = _select_constraint_layout
 def _build_surrogate_constraint_expression(x_values, timestep, offsets, alpha_value, beta_value, gamma_value, horizon):
     expr = 0.0
     if 0 in offsets and 0 <= timestep < horizon:
@@ -333,6 +350,70 @@ def test_collect_integer_solutions_returns_subproblem_milp_candidates(monkeypatc
         details['x_init_k_m_milp'],
         np.array([[[1, 1, 0]], [[1, 1, 0]]], dtype=int),
     )
+
+
+def test_collect_integer_solutions_forwards_sign4_scope(monkeypatch):
+    active_set_data = [
+        {
+            'load_data': np.full((2, 3), 10.0),
+            'renewable_data': np.zeros((2, 3)),
+            'sample_id': 0,
+        },
+    ]
+    trainers = {
+        0: _DummyTrainer(
+            0,
+            active_set_data,
+            horizon=3,
+            constraint_generation_strategy='all_templates_sign4',
+        ),
+    }
+    scopes = []
+
+    def _fake_unit_lp(
+        _trainer,
+        _lambda_val,
+        alphas,
+        betas,
+        gammas,
+        deltas,
+        costs=None,
+        pg_costs=None,
+        scenario_sample=None,
+        surrogate_constraint_scope='all',
+    ):
+        scopes.append(surrogate_constraint_scope)
+        return np.array([0.9, 0.1, 0.9], dtype=float), 2, {'status_name': 'OPTIMAL'}
+
+    monkeypatch.setattr(fp, '_solve_unit_LP_with_surrogate', _fake_unit_lp)
+
+    _x_surr_lp, _x_init_k, _x_init_k_m, details = fp.collect_integer_solutions(
+        pd_data=active_set_data[0],
+        lambda_val=np.array([1.0, 1.0, 1.0], dtype=float),
+        trainers=trainers,
+        n_perturbations=1,
+        n_similar_scenarios=0,
+        n_load_perturbations=0,
+        rng=np.random.default_rng(13),
+        surrogate_constraint_scope='sign4',
+        return_details=True,
+    )
+
+    assert scopes == ['sign4', 'sign4']
+    assert details['surrogate_constraint_scope'] == 'sign4'
+
+
+def test_surrogate_constraint_scope_none_disables_subproblem_rows():
+    trainer = _DummyTrainer(
+        0,
+        [{'load_data': np.ones((2, 3)), 'renewable_data': np.zeros((2, 3))}],
+        horizon=3,
+        constraint_generation_strategy='all_templates_sign4',
+    )
+
+    assert fp._normalize_surrogate_constraint_scope('no-subproblem-surrogate') == 'none'
+    assert fp._allow_surrogate_constraint_by_scope(trainer, 0, 'none') is False
+    assert fp._allow_surrogate_constraint_by_scope(trainer, 1, 'none') is False
 
 
 def test_select_pool_restart_candidate_prefers_free_variable_difference():

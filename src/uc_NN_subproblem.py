@@ -16,7 +16,7 @@ import json
 import copy
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 import warnings
 
 import os
@@ -8865,6 +8865,91 @@ def train_complete_model(ppc, active_set_data: List[Dict], T_delta: float = 1.0,
     return dual_predictor, trainers
 
 
+def _peek_dual_checkpoint(dual_path: str) -> tuple[Dict[str, Any], bool, Optional[BaseException]]:
+    """尝试读取 dual checkpoint dict；文件不存在或不可用则 ok=False。"""
+    if not os.path.exists(dual_path):
+        return {}, False, None
+    if not TORCH_AVAILABLE:
+        return {}, False, None
+    try:
+        try:
+            raw_ckpt = torch.load(dual_path, map_location="cpu", weights_only=False)
+        except TypeError:
+            raw_ckpt = torch.load(dual_path, map_location="cpu")
+        if not isinstance(raw_ckpt, dict):
+            raise ValueError(f"checkpoint root is {type(raw_ckpt)!r}, expected dict")
+        return raw_ckpt, True, None
+    except Exception as exc:
+        return {}, False, exc
+
+
+def _env_dual_predictor_fallback_file() -> Optional[str]:
+    """
+    环境变量 RUN_TEST_DUAL_PREDICTOR_FALLBACK：
+    指向可用的 dual_predictor.pth 文件，或其所在目录（自动拼 dual_predictor.pth）。
+    """
+    raw = str(os.environ.get("RUN_TEST_DUAL_PREDICTOR_FALLBACK", "") or "").strip()
+    if not raw:
+        return None
+    p = Path(raw)
+    if not p.is_absolute():
+        p = (Path(__file__).resolve().parent.parent / p).resolve()
+    else:
+        p = p.resolve()
+    if p.is_file():
+        return str(p)
+    if p.is_dir():
+        fp = p / "dual_predictor.pth"
+        return str(fp) if fp.is_file() else None
+    return None
+
+
+def _auto_fallback_main_dual_path(load_dir: str) -> Optional[str]:
+    """
+    若当前目录名为 ..._control_...，在同级目录中寻找「同算例、非 control」的
+    subproblem_models_*（取 mtime 最新且含 dual_predictor.pth），用于回退加载对偶网络。
+    """
+    import re
+
+    ld = Path(str(load_dir)).resolve()
+    if not ld.is_dir():
+        return None
+    parent = ld.parent
+    m = re.match(
+        r"^subproblem_models_(case\d+(?:lite(?:_perturbed)?)?)_(.+)$",
+        ld.name,
+        re.IGNORECASE,
+    )
+    if not m:
+        return None
+    case_tok = m.group(1)
+    rest = m.group(2)
+    if not str(rest).lower().startswith("control_"):
+        return None
+    prefix = f"subproblem_models_{case_tok}_"
+    best: Optional[Path] = None
+    best_mtime = -1.0
+    for ch in parent.iterdir():
+        if not ch.is_dir() or ch.resolve() == ld:
+            continue
+        if not ch.name.startswith(prefix):
+            continue
+        suffix = ch.name[len(prefix) :]
+        if str(suffix).lower().startswith("control_"):
+            continue
+        dual_fp = ch / "dual_predictor.pth"
+        if not dual_fp.is_file():
+            continue
+        try:
+            mt = ch.stat().st_mtime
+        except OSError:
+            continue
+        if mt > best_mtime:
+            best_mtime = mt
+            best = dual_fp
+    return str(best) if best is not None else None
+
+
 def load_trained_models(ppc, active_set_data: List[Dict], T_delta: float,
                          load_dir: str, unit_ids: List[int] = None,
                          lp_backend: str | None = None,
@@ -8908,17 +8993,32 @@ def load_trained_models(ppc, active_set_data: List[Dict], T_delta: float,
     
     print(f"从 {load_dir} 加载模型...", flush=True)
     
-    # 加载对偶预测器（预读 checkpoint 以对齐网络结构与标准化参数）
-    dual_path = os.path.join(load_dir, 'dual_predictor.pth')
-    peek: dict = {}
-    if os.path.exists(dual_path) and TORCH_AVAILABLE:
-        try:
-            try:
-                peek = torch.load(dual_path, map_location='cpu', weights_only=False)
-            except TypeError:
-                peek = torch.load(dual_path, map_location='cpu')
-        except Exception as exc:
-            print(f"警告: 预读 dual_predictor.pth 失败: {exc}", flush=True)
+    # 加载对偶预测器：当前目录 dual_predictor.pth 损坏时，可回退到环境变量或同级「本文」训练目录
+    dual_path_primary = os.path.join(load_dir, 'dual_predictor.pth')
+    peek, dual_ckpt_ok, dual_ckpt_error = _peek_dual_checkpoint(dual_path_primary)
+    dual_load_path: Optional[str] = dual_path_primary if dual_ckpt_ok else None
+
+    if os.path.exists(dual_path_primary) and TORCH_AVAILABLE and not dual_ckpt_ok:
+        print(f"警告: 预读 dual_predictor.pth 失败: {dual_ckpt_error}", flush=True)
+
+    if not dual_ckpt_ok:
+        fb = _env_dual_predictor_fallback_file()
+        if fb is None:
+            fb = _auto_fallback_main_dual_path(load_dir)
+        if fb:
+            peek2, ok2, err2 = _peek_dual_checkpoint(fb)
+            if ok2:
+                peek = peek2
+                dual_ckpt_ok = True
+                dual_ckpt_error = None
+                dual_load_path = fb
+                print(
+                    f"提示: 已改用回退 dual_predictor（当前目录 checkpoint 不可用）: {fb}",
+                    flush=True,
+                )
+            elif err2:
+                print(f"警告: 回退路径 dual 仍无法读取: {fb} | {err2}", flush=True)
+
     dual_predictor = DualVariablePredictorTrainer(
         ppc,
         active_set_data,
@@ -8929,10 +9029,35 @@ def load_trained_models(ppc, active_set_data: List[Dict], T_delta: float,
         dual_cosine_loss_weight=float(peek.get('dual_cosine_loss_weight', 0.0)),
         dual_smooth_l1_beta=float(peek.get('dual_smooth_l1_beta', 1.0)),
     )
-    if os.path.exists(dual_path):
-        dual_predictor.load(dual_path)
-    else:
-        print(f"警告: 未找到对偶预测器模型 {dual_path}", flush=True)
+
+    if TORCH_AVAILABLE:
+        if dual_ckpt_ok and dual_load_path:
+            dual_predictor.load(dual_load_path)
+        elif os.path.exists(dual_path_primary) and not dual_ckpt_ok:
+            abs_dp = os.path.abspath(dual_path_primary)
+            size_hint = ""
+            try:
+                size_hint = f" 本地文件大小: {os.path.getsize(dual_path_primary)} bytes\n"
+            except OSError:
+                pass
+            msg = (
+                "dual_predictor.pth 损坏或未完成写入，且未找到可用的回退 dual（检查同级非-control "
+                "目录或环境变量 RUN_TEST_DUAL_PREDICTOR_FALLBACK）。\n"
+                + size_hint
+                + f"  路径: {abs_dp}\n"
+            )
+            if dual_ckpt_error is not None:
+                raise RuntimeError(msg) from dual_ckpt_error
+            raise RuntimeError(msg)
+        elif not os.path.exists(dual_path_primary) and not dual_ckpt_ok:
+            print(f"警告: 未找到对偶预测器模型 {dual_path_primary}", flush=True)
+    elif os.path.exists(dual_path_primary) and not TORCH_AVAILABLE:
+        print(
+            f"警告: 已存在 {dual_path_primary} 但当前不可用 PyTorch，跳过对偶权重加载",
+            flush=True,
+        )
+    elif not os.path.exists(dual_path_primary) and not dual_ckpt_ok:
+        print(f"警告: 未找到对偶预测器模型 {dual_path_primary}", flush=True)
     
     # 加载代理约束模型
     trainers = {}

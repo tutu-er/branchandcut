@@ -38,7 +38,7 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--unit-ids", type=str, default="all", help="'all' or comma-separated ids, e.g. 0,1,2")
     p.add_argument(
         "--surrogate-constraint-scope",
-        choices=("all", "sign4"),
+        choices=("all", "sign4", "none"),
         default="all",
         help="Which surrogate subproblem constraints to apply in LP tests.",
     )
@@ -46,6 +46,11 @@ def _parse_args() -> argparse.Namespace:
         "--surrogate-sign4-only",
         action="store_true",
         help="Shortcut for --surrogate-constraint-scope sign4.",
+    )
+    p.add_argument(
+        "--no-subproblem-surrogate",
+        action="store_true",
+        help="Shortcut for --surrogate-constraint-scope none.",
     )
     p.add_argument("--no-fp", action="store_true", help="Skip feasibility-pump testing.")
     p.add_argument("--disable-plots", action="store_true")
@@ -63,6 +68,8 @@ def main() -> None:
     args = _parse_args()
     if args.surrogate_sign4_only:
         args.surrogate_constraint_scope = "sign4"
+    if args.no_subproblem_surrogate:
+        args.surrogate_constraint_scope = "none"
 
     model_dir = Path(args.model_dir) if args.model_dir else _latest_path(
         ROOT / "result" / "surrogate_models",

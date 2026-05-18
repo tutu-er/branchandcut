@@ -73,7 +73,7 @@ MODE      = 'surrogate'
 RUN_FP    = True       # surrogate / both 模式：是否运行可行性泵测试
 CASE_NAME = 'case3lite'   # 'case3' / 'case3lite' / 'case14' / 'case30' / 'case30lite' / 'case30lite_perturbed' / 'case39' / 'case118'
 SURROGATE_CONSTRAINT_STRATEGY = 'auto'  # 'auto' / 'sensitive' / 'all' / 'all_templates_sign4' / 'all_single_time'
-SURROGATE_CONSTRAINT_SCOPE = "all"  # "all" or "sign4"
+SURROGATE_CONSTRAINT_SCOPE = os.environ.get("RUN_TEST_SURROGATE_CONSTRAINT_SCOPE", "all")  # "all", "sign4", or "none"
 SUBPROBLEM_IGNORE_STARTUP_SHUTDOWN_COSTS = False
 BCD_LAMBDA_INIT_STRATEGY = 'lp_relaxation'   # 'lp_relaxation' / 'ed_on_x_opt'
 THETA_HOT_START_STRATEGY = 'dcpf_relative'   # 'dcpf_relative' / 'gaussian'
@@ -102,11 +102,14 @@ UNIT_PREDICTOR_DIR = None
 # 设为 None 则自动查找 result/bcd_models/ 下最新的匹配文件
 # 环境变量 RUN_TEST_BCD_MODEL_PATH 可覆盖本常量
 BCD_MODEL_PATH = None
-BCD_PROXY_SCOPE = "both"  # "both", "theta", "zeta", or "none"
+BCD_PROXY_SCOPE = os.environ.get("RUN_TEST_BCD_PROXY_SCOPE", "both")  # "both", "theta", "zeta", or "none"
 
 # 绘图开关：在自动化评估（如 agentic_fp_optimizer）中建议禁用绘图以避免空数据导致的 matplotlib 崩溃
 # - 设环境变量 RUN_TEST_DISABLE_PLOTS=1 可跳过所有 plot_* 调用
 RUN_TEST_DISABLE_PLOTS = (os.environ.get("RUN_TEST_DISABLE_PLOTS", "").strip() not in ("", "0", "false", "False"))
+RUN_TEST_SKIP_ZETA_PLOTS = (
+    os.environ.get("RUN_TEST_SKIP_ZETA_PLOTS", "").strip() not in ("", "0", "false", "False")
+)
 
 
 def _auto_discover_model_path(directory, glob_pattern, label):
@@ -147,6 +150,10 @@ FP_SURROGATE_SCREEN_SOFT_PENALTY = 25.0
 FP_PROJECTION_OBJECTIVE_TAU = 'adaptive'
 USE_CASE3LITE_CUSTOM_FP = True
 CASE3LITE_CUSTOM_FP_MAX_GLOBAL_COMBINATIONS = 24
+CASE3LITE_CUSTOM_FP_MAX_EVALUATED_COMBINATIONS = 6
+CASE3LITE_CUSTOM_FP_EARLY_STOP_NO_IMPROVE = 3
+CASE3LITE_CUSTOM_FP_EARLY_STOP_MIN_WEIGHT = 0.01
+CASE3LITE_CUSTOM_FP_PLAIN_MAX_ITER = 8
 CASE3LITE_CUSTOM_FP_PLOT_DIR = 'result/figures_case3lite_custom_fp'
 USE_CASE118_CUSTOM_FP = True
 ACTIVE_SETS_FILE = 'result/active_set/active_sets_case3lite_T24_n1000_20260403_180137.json'  # 指定 active_sets JSON 文件路径（None=自动查找最新）
@@ -1183,6 +1190,56 @@ def plot_fp_screening_comparison(screening_records: list, fig_dir: Path, case_na
     _save_fig(fig, fig_dir / f'{case_name}_fp_screening_comparison', 'FP 筛选对比')
 
 
+def plot_fp_iteration_traces(trace_records: list, fig_dir: Path, case_name: str) -> None:
+    """Plot FP iteration traces collected from recover_integer_solution details."""
+    if not MPL_AVAILABLE or not trace_records:
+        return
+
+    _apply_style()
+    traces_by_label: dict[str, list[dict]] = {}
+    for row in trace_records:
+        label = str(row.get('hot_start_name', 'unknown'))
+        traces_by_label.setdefault(label, []).append(row)
+
+    fig, axes = plt.subplots(3, 1, figsize=(10, 8), sharex=True)
+    fig.suptitle(
+        f'FP Iteration Traces by Hot Start  [{case_name}]',
+        fontsize=12, fontweight='bold',
+    )
+
+    for label, rows in traces_by_label.items():
+        rows_by_iter: dict[int, list[dict]] = {}
+        sample_ids = set()
+        for row in rows:
+            rows_by_iter.setdefault(int(row.get('iteration', 0)), []).append(row)
+            sample_ids.add(row.get('sample_index'))
+        xs = sorted(rows_by_iter)
+        mean_l1 = []
+        mean_changed = []
+        feasible_rate = []
+        for iteration in xs:
+            iter_rows = rows_by_iter[iteration]
+            mean_l1.append(float(np.mean([float(r.get('l1_projection', 0.0)) for r in iter_rows])))
+            mean_changed.append(float(np.mean([float(r.get('changed_bits', 0.0)) for r in iter_rows])))
+            feasible_rate.append(100.0 * float(np.mean([1.0 if r.get('post_feasible') else 0.0 for r in iter_rows])))
+        legend_label = f"{label} (n={len(sample_ids)})"
+        axes[0].plot(xs, mean_l1, marker='o', linewidth=1.8, label=legend_label)
+        axes[1].plot(xs, mean_changed, marker='s', linewidth=1.8, label=legend_label)
+        axes[2].plot(xs, feasible_rate, marker='^', linewidth=1.8, label=legend_label)
+
+    axes[0].set_ylabel('Mean LP-to-candidate L1')
+    axes[1].set_ylabel('Mean changed bits')
+    axes[2].set_ylabel('Feasible rate (%)')
+    axes[2].set_xlabel('FP iteration')
+    axes[2].set_ylim(-5, 105)
+    for ax in axes:
+        ax.grid(True, axis='y', alpha=0.25)
+    axes[0].legend(loc='upper right', fontsize=7, framealpha=0.85)
+
+    fig.tight_layout()
+    _save_fig(fig, fig_dir / f'{case_name}_fp_iteration_traces', 'FP 迭代轨迹')
+
+
 def plot_bcd_analysis(agent, fig_dir: Path, case_name: str) -> None:
     """绘制 BCD 模型两张分析图：θ/ζ 参数直方�?+ 网络权重分布�?
 
@@ -1200,11 +1257,13 @@ def plot_bcd_analysis(agent, fig_dir: Path, case_name: str) -> None:
     # ── �?1：�?/ ζ 参数直方�?────────────────────────────
     theta_vals = _collect_bcd_param_values(agent, "theta")
     zeta_vals = _collect_bcd_param_values(agent, "zeta")
+    if RUN_TEST_SKIP_ZETA_PLOTS:
+        zeta_vals = np.asarray([], dtype=float)
     has_theta = theta_vals.size > 0
     has_zeta  = zeta_vals.size > 0
 
     if has_theta or has_zeta:
-        log("绘制图1：theta / zeta 参数直方图...")
+        log("绘制图1：theta 参数直方图..." if RUN_TEST_SKIP_ZETA_PLOTS else "绘制图1：theta / zeta 参数直方图...")
         ncols = int(has_theta) + int(has_zeta)
         fig1, axes1 = plt.subplots(1, ncols, figsize=(5 * ncols, 4))
         if ncols == 1:
@@ -1248,7 +1307,11 @@ def plot_bcd_analysis(agent, fig_dir: Path, case_name: str) -> None:
             ax_idx += 1
 
         fig1.tight_layout()
-        _save_fig(fig1, fig_dir / f'{case_name}_bcd_param_hist', 'θ/ζ 直方图')
+        _save_fig(
+            fig1,
+            fig_dir / f'{case_name}_bcd_param_hist',
+            'θ 直方图' if RUN_TEST_SKIP_ZETA_PLOTS else 'θ/ζ 直方图',
+        )
 
     # ── �?2：神经网络权重层分布（violin�?────────────────────
     import torch
@@ -1256,7 +1319,7 @@ def plot_bcd_analysis(agent, fig_dir: Path, case_name: str) -> None:
     net_specs = []
     if hasattr(agent, 'theta_net') and agent.theta_net is not None:
         net_specs.append((agent.theta_net, r'$\theta$-Net', '#2166AC'))
-    if hasattr(agent, 'zeta_net') and agent.zeta_net is not None:
+    if not RUN_TEST_SKIP_ZETA_PLOTS and hasattr(agent, 'zeta_net') and agent.zeta_net is not None:
         net_specs.append((agent.zeta_net, r'$\zeta$-Net', '#D6604D'))
 
     if not net_specs:
@@ -1418,29 +1481,32 @@ def plot_both_analysis(agent, trainers: dict, fig_dir: Path, case_name: str) -> 
 
     # ── (d) BCD ζ 分布 ─────────────────────────────────────
     ax_d = axes[1, 1]
-    zeta_vals = _collect_bcd_param_values(agent, "zeta")
-    has_zeta = zeta_vals.size > 0
-    if has_zeta:
-        n_bins = min(50, max(10, len(zeta_vals) // 5))
-        ax_d.hist(zeta_vals, bins=n_bins, color='#D6604D', alpha=0.65,
-                  edgecolor='white', linewidth=0.5, density=True)
-        try:
-            from scipy.stats import gaussian_kde
-            kde = gaussian_kde(zeta_vals, bw_method='scott')
-            xs = np.linspace(zeta_vals.min(), zeta_vals.max(), 300)
-            ax_d.plot(xs, kde(xs), color='#7B1A0A', linewidth=1.8,
-                      linestyle='--', label='KDE')
-        except Exception:
-            pass
-        ax_d.axvline(zeta_vals.mean(), color='#2166AC', linewidth=1.4,
-                     linestyle=':', label=f'mean={zeta_vals.mean():.3f}')
-        ax_d.legend(fontsize=8)
-        ax_d.set_xlabel(r'$\zeta$ value')
+    if RUN_TEST_SKIP_ZETA_PLOTS:
+        fig.delaxes(ax_d)
     else:
-        ax_d.text(0.5, 0.5, 'zeta_values not available',
-                  transform=ax_d.transAxes, ha='center', va='center')
-    ax_d.set_ylabel('Density')
-    ax_d.set_title(r'(d) BCD $\zeta$ Parameter Distribution', loc='left', fontsize=10)
+        zeta_vals = _collect_bcd_param_values(agent, "zeta")
+        has_zeta = zeta_vals.size > 0
+        if has_zeta:
+            n_bins = min(50, max(10, len(zeta_vals) // 5))
+            ax_d.hist(zeta_vals, bins=n_bins, color='#D6604D', alpha=0.65,
+                      edgecolor='white', linewidth=0.5, density=True)
+            try:
+                from scipy.stats import gaussian_kde
+                kde = gaussian_kde(zeta_vals, bw_method='scott')
+                xs = np.linspace(zeta_vals.min(), zeta_vals.max(), 300)
+                ax_d.plot(xs, kde(xs), color='#7B1A0A', linewidth=1.8,
+                          linestyle='--', label='KDE')
+            except Exception:
+                pass
+            ax_d.axvline(zeta_vals.mean(), color='#2166AC', linewidth=1.4,
+                         linestyle=':', label=f'mean={zeta_vals.mean():.3f}')
+            ax_d.legend(fontsize=8)
+            ax_d.set_xlabel(r'$\zeta$ value')
+        else:
+            ax_d.text(0.5, 0.5, 'zeta_values not available',
+                      transform=ax_d.transAxes, ha='center', va='center')
+        ax_d.set_ylabel('Density')
+        ax_d.set_title(r'(d) BCD $\zeta$ Parameter Distribution', loc='left', fontsize=10)
 
     fig.tight_layout()
     _save_fig(fig, fig_dir / f'{case_name}_both_joint_characterization', 'BCD-Surrogate 联合表征')
@@ -2017,7 +2083,7 @@ def _save_global_surrogate_solve_stats(rows: list[dict], fig_dir: Path, case_nam
 
 
 def _save_global_main_constraint_activity(rows: list[dict], fig_dir: Path, case_name: str) -> None:
-    """Persist and plot main-problem activity for proxy constraints in the global model."""
+    """Persist and plot main-problem activity for surrogate constraints in the global model."""
     if not rows:
         return
 
@@ -2066,7 +2132,7 @@ def _save_global_main_constraint_activity(rows: list[dict], fig_dir: Path, case_
             writer.writeheader()
             writer.writerows(aggregate_rows)
 
-    log_section("Global main-problem proxy constraint activity")
+    log_section("Global main-problem surrogate constraint activity")
     log(f"activity files: {csv_path} / {aggregate_path}")
     log(f"activity rows={len(rows)} | summary rows={len(aggregate_rows)}")
 
@@ -2084,38 +2150,38 @@ def _save_global_main_constraint_activity(rows: list[dict], fig_dir: Path, case_
             rec = next((r for r in aggregate_rows if r["sample_index"] == sid and r["kind"] == kind), None)
             y.append(np.nan if rec is None else float(rec["row_active_rate_1e_6"]))
         ax.plot(sample_ids, y, marker="o", linewidth=1.4, label=kind)
-    ax.set_title("Main-problem proxy row activity", loc="left", fontsize=10)
+    ax.set_title("Main-problem surrogate row activity", loc="left", fontsize=10)
     ax.set_xlabel("Sample index")
     ax.set_ylabel("Active row rate")
     ax.set_ylim(-0.02, 1.02)
     ax.legend(frameon=True)
     ax.grid(True, axis="y", alpha=0.3)
     fig.tight_layout()
-    _save_fig(fig, plot_dir / "main_row_active_rate_by_sample", "Main-problem proxy row activity")
+    _save_fig(fig, plot_dir / "main_row_active_rate_by_sample", "Main-problem surrogate row activity")
 
     fig, ax = plt.subplots(figsize=(7, 4))
     slack_vals = np.asarray([float(r.get("abs_row_slack", np.nan)) for r in rows], dtype=float)
     slack_vals = slack_vals[np.isfinite(slack_vals)]
     if slack_vals.size:
         ax.hist(np.log10(slack_vals + 1e-12), bins=30, color="#3182BD", alpha=0.85)
-    ax.set_title("Main-problem proxy slack distribution", loc="left", fontsize=10)
+    ax.set_title("Main-problem surrogate slack distribution", loc="left", fontsize=10)
     ax.set_xlabel(r"$\log_{10}(|slack| + 10^{-12})$")
     ax.set_ylabel("Rows")
     ax.grid(True, axis="y", alpha=0.3)
     fig.tight_layout()
-    _save_fig(fig, plot_dir / "main_row_slack_hist", "Main-problem proxy slack distribution")
+    _save_fig(fig, plot_dir / "main_row_slack_hist", "Main-problem surrogate slack distribution")
 
     fig, ax = plt.subplots(figsize=(7, 4))
     dual_vals = np.asarray([float(r.get("abs_dual", np.nan)) for r in rows], dtype=float)
     dual_vals = dual_vals[np.isfinite(dual_vals)]
     if dual_vals.size:
         ax.hist(np.log10(dual_vals + 1e-12), bins=30, color="#D6604D", alpha=0.85)
-    ax.set_title("Main-problem proxy dual distribution", loc="left", fontsize=10)
+    ax.set_title("Main-problem surrogate dual distribution", loc="left", fontsize=10)
     ax.set_xlabel(r"$\log_{10}(|dual| + 10^{-12})$")
     ax.set_ylabel("Rows")
     ax.grid(True, axis="y", alpha=0.3)
     fig.tight_layout()
-    _save_fig(fig, plot_dir / "main_row_dual_hist", "Main-problem proxy dual distribution")
+    _save_fig(fig, plot_dir / "main_row_dual_hist", "Main-problem surrogate dual distribution")
 
 
 def run_lp_compare_test(ppc, all_samples: list, dual_predictor, trainers: dict,
@@ -2466,6 +2532,7 @@ def run_fp_test(ppc, all_samples: list, dual_predictor, trainers: dict,
 
     results = []
     screening_records = []
+    fp_trace_records = []
     if scenario_bank is None:
         scenario_bank = all_samples
     custom_fp_plot_dir = None
@@ -2491,8 +2558,27 @@ def run_fp_test(ppc, all_samples: list, dual_predictor, trainers: dict,
                     plot_dir=custom_fp_plot_dir,
                     sample_tag=f'sample_{i:03d}',
                     max_global_combinations=CASE3LITE_CUSTOM_FP_MAX_GLOBAL_COMBINATIONS,
+                    max_evaluated_combinations=CASE3LITE_CUSTOM_FP_MAX_EVALUATED_COMBINATIONS,
+                    early_stop_no_improve=CASE3LITE_CUSTOM_FP_EARLY_STOP_NO_IMPROVE,
+                    early_stop_min_weight=CASE3LITE_CUSTOM_FP_EARLY_STOP_MIN_WEIGHT,
+                    plain_fp_max_iter=CASE3LITE_CUSTOM_FP_PLAIN_MAX_ITER,
+                    run_plain_fp_baseline=True,
+                    surrogate_constraint_scope=SURROGATE_CONSTRAINT_SCOPE,
+                    bcd_proxy_scope=BCD_PROXY_SCOPE,
                     verbose=True,
                 )
+                for fp_history in _details.get('fp_histories', []) or []:
+                    for row in fp_history.get('history', []) or []:
+                        fp_trace_records.append({
+                            'sample_index': i,
+                            'hot_start_name': fp_history.get('hot_start_name', 'case3lite_custom'),
+                            'iteration': int(row.get('iteration', 0)),
+                            'l1_projection': float(row.get('l1_projection', 0.0)),
+                            'changed_bits': int(row.get('changed_bits', 0)),
+                            'post_feasible': bool(row.get('post_feasible', False)),
+                            'tau': float(row.get('tau', 0.0)),
+                            'soft_penalty': float(row.get('soft_penalty', 0.0)),
+                        })
             elif CASE_NAME == 'case118' and USE_CASE118_CUSTOM_FP:
                 x_result, success, fp_details = recover_integer_solution_case118(
                     sample, trainers, dual_predictor, ppc, T_DELTA,
@@ -2575,6 +2661,18 @@ def run_fp_test(ppc, all_samples: list, dual_predictor, trainers: dict,
                         f"soft_penalty={fp_details.get('surrogate_screen_soft_penalty', 0.0):.2f} | "
                         f"tau={fp_details.get('projection_objective_tau', 'adaptive')}"
                     )
+                for fp_history in fp_details.get('fp_histories', []) or []:
+                    for row in fp_history.get('history', []) or []:
+                        fp_trace_records.append({
+                            'sample_index': i,
+                            'hot_start_name': fp_history.get('hot_start_name', 'unknown'),
+                            'iteration': int(row.get('iteration', 0)),
+                            'l1_projection': float(row.get('l1_projection', 0.0)),
+                            'changed_bits': int(row.get('changed_bits', 0)),
+                            'post_feasible': bool(row.get('post_feasible', False)),
+                            'tau': float(row.get('tau', 0.0)),
+                            'soft_penalty': float(row.get('soft_penalty', 0.0)),
+                        })
         except Exception as e:
             log(f"  异常: {e}")
             import traceback
@@ -2590,6 +2688,8 @@ def run_fp_test(ppc, all_samples: list, dual_predictor, trainers: dict,
     log_section(f"可行性泵汇总 | success={n_success}/{test_n}")
     if fig_dir is not None and screening_records:
         plot_fp_screening_comparison(screening_records, fig_dir, CASE_NAME)
+    if fig_dir is not None and fp_trace_records:
+        plot_fp_iteration_traces(fp_trace_records, fig_dir, CASE_NAME)
     return results
 
 
@@ -3525,7 +3625,7 @@ def test_bcd(ppc, data_file: Path, bcd_model_path: str,
     log_section(f"加载 BCD 模型 | path={bcd_model_path}")
     log("说明: bcd 模式只分析 `Standard LP` 与 `BCD LP`，不加载 surrogate 模型，也不运行 FP 恢复整数解。")
 
-    log(f"BCD proxy scope: {bcd_proxy_scope}")
+    log(f"BCD surrogate scope: {bcd_proxy_scope}")
 
     agent = _load_bcd_agent(
         ppc,

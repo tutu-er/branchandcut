@@ -1,17 +1,18 @@
 #!/usr/bin/env python3
 """Run and collect the paper evaluation suite.
 
-This script orchestrates the recommended tests for case14, case30lite,
-and case3lite:
+This script orchestrates the recommended ablation tests for case14,
+case30lite, and case3lite:
 
-  A. Surrogate-only
-  B. BCD + surrogate
-
-Test C (BCD + surrogate + feasibility pump) is opt-in via --with-fp.
+  1. BCD theta constraints only
+  2. BCD theta + zeta constraints
+  3. Surrogate sign4 constraints only
+  4. Surrogate sign4 + single constraints
+  5. Full joint surrogate model
 
 For each run it copies the overwritten run_test outputs into a stable
-experiment directory, then builds consolidated CSV files and a few paper-ready
-distribution plots.
+experiment directory, then writes consolidated data CSV files separately from
+paper-ready distribution plots.
 """
 
 from __future__ import annotations
@@ -55,7 +56,11 @@ class RunSpec:
     run_id: str
     case: CaseConfig
     method: str
+    label: str
     mode: str
+    bcd_proxy_scope: str | None = None
+    surrogate_constraint_scope: str = "all"
+    strategy: str = "auto"
     run_fp: bool = False
 
 
@@ -87,6 +92,32 @@ CASES: tuple[CaseConfig, ...] = (
 )
 
 
+METHOD_LABELS = {
+    "bcd_theta": "BCD θ",
+    "bcd_theta_zeta": "BCD θ+ζ",
+    "surrogate_sign4": "Surr. sign4",
+    "surrogate_sign4_single": "Surr. sign4+single",
+    "full_joint": "Full",
+    "full_joint_fp": "Full+FP",
+}
+
+METHOD_ORDER = list(METHOD_LABELS)
+
+
+def _test_keys(spec: RunSpec) -> set[str]:
+    prefix = spec.run_id.split("_", 1)[0].lower()
+    number = prefix[1:] if prefix.startswith("s") else prefix
+    bare_number = number.lstrip("0") or number
+    return {
+        prefix,
+        number,
+        bare_number,
+        f"s{bare_number}",
+        spec.run_id.lower(),
+        spec.method.lower(),
+    }
+
+
 def _run_specs(
     selected_cases: set[str] | None,
     selected_tests: set[str] | None,
@@ -98,15 +129,62 @@ def _run_specs(
         if selected_cases and case.name not in selected_cases:
             continue
         candidates = [
-            RunSpec("A_surrogate_only", case, "surrogate", "surrogate", False),
-            RunSpec("B_bcd_surrogate", case, "bcd_surrogate", "both", False),
-            RunSpec("C_bcd_surrogate_fp", case, "bcd_surrogate_fp", "both", True),
+            RunSpec(
+                "S01_bcd_theta",
+                case,
+                "bcd_theta",
+                METHOD_LABELS["bcd_theta"],
+                "both",
+                bcd_proxy_scope="theta",
+            ),
+            RunSpec(
+                "S02_bcd_theta_zeta",
+                case,
+                "bcd_theta_zeta",
+                METHOD_LABELS["bcd_theta_zeta"],
+                "both",
+                bcd_proxy_scope="both",
+            ),
+            RunSpec(
+                "S03_surrogate_sign4",
+                case,
+                "surrogate_sign4",
+                METHOD_LABELS["surrogate_sign4"],
+                "surrogate",
+                surrogate_constraint_scope="sign4",
+            ),
+            RunSpec(
+                "S04_surrogate_sign4_single",
+                case,
+                "surrogate_sign4_single",
+                METHOD_LABELS["surrogate_sign4_single"],
+                "surrogate",
+                surrogate_constraint_scope="sign4",
+                strategy="all_templates_sign4_plus_single",
+            ),
+            RunSpec(
+                "S05_full_joint",
+                case,
+                "full_joint",
+                METHOD_LABELS["full_joint"],
+                "both",
+                bcd_proxy_scope="both",
+            ),
         ]
-        if not with_fp:
-            candidates = [c for c in candidates if not c.run_fp]
+        if with_fp:
+            candidates.append(
+                RunSpec(
+                    "S05_full_joint_fp",
+                    case,
+                    "full_joint_fp",
+                    METHOD_LABELS["full_joint_fp"],
+                    "both",
+                    bcd_proxy_scope="both",
+                    run_fp=True,
+                )
+            )
         for spec in candidates:
-            test_key = spec.run_id.split("_", 1)[0].lower()
-            if selected_tests and test_key not in selected_tests:
+            if selected_tests and not (_test_keys(spec) & selected_tests):
                 continue
             specs.append(spec)
     return specs
@@ -124,9 +202,15 @@ def _build_command(spec: RunSpec, with_activity: bool) -> list[str]:
         str(spec.case.samples),
         "--sample-range",
         spec.case.sample_range,
+        "--surrogate-constraint-scope",
+        spec.surrogate_constraint_scope,
+        "--strategy",
+        spec.strategy,
     ]
     if spec.mode == "both":
         cmd.extend(["--bcd-model", spec.case.bcd_model])
+        if spec.bcd_proxy_scope:
+            cmd.extend(["--bcd-proxy-scope", spec.bcd_proxy_scope])
     if spec.run_fp:
         cmd.append("--fp")
     if not with_activity:
@@ -278,8 +362,14 @@ def _add_lp_summary_rows(report: dict, spec: RunSpec, rows: list[dict]) -> None:
             {
                 "test_id": spec.run_id,
                 "case": spec.case.name,
+                "experiment_method": spec.method,
+                "experiment_label": spec.label,
                 "method": method_name,
                 "level": "aggregate",
+                "mode": spec.mode,
+                "bcd_proxy_scope": spec.bcd_proxy_scope or "",
+                "surrogate_constraint_scope": spec.surrogate_constraint_scope,
+                "strategy": spec.strategy,
                 "n_samples": lp_summary.get("n_samples"),
                 "sample_range": report.get("sample_range"),
                 "mean_l1": item.get("mean_l1"),
@@ -331,10 +421,15 @@ def _collect_run_outputs(
                 "test_id": spec.run_id,
                 "case": spec.case.name,
                 "method": spec.method,
+                "method_label": spec.label,
                 "level": "sample",
                 "run_fp": str(bool(spec.run_fp)),
+                "mode": spec.mode,
                 "model_dir": spec.case.model_dir,
                 "bcd_model": spec.case.bcd_model if spec.mode == "both" else "",
+                "bcd_proxy_scope": spec.bcd_proxy_scope or "",
+                "surrogate_constraint_scope": spec.surrogate_constraint_scope,
+                "strategy": spec.strategy,
                 "sample_range": report.get("sample_range", spec.case.sample_range),
                 "n_units": n_units if n_units is not None else "",
                 "T": horizon if horizon is not None else "",
@@ -349,7 +444,11 @@ def _collect_run_outputs(
         "test_id": spec.run_id,
         "case": spec.case.name,
         "method": spec.method,
+        "method_label": spec.label,
         "mode": spec.mode,
+        "bcd_proxy_scope": spec.bcd_proxy_scope or "",
+        "surrogate_constraint_scope": spec.surrogate_constraint_scope,
+        "strategy": spec.strategy,
         "run_fp": str(bool(spec.run_fp)),
         "status": report.get("status", ""),
         "sample_range": report.get("sample_range", spec.case.sample_range),
@@ -389,12 +488,7 @@ def _boxplot_compatible(ax, data: list, tick_labels_: list[str]) -> None:
 def _plot_metric_boxplots(sample_rows: list[dict], output_dir: Path) -> None:
     plot_dir = output_dir / "figures"
     plot_dir.mkdir(parents=True, exist_ok=True)
-    methods = ["surrogate", "bcd_surrogate", "bcd_surrogate_fp"]
-    method_labels = {
-        "surrogate": "Surrogate",
-        "bcd_surrogate": "BCD+Surr.",
-        "bcd_surrogate_fp": "BCD+Surr.+FP",
-    }
+    methods = [method for method in METHOD_ORDER if any(r.get("method") == method for r in sample_rows)]
     cases = [case.name for case in CASES if any(r.get("case") == case.name for r in sample_rows)]
 
     for metric, ylabel, filename in (
@@ -417,7 +511,7 @@ def _plot_metric_boxplots(sample_rows: list[dict], output_dir: Path) -> None:
                 vals = [v for v in vals if v is not None]
                 if vals:
                     data.append(vals)
-                    labels.append(method_labels[method])
+                    labels.append(METHOD_LABELS[method])
             if data:
                 _boxplot_compatible(ax, data, labels)
                 for idx, vals in enumerate(data, start=1):
@@ -440,15 +534,17 @@ def run_suite(args: argparse.Namespace) -> None:
     if args.timestamped:
         output_dir = output_dir / timestamp
     raw_dir = output_dir / "raw"
+    data_dir = output_dir / "data"
     log_dir = raw_dir / "logs"
     run_root = raw_dir / "runs"
     output_dir.mkdir(parents=True, exist_ok=True)
+    data_dir.mkdir(parents=True, exist_ok=True)
     log_dir.mkdir(parents=True, exist_ok=True)
     run_root.mkdir(parents=True, exist_ok=True)
 
-    selected_cases = set(args.cases.split(",")) if args.cases else None
-    selected_tests = set(args.tests.lower().split(",")) if args.tests else None
-    with_fp = bool(args.with_fp) or ("c" in (selected_tests or set()))
+    selected_cases = {item.strip() for item in args.cases.split(",") if item.strip()} if args.cases else None
+    selected_tests = {item.strip().lower() for item in args.tests.split(",") if item.strip()} if args.tests else None
+    with_fp = bool(args.with_fp)
     specs = _run_specs(selected_cases, selected_tests, with_fp=with_fp)
     if not specs:
         raise SystemExit("No run specs selected.")
@@ -471,6 +567,7 @@ def run_suite(args: argparse.Namespace) -> None:
         started_at = datetime.now().timestamp()
         child_env = os.environ.copy()
         child_env.setdefault("PYTHONIOENCODING", "utf-8")
+        child_env["RUN_TEST_SKIP_ZETA_PLOTS"] = "1"
         proc = subprocess.run(
             cmd,
             cwd=ROOT,
@@ -502,31 +599,36 @@ def run_suite(args: argparse.Namespace) -> None:
     if args.dry_run:
         return
 
-    _write_csv(
-        raw_dir / "sample_metrics.csv",
-        all_sample_rows,
-        preferred_fields=[
-            "test_id",
-            "case",
-            "method",
-            "level",
-            "sample_index",
-            "status_name",
-            "runtime_sec",
-            "objective",
-            "objective_uc_cost",
-            "integrality_gap",
-            "l1_to_true",
-            "hamming_to_true",
-            "normalized_hamming",
-            "num_vars",
-            "num_constraints",
-            "num_nonzeros",
-            "subproblem_slack_sum",
-            "bcd_slack_sum",
-        ],
-    )
+    sample_metric_fields = [
+        "test_id",
+        "case",
+        "method",
+        "method_label",
+        "level",
+        "mode",
+        "bcd_proxy_scope",
+        "surrogate_constraint_scope",
+        "strategy",
+        "sample_index",
+        "status_name",
+        "runtime_sec",
+        "objective",
+        "objective_uc_cost",
+        "integrality_gap",
+        "l1_to_true",
+        "hamming_to_true",
+        "normalized_hamming",
+        "num_vars",
+        "num_constraints",
+        "num_nonzeros",
+        "subproblem_slack_sum",
+        "bcd_slack_sum",
+    ]
+    _write_csv(data_dir / "sample_metrics.csv", all_sample_rows, preferred_fields=sample_metric_fields)
+    _write_csv(raw_dir / "sample_metrics.csv", all_sample_rows, preferred_fields=sample_metric_fields)
+    _write_csv(data_dir / "run_summary.csv", run_summaries)
     _write_csv(raw_dir / "run_summary.csv", run_summaries)
+    _write_csv(data_dir / "lp_compare_summary.csv", aggregate_rows)
     _write_csv(raw_dir / "lp_compare_summary.csv", aggregate_rows)
     _plot_metric_boxplots(all_sample_rows, output_dir)
 
@@ -536,14 +638,16 @@ def run_suite(args: argparse.Namespace) -> None:
         "with_activity": bool(args.with_activity),
         "runs": [summary for summary in run_summaries],
         "with_fp": bool(with_fp),
+        "skip_zeta_plots": True,
+        "data_dir": str(data_dir),
     }
     (output_dir / "manifest.json").write_text(
         json.dumps(manifest, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
     print("=" * 80)
-    print(f"sample_metrics: {raw_dir / 'sample_metrics.csv'}")
-    print(f"run_summary:    {raw_dir / 'run_summary.csv'}")
+    print(f"sample_metrics: {data_dir / 'sample_metrics.csv'}")
+    print(f"run_summary:    {data_dir / 'run_summary.csv'}")
     print(f"figures:        {output_dir / 'figures'}")
 
 
@@ -552,13 +656,20 @@ def main() -> None:
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--timestamped", action="store_true", help="Write into output-dir/YYYYMMDD_HHMMSS.")
     parser.add_argument("--cases", default=None, help="Comma-separated case filter, e.g. case14,case30lite.")
-    parser.add_argument("--tests", default=None, help="Comma-separated test filter: a,b,c.")
+    parser.add_argument(
+        "--tests",
+        default=None,
+        help=(
+            "Comma-separated test filter: 1,2,3,4,5 or "
+            "s01,s02,s03,s04,s05 or method names such as bcd_theta."
+        ),
+    )
     parser.add_argument("--with-activity", action="store_true", help="Do not pass --skip-activity to case runners.")
     parser.add_argument("--dry-run", action="store_true", help="Print commands without running them.")
     parser.add_argument(
         "--with-fp",
         action="store_true",
-        help="Run test C (BCD+surrogate+feasibility pump). Implied when --tests includes c.",
+        help="Append an optional full-joint feasibility-pump run.",
     )
     args = parser.parse_args()
     run_suite(args)

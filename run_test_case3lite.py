@@ -33,8 +33,8 @@ CASE_NAME = train_base.CASE_NAME
 MODE = "surrogate"  # use "bcd" for only BCD or "both" to evaluate BCD + surrogate
 # 与训练相同：None 表示在 run_test / activity 脚本内按 case 自动选取最新 active_set JSON
 ACTIVE_SETS_FILE = train_base.ACTIVE_SETS_FILE
-MODEL_DIR: str | None = "result/surrogate_models/subproblem_models_case3lite_20260509_190031"
-BCD_MODEL_PATH: str | None = None
+MODEL_DIR: str | None = "result/surrogate_models/subproblem_models_case3lite_20260510_merge"
+BCD_MODEL_PATH: str | None = "result/bcd_models/bcd_model_case3lite_20260511_021417.pth"
 TEST_SAMPLES = 100
 SAMPLE_RANGE = f"0:100"
 SURROGATE_CONSTRAINT_STRATEGY = train_base.SURROGATE_CONSTRAINT_STRATEGY
@@ -71,7 +71,7 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--strategy", type=str, default=SURROGATE_CONSTRAINT_STRATEGY)
     p.add_argument(
         "--surrogate-constraint-scope",
-        choices=("all", "sign4"),
+        choices=("all", "sign4", "none"),
         default="all",
         help="Which surrogate subproblem constraints to apply in LP and activity tests.",
     )
@@ -80,8 +80,17 @@ def _parse_args() -> argparse.Namespace:
         action="store_true",
         help="Shortcut for --surrogate-constraint-scope sign4.",
     )
+    p.add_argument(
+        "--no-subproblem-surrogate",
+        action="store_true",
+        help="Shortcut for --surrogate-constraint-scope none; keep BCD theta/zeta constraints available.",
+    )
     p.add_argument("--fp", action="store_true", help="Run feasibility-pump testing.")
     p.add_argument("--no-custom-fp", action="store_true", help="Disable the case3lite custom FP path when --fp is used.")
+    p.add_argument("--custom-fp-max-eval", type=int, default=6, help="Maximum custom FP combinations to evaluate per sample.")
+    p.add_argument("--custom-fp-early-stop-no-improve", type=int, default=3, help="Stop after this many non-improving custom combinations once an incumbent exists.")
+    p.add_argument("--custom-fp-early-stop-min-weight", type=float, default=0.01, help="Early-stop when remaining combination weight is below this threshold.")
+    p.add_argument("--plain-fp-max-iter", type=int, default=8, help="Short budget for the ordinary LP-round FP baseline trace.")
     p.add_argument(
         "--subproblem-milp",
         action="store_true",
@@ -96,7 +105,7 @@ def _parse_args() -> argparse.Namespace:
         "--bcd-proxy-scope",
         choices=("both", "theta", "zeta", "none"),
         default="both",
-        help="Which BCD main proxy constraints to add in BCD/surrogate LP and main activity tests.",
+        help="Which BCD main surrogate constraints to add in BCD/surrogate LP and main activity tests.",
     )
     p.add_argument(
         "--bcd-theta-only",
@@ -265,6 +274,8 @@ def main() -> None:
     args = _parse_args()
     if args.surrogate_sign4_only:
         args.surrogate_constraint_scope = "sign4"
+    if args.no_subproblem_surrogate:
+        args.surrogate_constraint_scope = "none"
     if args.bcd_theta_only or args.activity_main_theta_only:
         args.bcd_proxy_scope = "theta"
 
@@ -290,6 +301,10 @@ def main() -> None:
         rt.RUN_SUBPROBLEM_MILP_TEST = bool(args.subproblem_milp)
         rt.RUN_TEST_DISABLE_PLOTS = bool(args.disable_plots)
         rt.USE_CASE3LITE_CUSTOM_FP = bool(args.fp) and not bool(args.no_custom_fp)
+        rt.CASE3LITE_CUSTOM_FP_MAX_EVALUATED_COMBINATIONS = max(1, int(args.custom_fp_max_eval))
+        rt.CASE3LITE_CUSTOM_FP_EARLY_STOP_NO_IMPROVE = max(1, int(args.custom_fp_early_stop_no_improve))
+        rt.CASE3LITE_CUSTOM_FP_EARLY_STOP_MIN_WEIGHT = max(0.0, float(args.custom_fp_early_stop_min_weight))
+        rt.CASE3LITE_CUSTOM_FP_PLAIN_MAX_ITER = max(1, int(args.plain_fp_max_iter))
         rt.USE_CASE118_CUSTOM_FP = False
 
         print("=" * 72, flush=True)
@@ -303,6 +318,7 @@ def main() -> None:
             f"surrogate_constraint_scope={rt.SURROGATE_CONSTRAINT_SCOPE} | "
             f"subproblem_ignore_startup_shutdown={SUBPROBLEM_IGNORE_STARTUP_SHUTDOWN_COSTS} | "
             f"fp={rt.RUN_FP} | custom_fp={rt.USE_CASE3LITE_CUSTOM_FP} | "
+            f"custom_fp_max_eval={rt.CASE3LITE_CUSTOM_FP_MAX_EVALUATED_COMBINATIONS} | "
             f"subproblem_milp={rt.RUN_SUBPROBLEM_MILP_TEST} | "
             f"bcd_proxy_scope={rt.BCD_PROXY_SCOPE} | "
             f"plots={not rt.RUN_TEST_DISABLE_PLOTS}",

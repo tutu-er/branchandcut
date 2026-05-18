@@ -44,7 +44,7 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--strategy", type=str, default=SURROGATE_CONSTRAINT_STRATEGY)
     p.add_argument(
         "--surrogate-constraint-scope",
-        choices=("all", "sign4"),
+        choices=("all", "sign4", "none"),
         default="all",
         help="Which surrogate subproblem constraints to apply in LP and activity tests.",
     )
@@ -52,6 +52,11 @@ def _parse_args() -> argparse.Namespace:
         "--surrogate-sign4-only",
         action="store_true",
         help="Shortcut for --surrogate-constraint-scope sign4.",
+    )
+    p.add_argument(
+        "--no-subproblem-surrogate",
+        action="store_true",
+        help="Shortcut for --surrogate-constraint-scope none; keep BCD theta/zeta constraints available.",
     )
     p.add_argument("--fp", action="store_true", help="Run feasibility-pump testing.")
     p.add_argument("--disable-plots", action="store_true", help="Disable plot generation.")
@@ -61,6 +66,22 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--main-activity", action="store_true", help="Also test main-model theta/zeta activity.")
     p.add_argument("--main-activity-only", action="store_true", help="Run only main-model theta/zeta activity diagnostics.")
     p.add_argument("--main-include-subproblem", action="store_true", help="Include subproblem rows in main activity CSVs.")
+    p.add_argument(
+        "--bcd-proxy-scope",
+        choices=("both", "theta", "zeta", "none"),
+        default="both",
+        help="Which BCD main surrogate constraints to add in BCD/surrogate LP and main activity tests.",
+    )
+    p.add_argument(
+        "--bcd-theta-only",
+        action="store_true",
+        help="Shortcut for --bcd-proxy-scope theta.",
+    )
+    p.add_argument(
+        "--activity-main-theta-only",
+        action="store_true",
+        help="Backward-compatible shortcut for --bcd-proxy-scope theta.",
+    )
     p.add_argument("--activity-train-samples", type=int, default=32)
     p.add_argument("--activity-test-samples", type=int, default=16)
     p.add_argument("--activity-output-dir", type=str, default=None)
@@ -125,6 +146,7 @@ def _run_activity_check(args: argparse.Namespace) -> None:
     )
     if run_main_activity:
         argv.append("--main-activity")
+        argv.extend(["--main-bcd-proxy-scope", args.bcd_proxy_scope])
         if args.bcd_model:
             argv.extend(["--bcd-model", args.bcd_model])
     if args.main_activity_only:
@@ -140,6 +162,7 @@ def _run_activity_check(args: argparse.Namespace) -> None:
         f"train_samples={args.activity_train_samples} | "
         f"test_samples={args.activity_test_samples} | "
         f"surrogate_constraint_scope={args.surrogate_constraint_scope} | "
+        f"main_bcd_proxy_scope={args.bcd_proxy_scope} | "
         f"main_activity={run_main_activity} | "
         f"output_dir={output_dir}",
         flush=True,
@@ -158,12 +181,17 @@ def main() -> None:
     args = _parse_args()
     if args.surrogate_sign4_only:
         args.surrogate_constraint_scope = "sign4"
+    if args.no_subproblem_surrogate:
+        args.surrogate_constraint_scope = "none"
+    if args.bcd_theta_only or args.activity_main_theta_only:
+        args.bcd_proxy_scope = "theta"
 
     rt.CASE_NAME = CASE_NAME
     rt.MODE = args.mode
     rt.ACTIVE_SETS_FILE = args.active_sets
     rt.MODEL_DIR = args.model_dir
     rt.BCD_MODEL_PATH = args.bcd_model
+    rt.BCD_PROXY_SCOPE = args.bcd_proxy_scope
     rt.SURROGATE_CONSTRAINT_SCOPE = args.surrogate_constraint_scope
     rt.SURROGATE_CONSTRAINT_STRATEGY = args.strategy
     rt.UNIT_IDS = _parse_unit_ids(args.unit_ids)
@@ -185,7 +213,9 @@ def main() -> None:
             f"active_sets={rt.ACTIVE_SETS_FILE} | "
             f"unit_ids={rt.UNIT_IDS if rt.UNIT_IDS is not None else 'all'} | "
             f"samples={rt.TEST_SAMPLES} | sample_range={rt.SAMPLE_RANGE} | "
+            f"strategy={rt.SURROGATE_CONSTRAINT_STRATEGY} | "
             f"surrogate_constraint_scope={rt.SURROGATE_CONSTRAINT_SCOPE} | "
+            f"bcd_proxy_scope={rt.BCD_PROXY_SCOPE} | "
             f"fp={rt.RUN_FP} | plots={not rt.RUN_TEST_DISABLE_PLOTS}",
             flush=True,
         )

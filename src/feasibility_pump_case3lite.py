@@ -806,6 +806,49 @@ def _print_final_combo_summary(combo: dict) -> None:
         )
 
 
+def _distance_trace_row(
+    *,
+    iteration: int,
+    x_reference: np.ndarray,
+    x_candidate: np.ndarray,
+    feasible: bool,
+    reason: str,
+    projection_status_name: str = "REFERENCE",
+) -> dict:
+    """Build a compact LP-to-rounded/candidate distance row for plotting."""
+    ref = np.asarray(x_reference, dtype=float)
+    cand = np.asarray(x_candidate, dtype=float)
+    return {
+        "iteration": int(iteration),
+        "pre_feasible": False,
+        "pre_reason": "",
+        "projection_status": 2,
+        "projection_status_name": str(projection_status_name),
+        "l1_projection": float(np.sum(np.abs(ref - cand))),
+        "soft_penalty": 0.0,
+        "tau": 0.0,
+        "tau_cost": 0.0,
+        "primal_objective": float("nan"),
+        "changed_bits": int(np.sum(round_to_integer(ref) != np.rint(cand).astype(int))),
+        "n_trusted": 0,
+        "n_free": int(ref.size),
+        "cycle_hit": False,
+        "perturbation_applied": False,
+        "perturbation_mode": None,
+        "post_feasible": bool(feasible),
+        "post_reason": str(reason),
+    }
+
+
+def _offset_fp_history_iterations(history: List[dict], offset: int) -> List[dict]:
+    shifted: List[dict] = []
+    for row in history:
+        row_copy = dict(row)
+        row_copy["iteration"] = int(row_copy.get("iteration", 0)) + int(offset)
+        shifted.append(row_copy)
+    return shifted
+
+
 def _save_fig(fig: "plt.Figure", path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(str(path.with_suffix(".png")))
@@ -980,8 +1023,15 @@ def recover_integer_solution_case3lite(
     plot_dir: Optional[str | Path] = None,
     sample_tag: str = "sample",
     max_global_combinations: int = 24,
+    max_evaluated_combinations: int = 6,
+    early_stop_no_improve: int = 3,
+    early_stop_min_weight: float = 0.01,
+    plain_fp_max_iter: int = 8,
+    run_plain_fp_baseline: bool = True,
     use_subproblem_milp_candidate: bool = True,
     subproblem_milp_for_perturbations: bool = False,
+    surrogate_constraint_scope: str = "all",
+    bcd_proxy_scope: str = "both",
 ) -> Tuple[Optional[np.ndarray], bool, dict]:
     sample = normalize_sample_arrays(dict(_coerce_scenario_sample(pd_data)))
     pd_matrix = get_sample_net_load(sample)
@@ -1019,6 +1069,8 @@ def recover_integer_solution_case3lite(
         trainers,
         lambda_val,
         agent=agent,
+        surrogate_constraint_scope=surrogate_constraint_scope,
+        bcd_proxy_scope=bcd_proxy_scope,
     )
 
     if verbose:
@@ -1038,6 +1090,7 @@ def recover_integer_solution_case3lite(
         rng=rng,
         use_milp_candidate=use_subproblem_milp_candidate,
         milp_for_perturbations=subproblem_milp_for_perturbations,
+        surrogate_constraint_scope=surrogate_constraint_scope,
         return_details=True,
     )
     x_init_k_milp = candidate_details.get("x_init_k_milp")
@@ -1049,6 +1102,58 @@ def recover_integer_solution_case3lite(
         x_init_k_m,
         conf_threshold=conf_threshold,
     )
+
+    fp_histories: List[dict] = []
+    if run_plain_fp_baseline:
+        plain_start = round_to_integer(x_lp)
+        plain_feasible, plain_reason = check_uc_feasibility(plain_start, ppc, pd_matrix, T_delta)
+        plain_history = [
+            _distance_trace_row(
+                iteration=0,
+                x_reference=x_lp,
+                x_candidate=plain_start,
+                feasible=plain_feasible,
+                reason=plain_reason,
+                projection_status_name="LP_ROUND",
+            )
+        ]
+        plain_result = plain_start
+        plain_success = bool(plain_feasible)
+        if not plain_success:
+            plain_result, plain_success, plain_details = run_feasibility_pump(
+                plain_start,
+                np.zeros_like(base_trusted_mask, dtype=bool),
+                ppc,
+                pd_matrix,
+                T_delta,
+                x_pool=None,
+                max_iter=max(1, min(int(plain_fp_max_iter), int(max_fp_iter))),
+                stall_perturbation_mode="flip",
+                stall_flip_fraction=stall_flip_fraction,
+                rng=rng,
+                verbose=False,
+                return_history=True,
+            )
+            plain_history.extend(
+                _offset_fp_history_iterations(plain_details.get("history", []), offset=1)
+            )
+        fp_histories.append({
+            "hot_start_index": 0,
+            "hot_start_name": "plain_fp_lp_round",
+            "parallel": False,
+            "success": bool(plain_success),
+            "x_result": np.asarray(plain_result, dtype=int),
+            "history": plain_history,
+            "termination": "feasible" if plain_success else "budget_exhausted",
+        })
+        if verbose:
+            print(
+                "Case3lite custom FP baseline: "
+                f"plain_fp_success={plain_success} "
+                f"initial_LP_round_L1={plain_history[0]['l1_projection']:.2f} "
+                f"iters={len(plain_history)}",
+                flush=True,
+            )
 
     nearby_commitment_candidates = _build_nearby_commitment_candidates(
         sample,
@@ -1167,7 +1272,33 @@ def recover_integer_solution_case3lite(
     final_success = False
     final_combo = None
     final_objective_estimate = None
+    no_improve_count = 0
+    evaluated_count = 0
+    max_eval = max(1, min(int(max_evaluated_combinations), len(global_combinations)))
     for rank, combo in enumerate(global_combinations, start=1):
+        if evaluated_count >= max_eval:
+            if verbose:
+                print(
+                    f"Case3lite custom FP: stop after {evaluated_count} evaluated combos "
+                    f"(budget={max_eval})",
+                    flush=True,
+                )
+            break
+        if (
+            final_solution is not None
+            and float(combo.get("weight", 0.0)) < float(early_stop_min_weight)
+            and no_improve_count >= max(1, int(early_stop_no_improve))
+        ):
+            if verbose:
+                print(
+                    "Case3lite custom FP: early stop "
+                    f"(weight={combo.get('weight', 0.0):.3f}, "
+                    f"no_improve={no_improve_count})",
+                    flush=True,
+                )
+            break
+
+        evaluated_count += 1
         x_start = np.asarray(combo["candidate"], dtype=int)
         start_feasible, _reason = check_uc_feasibility(x_start, ppc, pd_matrix, T_delta)
         if verbose:
@@ -1178,11 +1309,21 @@ def recover_integer_solution_case3lite(
             )
         candidate_solution = None
         candidate_success = False
+        combo_history = [
+            _distance_trace_row(
+                iteration=0,
+                x_reference=x_lp,
+                x_candidate=x_start,
+                feasible=start_feasible,
+                reason=_reason,
+                projection_status_name="CUSTOM_CANDIDATE",
+            )
+        ]
         if start_feasible:
             candidate_solution = x_start
             candidate_success = True
         else:
-            x_result, success = run_feasibility_pump(
+            x_result, success, fp_details = run_feasibility_pump(
                 x_start,
                 trusted_mask,
                 ppc,
@@ -1194,12 +1335,28 @@ def recover_integer_solution_case3lite(
                 stall_flip_fraction=stall_flip_fraction,
                 rng=rng,
                 verbose=False,
+                return_history=True,
+            )
+            combo_history.extend(
+                _offset_fp_history_iterations(fp_details.get("history", []), offset=1)
             )
             if success:
                 candidate_solution = np.asarray(x_result, dtype=int)
                 candidate_success = True
 
+        fp_histories.append({
+            "hot_start_index": int(rank),
+            "hot_start_name": f"custom_combo_{rank}",
+            "parallel": False,
+            "combo_weight": float(combo.get("weight", 0.0)),
+            "combo_score": float(combo.get("score", 0.0)),
+            "success": bool(candidate_success),
+            "history": combo_history,
+            "termination": "feasible" if candidate_success else "no_feasible_solution",
+        })
+
         if not candidate_success or candidate_solution is None:
+            no_improve_count += 1
             continue
 
         candidate_objective_estimate = _estimate_commitment_primal_objective(
@@ -1215,6 +1372,7 @@ def recover_integer_solution_case3lite(
             )
 
         combo["final_objective_estimate"] = float(candidate_objective_estimate)
+        previous_objective_estimate = final_objective_estimate
         if (
             final_solution is None
             or final_objective_estimate is None
@@ -1233,6 +1391,16 @@ def recover_integer_solution_case3lite(
                     f"    incumbent updated by combo {rank}: obj≈{final_objective_estimate:.2f}",
                     flush=True,
                 )
+        if (
+            previous_objective_estimate is None
+            or (
+                final_objective_estimate is not None
+                and final_objective_estimate < float(previous_objective_estimate) - 1e-6
+            )
+        ):
+            no_improve_count = 0
+        else:
+            no_improve_count += 1
 
     if final_combo is not None:
         final_combo["objective_estimate"] = float(final_objective_estimate)
@@ -1279,5 +1447,8 @@ def recover_integer_solution_case3lite(
         "reference_solution": reference_solution,
         "selected_combo": final_combo,
         "final_objective_estimate": final_objective_estimate,
+        "surrogate_constraint_scope": str(surrogate_constraint_scope),
+        "bcd_proxy_scope": str(bcd_proxy_scope),
+        "fp_histories": fp_histories,
     }
     return final_solution, final_success, details

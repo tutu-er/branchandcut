@@ -1486,10 +1486,10 @@ def _run_fp_hot_start_task(
     stall_perturbation_mode: str,
     stall_flip_fraction: float,
     rng_seed: int,
-) -> Tuple[int, str, np.ndarray, bool]:
+) -> Tuple[int, str, np.ndarray, bool, Dict[str, Any]]:
     """Run one FP task with an isolated RNG for optional parallel execution."""
     task_rng = np.random.default_rng(int(rng_seed))
-    x_result, success = run_feasibility_pump(
+    x_result, success, fp_details = run_feasibility_pump(
         x_start,
         trusted_mask,
         ppc,
@@ -1504,8 +1504,9 @@ def _run_fp_hot_start_task(
         stall_flip_fraction=stall_flip_fraction,
         rng=task_rng,
         verbose=False,
+        return_history=True,
     )
-    return task_idx, name, x_result, success
+    return task_idx, name, x_result, success, fp_details
 
 
 def _add_surrogate_constraints(
@@ -1916,6 +1917,7 @@ def collect_integer_solutions(
     rng: Optional[np.random.Generator] = None,
     use_milp_candidate: bool = False,
     milp_for_perturbations: bool = False,
+    surrogate_constraint_scope: str = "all",
     return_details: bool = False,
 ):
     """
@@ -1939,6 +1941,7 @@ def collect_integer_solutions(
     """
     if rng is None:
         rng = np.random.default_rng()
+    surrogate_constraint_scope_norm = _normalize_surrogate_constraint_scope(surrogate_constraint_scope)
 
     sample = _coerce_scenario_sample(pd_data)
     pd_matrix = get_sample_net_load(sample)
@@ -1978,6 +1981,14 @@ def collect_integer_solutions(
         _base_name, base_scenario, alphas, betas, gammas, deltas, costs, pg_costs = param_candidates[0]
 
         # 原始子问�?LP
+        solve_kwargs = {
+            'costs': costs,
+            'pg_costs': pg_costs,
+            'scenario_sample': base_scenario,
+        }
+        if surrogate_constraint_scope_norm != "all":
+            solve_kwargs['surrogate_constraint_scope'] = surrogate_constraint_scope_norm
+
         x_LP_k, status_k, details_k = _solve_unit_LP_with_surrogate(
             trainer,
             lambda_val,
@@ -1985,9 +1996,7 @@ def collect_integer_solutions(
             betas,
             gammas,
             deltas,
-            costs=costs,
-            pg_costs=pg_costs,
-            scenario_sample=base_scenario,
+            **solve_kwargs,
         )
         if status_k != GRB.OPTIMAL:
             raise RuntimeError(
@@ -2004,9 +2013,7 @@ def collect_integer_solutions(
                 betas,
                 gammas,
                 deltas,
-                costs=costs,
-                pg_costs=pg_costs,
-                scenario_sample=base_scenario,
+                **solve_kwargs,
             )
             if status_milp_k == GRB.OPTIMAL:
                 x_init_k_milp[g] = round_to_integer(x_MILP_k)
@@ -2029,6 +2036,14 @@ def collect_integer_solutions(
             costs_m,
             pg_costs_m,
         ) in enumerate(param_candidates[1:]):
+            solve_kwargs_m = {
+                'costs': costs_m,
+                'pg_costs': pg_costs_m,
+                'scenario_sample': scenario_m,
+            }
+            if surrogate_constraint_scope_norm != "all":
+                solve_kwargs_m['surrogate_constraint_scope'] = surrogate_constraint_scope_norm
+
             x_LP_m, status_m, details_m = _solve_unit_LP_with_surrogate(
                 trainer,
                 lambda_val,
@@ -2036,9 +2051,7 @@ def collect_integer_solutions(
                 betas_m,
                 gammas_m,
                 deltas_m,
-                costs=costs_m,
-                pg_costs=pg_costs_m,
-                scenario_sample=scenario_m,
+                **solve_kwargs_m,
             )
             if status_m == GRB.OPTIMAL:
                 x_init_k_m[g, m] = round_to_integer(x_LP_m)
@@ -2057,9 +2070,7 @@ def collect_integer_solutions(
                     betas_m,
                     gammas_m,
                     deltas_m,
-                    costs=costs_m,
-                    pg_costs=pg_costs_m,
-                    scenario_sample=scenario_m,
+                    **solve_kwargs_m,
                 )
                 if status_milp_m == GRB.OPTIMAL:
                     x_init_k_m_milp[g, m] = round_to_integer(x_MILP_m)
@@ -2070,6 +2081,7 @@ def collect_integer_solutions(
         details = {
             'use_milp_candidate': bool(use_milp_candidate),
             'milp_for_perturbations': bool(milp_for_perturbations),
+            'surrogate_constraint_scope': surrogate_constraint_scope_norm,
             'x_init_k_milp': None if x_init_k_milp is None else np.asarray(x_init_k_milp, dtype=int),
             'x_init_k_m_milp': (
                 None if x_init_k_m_milp is None else np.asarray(x_init_k_m_milp, dtype=int)
@@ -2180,10 +2192,16 @@ def _normalize_surrogate_constraint_scope(scope: str | None) -> str:
         "all_constraints": "all",
         "sign4_only": "sign4",
         "sign_4": "sign4",
+        "no_subproblem": "none",
+        "no_subproblem_surrogate": "none",
+        "subproblem_none": "none",
+        "none": "none",
+        "off": "none",
+        "false": "none",
     }
     scope_norm = aliases.get(scope_norm, scope_norm)
-    if scope_norm not in {"all", "sign4"}:
-        raise ValueError(f"Unsupported surrogate_constraint_scope={scope!r}; expected 'all' or 'sign4'")
+    if scope_norm not in {"all", "sign4", "none"}:
+        raise ValueError(f"Unsupported surrogate_constraint_scope={scope!r}; expected 'all', 'sign4', or 'none'")
     return scope_norm
 
 
@@ -2195,6 +2213,8 @@ def _allow_surrogate_constraint_by_scope(
     scope_norm = _normalize_surrogate_constraint_scope(scope)
     if scope_norm == "all":
         return True
+    if scope_norm == "none":
+        return False
     return _is_sign4_surrogate_constraint(trainer, constraint_index)
 
 
@@ -3195,8 +3215,9 @@ def run_feasibility_pump(
     stall_perturbation_mode: str = 'pool_then_flip',
     stall_flip_fraction: float = 0.10,
     rng: Optional[np.random.Generator] = None,
-    verbose: bool = False
-) -> Tuple[np.ndarray, bool]:
+    verbose: bool = False,
+    return_history: bool = False,
+) -> Tuple[np.ndarray, bool] | Tuple[np.ndarray, bool, Dict[str, Any]]:
     """
     可行性泵主循环�?
 
@@ -3248,6 +3269,7 @@ def run_feasibility_pump(
             print(f"  FP warning: DC flow constraints unavailable ({_e})", flush=True)
 
     history: List[tuple] = []
+    trace: List[Dict[str, Any]] = []
     no_improve_count = 0
     adaptive_tau_reference_obj = _estimate_commitment_primal_objective(
         x_curr,
@@ -3264,6 +3286,13 @@ def run_feasibility_pump(
         if is_feas:
             if verbose:
                 print(f"  FP: found feasible solution at iteration {iteration}", flush=True)
+            if return_history:
+                return x_curr, True, {
+                    'history': trace,
+                    'iterations': int(iteration),
+                    'termination': 'feasible',
+                    'final_reason': str(reason),
+                }
             return x_curr, True
 
         # LP Projection：最小化 L1(x, x_curr)，满�?UC 连续约束
@@ -3423,6 +3452,15 @@ def run_feasibility_pump(
         if model.status != GRB.OPTIMAL:
             if verbose:
                 print(f"  FP: LP projection failed at iteration {iteration} (status={model.status})", flush=True)
+            if return_history:
+                trace.append({
+                    'iteration': int(iteration),
+                    'pre_feasible': False,
+                    'pre_reason': str(reason),
+                    'projection_status': int(model.status),
+                    'projection_status_name': _gurobi_status_name(model.status),
+                    'termination': 'projection_failed',
+                })
             break
 
         x_LP_proj = np.array([[x[g, t].X for t in range(T)] for g in range(ng)])
@@ -3436,17 +3474,18 @@ def run_feasibility_pump(
         x_next = round_to_integer(x_LP_proj)
         x_next[trusted_mask] = x_curr[trusted_mask]
 
+        l1_dist = float(np.sum(np.abs(x_LP_proj[~trusted_mask] - x_curr[~trusted_mask])))
+        soft_penalty = 0.0
+        if surrogate_screen_slacks:
+            soft_penalty = float(surrogate_screen_soft_penalty) * float(np.sum([
+                float(slack_var.X) / scale for slack_var, scale in surrogate_screen_slacks
+            ]))
+        primal_cost_term = 0.0
+        if abs(float(tau_used)) > 1e-12:
+            primal_cost_term = float(tau_used) * primal_obj_value
+        changed = int(np.sum(x_next != x_curr))
+
         if verbose:
-            l1_dist = float(np.sum(np.abs(x_LP_proj[~trusted_mask] - x_curr[~trusted_mask])))
-            soft_penalty = 0.0
-            if surrogate_screen_slacks:
-                soft_penalty = float(surrogate_screen_soft_penalty) * float(np.sum([
-                    float(slack_var.X) / scale for slack_var, scale in surrogate_screen_slacks
-                ]))
-            primal_cost_term = 0.0
-            if abs(float(tau_used)) > 1e-12:
-                primal_cost_term = float(tau_used) * primal_obj_value
-            changed = int(np.sum(x_next != x_curr))
             print(
                 f"  FP iter {iteration}: L1 projection={l1_dist:.3f}, "
                 f"soft_penalty={soft_penalty:.3f}, "
@@ -3457,11 +3496,16 @@ def run_feasibility_pump(
 
         # 振荡检测（最近历史中出现过相同点�?
         x_key = tuple(x_next.flatten())
-        if x_key in history:
+        cycle_hit = x_key in history
+        perturbation_applied = False
+        perturbation_mode_used = None
+        if cycle_hit:
             no_improve_count += 1
             if no_improve_count >= 3:
                 if verbose:
                     print(f"  FP: detected stall/cycle, applying perturbation mode {stall_perturbation_mode}", flush=True)
+                perturbation_applied = True
+                perturbation_mode_used = str(stall_perturbation_mode)
 
                 if stall_perturbation_mode in ('pool_restart', 'pool_then_flip'):
                     pool_candidate = _select_pool_restart_candidate(x_next, x_pool, trusted_mask, rng)
@@ -3484,10 +3528,40 @@ def run_feasibility_pump(
         if len(history) > 10:
             history.pop(0)
 
+        if return_history:
+            next_feasible, next_reason = check_uc_feasibility(x_next, ppc, pd_data, T_delta)
+            trace.append({
+                'iteration': int(iteration),
+                'pre_feasible': False,
+                'pre_reason': str(reason),
+                'projection_status': int(model.status),
+                'projection_status_name': _gurobi_status_name(model.status),
+                'l1_projection': float(l1_dist),
+                'soft_penalty': float(soft_penalty),
+                'tau': float(tau_used),
+                'tau_cost': float(primal_cost_term),
+                'primal_objective': float(primal_obj_value),
+                'changed_bits': int(changed),
+                'n_trusted': int(np.sum(trusted_mask)),
+                'n_free': int(np.size(trusted_mask) - np.sum(trusted_mask)),
+                'cycle_hit': bool(cycle_hit),
+                'perturbation_applied': bool(perturbation_applied),
+                'perturbation_mode': perturbation_mode_used,
+                'post_feasible': bool(next_feasible),
+                'post_reason': str(next_reason),
+            })
+
         x_curr = x_next
 
     if verbose:
         print(f"  FP: reached max_iter={max_iter} without feasibility", flush=True)
+    if return_history:
+        return x_curr, False, {
+            'history': trace,
+            'iterations': int(len(trace)),
+            'termination': 'max_iter_or_failed_projection',
+            'final_reason': trace[-1].get('post_reason', '') if trace else '',
+        }
     return x_curr, False
 
 
@@ -3534,6 +3608,8 @@ def recover_integer_solution(
     projection_objective_tau = 'adaptive',
     use_subproblem_milp_candidate: bool = True,
     subproblem_milp_for_perturbations: bool = False,
+    surrogate_constraint_scope: str = "all",
+    bcd_proxy_scope: str = "both",
     return_details: bool = False,
 ):
     """
@@ -3578,6 +3654,10 @@ def recover_integer_solution(
 
     if rng is None:
         rng = np.random.default_rng(42)
+    surrogate_constraint_scope_norm = _normalize_surrogate_constraint_scope(surrogate_constraint_scope)
+    bcd_proxy_scope_norm = str(bcd_proxy_scope or "both").strip().lower()
+    if bcd_proxy_scope_norm not in {"both", "theta", "zeta", "none"}:
+        raise ValueError(f"Unsupported bcd_proxy_scope={bcd_proxy_scope!r}")
 
     # Step 1：获取对偶变�?
     if verbose:
@@ -3593,6 +3673,8 @@ def recover_integer_solution(
             lambda_val,
             sparse_library=sparse_library,
             sparse_x_template_library=sparse_x_template_library,
+            surrogate_constraint_scope=surrogate_constraint_scope_norm,
+            bcd_proxy_scope=bcd_proxy_scope_norm,
         )
     else:
         x_LP = solve_global_LP_relaxation(
@@ -3604,6 +3686,8 @@ def recover_integer_solution(
             agent=agent,
             sparse_library=sparse_library,
             sparse_x_template_library=sparse_x_template_library,
+            surrogate_constraint_scope=surrogate_constraint_scope_norm,
+            bcd_proxy_scope=bcd_proxy_scope_norm,
         )
     x_init = round_to_integer(x_LP)
 
@@ -3627,6 +3711,7 @@ def recover_integer_solution(
         rng=rng,
         use_milp_candidate=use_subproblem_milp_candidate,
         milp_for_perturbations=subproblem_milp_for_perturbations,
+        surrogate_constraint_scope=surrogate_constraint_scope_norm,
         return_details=True,
     )
     x_init_k_milp = candidate_details.get('x_init_k_milp')
@@ -3892,6 +3977,9 @@ def recover_integer_solution(
         'surrogate_screen_summary': surrogate_screen_summary,
         'surrogate_screen_soft_penalty': float(surrogate_screen_soft_penalty),
         'projection_objective_tau': projection_objective_tau,
+        'surrogate_constraint_scope': surrogate_constraint_scope_norm,
+        'bcd_proxy_scope': bcd_proxy_scope_norm,
+        'fp_histories': [],
     }
 
     if verbose:
@@ -3954,12 +4042,18 @@ def recover_integer_solution(
             for future in as_completed(future_to_task):
                 idx, name = future_to_task[future]
                 try:
-                    task_idx, _task_name, task_result, task_success = future.result()
+                    task_idx, _task_name, task_result, task_success, task_details = future.result()
                 except Exception as exc:
                     if verbose:
                         print(f"  Parallel FP hot start {idx}: {name} failed with {exc}", flush=True)
                     continue
                 parallel_results[task_idx] = task_result
+                recovery_details['fp_histories'].append({
+                    'hot_start_index': int(task_idx),
+                    'hot_start_name': str(name),
+                    'parallel': True,
+                    **dict(task_details or {}),
+                })
                 parallel_warm_result = task_result
                 if verbose:
                     status = "success" if task_success else "no_feasible_solution"
@@ -4005,7 +4099,7 @@ def recover_integer_solution(
 
         if verbose:
             print(f"  Run FP hot start {idx}/{len(hot_start_candidates)}: {name}", flush=True)
-        x_result, success = run_feasibility_pump(
+        x_result, success, fp_details = run_feasibility_pump(
             x_start, trusted_mask, ppc, pd_data, T_delta,
             x_pool=x_pool,
             surrogate_screen_constraints=surrogate_screen_constraints,
@@ -4016,7 +4110,14 @@ def recover_integer_solution(
             stall_flip_fraction=stall_flip_fraction,
             rng=rng,
             verbose=verbose,
+            return_history=True,
         )
+        recovery_details['fp_histories'].append({
+            'hot_start_index': int(idx),
+            'hot_start_name': str(name),
+            'parallel': False,
+            **dict(fp_details or {}),
+        })
         if success:
             break
 

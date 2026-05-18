@@ -3,8 +3,14 @@
 
 The script intentionally keeps only strategies that are naturally expressed as
 training schedules: warm starts, delayed activation, curriculum ramps, floor
-switches, caps, and direct fitting phases. Static modeling choices are better
-described in the caption/table rather than drawn as Gantt bars.
+switches, caps, and direct fitting phases. Captions under the figure are empty by default (use ``bcd``/``surrogate``
+``caption`` in ``TEXT`` or ``--text-json`` if needed).
+
+Default styling is publication-oriented: concise in-bar tags (short math/text),
+no color legend (meanings follow row/bar labels), no extra percent labels under
+vertical guides unless enabled, and (a)/(b) panel titles.
+Toggle verbosity via ``show_bar_text``, ``bar_label_min_width``, ``show_guide_line_labels``,
+``show_figure_subtitle``, or ``--text-json`` overrides.
 """
 
 from __future__ import annotations
@@ -19,13 +25,14 @@ import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from matplotlib.patches import Patch
 
 
 DEFAULT_OUTPUT_DIR = Path("result/paper_figures/strong_complex_dual_floor_schedule")
 
 
 COLORS = {
+    # 两图同一语义同色：constraint=代理约束主段（渐进加入等）；constraint_light=代理约束末段（全开）；
+    # dual/dual_light/flip=对偶；direct=NN-direct；cost+inactive=h(θ) 前段/后段；pretrain/warm_light=机组。
     "pretrain": "#5B677A",
     "warm": "#4C78A8",
     "warm_light": "#A9C6E8",
@@ -33,20 +40,34 @@ COLORS = {
     "constraint_light": "#7AC0D8",
     "dual": "#D97924",
     "dual_light": "#F0A54A",
-    "flip": "#C06C84",
+    # 与 dual 同系、略偏深的琥珀色，用于符号翻转条，避免与粉紫混杂。
+    "flip": "#B86820",
     "direct": "#2E8B57",
     "direct_light": "#82BC8A",
-    "cap": "#8A5BB8",
     "cost": "#697386",
     "inactive": "#CBD2D9",
 }
 
 
 TEXT: dict[str, Any] = {
-    "font_family": ["Microsoft YaHei", "SimHei", "Arial Unicode MS", "DejaVu Sans"],
-    "x_label": "Normalized training progress",
-    "pre_loop_label": "Pretrain / init",
-    "axis_ticks": ["0%", "25%", "50%", "75%", "100%"],
+    # 中文图注需在系统/环境中存在相应字体；亦可改用 --text-json 覆写 font_family。
+    "font_family": ["Microsoft YaHei", "SimHei", "Arial Unicode MS", "DejaVu Sans", "sans-serif"],
+    "show_bar_text": True,
+    "bar_label_min_width": 4.0,
+    "show_guide_line_labels": False,
+    "show_figure_subtitle": False,
+    "title_fontsize": 11.0,
+    "title_fontweight": "normal",
+    "title_loc": "center",
+    "bar_fontsize": 9.5,
+    "pre_bar_fontsize": 9.0,
+    "ytick_fontsize": 9.5,
+    "xtick_fontsize": 10.0,
+    "xlabel_fontsize": 11.0,
+    "x_label": "训练进度（归一化）",
+    "pre_loop_label": "",
+    "axis_ticks": ["0", "0.25", "0.5", "0.75", "1"],
+    # Kept for --text-json overrides; not drawn when show_guide_line_labels is False.
     "guide_labels": {
         5: "5%",
         10: "10%",
@@ -58,80 +79,68 @@ TEXT: dict[str, Any] = {
         85: "85%",
     },
     "bcd": {
-        "title": "BCD Training Heuristic Schedule",
-        "subtitle": "Only time-dependent strategies are shown; static choices are summarized in the caption.",
-        "caption": (
-            "Static but important choices not drawn as bars: simplified BCD objective, smooth-|.| loss, "
-            "deadband, inter-iteration regularization, and heuristic coefficient initialization."
-        ),
+        "title": "(a) 主问题训练日程（与启发式对应）",
+        "subtitle": "",
+        "caption": "",
         "rows": {
-            "unit_warm_start": "Unit predictor warm start",
-            "theta_activation": "h(theta) activation",
-            "theta_stage": "h(theta) constraint budget",
-            "dual_floor": "Dual lower bound",
-            "dual_flip": "Dual sign relaxation",
-            "nn_direct": "NN-direct local fit",
+            "unit_warm_start": "机组预测热启动",
+            "theta_activation": "代理约束渐进加入",
+            "theta_stage": "代理约束：结构/数量分阶段",
+            "dual_floor": r"对偶变量 $\lambda$：独立下界",
+            "dual_flip": r"对偶变量 $\lambda$：符号翻转",
+            "single_mu_cap": "对偶变量限制",
+            "nn_direct": "NN-direct",
         },
         "bars": {
-            "unit_pretrain": "pretrain predictor",
-            "unit_bootstrap": "bootstrap x",
-            "unit_finetune": "co-train / adapt",
-            "theta_delay": "delayed",
-            "theta_ramp": "curriculum ramp",
-            "theta_full": "active",
-            "stage_delay": "wait",
-            "stage_6": "max 6",
-            "stage_12": "max 12",
-            "stage_20": "max 20",
-            "independent_floor": "independent floor",
-            "group_floor": "grouped floor",
-            "floor_release": "release",
-            "sign_flip": "conditional sign flip",
-            "pseudo_label": "local pseudo-labels",
-            "direct_fit": "direct MSE warm-up",
+            "unit_pretrain": "0/1预测器预训",
+            "unit_bootstrap": "作热启动",
+            "unit_finetune": "随代理微调",
+            "theta_delay": "等待",
+            "theta_ramp": "渐进加入",
+            "theta_full": "全开",
+            "stage_delay": "等待",
+            "stage_6": r"$K{\leq}6$",
+            "stage_12": r"$K{\leq}12$",
+            "stage_20": r"$K{\leq}20$",
+            "independent_floor": "独立下界",
+            "group_floor": r"$\lambda$ 总体下界",
+            "floor_release": "解除",
+            "sign_flip": "条件允许翻转",
+            "single_cap_ramp": "渐进",
+            "single_cap_full": "惩罚",
+            "pseudo_label": "KKT-Loss",
+            "direct_fit": "direct",
         },
     },
     "surrogate": {
-        "title": "Subproblem Surrogate Training Heuristic Schedule",
-        "subtitle": "The figure focuses on staged surrogate learning and strong-complex-dual-floor controls.",
-        "caption": (
-            "Static but important choices not drawn as bars: all-templates sign4 plus single-time constraint family, "
-            "smooth-|.| loss, deadband, delta reference lift, and regularization."
-        ),
+        "title": "(b) 子问题训练日程（与启发式对应）",
+        "subtitle": "",
+        "caption": "",
         "rows": {
-            "dual_predictor": "Dual predictor",
-            "unit_predictor": "Unit predictor",
-            "sign4_activation": "Sign4 activation",
-            "sign4_floor": "Sign4 dual floor",
-            "sign4_curriculum": "Sign4 curriculum",
-            "single_mu_cap": "Single-time mu cap",
-            "main_direct": "NN-main direct fit",
-            "c_pg": "c_pg cost learning",
+            "dual_predictor": r"对偶变量 $\lambda$：拉格朗日松弛预训",
+            "unit_predictor": "机组预测热启动",
+            "sign4_activation": "代理约束渐进加入",
+            "sign4_floor": r"对偶变量 $\lambda$：下界（独立$\rightarrow$打包）",
+            "single_mu_cap": "对偶变量限制",
+            "main_direct": "NN-direct",
+            "c_pg": r"$h(\theta)$ 分阶段加入",
         },
         "bars": {
-            "dual_pretrain": "pretrain lambda/dual",
-            "unit_pretrain": "pretrain x predictor",
-            "unit_finetune": "co-train / adapt",
-            "single_only": "single-time only",
-            "sign4_active": "sign4 enabled",
-            "sign4_individual": "individual floor",
-            "sign4_group": "grouped floor",
-            "floor_release": "release",
-            "sign4_scale": "scale 0.1 -> 2.0",
-            "single_cap_ramp": "cap ramp-up",
-            "single_cap_full": "full cap penalty",
-            "main_direct": "full-batch direct targets",
-            "cost_wait": "wait",
-            "cost_refine": "dispatch-cost surrogate",
+            "dual_pretrain": r"$\lambda$-LR 预训",
+            "unit_pretrain": "0/1预测器预训",
+            "unit_finetune": "随代理微调",
+            "single_only": "等待",
+            "sign4_active": "全开",
+            "sign4_individual": r"$\lambda$ 独立下界",
+            "sign4_group": r"$\lambda$ 总体下界",
+            "floor_release": "解除",
+            "sign4_scale": "渐进加入",
+            "single_cap_ramp": "渐进",
+            "single_cap_full": "惩罚",
+            "main_direct": "",
+            "cost_wait": r"$h(\theta)$ 未参与",
+            "cost_refine": r"纳入 $h(\theta)$",
         },
-    },
-    "legend": {
-        "pretrain": "Pretrain / warm start",
-        "constraint": "Constraint activation / curriculum",
-        "dual": "Dual floor / sign control",
-        "direct": "Direct neural fitting",
-        "cap": "Cap / penalty window",
-        "cost": "Cost surrogate phase",
     },
 }
 
@@ -174,7 +183,9 @@ def _add_bar(
     height: float = 0.58,
     alpha: float = 1.0,
     text_color: str = "#1F2933",
-    fontsize: float = 8.4,
+    fontsize: float = 9.5,
+    draw_label: bool = False,
+    label_min_width: float = 5.0,
 ) -> None:
     width = max(float(end) - float(start), 0.0)
     ax.barh(
@@ -188,7 +199,7 @@ def _add_bar(
         linewidth=1.0,
         zorder=3,
     )
-    if label and width >= 8:
+    if draw_label and label and width >= label_min_width:
         ax.text(
             start + width / 2.0,
             y,
@@ -201,8 +212,31 @@ def _add_bar(
         )
 
 
-def _add_pre_bar(ax: plt.Axes, y: float, color: str, label: str) -> None:
-    _add_bar(ax, y, -18, -2, color, label, text_color="white", fontsize=7.6)
+def _add_pre_bar(
+    ax: plt.Axes,
+    y: float,
+    color: str,
+    label: str,
+    *,
+    draw_label: bool,
+    label_min_width: float = 5.0,
+    fontsize: float = 9.0,
+) -> None:
+    _add_bar(
+        ax,
+        y,
+        -18,
+        -2,
+        color,
+        label,
+        text_color="white",
+        fontsize=fontsize,
+        draw_label=draw_label,
+        label_min_width=label_min_width,
+    )
+
+
+MAJOR_TICK_X = frozenset({0, 25, 50, 75, 100})
 
 
 def _format_axis(ax: plt.Axes, row_labels: list[str], text: dict[str, Any], guide_lines: list[int]) -> None:
@@ -210,71 +244,211 @@ def _format_axis(ax: plt.Axes, row_labels: list[str], text: dict[str, Any], guid
     ax.set_xlim(-20, 100)
     ax.set_ylim(-0.9, len(row_labels) - 0.12)
     ax.set_yticks(y_positions)
-    ax.set_yticklabels(row_labels, fontsize=9.4)
+    ax.set_yticklabels(row_labels, fontsize=float(text.get("ytick_fontsize", 9.5)))
     ax.set_xticks([0, 25, 50, 75, 100])
-    ax.set_xticklabels(text["axis_ticks"], fontsize=9)
-    ax.set_xlabel(text["x_label"], fontsize=10.5)
+    ax.set_xticklabels(text["axis_ticks"], fontsize=float(text.get("xtick_fontsize", 10.0)))
+    ax.tick_params(axis="x", which="minor", bottom=False, top=False)
+    ax.minorticks_off()
+    ax.set_xlabel(text["x_label"], fontsize=float(text.get("xlabel_fontsize", 11.0)))
     ax.grid(axis="x", color="#E5E9EF", linewidth=0.8, zorder=0)
     ax.axvline(0, color="#5B6770", linewidth=1.0, zorder=2)
+    show_guide_lbl = bool(text.get("show_guide_line_labels", False))
     for x in guide_lines:
         ax.axvline(x, color="#A0A8B0", linestyle=(0, (3, 3)), linewidth=0.85, zorder=1)
+        if not show_guide_lbl:
+            continue
+        if x in MAJOR_TICK_X:
+            continue
         label = text["guide_labels"].get(x, f"{x}%")
         ax.text(x, -1.08, label, ha="center", va="top", fontsize=8.0, color="#5B6770")
-    ax.text(-10, -1.08, text["pre_loop_label"], ha="center", va="top", fontsize=8.0, color="#5B6770")
+    pre_loop = (text.get("pre_loop_label") or "").strip()
+    if pre_loop:
+        ax.text(-10, -1.08, pre_loop, ha="center", va="top", fontsize=8.0, color="#5B6770")
     ax.tick_params(axis="y", length=0)
     for spine in ("top", "right", "left"):
         ax.spines[spine].set_visible(False)
     ax.spines["bottom"].set_color("#CBD2D9")
 
 
-def _legend_handles(text: dict[str, Any]) -> list[Patch]:
-    return [
-        Patch(facecolor=COLORS["pretrain"], label=text["legend"]["pretrain"]),
-        Patch(facecolor=COLORS["constraint"], label=text["legend"]["constraint"]),
-        Patch(facecolor=COLORS["dual"], label=text["legend"]["dual"]),
-        Patch(facecolor=COLORS["direct"], label=text["legend"]["direct"]),
-        Patch(facecolor=COLORS["cap"], label=text["legend"]["cap"]),
-        Patch(facecolor=COLORS["cost"], label=text["legend"]["cost"]),
-    ]
-
-
 def _plot_bcd(output_dir: Path, stem: str, text: dict[str, Any], dpi: int) -> list[Path]:
     cfg = text["bcd"]
+    draw_bar = bool(text.get("show_bar_text", False))
+    lmw = float(text.get("bar_label_min_width", 5.0))
+    bf = float(text.get("bar_fontsize", 9.5))
+    pbf = float(text.get("pre_bar_fontsize", 9.0))
     row_keys = [
         "unit_warm_start",
         "theta_activation",
         "theta_stage",
         "dual_floor",
         "dual_flip",
+        "single_mu_cap",
         "nn_direct",
     ]
     row_labels = [cfg["rows"][key] for key in row_keys]
     y = dict(zip(row_keys, reversed(range(len(row_keys)))))
 
-    fig, ax = plt.subplots(figsize=(12.5, 4.8))
+    fig, ax = plt.subplots(figsize=(12.5, 5.2))
     fig.patch.set_facecolor("white")
     ax.set_facecolor("white")
 
-    _add_pre_bar(ax, y["unit_warm_start"], COLORS["pretrain"], cfg["bars"]["unit_pretrain"])
-    _add_bar(ax, y["unit_warm_start"], 0, 12, COLORS["warm"], cfg["bars"]["unit_bootstrap"], text_color="white")
-    _add_bar(ax, y["unit_warm_start"], 12, 100, COLORS["warm_light"], cfg["bars"]["unit_finetune"])
+    _add_pre_bar(
+        ax,
+        y["unit_warm_start"],
+        COLORS["pretrain"],
+        cfg["bars"]["unit_pretrain"],
+        draw_label=draw_bar,
+        label_min_width=lmw,
+        fontsize=pbf,
+    )
+    _add_bar(
+        ax,
+        y["unit_warm_start"],
+        0,
+        100,
+        COLORS["warm_light"],
+        cfg["bars"]["unit_finetune"],
+        draw_label=draw_bar,
+        label_min_width=lmw,
+    )
 
-    _add_bar(ax, y["theta_activation"], 0, 10, COLORS["inactive"], cfg["bars"]["theta_delay"], fontsize=7.6)
-    _add_bar(ax, y["theta_activation"], 10, 45, COLORS["constraint"], cfg["bars"]["theta_ramp"], text_color="white")
-    _add_bar(ax, y["theta_activation"], 45, 100, COLORS["constraint_light"], cfg["bars"]["theta_full"])
+    _add_bar(
+        ax,
+        y["theta_activation"],
+        0,
+        10,
+        COLORS["inactive"],
+        cfg["bars"]["theta_delay"],
+        draw_label=draw_bar,
+        label_min_width=lmw,
+    )
+    _add_bar(
+        ax,
+        y["theta_activation"],
+        10,
+        45,
+        COLORS["constraint"],
+        cfg["bars"]["theta_ramp"],
+        text_color="white",
+        draw_label=draw_bar, label_min_width=lmw,
+    )
+    _add_bar(
+        ax,
+        y["theta_activation"],
+        45,
+        100,
+        COLORS["constraint_light"],
+        cfg["bars"]["theta_full"],
+        draw_label=draw_bar, label_min_width=lmw,
+    )
 
-    _add_bar(ax, y["theta_stage"], 0, 10, COLORS["inactive"], cfg["bars"]["stage_delay"], fontsize=7.6)
-    _add_bar(ax, y["theta_stage"], 10, 25, COLORS["constraint"], cfg["bars"]["stage_6"], text_color="white")
-    _add_bar(ax, y["theta_stage"], 25, 50, COLORS["constraint"], cfg["bars"]["stage_12"], text_color="white", alpha=0.86)
-    _add_bar(ax, y["theta_stage"], 50, 100, COLORS["constraint_light"], cfg["bars"]["stage_20"])
+    _add_bar(
+        ax,
+        y["theta_stage"],
+        0,
+        10,
+        COLORS["inactive"],
+        cfg["bars"]["stage_delay"],
+        draw_label=draw_bar,
+        label_min_width=lmw,
+    )
+    _add_bar(
+        ax,
+        y["theta_stage"],
+        10,
+        25,
+        COLORS["constraint"],
+        cfg["bars"]["stage_6"],
+        text_color="white",
+        draw_label=draw_bar, label_min_width=lmw,
+    )
+    _add_bar(
+        ax,
+        y["theta_stage"],
+        25,
+        50,
+        COLORS["constraint"],
+        cfg["bars"]["stage_12"],
+        text_color="white",
+        alpha=0.86,
+        draw_label=draw_bar, label_min_width=lmw,
+    )
+    _add_bar(
+        ax,
+        y["theta_stage"],
+        50,
+        100,
+        COLORS["constraint_light"],
+        cfg["bars"]["stage_20"],
+        draw_label=draw_bar, label_min_width=lmw,
+    )
 
-    _add_bar(ax, y["dual_floor"], 0, 40, COLORS["dual"], cfg["bars"]["independent_floor"], text_color="white")
-    _add_bar(ax, y["dual_floor"], 40, 85, COLORS["dual_light"], cfg["bars"]["group_floor"])
-    _add_bar(ax, y["dual_floor"], 85, 100, COLORS["inactive"], cfg["bars"]["floor_release"], fontsize=7.6)
+    _add_bar(
+        ax,
+        y["dual_floor"],
+        0,
+        85,
+        COLORS["dual"],
+        cfg["bars"]["independent_floor"],
+        text_color="white",
+        draw_label=draw_bar, label_min_width=lmw,
+    )
+    _add_bar(
+        ax,
+        y["dual_floor"],
+        85,
+        100,
+        COLORS["inactive"],
+        cfg["bars"]["floor_release"],
+        draw_label=draw_bar, label_min_width=lmw,
+    )
 
-    _add_bar(ax, y["dual_flip"], 15, 55, COLORS["flip"], cfg["bars"]["sign_flip"], text_color="white")
+    _add_bar(
+        ax,
+        y["dual_flip"],
+        15,
+        55,
+        COLORS["flip"],
+        cfg["bars"]["sign_flip"],
+        text_color="white",
+        draw_label=draw_bar, label_min_width=lmw,
+    )
 
-    _add_bar(ax, y["nn_direct"], 0, 100, COLORS["direct"], cfg["bars"]["pseudo_label"], text_color="white")
+    _add_bar(
+        ax,
+        y["single_mu_cap"],
+        25,
+        55,
+        COLORS["dual_light"],
+        cfg["bars"]["single_cap_ramp"],
+        text_color="#1F2933",
+        alpha=0.72,
+        draw_label=draw_bar,
+        label_min_width=lmw,
+    )
+    _add_bar(
+        ax,
+        y["single_mu_cap"],
+        55,
+        100,
+        COLORS["dual"],
+        cfg["bars"]["single_cap_full"],
+        text_color="white",
+        alpha=1.0,
+        draw_label=draw_bar,
+        label_min_width=lmw,
+    )
+
+    _add_bar(
+        ax,
+        y["nn_direct"],
+        0,
+        100,
+        COLORS["direct"],
+        cfg["bars"]["pseudo_label"],
+        text_color="white",
+        draw_label=draw_bar, label_min_width=lmw,
+    )
     _add_bar(
         ax,
         y["nn_direct"] + 0.25,
@@ -282,45 +456,49 @@ def _plot_bcd(output_dir: Path, stem: str, text: dict[str, Any], dpi: int) -> li
         100,
         COLORS["direct_light"],
         cfg["bars"]["direct_fit"],
-        height=0.20,
-        fontsize=7.4,
+        height=0.22,
+        fontsize=bf,
         alpha=0.82,
+        draw_label=draw_bar,
+        label_min_width=lmw,
     )
 
     _format_axis(ax, row_labels, text, [10, 25, 40, 45, 50, 55, 85])
-    ax.set_title(cfg["title"], loc="left", fontsize=14, fontweight="bold", pad=18)
-    ax.text(-20, len(row_labels) - 0.35, cfg["subtitle"], ha="left", va="top", fontsize=9.5, color="#52616B")
-    ax.legend(
-        handles=_legend_handles(text),
-        loc="upper center",
-        bbox_to_anchor=(0.5, -0.22),
-        ncol=3,
-        frameon=False,
-        fontsize=8.5,
-    )
-    fig.text(0.075, 0.045, cfg["caption"], ha="left", va="bottom", fontsize=8.3, color="#4A5560")
-    fig.subplots_adjust(left=0.19, right=0.985, top=0.86, bottom=0.27)
+    tit_fs = float(text.get("title_fontsize", 11.0))
+    tit_fw = text.get("title_fontweight", "normal")
+    tit_loc = str(text.get("title_loc", "center"))
+    ax.set_title(cfg["title"], loc=tit_loc, fontsize=tit_fs, fontweight=tit_fw, pad=14)
+    sub = (cfg.get("subtitle") or "").strip()
+    if bool(text.get("show_figure_subtitle", False)) and sub:
+        ax.text(-20, len(row_labels) - 0.35, sub, ha="left", va="top", fontsize=9.0, color="#52616B")
+    cap = cfg.get("caption") or ""
+    if cap:
+        fig.text(0.075, 0.04, cap, ha="left", va="bottom", fontsize=8.0, color="#4A5560")
+    fig.subplots_adjust(left=0.21, right=0.93, top=0.92, bottom=0.13)
 
     paths = [
         output_dir / f"{stem}_bcd.png",
         output_dir / f"{stem}_bcd.pdf",
         output_dir / f"{stem}_bcd.svg",
     ]
-    fig.savefig(paths[0], dpi=dpi, bbox_inches="tight")
-    fig.savefig(paths[1], bbox_inches="tight")
-    fig.savefig(paths[2], bbox_inches="tight")
+    fig.savefig(paths[0], dpi=dpi, bbox_inches="tight", pad_inches=0.2)
+    fig.savefig(paths[1], bbox_inches="tight", pad_inches=0.2)
+    fig.savefig(paths[2], bbox_inches="tight", pad_inches=0.2)
     plt.close(fig)
     return paths
 
 
 def _plot_surrogate(output_dir: Path, stem: str, text: dict[str, Any], dpi: int) -> list[Path]:
     cfg = text["surrogate"]
+    draw_bar = bool(text.get("show_bar_text", False))
+    lmw = float(text.get("bar_label_min_width", 5.0))
+    bf = float(text.get("bar_fontsize", 9.5))
+    pbf = float(text.get("pre_bar_fontsize", 9.0))
     row_keys = [
         "dual_predictor",
         "unit_predictor",
         "sign4_activation",
         "sign4_floor",
-        "sign4_curriculum",
         "single_mu_cap",
         "main_direct",
         "c_pg",
@@ -328,50 +506,170 @@ def _plot_surrogate(output_dir: Path, stem: str, text: dict[str, Any], dpi: int)
     row_labels = [cfg["rows"][key] for key in row_keys]
     y = dict(zip(row_keys, reversed(range(len(row_keys)))))
 
-    fig, ax = plt.subplots(figsize=(12.5, 5.3))
+    fig, ax = plt.subplots(figsize=(12.5, 5.2))
     fig.patch.set_facecolor("white")
     ax.set_facecolor("white")
 
-    _add_pre_bar(ax, y["dual_predictor"], COLORS["pretrain"], cfg["bars"]["dual_pretrain"])
-    _add_pre_bar(ax, y["unit_predictor"], COLORS["warm"], cfg["bars"]["unit_pretrain"])
-    _add_bar(ax, y["unit_predictor"], 0, 100, COLORS["warm_light"], cfg["bars"]["unit_finetune"])
+    _add_pre_bar(
+        ax,
+        y["dual_predictor"],
+        COLORS["dual"],
+        cfg["bars"]["dual_pretrain"],
+        draw_label=draw_bar,
+        label_min_width=lmw,
+        fontsize=pbf,
+    )
+    _add_pre_bar(
+        ax,
+        y["unit_predictor"],
+        COLORS["pretrain"],
+        cfg["bars"]["unit_pretrain"],
+        draw_label=draw_bar,
+        label_min_width=lmw,
+        fontsize=pbf,
+    )
+    _add_bar(
+        ax, y["unit_predictor"], 0, 100, COLORS["warm_light"], cfg["bars"]["unit_finetune"], draw_label=draw_bar, label_min_width=lmw
+    )
 
-    _add_bar(ax, y["sign4_activation"], 0, 5, COLORS["inactive"], cfg["bars"]["single_only"], fontsize=7.3)
-    _add_bar(ax, y["sign4_activation"], 5, 100, COLORS["constraint"], cfg["bars"]["sign4_active"], text_color="white")
+    _add_bar(
+        ax,
+        y["sign4_activation"],
+        0,
+        5,
+        COLORS["inactive"],
+        cfg["bars"]["single_only"],
+        draw_label=draw_bar, label_min_width=lmw,
+    )
+    _add_bar(
+        ax,
+        y["sign4_activation"],
+        5,
+        45,
+        COLORS["constraint"],
+        cfg["bars"]["sign4_scale"],
+        text_color="white",
+        draw_label=draw_bar, label_min_width=lmw,
+    )
+    _add_bar(
+        ax,
+        y["sign4_activation"],
+        45,
+        100,
+        COLORS["constraint_light"],
+        cfg["bars"]["sign4_active"],
+        draw_label=draw_bar, label_min_width=lmw,
+    )
 
-    _add_bar(ax, y["sign4_floor"], 0, 50, COLORS["dual"], cfg["bars"]["sign4_individual"], text_color="white")
-    _add_bar(ax, y["sign4_floor"], 50, 85, COLORS["dual_light"], cfg["bars"]["sign4_group"])
-    _add_bar(ax, y["sign4_floor"], 85, 100, COLORS["inactive"], cfg["bars"]["floor_release"], fontsize=7.6)
+    _add_bar(
+        ax,
+        y["sign4_floor"],
+        0,
+        50,
+        COLORS["dual"],
+        cfg["bars"]["sign4_individual"],
+        text_color="white",
+        draw_label=draw_bar, label_min_width=lmw,
+    )
+    _add_bar(ax, y["sign4_floor"], 50, 85, COLORS["dual_light"], cfg["bars"]["sign4_group"], draw_label=draw_bar, label_min_width=lmw)
+    _add_bar(
+        ax,
+        y["sign4_floor"],
+        85,
+        100,
+        COLORS["inactive"],
+        cfg["bars"]["floor_release"],
+        draw_label=draw_bar, label_min_width=lmw,
+    )
 
-    _add_bar(ax, y["sign4_curriculum"], 5, 45, COLORS["dual_light"], cfg["bars"]["sign4_scale"])
-    _add_bar(ax, y["single_mu_cap"], 25, 55, COLORS["cap"], cfg["bars"]["single_cap_ramp"], text_color="white")
-    _add_bar(ax, y["single_mu_cap"], 55, 100, COLORS["cap"], cfg["bars"]["single_cap_full"], text_color="white", alpha=0.72)
-    _add_bar(ax, y["main_direct"], 0, 100, COLORS["direct"], cfg["bars"]["main_direct"], text_color="white")
-    _add_bar(ax, y["c_pg"], 0, 25, COLORS["inactive"], cfg["bars"]["cost_wait"], fontsize=7.6)
-    _add_bar(ax, y["c_pg"], 25, 100, COLORS["cost"], cfg["bars"]["cost_refine"], text_color="white")
+    _add_bar(
+        ax,
+        y["single_mu_cap"],
+        25,
+        55,
+        COLORS["dual_light"],
+        cfg["bars"]["single_cap_ramp"],
+        text_color="#1F2933",
+        alpha=0.72,
+        draw_label=draw_bar, label_min_width=lmw,
+    )
+    _add_bar(
+        ax,
+        y["single_mu_cap"],
+        55,
+        100,
+        COLORS["dual"],
+        cfg["bars"]["single_cap_full"],
+        text_color="white",
+        alpha=1.0,
+        draw_label=draw_bar, label_min_width=lmw,
+    )
+    # Same stacking as main-problem nn_direct: base vs. thin direct-regression lane.
+    bcd_bars = text["bcd"]["bars"]
+    _add_bar(
+        ax,
+        y["main_direct"],
+        0,
+        100,
+        COLORS["direct"],
+        bcd_bars["pseudo_label"],
+        text_color="white",
+        draw_label=draw_bar, label_min_width=lmw,
+    )
+    _add_bar(
+        ax,
+        y["main_direct"] + 0.25,
+        0,
+        100,
+        COLORS["direct_light"],
+        bcd_bars["direct_fit"],
+        height=0.22,
+        fontsize=bf,
+        alpha=0.82,
+        draw_label=draw_bar, label_min_width=lmw,
+    )
+    _add_bar(
+        ax,
+        y["c_pg"],
+        0,
+        25,
+        COLORS["inactive"],
+        cfg["bars"]["cost_wait"],
+        draw_label=draw_bar,
+        label_min_width=lmw,
+    )
+    _add_bar(
+        ax,
+        y["c_pg"],
+        25,
+        100,
+        COLORS["cost"],
+        cfg["bars"]["cost_refine"],
+        text_color="white",
+        draw_label=draw_bar, label_min_width=lmw,
+    )
 
     _format_axis(ax, row_labels, text, [5, 25, 45, 50, 55, 85])
-    ax.set_title(cfg["title"], loc="left", fontsize=14, fontweight="bold", pad=18)
-    ax.text(-20, len(row_labels) - 0.35, cfg["subtitle"], ha="left", va="top", fontsize=9.5, color="#52616B")
-    ax.legend(
-        handles=_legend_handles(text),
-        loc="upper center",
-        bbox_to_anchor=(0.5, -0.19),
-        ncol=3,
-        frameon=False,
-        fontsize=8.5,
-    )
-    fig.text(0.075, 0.045, cfg["caption"], ha="left", va="bottom", fontsize=8.3, color="#4A5560")
-    fig.subplots_adjust(left=0.19, right=0.985, top=0.88, bottom=0.24)
+    tit_fs = float(text.get("title_fontsize", 11.0))
+    tit_fw = text.get("title_fontweight", "normal")
+    tit_loc = str(text.get("title_loc", "center"))
+    ax.set_title(cfg["title"], loc=tit_loc, fontsize=tit_fs, fontweight=tit_fw, pad=14)
+    sub = (cfg.get("subtitle") or "").strip()
+    if bool(text.get("show_figure_subtitle", False)) and sub:
+        ax.text(-20, len(row_labels) - 0.35, sub, ha="left", va="top", fontsize=9.0, color="#52616B")
+    cap = cfg.get("caption") or ""
+    if cap:
+        fig.text(0.075, 0.04, cap, ha="left", va="bottom", fontsize=8.0, color="#4A5560")
+    fig.subplots_adjust(left=0.21, right=0.93, top=0.92, bottom=0.13)
 
     paths = [
         output_dir / f"{stem}_surrogate.png",
         output_dir / f"{stem}_surrogate.pdf",
         output_dir / f"{stem}_surrogate.svg",
     ]
-    fig.savefig(paths[0], dpi=dpi, bbox_inches="tight")
-    fig.savefig(paths[1], bbox_inches="tight")
-    fig.savefig(paths[2], bbox_inches="tight")
+    fig.savefig(paths[0], dpi=dpi, bbox_inches="tight", pad_inches=0.2)
+    fig.savefig(paths[1], bbox_inches="tight", pad_inches=0.2)
+    fig.savefig(paths[2], bbox_inches="tight", pad_inches=0.2)
     plt.close(fig)
     return paths
 

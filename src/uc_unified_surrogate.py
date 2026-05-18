@@ -35,9 +35,21 @@ except ImportError:
     TORCH_AVAILABLE = False
 
 try:
-    from feasibility_pump import _add_surrogate_constraints, _build_ptdf_data
+    from feasibility_pump import (
+        _add_surrogate_constraints,
+        _allow_surrogate_constraint_by_scope,
+        _build_ptdf_data,
+        _normalize_surrogate_constraint_scope,
+        _resolve_surrogate_constraint_layout,
+    )
 except ImportError:
-    from src.feasibility_pump import _add_surrogate_constraints, _build_ptdf_data
+    from src.feasibility_pump import (
+        _add_surrogate_constraints,
+        _allow_surrogate_constraint_by_scope,
+        _build_ptdf_data,
+        _normalize_surrogate_constraint_scope,
+        _resolve_surrogate_constraint_layout,
+    )
 try:
     from uc_NN_subproblem import build_surrogate_constraint_expression, resolve_constraint_offsets_from_trainer
 except ImportError:
@@ -459,6 +471,8 @@ class UnifiedSurrogateManager:
         lambda_val: np.ndarray,
         sparse_library: Optional[SparseSurrogateLibrary] = None,
         sparse_x_template_library: Optional[SparseConstraintTemplateLibrary] = None,
+        surrogate_constraint_scope: str = "all",
+        bcd_proxy_scope: str = "both",
     ) -> np.ndarray:
         """
         给定新负荷，构建包含两类约束的全局 LP 松弛并求解。
@@ -472,9 +486,18 @@ class UnifiedSurrogateManager:
         Returns:
             x_LP: (ng, T) LP 松弛解；不可行时返回零矩阵
         """
-        theta_values, zeta_values = self.get_theta_zeta_params(pd_data, lambda_val)
+        sample = None
+        if isinstance(pd_data, dict):
+            sample = normalize_sample_arrays(dict(pd_data))
+            pd_matrix = get_sample_net_load(sample)
+        else:
+            pd_matrix = np.asarray(pd_data, dtype=float)
+        sample_id = int(sample.get("sample_id", 0)) if sample is not None else 0
+        scenario_input = sample if sample is not None else pd_matrix
+
+        theta_values, zeta_values = self.get_theta_zeta_params(scenario_input, lambda_val)
         surrogate_params = {
-            g: self.get_surrogate_params(g, pd_data, lambda_val)
+            g: self.get_surrogate_params(g, scenario_input, lambda_val)
             for g in range(self.ng) if g in self.trainers
         }
 
@@ -483,7 +506,15 @@ class UnifiedSurrogateManager:
         gencost = self._gencost
         ng, T = self.ng, self.T
         T_delta = self.T_delta
-        Pd_sum = np.sum(pd_data, axis=0)
+        Pd_sum = np.sum(pd_matrix, axis=0)
+        surrogate_constraint_scope_norm = _normalize_surrogate_constraint_scope(
+            surrogate_constraint_scope
+        )
+        bcd_proxy_scope_norm = str(bcd_proxy_scope or "both").strip().lower()
+        if bcd_proxy_scope_norm not in {"both", "theta", "zeta", "none"}:
+            raise ValueError(f"Unsupported bcd_proxy_scope={bcd_proxy_scope!r}")
+        add_bcd_theta = bcd_proxy_scope_norm in {"both", "theta"}
+        add_bcd_zeta = bcd_proxy_scope_norm in {"both", "zeta"}
 
         Ru, Rd, Ru_co, Rd_co = self.Ru, self.Rd, self.Ru_co, self.Rd_co
         Ton, Toff = self.Ton, self.Toff
@@ -535,34 +566,36 @@ class UnifiedSurrogateManager:
 
         # theta 软约束
         ua = self.agent._current_union_analysis or {}
-        for ci in ua.get('union_constraints', []):
-            bid = ci['branch_id']
-            ts = ci['time_slot']
-            lhs = gp.LinExpr()
-            for ci2 in ci.get('nonzero_pg_coefficients', []):
-                uid = ci2['unit_id']
-                tname = f'theta_branch_{bid}_unit_{uid}_time_{ts}'
-                coeff = float(theta_values.get(tname, 0.0))
-                if abs(coeff) > 1e-10 and uid < ng and ts < T:
-                    lhs += coeff * x[uid, ts]
-            rhs_name = f'theta_rhs_branch_{bid}_time_{ts}'
-            rhs = float(theta_values.get(rhs_name, 1.0))
-            slack = model.addVar(lb=0, name=f'theta_slack_{bid}_{ts}')
-            model.addConstr(lhs - rhs <= slack)
-            surr_slacks.append(slack)
+        if add_bcd_theta:
+            for ci in ua.get('union_constraints', []):
+                bid = ci['branch_id']
+                ts = ci['time_slot']
+                lhs = gp.LinExpr()
+                for ci2 in ci.get('nonzero_pg_coefficients', []):
+                    uid = ci2['unit_id']
+                    tname = f'theta_branch_{bid}_unit_{uid}_time_{ts}'
+                    coeff = float(theta_values.get(tname, 0.0))
+                    if abs(coeff) > 1e-10 and uid < ng and ts < T:
+                        lhs += coeff * x[uid, ts]
+                rhs_name = f'theta_rhs_branch_{bid}_time_{ts}'
+                rhs = float(theta_values.get(rhs_name, 1.0))
+                slack = model.addVar(lb=0, name=f'theta_slack_{bid}_{ts}')
+                model.addConstr(lhs - rhs <= slack)
+                surr_slacks.append(slack)
 
         # zeta 软约束
-        for zc in ua.get('union_zeta_constraints', []):
-            uid = zc['unit_id']
-            ts = zc['time_slot']
-            zname = f'zeta_unit_{uid}_time_{ts}'
-            coeff = float(zeta_values.get(zname, 0.0))
-            rhs_name = f'zeta_rhs_unit_{uid}_time_{ts}'
-            rhs = float(zeta_values.get(rhs_name, 1.0))
-            if abs(coeff) > 1e-10 and uid < ng and ts < T:
-                slack = model.addVar(lb=0, name=f'zeta_slack_{uid}_{ts}')
-                model.addConstr(coeff * x[uid, ts] - rhs <= slack)
-                surr_slacks.append(slack)
+        if add_bcd_zeta:
+            for zc in ua.get('union_zeta_constraints', []):
+                uid = zc['unit_id']
+                ts = zc['time_slot']
+                zname = f'zeta_unit_{uid}_time_{ts}'
+                coeff = float(zeta_values.get(zname, 0.0))
+                rhs_name = f'zeta_rhs_unit_{uid}_time_{ts}'
+                rhs = float(zeta_values.get(rhs_name, 1.0))
+                if abs(coeff) > 1e-10 and uid < ng and ts < T:
+                    slack = model.addVar(lb=0, name=f'zeta_slack_{uid}_{ts}')
+                    model.addConstr(coeff * x[uid, ts] - rhs <= slack)
+                    surr_slacks.append(slack)
 
         # per-generator V3 代理软约束
         for g in range(ng):
@@ -570,17 +603,22 @@ class UnifiedSurrogateManager:
                 continue
             alphas, betas, gammas, deltas, *_ = surrogate_params[g]
             trainer = self.trainers.get(g)
-            constraint_timesteps = trainer.sensitive_timesteps[sample_id] if trainer is not None else []
-            constraint_offsets = (
-                resolve_constraint_offsets_from_trainer(
-                    trainer,
-                    sample_id,
-                    len(constraint_timesteps),
-                )
-                if trainer is not None else []
+            if trainer is None:
+                continue
+            constraint_timesteps, constraint_offsets = _resolve_surrogate_constraint_layout(
+                trainer,
+                sample,
+                T,
+                len(alphas),
             )
             x_vars = {t: x[g, t] for t in range(T)}
             for k in range(len(alphas)):
+                if not _allow_surrogate_constraint_by_scope(
+                    trainer,
+                    k,
+                    surrogate_constraint_scope_norm,
+                ):
+                    continue
                 if k >= len(constraint_timesteps):
                     break
                 t_k = constraint_timesteps[k]
@@ -608,7 +646,7 @@ class UnifiedSurrogateManager:
             model,
             x,
             pg,
-            pd_data,
+            pd_matrix,
             sparse_library=sparse_library or self.sparse_library,
             surr_slacks=surr_slacks,
             name_prefix="sparse",
@@ -624,7 +662,7 @@ class UnifiedSurrogateManager:
         # DC 线路潮流约束（硬约束）
         try:
             _PTDF, ptdf_g, branch_limit, active_lines = _build_ptdf_data(ppc_int)
-            ptdf_Pd = _PTDF @ pd_data
+            ptdf_Pd = _PTDF @ pd_matrix
             for l in active_lines:
                 limit = float(branch_limit[l])
                 for t in range(T):

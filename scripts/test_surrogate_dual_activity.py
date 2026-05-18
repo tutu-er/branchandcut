@@ -31,6 +31,7 @@ import argparse
 import csv
 import json
 import math
+import os
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -54,6 +55,10 @@ try:
     MPL_AVAILABLE = True
 except Exception:
     MPL_AVAILABLE = False
+
+RUN_TEST_SKIP_ZETA_PLOTS = (
+    os.environ.get("RUN_TEST_SKIP_ZETA_PLOTS", "").strip() not in ("", "0", "false", "False")
+)
 
 try:
     from src.case_registry import get_case_ppc
@@ -610,9 +615,21 @@ def aggregate_activity(rows: List[dict], train_mu_by_key: Dict[Tuple[int, int], 
 
 def _normalize_surrogate_constraint_scope(scope: str | None) -> str:
     scope_norm = str(scope or "all").strip().lower().replace("-", "_")
-    aliases = {"": "all", "full": "all", "all_constraints": "all", "sign4_only": "sign4", "sign_4": "sign4"}
+    aliases = {
+        "": "all",
+        "full": "all",
+        "all_constraints": "all",
+        "sign4_only": "sign4",
+        "sign_4": "sign4",
+        "no_subproblem": "none",
+        "no_subproblem_surrogate": "none",
+        "subproblem_none": "none",
+        "none": "none",
+        "off": "none",
+        "false": "none",
+    }
     scope_norm = aliases.get(scope_norm, scope_norm)
-    if scope_norm not in {"all", "sign4"}:
+    if scope_norm not in {"all", "sign4", "none"}:
         raise ValueError(f"Unsupported surrogate_constraint_scope={scope!r}")
     return scope_norm
 
@@ -621,6 +638,8 @@ def _allow_surrogate_constraint_by_scope(trainer, constraint_index: int, scope: 
     scope_norm = _normalize_surrogate_constraint_scope(scope)
     if scope_norm == "all":
         return True
+    if scope_norm == "none":
+        return False
     return _is_sign4_surrogate_constraint(trainer, constraint_index)
 
 
@@ -952,9 +971,10 @@ def make_main_activity_plots(output_dir: Path, aggregate_rows: List[dict], sampl
         ("abs_slack_mean", "mean absolute slack", "mean |slack|"),
     ]
     kind_specs = [
-        ("bcd_theta", "branch_id", "Theta main proxy", "branch id"),
-        ("bcd_zeta", "unit_id", "Zeta main proxy", "unit id"),
+        ("bcd_theta", "branch_id", "Theta main surrogate", "branch id"),
     ]
+    if not RUN_TEST_SKIP_ZETA_PLOTS:
+        kind_specs.append(("bcd_zeta", "unit_id", "Zeta main surrogate", "unit id"))
     for kind, row_field, title_prefix, ylabel in kind_specs:
         for field, label, cbar in plot_specs:
             if kind == "bcd_theta":
@@ -979,7 +999,8 @@ def make_main_activity_plots(output_dir: Path, aggregate_rows: List[dict], sampl
             )
 
     if sample_rows:
-        for kind in ("bcd_theta", "bcd_zeta"):
+        sample_kinds = ("bcd_theta",) if RUN_TEST_SKIP_ZETA_PLOTS else ("bcd_theta", "bcd_zeta")
+        for kind in sample_kinds:
             selected = [row for row in sample_rows if str(row.get("kind")) == kind]
             if not selected:
                 continue
@@ -1129,18 +1150,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--strategy", default=None, help="override constraint generation strategy")
     parser.add_argument(
         "--surrogate-constraint-scope",
-        choices=("all", "sign4"),
+        choices=("all", "sign4", "none"),
         default="all",
         help="which surrogate subproblem constraints to solve/analyze",
     )
     parser.add_argument("--ignore-startup-shutdown-costs", action="store_true")
-    parser.add_argument("--main-activity", action="store_true", help="also test main-model theta/zeta proxy constraint activity")
+    parser.add_argument("--main-activity", action="store_true", help="also test main-model theta/zeta surrogate constraint activity")
     parser.add_argument("--main-only", action="store_true", help="skip subproblem activity and run only main-model activity")
     parser.add_argument(
         "--main-bcd-proxy-scope",
         choices=("both", "theta", "zeta", "none"),
         default="both",
-        help="which BCD main proxy constraints to add during main activity solves",
+        help="which BCD main surrogate constraints to add during main activity solves",
     )
     parser.add_argument(
         "--main-include-subproblem",

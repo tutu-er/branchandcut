@@ -1,78 +1,94 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Case118 测试入口：在 ``run_test.py`` 默认配置基础上对齐子问题训练设定。
-
-与 ``run_training_case118.py`` 使用相同的 ``CASE118_ACTIVE_SET_JSON``，并默认采用与
-``run_training.SURROGATE_CONSTRAINT_STRATEGY`` 一致的 ``all_templates_sign4_plus_single``，
-以及 ``SUBPROBLEM_IGNORE_STARTUP_SHUTDOWN_COSTS=True``（与 case118 子问题 BCD 训练一致）。
-
-在项目根目录运行::
-
-    python run_test_case118.py
-    python run_test_case118.py --model-dir result/surrogate_models/subproblem_models_case118_YYYYMMDD_HHMMSS
-    python run_test_case118.py --mode surrogate --no-fp --max-samples 8
-    python run_test_case118.py --mode both --model-dir ... --bcd-model result/bcd_models/bcd_model_case118_xxx.pth
-
-环境变量（与 ``run_test.py`` 相同）::
-
-    RUN_TEST_SURROGATE_MODEL_DIR=...   # 覆盖 surrogate 目录
-    RUN_TEST_BCD_MODEL_PATH=...       # 覆盖 BCD 权重
-    RUN_TEST_DISABLE_PLOTS=1          # 跳过绘图（CI / 无显示环境）
-"""
+"""Case118 wrapper for run_test.py."""
 
 from __future__ import annotations
 
+import argparse
 import os
 import sys
 from pathlib import Path
 
+
+def _parse_unit_ids(value: str) -> list[int] | None:
+    text = (value or "").strip().lower()
+    if text in ("", "all", "none"):
+        return None
+    return [int(part.strip()) for part in text.split(",") if part.strip()]
+
+
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--mode", choices=("surrogate", "bcd", "both"), default="surrogate")
+    parser.add_argument("--model-dir", type=str, default="result/surrogate_models/subproblem_models_case118_20260420_175002")
+    parser.add_argument("--bcd-model", type=str, default=None)
+    parser.add_argument("--strategy", type=str, default="all_templates_sign4_plus_single")
+    parser.add_argument("--max-samples", type=int, default=None)
+    parser.add_argument("--sample-range", type=str, default="0:8")
+    parser.add_argument("--test-samples", type=int, default=8)
+    parser.add_argument("--unit-ids", type=str, default="0", help="'all' or comma-separated ids, e.g. 0,1,2")
+    parser.add_argument(
+        "--surrogate-constraint-scope",
+        choices=("all", "sign4", "none"),
+        default="all",
+        help="Which surrogate subproblem constraints to apply in LP and FP tests.",
+    )
+    parser.add_argument(
+        "--surrogate-sign4-only",
+        action="store_true",
+        help="Shortcut for --surrogate-constraint-scope sign4.",
+    )
+    parser.add_argument(
+        "--no-subproblem-surrogate",
+        action="store_true",
+        help="Shortcut for --surrogate-constraint-scope none; keep BCD theta/zeta constraints available.",
+    )
+    parser.add_argument("--no-fp", action="store_true", help="Skip feasibility-pump testing.")
+    return parser.parse_args()
+
+
 def main() -> None:
-    # -----------------------
-    # 显式参数设置（不使用命令行）
-    # -----------------------
-    mode: str = "surrogate"  # "surrogate" | "bcd" | "both"
-    model_dir: str | None = "result/surrogate_models/subproblem_models_case118_20260420_175002"  # None=自动选 result/surrogate_models/subproblem_models_case118_* 最新
-    bcd_model: str | None = None  # None=自动发现 result/bcd_models/bcd_model_case118_*.pth
-    strategy: str = "all_templates_sign4_plus_single"  # 或 "auto" 让 run_test 从 checkpoint 读取
-    max_samples: int | None = None
-    sample_range: str = "0:8"
-    test_samples: int = 8
-    run_fp: bool = True
-    units: list[int] | None = [0]  # None=全部；或例如 [1,2,3]
+    args = _parse_args()
+    if args.surrogate_sign4_only:
+        args.surrogate_constraint_scope = "sign4"
+    if args.no_subproblem_surrogate:
+        args.surrogate_constraint_scope = "none"
 
     root = Path(__file__).resolve().parent
-    # 与训练入口共用 active set 路径，避免数据/λ 分布不一致
+
     import run_training_case118 as case118_cfg
+    import run_test as rt
 
     active = case118_cfg.CASE118_ACTIVE_SET_JSON
     if not (root / active).exists():
         print(
-            f"[run_test_case118] 错误: 找不到 active set 文件（与训练共用）:\n  {root / active}",
+            f"[run_test_case118] missing active-set JSON:\n  {root / active}",
             file=sys.stderr,
         )
         sys.exit(1)
 
-    import run_test as rt
-
-    rt.MODE = mode
+    rt.MODE = args.mode
     rt.CASE_NAME = "case118"
     rt.ACTIVE_SETS_FILE = active
-    rt.SURROGATE_CONSTRAINT_STRATEGY = strategy
+    rt.SURROGATE_CONSTRAINT_STRATEGY = args.strategy
+    rt.SURROGATE_CONSTRAINT_SCOPE = args.surrogate_constraint_scope
     rt.SUBPROBLEM_IGNORE_STARTUP_SHUTDOWN_COSTS = True
-    rt.UNIT_IDS = units
+    rt.UNIT_IDS = _parse_unit_ids(args.unit_ids)
 
-    rt.MODEL_DIR = model_dir
-    rt.BCD_MODEL_PATH = bcd_model
-    rt.MAX_SAMPLES = max_samples
-    rt.SAMPLE_RANGE = sample_range
-    rt.TEST_SAMPLES = max(1, int(test_samples))
-    rt.RUN_FP = bool(run_fp)
+    rt.MODEL_DIR = args.model_dir
+    rt.BCD_MODEL_PATH = args.bcd_model
+    rt.MAX_SAMPLES = args.max_samples
+    rt.SAMPLE_RANGE = args.sample_range
+    rt.TEST_SAMPLES = max(1, int(args.test_samples))
+    rt.TEST_SAMPLES_DEFAULT = rt.TEST_SAMPLES
+    rt.RUN_FP = not bool(args.no_fp)
 
     print("=" * 72, flush=True)
     print("run_test_case118.py", flush=True)
     print(f"  mode={rt.MODE} | active_set={active}", flush=True)
     print(
         f"  strategy={rt.SURROGATE_CONSTRAINT_STRATEGY} | "
+        f"surrogate_constraint_scope={rt.SURROGATE_CONSTRAINT_SCOPE} | "
         f"ignore_startup_shutdown_costs={rt.SUBPROBLEM_IGNORE_STARTUP_SHUTDOWN_COSTS}",
         flush=True,
     )
