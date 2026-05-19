@@ -1941,18 +1941,6 @@ def _save_global_surrogate_solve_stats(rows: list[dict], fig_dir: Path, case_nam
     if not rows:
         return
 
-    source_fields = {
-        "num_base_constraints",
-        "num_proxy_constraints",
-        "num_subproblem_surrogate_constraints",
-        "num_bcd_theta_constraints",
-        "num_bcd_zeta_constraints",
-        "num_sparse_constraints",
-        "objective_solver_full",
-        "objective_bound",
-    }
-    rows = [{k: v for k, v in row.items() if k not in source_fields} for row in rows]
-
     stats_dir = Path(__file__).parent / "result" / "solve_stats"
     stats_dir.mkdir(parents=True, exist_ok=True)
     base = stats_dir / f"{case_name}_global_surrogate_solve_stats"
@@ -2236,7 +2224,12 @@ def run_lp_compare_test(ppc, all_samples: list, dual_predictor, trainers: dict,
 
         try:
             lambda_val = dual_predictor.predict(sample)
-            x_lp_plain = solve_global_LP_relaxation_without_surrogate(ppc, pd_data, T_DELTA)
+            x_lp_plain, plain_stats = solve_global_LP_relaxation_without_surrogate(
+                ppc,
+                pd_data,
+                T_DELTA,
+                return_stats=True,
+            )
             x_lp_surr, solve_stats = solve_global_LP_relaxation(
                 ppc,
                 sample,
@@ -2298,6 +2291,11 @@ def run_lp_compare_test(ppc, all_samples: list, dual_predictor, trainers: dict,
             "global_base_l1_to_true": float(plain_metrics["l1"]),
             "global_base_hamming_to_true": hamming_plain,
             "global_base_integrality_gap": float(plain_metrics["integrality_gap"]),
+            "global_base_runtime_sec": (plain_stats or {}).get("runtime_sec"),
+            "global_base_num_vars": (plain_stats or {}).get("num_vars"),
+            "global_base_num_constraints": (plain_stats or {}).get("num_constraints"),
+            "global_base_num_nonzeros": (plain_stats or {}).get("num_nonzeros"),
+            "global_base_status_name": (plain_stats or {}).get("status_name"),
             "integrality_gap": float(integ_surr),
             "l1_to_true": float(l1_surr),
             "hamming_to_true": int(hamming_surr),

@@ -35,9 +35,12 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--bcd-iter", type=int, default=BCD_MAX_ITER)
     p.add_argument("--sub-iter", type=int, default=SUBPROBLEM_MAX_ITER)
     p.add_argument("--sample-workers", type=int, default=N_WORKERS_SAMPLE)
+    p.add_argument("--bcd-lp-backend", choices=("gurobi", "cvxpy_highs"), default=BCD_LP_BACKEND)
+    p.add_argument("--subproblem-lp-backend", choices=("gurobi", "cvxpy_highs"), default=SUBPROBLEM_LP_BACKEND)
     p.add_argument("--unit-predictor", type=str, default=UNIT_PREDICTOR_LOAD_PATH)
     p.add_argument("--no-unit-predictor", action="store_true")
     p.add_argument("--no-auto-latest-unit-predictor", action="store_true")
+    p.add_argument("--metrics-tag", type=str, default=None)
     return p.parse_args()
 
 
@@ -84,8 +87,8 @@ def main() -> None:
     rt.N_WORKERS_SUBPROBLEM = rt.N_WORKERS_SAMPLE
     rt.N_WORKERS_UNIT = N_WORKERS_UNIT
     rt.N_WORKERS_BCD = N_WORKERS_BCD
-    rt.SUBPROBLEM_LP_BACKEND = SUBPROBLEM_LP_BACKEND
-    rt.BCD_LP_BACKEND = BCD_LP_BACKEND
+    rt.SUBPROBLEM_LP_BACKEND = args.subproblem_lp_backend
+    rt.BCD_LP_BACKEND = args.bcd_lp_backend
     rt.SURROGATE_CONSTRAINT_STRATEGY = SURROGATE_CONSTRAINT_STRATEGY
     rt.USE_UNIT_PREDICTOR = not bool(args.no_unit_predictor)
     rt.BCD_USE_UNIT_PREDICTOR = rt.USE_UNIT_PREDICTOR
@@ -95,6 +98,7 @@ def main() -> None:
     rt.SURROGATE_DUAL_PREDICTOR_ONLY = False
     rt.BCD_MODEL_FILE = None
     rt.SURROGATE_MODEL_DIR = None
+    rt.METRICS_NAME_TAG = (args.metrics_tag or "").strip()
     _configure_iterations(args.bcd_iter, args.sub_iter)
 
     print("=" * 72, flush=True)
@@ -107,7 +111,9 @@ def main() -> None:
     print(
         f"unit_predictor={rt.USE_UNIT_PREDICTOR} | "
         f"load_path={rt.UNIT_PREDICTOR_LOAD_PATH or 'auto-latest'} | "
-        f"auto_latest={rt.UNIT_PREDICTOR_AUTO_LATEST_STANDALONE}",
+        f"auto_latest={rt.UNIT_PREDICTOR_AUTO_LATEST_STANDALONE} | "
+        f"metrics_tag={rt.METRICS_NAME_TAG or '(none)'} | "
+        f"bcd_backend={rt.BCD_LP_BACKEND} | subproblem_backend={rt.SUBPROBLEM_LP_BACKEND}",
         flush=True,
     )
     print("=" * 72, flush=True)

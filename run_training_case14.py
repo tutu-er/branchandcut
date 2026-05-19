@@ -25,6 +25,7 @@ N_WORKERS_BCD = 1
 SUBPROBLEM_LP_BACKEND = "cvxpy_highs"
 BCD_LP_BACKEND = "gurobi"
 SURROGATE_CONSTRAINT_STRATEGY = "all_templates_sign4_plus_single"
+UNIT_PREDICTOR_LOAD_PATH: str | None = None
 
 
 def _parse_args() -> argparse.Namespace:
@@ -37,6 +38,8 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--bcd-iter", type=int, default=BCD_MAX_ITER)
     p.add_argument("--sub-iter", type=int, default=SUBPROBLEM_MAX_ITER)
     p.add_argument("--sample-workers", type=int, default=N_WORKERS_SAMPLE)
+    p.add_argument("--unit-predictor", type=str, default=UNIT_PREDICTOR_LOAD_PATH)
+    p.add_argument("--no-auto-latest-unit-predictor", action="store_true")
     p.add_argument(
         "--unit-ids",
         type=str,
@@ -143,11 +146,11 @@ def main() -> None:
     rt.SURROGATE_CONSTRAINT_STRATEGY = SURROGATE_CONSTRAINT_STRATEGY
     rt.USE_UNIT_PREDICTOR = True
     rt.BCD_USE_UNIT_PREDICTOR = True
-    rt.UNIT_PREDICTOR_AUTO_LATEST_STANDALONE = True
+    rt.UNIT_PREDICTOR_LOAD_PATH = args.unit_predictor
+    rt.UNIT_PREDICTOR_AUTO_LATEST_STANDALONE = not bool(args.no_auto_latest_unit_predictor)
+    rt.UNIT_PREDICTOR_LOAD_METADATA_CONFIG = True
     rt.SURROGATE_DUAL_PREDICTOR_ONLY = False
     rt.BCD_MODEL_FILE = None
-
-    rt.UNIT_PREDICTOR_LOAD_PATH = "result/surrogate_models/unit_predictor_case14_20260504_132051/unit_predictor.pth"
 
     _configure_iterations(args.bcd_iter, args.sub_iter)
 
@@ -189,6 +192,8 @@ def main() -> None:
         f"pg_cost_nn_epochs={rt.SUBPROBLEM_PG_COST_NN_EPOCHS} | "
         f"metrics_tag={rt.METRICS_NAME_TAG or '(none)'} | "
         f"active_sets={rt.ACTIVE_SETS_FILE or 'auto-latest'} | "
+        f"unit_predictor={rt.UNIT_PREDICTOR_LOAD_PATH or 'auto-latest'} | "
+        f"auto_latest_unit_predictor={rt.UNIT_PREDICTOR_AUTO_LATEST_STANDALONE} | "
         f"resume_dir={rt.SURROGATE_MODEL_DIR or '(none)'} | "
         f"skip_existing={rt.SURROGATE_SKIP_EXISTING_UNITS}",
         flush=True,

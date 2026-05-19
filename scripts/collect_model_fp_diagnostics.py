@@ -242,8 +242,10 @@ def _binary_error_matrix(x_candidate: Optional[np.ndarray], x_true: np.ndarray) 
     if x_arr.shape != x_true.shape:
         return None
     valid = np.isfinite(x_arr) & np.isfinite(x_true)
-    rounded = np.rint(np.clip(x_arr, 0.0, 1.0)).astype(int)
-    truth = np.rint(np.clip(x_true, 0.0, 1.0)).astype(int)
+    rounded = np.zeros_like(x_arr, dtype=int)
+    truth = np.zeros_like(x_true, dtype=int)
+    rounded[valid] = np.rint(np.clip(x_arr[valid], 0.0, 1.0)).astype(int)
+    truth[valid] = np.rint(np.clip(x_true[valid], 0.0, 1.0)).astype(int)
     err = np.zeros_like(rounded, dtype=int)
     err[valid & (rounded == 1) & (truth == 0)] = 1
     err[valid & (rounded == 0) & (truth == 1)] = -1
@@ -340,11 +342,168 @@ def _clean_solve_stats(stats: Optional[dict]) -> dict:
     return {k: stats.get(k) for k in sorted(keep) if k in stats}
 
 
+def _compact_fp_histories(fp_details: Optional[dict]) -> List[dict]:
+    """Keep scalar FP trace data and drop large arrays from recovery details."""
+    histories = []
+    for item in (fp_details or {}).get("fp_histories") or []:
+        compact = {
+            "hot_start_index": item.get("hot_start_index"),
+            "hot_start_name": item.get("hot_start_name"),
+            "score": item.get("score"),
+            "precheck_feasible": item.get("precheck_feasible"),
+            "precheck_reason": item.get("precheck_reason"),
+            "parallel": item.get("parallel"),
+            "entered_fp_iterations": item.get("entered_fp_iterations", bool(item.get("history"))),
+            "iterations": item.get("iterations", len(item.get("history") or [])),
+            "termination": item.get("termination"),
+            "final_reason": item.get("final_reason"),
+            "history": item.get("history") or [],
+        }
+        histories.append(compact)
+    return histories
+
+
+def _fp_iteration_plot_rows(fp_details: Optional[dict], sample_id: Any) -> List[dict]:
+    rows: List[dict] = []
+    for hist in _compact_fp_histories(fp_details):
+        base = {
+            "sample_id": sample_id,
+            "hot_start_index": hist.get("hot_start_index"),
+            "hot_start_name": hist.get("hot_start_name"),
+            "parallel": bool(hist.get("parallel", False)),
+            "entered_fp_iterations": bool(hist.get("entered_fp_iterations", False)),
+            "termination": hist.get("termination"),
+            "final_reason": hist.get("final_reason"),
+        }
+        history_rows = hist.get("history") or []
+        if not history_rows:
+            rows.append({
+                **base,
+                "event": hist.get("termination") or "hot_start_precheck",
+                "iteration": None,
+                "precheck_feasible": hist.get("precheck_feasible"),
+                "precheck_reason": hist.get("precheck_reason"),
+            })
+            continue
+        for step in history_rows:
+            rows.append({
+                **base,
+                "event": "fp_iteration",
+                "iteration": step.get("iteration"),
+                "precheck_feasible": hist.get("precheck_feasible"),
+                "precheck_reason": hist.get("precheck_reason"),
+                "projection_status": step.get("projection_status"),
+                "projection_status_name": step.get("projection_status_name"),
+                "phi_project": step.get("phi_project", step.get("l1_projection")),
+                "phi_hat": step.get("phi_hat"),
+                "l1_projection": step.get("l1_projection"),
+                "soft_penalty": step.get("soft_penalty"),
+                "tau": step.get("tau"),
+                "tau_cost": step.get("tau_cost"),
+                "primal_objective": step.get("primal_objective"),
+                "changed_bits": step.get("changed_bits"),
+                "changed_bits_after_heuristic": step.get("changed_bits_after_heuristic"),
+                "trusted_bits": step.get("trusted_bits", step.get("n_trusted")),
+                "free_bits": step.get("free_bits", step.get("n_free")),
+                "candidate_convex_hull_active": step.get("candidate_convex_hull_active"),
+                "candidate_pool_size": step.get("candidate_pool_size"),
+                "surrogate_screen_active": step.get("surrogate_screen_active"),
+                "surrogate_screen_constraints": step.get("surrogate_screen_constraints"),
+                "cycle_hit": step.get("cycle_hit"),
+                "perturbation_applied": step.get("perturbation_applied"),
+                "perturbation_mode": step.get("perturbation_mode"),
+                "pool_restart_applied": step.get("pool_restart_applied"),
+                "flipped_bits": step.get("flipped_bits"),
+                "post_feasible": step.get("post_feasible"),
+                "post_reason": step.get("post_reason"),
+            })
+    return rows
+
+
+def _summarize_fp_heuristics(fp_details: Optional[dict]) -> dict:
+    if not fp_details:
+        return {}
+    histories = _compact_fp_histories(fp_details)
+    rows = _fp_iteration_plot_rows(fp_details, sample_id=None)
+    screen = fp_details.get("surrogate_screen_summary") or {}
+    selected = fp_details.get("selected_hot_start")
+    iter_rows = [row for row in rows if row.get("event") == "fp_iteration"]
+    return {
+        "selected_hot_start": selected,
+        "selected_from_nearby_history": bool(str(selected or "").startswith("nearby_opt_commitment_")),
+        "hot_start_prechecks": len(fp_details.get("hot_start_prechecks") or []),
+        "hot_start_already_feasible": sum(
+            1 for hist in histories if hist.get("termination") == "hot_start_already_feasible"
+        ),
+        "fp_hot_starts_entered": sum(1 for hist in histories if hist.get("entered_fp_iterations")),
+        "fp_iterations": len(iter_rows),
+        "cycle_hits": sum(1 for row in iter_rows if row.get("cycle_hit")),
+        "perturbations": sum(1 for row in iter_rows if row.get("perturbation_applied")),
+        "pool_restarts": sum(1 for row in iter_rows if row.get("pool_restart_applied")),
+        "flipped_bits": int(sum(int(row.get("flipped_bits") or 0) for row in iter_rows)),
+        "candidate_convex_hull_iterations": sum(
+            1 for row in iter_rows if row.get("candidate_convex_hull_active")
+        ),
+        "surrogate_screen_constraints": screen.get("n_constraints", 0),
+        "hot_starts_after_screen": screen.get("hot_starts_after", 0),
+        "x_pool_after_screen": screen.get("x_pool_after", 0),
+        "projection_objective_tau": fp_details.get("projection_objective_tau"),
+    }
+
+
+def _load_bcd_agent(
+    ppc: dict,
+    active_set_path: Path,
+    bcd_model_path: Path,
+    t_delta: float,
+):
+    """Load a trained BCD agent for theta/zeta proxy rows."""
+    if not bcd_model_path.exists():
+        raise FileNotFoundError(f"BCD model file does not exist: {bcd_model_path}")
+    try:
+        from src.uc_NN_BCD import Agent_NN_BCD, load_active_set_from_json
+    except ImportError:
+        from uc_NN_BCD import Agent_NN_BCD, load_active_set_from_json
+
+    print(f"[diagnostics] loading BCD active-set data: {active_set_path}", flush=True)
+    active_set_data = load_active_set_from_json(str(active_set_path))
+    print(f"[diagnostics] loading BCD model: {bcd_model_path}", flush=True)
+    agent = Agent_NN_BCD(ppc, active_set_data=active_set_data, T_delta=float(t_delta))
+    agent.load_model_parameters(str(bcd_model_path), restore_rho_state=False)
+    return agent
+
+
+def _load_tailored_fp_kwargs(config_path: Optional[Path]) -> dict:
+    if config_path is None:
+        return {}
+    if not config_path.exists():
+        raise FileNotFoundError(f"Tailored FP config does not exist: {config_path}")
+    with config_path.open("r", encoding="utf-8") as f:
+        config = json.load(f)
+    kwargs = dict(config.get("recover_integer_solution_kwargs") or {})
+    print(
+        "[diagnostics] loaded tailored FP config: "
+        f"{config_path} | profile={config.get('selected_profile')}",
+        flush=True,
+    )
+    return kwargs
+
+
 def collect_diagnostics(args: argparse.Namespace) -> dict:
     _ensure_runtime_imports()
 
     active_set_path = _resolve_path(args.active_sets, _latest_active_set(args.case))
     model_dir = _resolve_path(args.model_dir, _latest_model_dir(args.case))
+    bcd_model_path = (
+        _resolve_path(args.bcd_model, None)
+        if args.bcd_model is not None and str(args.bcd_model).strip()
+        else None
+    )
+    tailored_config_path = (
+        _resolve_path(args.tailored_config, None)
+        if args.tailored_config is not None and str(args.tailored_config).strip()
+        else None
+    )
     output_path = _resolve_path(
         args.output,
         ROOT / "result" / "fp_diagnostics" / (
@@ -356,6 +515,10 @@ def collect_diagnostics(args: argparse.Namespace) -> dict:
     print(f"[diagnostics] case={args.case}", flush=True)
     print(f"[diagnostics] active_sets={active_set_path}", flush=True)
     print(f"[diagnostics] model_dir={model_dir}", flush=True)
+    if bcd_model_path is not None:
+        print(f"[diagnostics] bcd_model={bcd_model_path}", flush=True)
+    if tailored_config_path is not None:
+        print(f"[diagnostics] tailored_config={tailored_config_path}", flush=True)
     print(f"[diagnostics] output={output_path}", flush=True)
 
     ppc = get_case_ppc(args.case)
@@ -383,6 +546,37 @@ def collect_diagnostics(args: argparse.Namespace) -> dict:
         use_unit_predictor=bool(args.use_unit_predictor),
         skip_initial_solve=True,
     )
+    expected_units = (
+        list(range(int(np.asarray(ppc["gen"]).shape[0])))
+        if unit_ids is None
+        else [int(unit_id) for unit_id in unit_ids]
+    )
+    loaded_units = sorted(int(unit_id) for unit_id in trainers.keys())
+    missing_units = [unit_id for unit_id in expected_units if unit_id not in loaded_units]
+    if missing_units and not args.allow_missing_surrogates:
+        raise FileNotFoundError(
+            "Missing surrogate_unit_*.pth checkpoints for requested units: "
+            f"{missing_units}. The selected model dir is {model_dir}. "
+            "Use a subproblem model directory that contains surrogate_unit_<g>.pth, "
+            "or pass --allow-missing-surrogates for dual/plain-LP-only diagnostics."
+        )
+    if missing_units:
+        print(
+            "[diagnostics] warning: continuing with missing surrogate units "
+            f"{missing_units}; surrogate/subproblem/FP diagnostics may be incomplete",
+            flush=True,
+        )
+
+    agent = None
+    if bcd_model_path is not None:
+        agent = _load_bcd_agent(ppc, active_set_path, bcd_model_path, T_delta)
+    elif str(args.bcd_proxy_scope).strip().lower() != "none":
+        print(
+            "[diagnostics] warning: --bcd-proxy-scope is not 'none' but no "
+            "--bcd-model was provided; BCD theta/zeta proxy rows will be skipped.",
+            flush=True,
+        )
+    tailored_fp_kwargs = _load_tailored_fp_kwargs(tailored_config_path)
 
     records: List[dict] = []
     ng = int(np.asarray(ppc["gen"]).shape[0])
@@ -438,6 +632,7 @@ def collect_diagnostics(args: argparse.Namespace) -> dict:
                     T_delta,
                     trainers,
                     lambda_val,
+                    agent=agent,
                     surrogate_constraint_scope=args.surrogate_constraint_scope,
                     bcd_proxy_scope=args.bcd_proxy_scope,
                     return_stats=True,
@@ -479,40 +674,54 @@ def collect_diagnostics(args: argparse.Namespace) -> dict:
 
         if args.run_fp:
             try:
+                scenario_bank = [] if args.scenario_bank_mode == "none" else all_samples
+                fp_kwargs = {
+                    "agent": agent,
+                    "max_fp_iter": args.max_fp_iter,
+                    "conf_threshold": args.fp_conf_threshold,
+                    "max_perturbation_hot_starts": args.max_perturbation_hot_starts,
+                    "max_unit_options_per_generator": args.max_unit_options_per_generator,
+                    "max_unit_combination_candidates": args.max_unit_combination_candidates,
+                    "max_nearby_commitment_hot_starts": args.max_nearby_commitment_hot_starts,
+                    "nearby_commitment_pool_size": args.nearby_commitment_pool_size,
+                    "parallel_fp_starts": args.parallel_fp_starts,
+                    "scenario_bank": scenario_bank,
+                    "surrogate_screen_mode": args.surrogate_screen_mode,
+                    "surrogate_screen_max_constraints_per_unit": args.surrogate_screen_max_constraints_per_unit,
+                    "surrogate_screen_min_support_ratio": args.surrogate_screen_min_support_ratio,
+                    "surrogate_screen_max_normalized_violation": args.surrogate_screen_max_normalized_violation,
+                    "surrogate_screen_min_mean_margin": args.surrogate_screen_min_mean_margin,
+                    "surrogate_screen_candidate_violation_tol": args.surrogate_screen_candidate_violation_tol,
+                    "surrogate_screen_soft_penalty": args.surrogate_screen_soft_penalty,
+                    "projection_objective_tau": args.projection_objective_tau,
+                    "return_details": True,
+                    "verbose": bool(args.verbose_fp),
+                }
+                if args.no_subproblem_milp_candidate:
+                    fp_kwargs["use_subproblem_milp_candidate"] = False
+                fp_kwargs.update(tailored_fp_kwargs)
                 x_fp, success, fp_details = recover_integer_solution(
                     sample,
                     trainers,
                     dual_predictor,
                     ppc,
                     T_delta,
-                    max_fp_iter=args.max_fp_iter,
-                    conf_threshold=args.fp_conf_threshold,
-                    max_perturbation_hot_starts=args.max_perturbation_hot_starts,
-                    max_unit_options_per_generator=args.max_unit_options_per_generator,
-                    max_unit_combination_candidates=args.max_unit_combination_candidates,
-                    max_nearby_commitment_hot_starts=args.max_nearby_commitment_hot_starts,
-                    nearby_commitment_pool_size=args.nearby_commitment_pool_size,
-                    parallel_fp_starts=args.parallel_fp_starts,
-                    scenario_bank=all_samples,
-                    surrogate_screen_mode=args.surrogate_screen_mode,
-                    surrogate_screen_max_constraints_per_unit=args.surrogate_screen_max_constraints_per_unit,
-                    surrogate_screen_min_support_ratio=args.surrogate_screen_min_support_ratio,
-                    surrogate_screen_max_normalized_violation=args.surrogate_screen_max_normalized_violation,
-                    surrogate_screen_min_mean_margin=args.surrogate_screen_min_mean_margin,
-                    surrogate_screen_candidate_violation_tol=args.surrogate_screen_candidate_violation_tol,
-                    surrogate_screen_soft_penalty=args.surrogate_screen_soft_penalty,
-                    projection_objective_tau=args.projection_objective_tau,
-                    return_details=True,
-                    verbose=bool(args.verbose_fp),
+                    **fp_kwargs,
                 )
                 record["solutions"]["x_fp"] = x_fp
                 record["metrics"]["fp_to_true"] = _distance_metrics(x_fp, x_true)
                 record["fp_success"] = bool(success)
+                fp_histories = _compact_fp_histories(fp_details)
+                fp_plot_rows = _fp_iteration_plot_rows(fp_details, record.get("sample_id"))
                 record["fp_details"] = {
                     "selected_hot_start": fp_details.get("selected_hot_start"),
                     "projection_objective_tau": fp_details.get("projection_objective_tau"),
                     "surrogate_screen_summary": fp_details.get("surrogate_screen_summary"),
+                    "hot_start_prechecks": fp_details.get("hot_start_prechecks"),
+                    "fp_histories": fp_histories,
+                    "heuristic_summary": _summarize_fp_heuristics(fp_details),
                 }
+                record["fp_iteration_plot_rows"] = fp_plot_rows
             except Exception as exc:
                 record["fp_error"] = str(exc)
 
@@ -524,6 +733,9 @@ def collect_diagnostics(args: argparse.Namespace) -> dict:
             "case": args.case,
             "active_set_path": str(active_set_path),
             "model_dir": str(model_dir),
+            "bcd_model": None if bcd_model_path is None else str(bcd_model_path),
+            "tailored_config": None if tailored_config_path is None else str(tailored_config_path),
+            "tailored_fp_kwargs": tailored_fp_kwargs,
             "t_delta": T_delta,
             "sample_start": int(args.start),
             "sample_count": int(len(selected_samples)),
@@ -533,6 +745,7 @@ def collect_diagnostics(args: argparse.Namespace) -> dict:
             "surrogate_constraint_scope": args.surrogate_constraint_scope,
             "bcd_proxy_scope": args.bcd_proxy_scope,
             "run_fp": bool(args.run_fp),
+            "scenario_bank_mode": args.scenario_bank_mode,
         },
         "records": records,
     }
@@ -549,6 +762,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--case", default="case3lite")
     p.add_argument("--active-sets", default=None, help="Active-set JSON; default = latest for case.")
     p.add_argument("--model-dir", default=None, help="Trained model directory; default = latest for case.")
+    p.add_argument("--bcd-model", default=None, help="Optional trained BCD model for theta/zeta proxy rows.")
+    p.add_argument("--tailored-config", default=None, help="Optional tailored FP config JSON from build_tailored_fp_from_diagnostics.py.")
     p.add_argument("--output", default=None)
     p.add_argument("--start", type=int, default=0)
     p.add_argument("--samples", type=int, default=8, help="<=0 means all samples from --start.")
@@ -558,7 +773,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--lp-backend", default=None, help="Subproblem LP backend; default = checkpoint metadata.")
     p.add_argument("--ignore-startup-shutdown-costs", type=int, choices=(0, 1), default=None)
     p.add_argument("--use-unit-predictor", action="store_true")
-    p.add_argument("--surrogate-constraint-scope", choices=("all", "sign4"), default="all")
+    p.add_argument(
+        "--allow-missing-surrogates",
+        action="store_true",
+        help="Continue when surrogate_unit_*.pth files are missing; output is dual/plain-LP oriented.",
+    )
+    p.add_argument("--surrogate-constraint-scope", choices=("all", "sign4", "none"), default="all")
     p.add_argument("--bcd-proxy-scope", choices=("both", "theta", "zeta", "none"), default="none")
     p.add_argument("--skip-plain-lp", action="store_true")
     p.add_argument("--skip-proxy-lp", action="store_true")
@@ -573,6 +793,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--max-unit-combination-candidates", type=int, default=12)
     p.add_argument("--max-nearby-commitment-hot-starts", type=int, default=4)
     p.add_argument("--nearby-commitment-pool-size", type=int, default=12)
+    p.add_argument(
+        "--scenario-bank-mode",
+        choices=("all", "none"),
+        default="all",
+        help=(
+            "Controls historical nearby-commitment candidates for FP. "
+            "`all` uses all loaded active-set samples; `none` disables the bank "
+            "to avoid same-file label leakage in iteration diagnostics."
+        ),
+    )
     p.add_argument("--parallel-fp-starts", type=int, default=1)
     p.add_argument("--surrogate-screen-mode", default="robust")
     p.add_argument("--surrogate-screen-max-constraints-per-unit", type=int, default=3)
@@ -582,6 +812,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--surrogate-screen-candidate-violation-tol", type=float, default=0.02)
     p.add_argument("--surrogate-screen-soft-penalty", type=float, default=25.0)
     p.add_argument("--projection-objective-tau", default="adaptive")
+    p.add_argument(
+        "--no-subproblem-milp-candidate",
+        action="store_true",
+        help="Do not add subproblem MILP solutions as FP hot-start/pool candidates.",
+    )
     return p
 
 

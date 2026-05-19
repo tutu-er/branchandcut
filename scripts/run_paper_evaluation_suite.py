@@ -4,7 +4,7 @@
 This script orchestrates the recommended ablation tests for case14,
 case30lite, and case3lite:
 
-  1. BCD theta constraints only
+  1. BCD theta constraints only (no subproblem surrogate rows)
   2. BCD theta + zeta constraints
   3. Surrogate sign4 constraints only
   4. Surrogate sign4 + single constraints
@@ -136,6 +136,7 @@ def _run_specs(
                 METHOD_LABELS["bcd_theta"],
                 "both",
                 bcd_proxy_scope="theta",
+                surrogate_constraint_scope="none",
             ),
             RunSpec(
                 "S02_bcd_theta_zeta",
@@ -557,6 +558,8 @@ def run_suite(args: argparse.Namespace) -> None:
         run_dir = run_root / spec.case.name / spec.run_id
         run_dir.mkdir(parents=True, exist_ok=True)
         cmd = _build_command(spec, with_activity=bool(args.with_activity))
+        if args.with_activity:
+            cmd.extend(["--activity-output-dir", str(run_dir / "activity")])
         log_path = log_dir / f"{spec.case.name}_{spec.run_id}.log"
         print("=" * 80)
         print(f"{spec.case.name} | {spec.run_id}")
@@ -612,6 +615,7 @@ def run_suite(args: argparse.Namespace) -> None:
         "sample_index",
         "status_name",
         "runtime_sec",
+        "global_base_runtime_sec",
         "objective",
         "objective_uc_cost",
         "integrality_gap",
@@ -621,6 +625,16 @@ def run_suite(args: argparse.Namespace) -> None:
         "num_vars",
         "num_constraints",
         "num_nonzeros",
+        "num_base_constraints",
+        "num_proxy_constraints",
+        "num_subproblem_surrogate_constraints",
+        "num_bcd_theta_constraints",
+        "num_bcd_zeta_constraints",
+        "num_sparse_constraints",
+        "global_base_num_vars",
+        "global_base_num_constraints",
+        "global_base_num_nonzeros",
+        "global_base_status_name",
         "subproblem_slack_sum",
         "bcd_slack_sum",
     ]

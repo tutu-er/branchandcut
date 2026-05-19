@@ -2838,8 +2838,9 @@ def solve_global_LP_relaxation(
 def solve_global_LP_relaxation_without_surrogate(
     ppc: dict,
     pd_data: np.ndarray,
-    T_delta: float
-) -> np.ndarray:
+    T_delta: float,
+    return_stats: bool = False,
+) -> np.ndarray | Tuple[np.ndarray, Dict[str, Any]]:
     """
     构建完整 UC LP 松弛（x �?[0,1]），不含任何代理约束，仅�?UC 基础约束�?DC 潮流约束�?
 
@@ -2945,11 +2946,34 @@ def solve_global_LP_relaxation_without_surrogate(
     model.setObjective(obj, GRB.MINIMIZE)
     model.optimize()
 
+    stats = {
+        "status": int(getattr(model, "Status", model.status)),
+        "status_name": _gurobi_status_name(getattr(model, "Status", model.status)),
+        "runtime_sec": float(getattr(model, "Runtime", float("nan"))),
+        "work": float(getattr(model, "Work", float("nan"))),
+        "iter_count": float(getattr(model, "IterCount", float("nan"))),
+        "bar_iter_count": float(getattr(model, "BarIterCount", float("nan"))),
+        "objective": (
+            float(getattr(model, "ObjVal", float("nan")))
+            if int(getattr(model, "SolCount", 0) or 0) > 0
+            else float("nan")
+        ),
+        "num_vars": int(getattr(model, "NumVars", 0) or 0),
+        "num_constraints": int(getattr(model, "NumConstrs", 0) or 0),
+        "num_nonzeros": int(getattr(model, "NumNZs", 0) or 0),
+    }
+
     if model.status == GRB.OPTIMAL:
-        return np.array([[x[g, t].X for t in range(T)] for g in range(ng)])
+        x_lp = np.array([[x[g, t].X for t in range(T)] for g in range(ng)])
+        if return_stats:
+            return x_lp, stats
+        return x_lp
 
     print(f"  警告: 全局 LP 松弛求解失败 (status={model.status})，返回零矩阵", flush=True)
-    return np.zeros((ng, T))
+    x_lp = np.zeros((ng, T))
+    if return_stats:
+        return x_lp, stats
+    return x_lp
 
 
 # ========================== Step 5：可行性验�?==========================
@@ -3495,10 +3519,12 @@ def run_feasibility_pump(
             )
 
         # 振荡检测（最近历史中出现过相同点�?
-        x_key = tuple(x_next.flatten())
-        cycle_hit = x_key in history
+        rounded_key = tuple(x_next.flatten())
+        cycle_hit = rounded_key in history
         perturbation_applied = False
         perturbation_mode_used = None
+        pool_restart_applied = False
+        flipped_bits = 0
         if cycle_hit:
             no_improve_count += 1
             if no_improve_count >= 3:
@@ -3511,6 +3537,7 @@ def run_feasibility_pump(
                     pool_candidate = _select_pool_restart_candidate(x_next, x_pool, trusted_mask, rng)
                     if pool_candidate is not None:
                         x_next = pool_candidate
+                        pool_restart_applied = True
 
                 if stall_perturbation_mode in ('flip', 'pool_then_flip'):
                     free_idx = np.argwhere(~trusted_mask)
@@ -3520,16 +3547,22 @@ def run_feasibility_pump(
                         for idx in chosen:
                             g_f, t_f = free_idx[idx]
                             x_next[g_f, t_f] = 1 - x_next[g_f, t_f]
+                        flipped_bits = int(len(chosen))
                 no_improve_count = 0
         else:
             no_improve_count = 0
 
-        history.append(x_key)
+        final_key = tuple(x_next.flatten())
+        history.append(final_key)
         if len(history) > 10:
             history.pop(0)
 
         if return_history:
             next_feasible, next_reason = check_uc_feasibility(x_next, ppc, pd_data, T_delta)
+            changed_after_heuristic = int(np.sum(x_next != x_curr))
+            candidate_pool_size = int(0 if x_pool is None else x_pool.shape[0])
+            surrogate_screen_count = int(len(surrogate_screen_constraints or []))
+            phi_hat = float(l1_dist + soft_penalty + primal_cost_term)
             trace.append({
                 'iteration': int(iteration),
                 'pre_feasible': False,
@@ -3537,16 +3570,31 @@ def run_feasibility_pump(
                 'projection_status': int(model.status),
                 'projection_status_name': _gurobi_status_name(model.status),
                 'l1_projection': float(l1_dist),
+                'phi_project': float(l1_dist),
+                'phi_hat': phi_hat,
                 'soft_penalty': float(soft_penalty),
+                'surrogate_screen_soft_penalty_weight': float(surrogate_screen_soft_penalty),
                 'tau': float(tau_used),
+                'projection_objective_tau': str(projection_objective_tau),
                 'tau_cost': float(primal_cost_term),
                 'primal_objective': float(primal_obj_value),
                 'changed_bits': int(changed),
+                'changed_bits_after_heuristic': int(changed_after_heuristic),
                 'n_trusted': int(np.sum(trusted_mask)),
                 'n_free': int(np.size(trusted_mask) - np.sum(trusted_mask)),
+                'trusted_bits': int(np.sum(trusted_mask)),
+                'free_bits': int(np.size(trusted_mask) - np.sum(trusted_mask)),
+                'candidate_convex_hull_active': bool(x_pool is not None and iteration >= 1),
+                'candidate_pool_size': candidate_pool_size,
+                'surrogate_screen_active': bool(surrogate_screen_count > 0),
+                'surrogate_screen_constraints': surrogate_screen_count,
                 'cycle_hit': bool(cycle_hit),
+                'rounded_state_revisited': bool(cycle_hit),
+                'final_state_revisited': bool(final_key in history[:-1]),
                 'perturbation_applied': bool(perturbation_applied),
                 'perturbation_mode': perturbation_mode_used,
+                'pool_restart_applied': bool(pool_restart_applied),
+                'flipped_bits': int(flipped_bits),
                 'post_feasible': bool(next_feasible),
                 'post_reason': str(next_reason),
             })
@@ -3979,6 +4027,7 @@ def recover_integer_solution(
         'projection_objective_tau': projection_objective_tau,
         'surrogate_constraint_scope': surrogate_constraint_scope_norm,
         'bcd_proxy_scope': bcd_proxy_scope_norm,
+        'hot_start_prechecks': [],
         'fp_histories': [],
     }
 
@@ -3992,11 +4041,28 @@ def recover_integer_solution(
     pending_fp_starts: List[Tuple[int, str, np.ndarray, float]] = []
     for idx, (name, x_start, score) in enumerate(hot_start_candidates, start=1):
         start_feas, _reason = check_uc_feasibility(x_start, ppc, pd_data, T_delta)
+        precheck_record = {
+            'hot_start_index': int(idx),
+            'hot_start_name': str(name),
+            'score': float(score),
+            'precheck_feasible': bool(start_feas),
+            'precheck_reason': str(_reason),
+        }
+        recovery_details['hot_start_prechecks'].append(precheck_record)
         if start_feas:
             if verbose:
                 print(f"  Hot start {idx}: {name} is already feasible; skip FP", flush=True)
             recovery_details['selected_hot_start'] = name
             recovery_details['x_result'] = np.asarray(x_start, dtype=int)
+            recovery_details['fp_histories'].append({
+                **precheck_record,
+                'parallel': False,
+                'entered_fp_iterations': False,
+                'iterations': 0,
+                'termination': 'hot_start_already_feasible',
+                'final_reason': str(_reason),
+                'history': [],
+            })
             return _finalize_recover_integer_solution_result(
                 np.asarray(x_start, dtype=int),
                 True,
@@ -4012,9 +4078,11 @@ def recover_integer_solution(
             print(f"  Launching {executed_parallel_count} FP hot starts in parallel", flush=True)
 
         seeded_tasks = []
-        for idx, name, x_start, _score in pending_fp_starts[:executed_parallel_count]:
+        task_scores: Dict[int, float] = {}
+        for idx, name, x_start, score in pending_fp_starts[:executed_parallel_count]:
             task_seed = int(rng.integers(0, np.iinfo(np.uint32).max))
             seeded_tasks.append((idx, name, x_start, task_seed))
+            task_scores[int(idx)] = float(score)
 
         with ThreadPoolExecutor(max_workers=executed_parallel_count) as executor:
             future_to_task = {
@@ -4051,7 +4119,10 @@ def recover_integer_solution(
                 recovery_details['fp_histories'].append({
                     'hot_start_index': int(task_idx),
                     'hot_start_name': str(name),
+                    'score': float(task_scores.get(int(task_idx), 0.0)),
+                    'precheck_feasible': False,
                     'parallel': True,
+                    'entered_fp_iterations': True,
                     **dict(task_details or {}),
                 })
                 parallel_warm_result = task_result
@@ -4072,17 +4143,14 @@ def recover_integer_solution(
                 first_parallel_idx = pending_fp_starts[0][0]
                 parallel_warm_result = parallel_results.get(first_parallel_idx, parallel_warm_result)
 
-    hot_start_candidates = [
-        (name, x_start, score)
-        for idx, name, x_start, score in pending_fp_starts[executed_parallel_count:]
-    ]
+    remaining_fp_starts = pending_fp_starts[executed_parallel_count:]
 
     x_result = parallel_warm_result if parallel_warm_result is not None else (
-        hot_start_candidates[0][1] if hot_start_candidates else x_init
+        remaining_fp_starts[0][2] if remaining_fp_starts else x_init
     )
     success = False
 
-    for idx, (name, x_start, _score) in enumerate(hot_start_candidates, start=1):
+    for idx, name, x_start, score in remaining_fp_starts:
         selected_hot_start_name = name
         start_feas, _reason = check_uc_feasibility(x_start, ppc, pd_data, T_delta)
         if start_feas:
@@ -4090,6 +4158,19 @@ def recover_integer_solution(
                 print(f"  Hot start {idx}: {name} is already feasible; skip FP", flush=True)
             recovery_details['selected_hot_start'] = name
             recovery_details['x_result'] = np.asarray(x_start, dtype=int)
+            recovery_details['fp_histories'].append({
+                'hot_start_index': int(idx),
+                'hot_start_name': str(name),
+                'score': float(score),
+                'precheck_feasible': True,
+                'precheck_reason': str(_reason),
+                'parallel': False,
+                'entered_fp_iterations': False,
+                'iterations': 0,
+                'termination': 'hot_start_already_feasible',
+                'final_reason': str(_reason),
+                'history': [],
+            })
             return _finalize_recover_integer_solution_result(
                 np.asarray(x_start, dtype=int),
                 True,
@@ -4098,7 +4179,7 @@ def recover_integer_solution(
             )
 
         if verbose:
-            print(f"  Run FP hot start {idx}/{len(hot_start_candidates)}: {name}", flush=True)
+            print(f"  Run FP hot start {idx}/{len(pending_fp_starts)}: {name}", flush=True)
         x_result, success, fp_details = run_feasibility_pump(
             x_start, trusted_mask, ppc, pd_data, T_delta,
             x_pool=x_pool,
@@ -4115,7 +4196,11 @@ def recover_integer_solution(
         recovery_details['fp_histories'].append({
             'hot_start_index': int(idx),
             'hot_start_name': str(name),
+            'score': float(score),
+            'precheck_feasible': False,
+            'precheck_reason': str(_reason),
             'parallel': False,
+            'entered_fp_iterations': True,
             **dict(fp_details or {}),
         })
         if success:
