@@ -45,6 +45,8 @@ _extract_unit_lambda = None
 _gurobi_status_name = None
 _solve_unit_LP_with_surrogate = None
 _solve_unit_MILP_with_surrogate = None
+round_to_integer = None
+check_uc_feasibility = None
 recover_integer_solution = None
 solve_global_LP_relaxation = None
 solve_global_LP_relaxation_without_surrogate = None
@@ -57,6 +59,7 @@ def _ensure_runtime_imports() -> None:
     global normalize_sample_arrays, load_trained_models
     global _extract_unit_lambda, _gurobi_status_name
     global _solve_unit_LP_with_surrogate, _solve_unit_MILP_with_surrogate
+    global round_to_integer, check_uc_feasibility
     global recover_integer_solution, solve_global_LP_relaxation
     global solve_global_LP_relaxation_without_surrogate, GRB
 
@@ -79,7 +82,9 @@ def _ensure_runtime_imports() -> None:
         _gurobi_status_name as __gurobi_status_name,
         _solve_unit_LP_with_surrogate as __solve_unit_LP_with_surrogate,
         _solve_unit_MILP_with_surrogate as __solve_unit_MILP_with_surrogate,
+        check_uc_feasibility as _check_uc_feasibility,
         recover_integer_solution as _recover_integer_solution,
+        round_to_integer as _round_to_integer,
         solve_global_LP_relaxation as _solve_global_LP_relaxation,
         solve_global_LP_relaxation_without_surrogate as _solve_global_LP_relaxation_without_surrogate,
     )
@@ -99,6 +104,8 @@ def _ensure_runtime_imports() -> None:
     _gurobi_status_name = __gurobi_status_name
     _solve_unit_LP_with_surrogate = __solve_unit_LP_with_surrogate
     _solve_unit_MILP_with_surrogate = __solve_unit_MILP_with_surrogate
+    round_to_integer = _round_to_integer
+    check_uc_feasibility = _check_uc_feasibility
     recover_integer_solution = _recover_integer_solution
     solve_global_LP_relaxation = _solve_global_LP_relaxation
     solve_global_LP_relaxation_without_surrogate = _solve_global_LP_relaxation_without_surrogate
@@ -435,6 +442,9 @@ def _summarize_fp_heuristics(fp_details: Optional[dict]) -> dict:
         "hot_start_already_feasible": sum(
             1 for hist in histories if hist.get("termination") == "hot_start_already_feasible"
         ),
+        "feasible_hot_starts_skipped_for_fp_test": sum(
+            1 for hist in histories if hist.get("termination") == "feasible_hot_start_skipped_for_fp_test"
+        ),
         "fp_hot_starts_entered": sum(1 for hist in histories if hist.get("entered_fp_iterations")),
         "fp_iterations": len(iter_rows),
         "cycle_hits": sum(1 for row in iter_rows if row.get("cycle_hit")),
@@ -638,9 +648,26 @@ def collect_diagnostics(args: argparse.Namespace) -> dict:
                     return_stats=True,
                 )
                 record["solutions"]["x_lp_proxy"] = x_lp_proxy
+                x_lp_proxy_round = round_to_integer(x_lp_proxy)
+                proxy_round_feasible, proxy_round_reason = check_uc_feasibility(
+                    x_lp_proxy_round,
+                    ppc,
+                    pd_data,
+                    T_delta,
+                )
+                record["solutions"]["x_lp_proxy_round"] = x_lp_proxy_round
                 record["metrics"]["proxy_lp_to_true"] = _distance_metrics(x_lp_proxy, x_true)
+                record["metrics"]["proxy_lp_round_to_true"] = _distance_metrics(
+                    x_lp_proxy_round,
+                    x_true,
+                )
                 record["errors_proxy_lp"] = _binary_error_matrix(x_lp_proxy, x_true)
                 record["solve_stats"]["proxy_lp"] = _clean_solve_stats(proxy_stats)
+                record["solve_stats"]["proxy_lp_round_feasibility"] = {
+                    "feasible": bool(proxy_round_feasible),
+                    "reason": str(proxy_round_reason),
+                    "hamming_to_true": record["metrics"]["proxy_lp_round_to_true"].get("hamming"),
+                }
             except Exception as exc:
                 record["proxy_lp_error"] = str(exc)
 
@@ -699,6 +726,8 @@ def collect_diagnostics(args: argparse.Namespace) -> dict:
                 }
                 if args.no_subproblem_milp_candidate:
                     fp_kwargs["use_subproblem_milp_candidate"] = False
+                if args.skip_feasible_hot_starts:
+                    fp_kwargs["skip_feasible_hot_starts"] = True
                 fp_kwargs.update(tailored_fp_kwargs)
                 x_fp, success, fp_details = recover_integer_solution(
                     sample,
@@ -816,6 +845,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--no-subproblem-milp-candidate",
         action="store_true",
         help="Do not add subproblem MILP solutions as FP hot-start/pool candidates.",
+    )
+    p.add_argument(
+        "--skip-feasible-hot-starts",
+        action="store_true",
+        help="Skip already-feasible hot starts so diagnostics exercise FP projection iterations.",
     )
     return p
 

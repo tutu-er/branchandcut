@@ -3656,6 +3656,7 @@ def recover_integer_solution(
     projection_objective_tau = 'adaptive',
     use_subproblem_milp_candidate: bool = True,
     subproblem_milp_for_perturbations: bool = False,
+    skip_feasible_hot_starts: bool = False,
     surrogate_constraint_scope: str = "all",
     bcd_proxy_scope: str = "both",
     return_details: bool = False,
@@ -4027,6 +4028,7 @@ def recover_integer_solution(
         'projection_objective_tau': projection_objective_tau,
         'surrogate_constraint_scope': surrogate_constraint_scope_norm,
         'bcd_proxy_scope': bcd_proxy_scope_norm,
+        'skip_feasible_hot_starts': bool(skip_feasible_hot_starts),
         'hot_start_prechecks': [],
         'fp_histories': [],
     }
@@ -4038,6 +4040,7 @@ def recover_integer_solution(
 
     parallel_warm_result = None
     selected_hot_start_name = None
+    skipped_feasible_fallback: Optional[Tuple[int, str, np.ndarray, float, str]] = None
     pending_fp_starts: List[Tuple[int, str, np.ndarray, float]] = []
     for idx, (name, x_start, score) in enumerate(hot_start_candidates, start=1):
         start_feas, _reason = check_uc_feasibility(x_start, ppc, pd_data, T_delta)
@@ -4050,19 +4053,38 @@ def recover_integer_solution(
         }
         recovery_details['hot_start_prechecks'].append(precheck_record)
         if start_feas:
-            if verbose:
-                print(f"  Hot start {idx}: {name} is already feasible; skip FP", flush=True)
-            recovery_details['selected_hot_start'] = name
-            recovery_details['x_result'] = np.asarray(x_start, dtype=int)
             recovery_details['fp_histories'].append({
                 **precheck_record,
                 'parallel': False,
                 'entered_fp_iterations': False,
                 'iterations': 0,
-                'termination': 'hot_start_already_feasible',
+                'termination': (
+                    'feasible_hot_start_skipped_for_fp_test'
+                    if skip_feasible_hot_starts
+                    else 'hot_start_already_feasible'
+                ),
                 'final_reason': str(_reason),
                 'history': [],
             })
+            if skip_feasible_hot_starts:
+                if skipped_feasible_fallback is None:
+                    skipped_feasible_fallback = (
+                        int(idx),
+                        str(name),
+                        np.asarray(x_start, dtype=int),
+                        float(score),
+                        str(_reason),
+                    )
+                if verbose:
+                    print(
+                        f"  Hot start {idx}: {name} is feasible; skip it to test FP iterations",
+                        flush=True,
+                    )
+                continue
+            if verbose:
+                print(f"  Hot start {idx}: {name} is already feasible; skip FP", flush=True)
+            recovery_details['selected_hot_start'] = name
+            recovery_details['x_result'] = np.asarray(x_start, dtype=int)
             return _finalize_recover_integer_solution_result(
                 np.asarray(x_start, dtype=int),
                 True,
@@ -4144,6 +4166,16 @@ def recover_integer_solution(
                 parallel_warm_result = parallel_results.get(first_parallel_idx, parallel_warm_result)
 
     remaining_fp_starts = pending_fp_starts[executed_parallel_count:]
+    if not remaining_fp_starts and skipped_feasible_fallback is not None:
+        _idx, _name, _x_start, _score, _reason = skipped_feasible_fallback
+        recovery_details['selected_hot_start'] = _name
+        recovery_details['x_result'] = np.asarray(_x_start, dtype=int)
+        return _finalize_recover_integer_solution_result(
+            np.asarray(_x_start, dtype=int),
+            True,
+            recovery_details,
+            return_details,
+        )
 
     x_result = parallel_warm_result if parallel_warm_result is not None else (
         remaining_fp_starts[0][2] if remaining_fp_starts else x_init
@@ -4154,10 +4186,6 @@ def recover_integer_solution(
         selected_hot_start_name = name
         start_feas, _reason = check_uc_feasibility(x_start, ppc, pd_data, T_delta)
         if start_feas:
-            if verbose:
-                print(f"  Hot start {idx}: {name} is already feasible; skip FP", flush=True)
-            recovery_details['selected_hot_start'] = name
-            recovery_details['x_result'] = np.asarray(x_start, dtype=int)
             recovery_details['fp_histories'].append({
                 'hot_start_index': int(idx),
                 'hot_start_name': str(name),
@@ -4167,10 +4195,33 @@ def recover_integer_solution(
                 'parallel': False,
                 'entered_fp_iterations': False,
                 'iterations': 0,
-                'termination': 'hot_start_already_feasible',
+                'termination': (
+                    'feasible_hot_start_skipped_for_fp_test'
+                    if skip_feasible_hot_starts
+                    else 'hot_start_already_feasible'
+                ),
                 'final_reason': str(_reason),
                 'history': [],
             })
+            if skip_feasible_hot_starts:
+                if skipped_feasible_fallback is None:
+                    skipped_feasible_fallback = (
+                        int(idx),
+                        str(name),
+                        np.asarray(x_start, dtype=int),
+                        float(score),
+                        str(_reason),
+                    )
+                if verbose:
+                    print(
+                        f"  Hot start {idx}: {name} is feasible; skip it to test FP iterations",
+                        flush=True,
+                    )
+                continue
+            if verbose:
+                print(f"  Hot start {idx}: {name} is already feasible; skip FP", flush=True)
+            recovery_details['selected_hot_start'] = name
+            recovery_details['x_result'] = np.asarray(x_start, dtype=int)
             return _finalize_recover_integer_solution_result(
                 np.asarray(x_start, dtype=int),
                 True,

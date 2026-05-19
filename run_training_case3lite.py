@@ -35,6 +35,8 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--bcd-iter", type=int, default=BCD_MAX_ITER)
     p.add_argument("--sub-iter", type=int, default=SUBPROBLEM_MAX_ITER)
     p.add_argument("--sample-workers", type=int, default=N_WORKERS_SAMPLE)
+    p.add_argument("--unit-workers", type=int, default=N_WORKERS_UNIT)
+    p.add_argument("--bcd-workers", type=int, default=N_WORKERS_BCD)
     p.add_argument("--bcd-lp-backend", choices=("gurobi", "cvxpy_highs"), default=BCD_LP_BACKEND)
     p.add_argument("--subproblem-lp-backend", choices=("gurobi", "cvxpy_highs"), default=SUBPROBLEM_LP_BACKEND)
     p.add_argument("--unit-predictor", type=str, default=UNIT_PREDICTOR_LOAD_PATH)
@@ -85,8 +87,8 @@ def main() -> None:
     rt.NN_EPOCHS = NN_EPOCHS
     rt.N_WORKERS_SAMPLE = max(1, int(args.sample_workers))
     rt.N_WORKERS_SUBPROBLEM = rt.N_WORKERS_SAMPLE
-    rt.N_WORKERS_UNIT = N_WORKERS_UNIT
-    rt.N_WORKERS_BCD = N_WORKERS_BCD
+    rt.N_WORKERS_UNIT = max(1, int(args.unit_workers))
+    rt.N_WORKERS_BCD = max(1, int(args.bcd_workers))
     rt.SUBPROBLEM_LP_BACKEND = args.subproblem_lp_backend
     rt.BCD_LP_BACKEND = args.bcd_lp_backend
     rt.SURROGATE_CONSTRAINT_STRATEGY = SURROGATE_CONSTRAINT_STRATEGY
@@ -114,6 +116,11 @@ def main() -> None:
         f"auto_latest={rt.UNIT_PREDICTOR_AUTO_LATEST_STANDALONE} | "
         f"metrics_tag={rt.METRICS_NAME_TAG or '(none)'} | "
         f"bcd_backend={rt.BCD_LP_BACKEND} | subproblem_backend={rt.SUBPROBLEM_LP_BACKEND}",
+        flush=True,
+    )
+    print(
+        f"workers: bcd={rt.N_WORKERS_BCD} | "
+        f"surrogate_unit={rt.N_WORKERS_UNIT} | surrogate_sample={rt.N_WORKERS_SAMPLE}",
         flush=True,
     )
     print("=" * 72, flush=True)

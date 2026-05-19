@@ -50,8 +50,16 @@ def summarize(path: Path) -> Dict[str, Any]:
     plain_h = _metric(records, "plain_lp_to_true", "hamming")
     proxy_h = _metric(records, "proxy_lp_to_true", "hamming")
     fp_h = _metric(records, "fp_to_true", "hamming")
+    proxy_round_h = _metric(records, "proxy_lp_round_to_true", "hamming")
     fp_success = sum(1 for r in records if r.get("fp_success") is True)
     fp_errors = [r.get("fp_error") for r in records if r.get("fp_error")]
+    proxy_round_feas = []
+    proxy_round_reasons: Counter = Counter()
+    for record in records:
+        feas = ((record.get("solve_stats") or {}).get("proxy_lp_round_feasibility") or {})
+        if "feasible" in feas:
+            proxy_round_feas.append(bool(feas.get("feasible")))
+            proxy_round_reasons[str(feas.get("reason"))] += 1
     rows = [row for r in records for row in (r.get("fp_iteration_plot_rows") or [])]
     iter_rows = [row for row in rows if row.get("event") == "fp_iteration"]
     return {
@@ -64,10 +72,16 @@ def summarize(path: Path) -> Dict[str, Any]:
         "mean_hamming": {
             "plain_lp": plain_h,
             "proxy_lp": proxy_h,
+            "proxy_lp_round": proxy_round_h,
             "fp": fp_h,
             "proxy_improvement_vs_plain": (
                 None if plain_h is None or proxy_h is None else plain_h - proxy_h
             ),
+        },
+        "proxy_lp_round_feasibility": {
+            "feasible": sum(1 for v in proxy_round_feas if v),
+            "total": len(proxy_round_feas),
+            "reasons": dict(proxy_round_reasons),
         },
         "proxy_lp_stages": dict(_counter(records, ["solve_stats", "proxy_lp", "stage_name"])),
         "fp_success": fp_success,
@@ -76,6 +90,9 @@ def summarize(path: Path) -> Dict[str, Any]:
         "selected_hot_starts": dict(_counter(records, ["fp_details", "selected_hot_start"])),
         "heuristics": {
             "hot_start_already_feasible": _sum_summary(records, "hot_start_already_feasible"),
+            "feasible_hot_starts_skipped_for_fp_test": _sum_summary(
+                records, "feasible_hot_starts_skipped_for_fp_test"
+            ),
             "fp_hot_starts_entered": _sum_summary(records, "fp_hot_starts_entered"),
             "fp_iterations": _sum_summary(records, "fp_iterations"),
             "candidate_convex_hull_iterations": _sum_summary(records, "candidate_convex_hull_iterations"),
