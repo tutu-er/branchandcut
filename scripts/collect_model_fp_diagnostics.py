@@ -21,6 +21,7 @@ Example:
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import math
 import sys
@@ -338,6 +339,7 @@ def _clean_solve_stats(stats: Optional[dict]) -> dict:
         "num_subproblem_surrogate_constraints",
         "num_bcd_theta_constraints",
         "num_bcd_zeta_constraints",
+        "bcd_theta_constraint_filter_count",
         "subproblem_slack_sum",
         "subproblem_slack_max",
         "bcd_slack_sum",
@@ -403,6 +405,8 @@ def _fp_iteration_plot_rows(fp_details: Optional[dict], sample_id: Any) -> List[
                 "projection_status_name": step.get("projection_status_name"),
                 "phi_project": step.get("phi_project", step.get("l1_projection")),
                 "phi_hat": step.get("phi_hat"),
+                "delta_k": step.get("delta_k", step.get("l1_projection")),
+                "delta_hat_k": step.get("delta_hat_k", step.get("phi_hat")),
                 "l1_projection": step.get("l1_projection"),
                 "soft_penalty": step.get("soft_penalty"),
                 "tau": step.get("tau"),
@@ -417,10 +421,18 @@ def _fp_iteration_plot_rows(fp_details: Optional[dict], sample_id: Any) -> List[
                 "surrogate_screen_active": step.get("surrogate_screen_active"),
                 "surrogate_screen_constraints": step.get("surrogate_screen_constraints"),
                 "cycle_hit": step.get("cycle_hit"),
+                "equipotential_cycle": step.get("equipotential_cycle"),
                 "perturbation_applied": step.get("perturbation_applied"),
                 "perturbation_mode": step.get("perturbation_mode"),
                 "pool_restart_applied": step.get("pool_restart_applied"),
                 "flipped_bits": step.get("flipped_bits"),
+                "chi_random_used_for_stall": step.get("chi_random_used_for_stall"),
+                "chi_random_attempts": step.get("chi_random_attempts"),
+                "theta_resample_added": step.get("theta_resample_added"),
+                "coverage_insufficient": step.get("coverage_insufficient"),
+                "rounding_strategy": step.get("rounding_strategy"),
+                "rounding_psi_score": step.get("rounding_psi_score"),
+                "chi_random_samples_used": step.get("chi_random_samples_used"),
                 "post_feasible": step.get("post_feasible"),
                 "post_reason": step.get("post_reason"),
             })
@@ -499,6 +511,76 @@ def _load_tailored_fp_kwargs(config_path: Optional[Path]) -> dict:
     return kwargs
 
 
+def _truthy_csv_value(value: Any) -> bool:
+    text = str(value or "").strip().lower()
+    return text in {"1", "1.0", "true", "yes", "y"}
+
+
+def _float_csv_value(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except Exception:
+        return default
+
+
+def _load_bcd_theta_activity_filter(
+    csv_path: Optional[Path],
+    mode: str,
+    min_rate: float,
+) -> Optional[set[Tuple[int, int]]]:
+    """Load active theta rows as ``(branch_id, time_slot)`` from activity CSVs."""
+    if csv_path is None:
+        return None
+    if not csv_path.exists():
+        raise FileNotFoundError(f"BCD theta activity CSV does not exist: {csv_path}")
+
+    selected: set[Tuple[int, int]] = set()
+    mode_norm = str(mode or "both").strip().lower()
+    with csv_path.open("r", encoding="utf-8", newline="") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            if str(row.get("kind") or "").strip() not in {"", "bcd_theta"}:
+                continue
+            try:
+                branch_id = int(float(row["branch_id"]))
+                time_slot = int(float(row["time_slot"]))
+            except Exception:
+                continue
+
+            if "row_active_rate" in row or "dual_active_rate" in row:
+                row_rate = _float_csv_value(row.get("row_active_rate"))
+                dual_rate = _float_csv_value(row.get("dual_active_rate"))
+                if mode_norm == "row":
+                    keep = row_rate >= min_rate
+                elif mode_norm == "dual":
+                    keep = dual_rate >= min_rate
+                elif mode_norm == "any":
+                    keep = max(row_rate, dual_rate) >= min_rate
+                else:
+                    keep = min(row_rate, dual_rate) >= min_rate
+            else:
+                row_active = _truthy_csv_value(row.get("is_row_active_1e_6"))
+                dual_active = _truthy_csv_value(row.get("is_dual_active_1e_7"))
+                if mode_norm == "row":
+                    keep = row_active
+                elif mode_norm == "dual":
+                    keep = dual_active
+                elif mode_norm == "any":
+                    keep = row_active or dual_active
+                else:
+                    keep = row_active and dual_active
+
+            if keep:
+                selected.add((branch_id, time_slot))
+
+    print(
+        "[diagnostics] loaded BCD theta activity filter: "
+        f"{csv_path} | mode={mode_norm} | selected={len(selected)}",
+        flush=True,
+    )
+    return selected
+
+
 def collect_diagnostics(args: argparse.Namespace) -> dict:
     _ensure_runtime_imports()
 
@@ -512,6 +594,11 @@ def collect_diagnostics(args: argparse.Namespace) -> dict:
     tailored_config_path = (
         _resolve_path(args.tailored_config, None)
         if args.tailored_config is not None and str(args.tailored_config).strip()
+        else None
+    )
+    bcd_theta_activity_csv = (
+        _resolve_path(args.bcd_theta_activity_csv, None)
+        if args.bcd_theta_activity_csv is not None and str(args.bcd_theta_activity_csv).strip()
         else None
     )
     output_path = _resolve_path(
@@ -529,6 +616,8 @@ def collect_diagnostics(args: argparse.Namespace) -> dict:
         print(f"[diagnostics] bcd_model={bcd_model_path}", flush=True)
     if tailored_config_path is not None:
         print(f"[diagnostics] tailored_config={tailored_config_path}", flush=True)
+    if bcd_theta_activity_csv is not None:
+        print(f"[diagnostics] bcd_theta_activity_csv={bcd_theta_activity_csv}", flush=True)
     print(f"[diagnostics] output={output_path}", flush=True)
 
     ppc = get_case_ppc(args.case)
@@ -587,6 +676,11 @@ def collect_diagnostics(args: argparse.Namespace) -> dict:
             flush=True,
         )
     tailored_fp_kwargs = _load_tailored_fp_kwargs(tailored_config_path)
+    bcd_theta_constraint_filter = _load_bcd_theta_activity_filter(
+        bcd_theta_activity_csv,
+        mode=str(args.bcd_theta_activity_mode),
+        min_rate=float(args.bcd_theta_min_activity_rate),
+    )
 
     records: List[dict] = []
     ng = int(np.asarray(ppc["gen"]).shape[0])
@@ -645,6 +739,7 @@ def collect_diagnostics(args: argparse.Namespace) -> dict:
                     agent=agent,
                     surrogate_constraint_scope=args.surrogate_constraint_scope,
                     bcd_proxy_scope=args.bcd_proxy_scope,
+                    bcd_theta_constraint_filter=bcd_theta_constraint_filter,
                     return_stats=True,
                 )
                 record["solutions"]["x_lp_proxy"] = x_lp_proxy
@@ -728,6 +823,15 @@ def collect_diagnostics(args: argparse.Namespace) -> dict:
                     fp_kwargs["use_subproblem_milp_candidate"] = False
                 if args.skip_feasible_hot_starts:
                     fp_kwargs["skip_feasible_hot_starts"] = True
+                fp_kwargs["fp_strategy"] = args.fp_strategy
+                fp_kwargs["rounding_strategy"] = args.rounding_strategy
+                fp_kwargs["chi_alpha"] = float(args.chi_alpha)
+                fp_kwargs["chi_random_samples"] = int(args.chi_random_samples)
+                fp_kwargs["chi_random_evaluator_weight"] = float(args.chi_random_evaluator_weight)
+                fp_kwargs["enable_stall_theta_resample"] = not args.disable_stall_theta_resample
+                fp_kwargs["stall_theta_resample_after_chi_random"] = int(
+                    args.stall_theta_resample_after_chi_random
+                )
                 fp_kwargs.update(tailored_fp_kwargs)
                 x_fp, success, fp_details = recover_integer_solution(
                     sample,
@@ -773,6 +877,20 @@ def collect_diagnostics(args: argparse.Namespace) -> dict:
             "lp_backend": args.lp_backend,
             "surrogate_constraint_scope": args.surrogate_constraint_scope,
             "bcd_proxy_scope": args.bcd_proxy_scope,
+            "bcd_theta_activity_csv": None if bcd_theta_activity_csv is None else str(bcd_theta_activity_csv),
+            "bcd_theta_activity_mode": str(args.bcd_theta_activity_mode),
+            "bcd_theta_min_activity_rate": float(args.bcd_theta_min_activity_rate),
+            "bcd_theta_activity_filter_count": (
+                None if bcd_theta_constraint_filter is None else int(len(bcd_theta_constraint_filter))
+            ),
+            "bcd_theta_activity_filter": (
+                None
+                if bcd_theta_constraint_filter is None
+                else [
+                    {"branch_id": int(branch_id), "time_slot": int(time_slot)}
+                    for branch_id, time_slot in sorted(bcd_theta_constraint_filter)
+                ]
+            ),
             "run_fp": bool(args.run_fp),
             "scenario_bank_mode": args.scenario_bank_mode,
         },
@@ -809,6 +927,26 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--surrogate-constraint-scope", choices=("all", "sign4", "none"), default="all")
     p.add_argument("--bcd-proxy-scope", choices=("both", "theta", "zeta", "none"), default="none")
+    p.add_argument(
+        "--bcd-theta-activity-csv",
+        default=None,
+        help=(
+            "Optional activity CSV from test_surrogate_dual_activity.py; when set, "
+            "only theta_surr_<branch_id>_<time_slot> rows selected by activity are added."
+        ),
+    )
+    p.add_argument(
+        "--bcd-theta-activity-mode",
+        choices=("both", "row", "dual", "any"),
+        default="both",
+        help="Activity criterion for --bcd-theta-activity-csv.",
+    )
+    p.add_argument(
+        "--bcd-theta-min-activity-rate",
+        type=float,
+        default=1e-12,
+        help="Minimum activity rate for summary CSVs; ignored for per-sample boolean CSV rows.",
+    )
     p.add_argument("--skip-plain-lp", action="store_true")
     p.add_argument("--skip-proxy-lp", action="store_true")
     p.add_argument("--skip-subproblem", action="store_true")
@@ -851,6 +989,31 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Skip already-feasible hot starts so diagnostics exercise FP projection iterations.",
     )
+    p.add_argument(
+        "--fp-strategy",
+        choices=("tailored", "tailored_no_theta", "vanilla"),
+        default="tailored",
+        help=(
+            "FP strategy. 'tailored' = Algorithm II with all enhancements; "
+            "'vanilla' = traditional Algorithm I (no hot starts, no candidate "
+            "convex hull, no surrogate screen, no tau objective)."
+        ),
+    )
+    p.add_argument(
+        "--rounding-strategy",
+        choices=("x_round", "chi_argmax", "chi_random"),
+        default="chi_argmax",
+        help="Rounding rule inside FP. 'x_round' is the textbook per-component rounding.",
+    )
+    p.add_argument("--chi-alpha", type=float, default=3.0)
+    p.add_argument("--chi-random-samples", type=int, default=8)
+    p.add_argument("--chi-random-evaluator-weight", type=float, default=0.05)
+    p.add_argument(
+        "--disable-stall-theta-resample",
+        action="store_true",
+        help="Disable eq (4-31/4-32) in-stall theta perturbation candidate regeneration.",
+    )
+    p.add_argument("--stall-theta-resample-after-chi-random", type=int, default=2)
     return p
 
 

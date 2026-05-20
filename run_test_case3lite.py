@@ -34,7 +34,7 @@ MODE = "surrogate"  # use "bcd" for only BCD or "both" to evaluate BCD + surroga
 # 与训练相同：None 表示在 run_test / activity 脚本内按 case 自动选取最新 active_set JSON
 ACTIVE_SETS_FILE = train_base.ACTIVE_SETS_FILE
 MODEL_DIR: str | None = "result/surrogate_models/subproblem_models_case3lite_20260510_merge"
-BCD_MODEL_PATH: str | None = "result/bcd_models/bcd_model_case3lite_20260511_021417.pth"
+BCD_MODEL_PATH: str | None = "result/bcd_models/bcd_model_case3lite_20260519_235955.pth"
 TEST_SAMPLES = 100
 SAMPLE_RANGE = f"0:100"
 SURROGATE_CONSTRAINT_STRATEGY = train_base.SURROGATE_CONSTRAINT_STRATEGY

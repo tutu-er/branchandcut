@@ -66,6 +66,18 @@ def load_activity(activity_path: Path) -> pd.DataFrame:
     )
 
 
+def load_selected_constraints_from_activity(activity_path: Path) -> pd.DataFrame:
+    df = pd.read_csv(activity_path)
+    theta = df[df["kind"].astype(str).eq("bcd_theta")].copy()
+    if theta.empty:
+        raise ValueError(f"No bcd_theta rows found in {activity_path}")
+    for col in ("branch_id", "time_slot"):
+        theta[col] = theta[col].astype(float).astype(int)
+    out = theta[["branch_id", "time_slot"]].drop_duplicates().copy()
+    out["selected"] = 1
+    return out
+
+
 def matrix_from_rows(df: pd.DataFrame, value_col: str, branches: list[int], times: list[int]) -> np.ndarray:
     mat = np.full((len(branches), len(times)), np.nan, dtype=float)
     b_index = {b: i for i, b in enumerate(branches)}
@@ -83,10 +95,20 @@ def main() -> None:
     parser.add_argument("--bcd-model", type=Path, default=DEFAULT_BCD_MODEL)
     parser.add_argument("--activity", type=Path, default=DEFAULT_ACTIVITY)
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
+    parser.add_argument("--case-name", default="case3lite")
+    parser.add_argument(
+        "--selected-source",
+        choices=("checkpoint", "activity"),
+        default="checkpoint",
+        help="Use checkpoint theta names or activity rows as the selected constraint set.",
+    )
     args = parser.parse_args()
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    selected = load_selected_constraints(args.bcd_model)
+    if args.selected_source == "activity":
+        selected = load_selected_constraints_from_activity(args.activity)
+    else:
+        selected = load_selected_constraints(args.bcd_model)
     activity = load_activity(args.activity)
     merged = selected.merge(activity, on=["branch_id", "time_slot"], how="left")
     merged[["row_active_rate", "dual_active_rate", "abs_dual_mean", "abs_slack_mean"]] = merged[
@@ -166,13 +188,14 @@ def main() -> None:
     ax3.set_xlabel("Dual-active rate")
     ax3.grid(True, axis="x", alpha=0.25)
 
-    out_png = args.output_dir / "case3lite_theta_selection_vs_activity.png"
-    out_pdf = args.output_dir / "case3lite_theta_selection_vs_activity.pdf"
+    prefix = f"{args.case_name}_theta_selection_vs_activity"
+    out_png = args.output_dir / f"{prefix}.png"
+    out_pdf = args.output_dir / f"{prefix}.pdf"
     fig.savefig(out_png, dpi=220)
     fig.savefig(out_pdf)
     plt.close(fig)
 
-    summary_csv = args.output_dir / "case3lite_theta_selection_vs_activity.csv"
+    summary_csv = args.output_dir / f"{prefix}.csv"
     merged.sort_values(["branch_id", "time_slot"]).to_csv(summary_csv, index=False)
     summary = {
         "selected_constraints": int(len(merged)),
@@ -186,7 +209,7 @@ def main() -> None:
         "figure_png": str(out_png),
         "summary_csv": str(summary_csv),
     }
-    with open(args.output_dir / "case3lite_theta_selection_vs_activity_summary.json", "w", encoding="utf-8") as f:
+    with open(args.output_dir / f"{prefix}_summary.json", "w", encoding="utf-8") as f:
         json.dump(summary, f, ensure_ascii=False, indent=2)
     print(json.dumps(summary, ensure_ascii=False, indent=2))
 

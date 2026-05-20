@@ -11,9 +11,11 @@ import run_test as rt
 
 CASE_NAME = "case3lite"
 MODE = "both"  # use "surrogate" to evaluate only subproblem models
-ACTIVE_SETS_FILE: str | None = None
-MODEL_DIR: str | None = None
-BCD_MODEL_PATH: str | None = None
+ACTIVE_SETS_FILE: str | None = (
+    "result/active_set/active_sets_case3lite_T24_n1000_20260403_180137.json"
+)
+MODEL_DIR: str | None = "result/surrogate_models/subproblem_models_case3lite_20260510_merge"
+BCD_MODEL_PATH: str | None = "result/bcd_models/bcd_model_case3lite_20260519_235955.pth"
 TEST_SAMPLES = 10
 SAMPLE_RANGE = "0:100"
 
@@ -27,6 +29,18 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--samples", type=int, default=TEST_SAMPLES)
     p.add_argument("--sample-range", type=str, default=SAMPLE_RANGE)
     p.add_argument("--no-custom-fp", action="store_true")
+    p.add_argument(
+        "--theta-flip",
+        action="store_true",
+        help="Use the pinned theta_flip_case3lite benchmark flow "
+             "(see run_case3lite_theta_flip_fp.py).",
+    )
+    p.add_argument(
+        "--error-bit-map",
+        type=str,
+        default="result/fp_diagnostics/history_error_bit_map_case3lite_n50_20260519_235955_merge.json",
+    )
+    p.add_argument("--flip-top-k", type=int, default=10)
     return p.parse_args()
 
 
@@ -43,6 +57,26 @@ def _ensure_bcd_imports() -> None:
 
 def main() -> None:
     args = _parse_args()
+    if args.theta_flip:
+        from run_case3lite_theta_flip_fp import cmd_bench
+
+        bench_args = argparse.Namespace(
+            active_sets=args.active_sets or ACTIVE_SETS_FILE,
+            model_dir=args.model_dir or MODEL_DIR,
+            bcd_model=args.bcd_model or BCD_MODEL_PATH,
+            start=0,
+            log=None,
+            error_bit_map=args.error_bit_map,
+            flip_top_k=int(args.flip_top_k),
+            strategies="theta_flip_case3lite,vanilla",
+            samples=max(1, int(args.samples)),
+            max_fp_iter=25,
+            output=(
+                f"result/fp_diagnostics/bench_fp_theta_case3lite_n{max(1, int(args.samples))}.json"
+            ),
+        )
+        raise SystemExit(cmd_bench(bench_args))
+
     rt.CASE_NAME = CASE_NAME
     rt.MODE = args.mode
     rt.RUN_FP = True

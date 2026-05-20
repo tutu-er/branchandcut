@@ -449,6 +449,8 @@ def recover_integer_solution_case118(
         max_perturbation_hot_starts=max(2, max_generic_hot_starts // 3),
         max_unit_options_per_generator=3,
         max_unit_combination_candidates=max_generic_hot_starts,
+        ppc=ppc,
+        unit_ids=None,
     )
     generic_ranked = _rank_hot_start_candidates(
         generic_candidates,

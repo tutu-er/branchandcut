@@ -24,8 +24,11 @@ try:
         _compute_hot_start_support_reference,
         _estimate_commitment_primal_objective,
         _compute_vote_majority,
+        _evaluate_commitment_dispatch_cost,
         _extract_commitment_from_sample,
+        _load_error_bit_map,
         _repair_commitment_logic_heuristic,
+        _repair_min_up_down_heuristic,
         _score_hot_start_candidate,
         _sanitize_named_commitment_candidates,
         check_commitment_logic_feasibility,
@@ -45,8 +48,11 @@ except ImportError:
         _compute_hot_start_support_reference,
         _estimate_commitment_primal_objective,
         _compute_vote_majority,
+        _evaluate_commitment_dispatch_cost,
         _extract_commitment_from_sample,
+        _load_error_bit_map,
         _repair_commitment_logic_heuristic,
+        _repair_min_up_down_heuristic,
         _score_hot_start_candidate,
         _sanitize_named_commitment_candidates,
         check_commitment_logic_feasibility,
@@ -1452,3 +1458,400 @@ def recover_integer_solution_case3lite(
         "fp_histories": fp_histories,
     }
     return final_solution, final_success, details
+
+
+def recover_via_theta_flip_case3lite(
+    pd_data: np.ndarray | dict,
+    trainers: Dict[int, object],
+    lambda_predictor,
+    ppc: dict,
+    T_delta: float,
+    agent,
+    error_bit_map,
+    *,
+    flip_top_k: int = 10,
+    suspicious_error_rate_min: float = 0.15,
+    conf_threshold: float = 0.15,
+    harvest_full_lp: bool = True,
+    defer_full_lp_to_fp: bool = True,
+    full_lp_inject_iter: int = 3,
+    run_fp_iterations: bool = True,
+    fp_max_iter: int = 10,
+    fp_min_iter: int = 3,
+    rescue_max_combinations: int = 30,
+    rescue_max_combo_size: int = 3,
+    max_global_combinations: int = 24,
+    n_perturbations: int = 5,
+    surrogate_constraint_scope: str = "all",
+    bcd_proxy_scope_full: str = "both",
+    verbose: bool = False,
+    return_details: bool = False,
+    rng: Optional[np.random.Generator] = None,
+) -> Tuple[Optional[np.ndarray], bool, dict]:
+    """Case3lite-tailored theta-flip FP with BCD-theta hot start.
+
+    Combines:
+      1. theta-only BCD proxy LP  -> primary hot-start commitment
+      2. full surrogate LP        -> case3lite role-based unit options
+      3. historical error-bit map -> suspicious (g,t) flips + untrusted bits
+      4. deferred full-LP harvest   -> injected into FP pool after a few iters
+      5. FP iterations with case3lite trusted mask
+    """
+    if agent is None:
+        raise ValueError("recover_via_theta_flip_case3lite requires a BCD agent")
+
+    sample = normalize_sample_arrays(dict(_coerce_scenario_sample(pd_data)))
+    pd_matrix = get_sample_net_load(sample)
+    if rng is None:
+        rng = np.random.default_rng(42)
+
+    map_data = _load_error_bit_map(error_bit_map)
+    top_bits = list(map_data.get("top_k_bits") or [])
+
+    if verbose:
+        print("Case3lite theta_flip: Step 1/6 predict lambda", flush=True)
+    lambda_val = lambda_predictor.predict(sample)
+
+    if verbose:
+        print(
+            "Case3lite theta_flip: Step 2/6 theta-only BCD proxy LP hot start",
+            flush=True,
+        )
+    x_LP_theta, initial_lp_stats = solve_global_LP_relaxation(
+        ppc,
+        sample,
+        T_delta,
+        trainers,
+        lambda_val,
+        agent=agent,
+        surrogate_constraint_scope="none",
+        bcd_proxy_scope="theta",
+        return_stats=True,
+    )
+    x_round_theta = round_to_integer(np.asarray(x_LP_theta, dtype=float))
+    x_round_theta = _repair_min_up_down_heuristic(
+        np.asarray(x_round_theta, dtype=int),
+        T_delta,
+        ppc=ppc,
+        unit_ids=None,
+    )
+
+    if verbose:
+        print("Case3lite theta_flip: Step 3/6 full surrogate LP + subproblem pool", flush=True)
+    x_lp = solve_global_LP_relaxation(
+        ppc,
+        sample,
+        T_delta,
+        trainers,
+        lambda_val,
+        agent=agent,
+        surrogate_constraint_scope=surrogate_constraint_scope,
+        bcd_proxy_scope=bcd_proxy_scope_full,
+    )
+    x_surr_lp, x_init_k, x_init_k_m, candidate_details = collect_integer_solutions(
+        sample,
+        lambda_val,
+        trainers,
+        n_perturbations=n_perturbations,
+        perturb_std=0.1,
+        neighborhood_weight=0.35,
+        lambda_predictor=lambda_predictor,
+        rng=rng,
+        use_milp_candidate=True,
+        milp_for_perturbations=False,
+        surrogate_constraint_scope=surrogate_constraint_scope,
+        return_details=True,
+    )
+    base_trusted_mask = identify_trusted_mask(
+        x_lp,
+        x_init_k,
+        x_init_k_m,
+        conf_threshold=conf_threshold,
+    )
+
+    nearby_commitment_candidates = _build_nearby_commitment_candidates(
+        sample,
+        trainers,
+        None,
+        x_lp.shape[0],
+        x_lp.shape[1],
+        n_candidates=4,
+        candidate_pool_size=12,
+        rng=rng,
+    )
+    nearby_commitment_candidates, _rejected_nearby = _sanitize_named_commitment_candidates(
+        nearby_commitment_candidates,
+        ppc,
+        T_delta,
+    )
+    unit_options, trusted_mask, support_reference = _build_case3lite_unit_options(
+        sample,
+        ppc,
+        T_delta,
+        x_lp,
+        x_surr_lp,
+        x_init_k,
+        x_init_k_m,
+        base_trusted_mask,
+        nearby_commitment_candidates,
+    )
+    global_combinations = _build_case3lite_global_combinations(
+        unit_options,
+        ppc,
+        pd_matrix,
+        x_lp,
+        x_surr_lp,
+        x_init_k,
+        x_init_k_m,
+        trusted_mask,
+        support_reference,
+        T_delta,
+        nearby_commitment_candidates,
+        max_global_combinations=max_global_combinations,
+    )
+
+    ng, T = x_round_theta.shape
+    suspicious_mask = np.zeros((ng, T), dtype=bool)
+    candidates: List[Tuple[str, np.ndarray]] = [("theta_lp_round", x_round_theta)]
+    n_flipped = 0
+    for r in top_bits[: max(0, int(flip_top_k))]:
+        try:
+            g = int(r.get("g", -1))
+            t = int(r.get("t", -1))
+            rate = float(r.get("error_rate", 0.0))
+        except Exception:
+            continue
+        if not (0 <= g < ng and 0 <= t < T) or rate <= 0.0:
+            continue
+        if rate >= float(suspicious_error_rate_min):
+            suspicious_mask[g, t] = True
+        c = x_round_theta.copy()
+        c[g, t] = 1 - int(c[g, t])
+        c_rep = _repair_min_up_down_heuristic(
+            np.asarray(c, dtype=int), T_delta, ppc=ppc, unit_ids=None,
+        )
+        candidates.append((f"suspicious_flip_g{g}_t{t}_p{rate:.2f}", c_rep))
+        n_flipped += 1
+
+    for combo in global_combinations[: max(1, int(max_global_combinations))]:
+        candidates.append(
+            (f"case3lite_combo_{combo.get('id', 0)}", np.asarray(combo["candidate"], dtype=int))
+        )
+
+    deferred_full_lp_candidate: Optional[np.ndarray] = None
+    if harvest_full_lp:
+        try:
+            x_LP_full = solve_global_LP_relaxation(
+                ppc,
+                sample,
+                T_delta,
+                trainers,
+                lambda_val,
+                agent=agent,
+                surrogate_constraint_scope=surrogate_constraint_scope,
+                bcd_proxy_scope=bcd_proxy_scope_full,
+            )
+            x_round_full = round_to_integer(np.asarray(x_LP_full, dtype=float))
+            x_round_full = _repair_min_up_down_heuristic(
+                np.asarray(x_round_full, dtype=int), T_delta, ppc=ppc, unit_ids=None,
+            )
+            if run_fp_iterations and defer_full_lp_to_fp and int(full_lp_inject_iter) > 0:
+                deferred_full_lp_candidate = np.asarray(x_round_full, dtype=int)
+            else:
+                candidates.append(("full_lp_round", x_round_full))
+        except Exception as exc:
+            if verbose:
+                print(f"Case3lite theta_flip: full LP harvest failed: {exc}", flush=True)
+
+    eval_log: List[dict] = []
+    best_name: Optional[str] = None
+    best_x: Optional[np.ndarray] = None
+    best_cost = float("inf")
+    for name, x_cand in candidates:
+        ok, reason = check_uc_feasibility(x_cand, ppc, pd_matrix, T_delta)
+        cost: Optional[float] = None
+        if ok:
+            cost = _evaluate_commitment_dispatch_cost(x_cand, ppc, pd_matrix, T_delta)
+            if cost is not None and float(cost) < best_cost:
+                best_name = name
+                best_x = np.asarray(x_cand, dtype=int)
+                best_cost = float(cost)
+        eval_log.append({
+            "name": name,
+            "feasible": bool(ok),
+            "reason": reason,
+            "uc_cost": None if cost is None else float(cost),
+        })
+
+    bit_pool: List[Tuple[int, int, float]] = []
+    pool_n = max(int(flip_top_k), 6)
+    for r in top_bits[: pool_n]:
+        try:
+            g_b = int(r.get("g", -1))
+            t_b = int(r.get("t", -1))
+            rate_b = float(r.get("error_rate", 0.0))
+        except Exception:
+            continue
+        if 0 <= g_b < ng and 0 <= t_b < T and rate_b > 0.0:
+            bit_pool.append((g_b, t_b, rate_b))
+
+    combo_added = 0
+    if run_fp_iterations:
+        combo_budget = max(0, int(rescue_max_combinations))
+        for combo_size in range(2, max(2, int(rescue_max_combo_size)) + 1):
+            if combo_added >= combo_budget:
+                break
+            for combo in itertools.combinations(bit_pool, combo_size):
+                if combo_added >= combo_budget:
+                    break
+                c = x_round_theta.copy()
+                tag_parts = []
+                for (g_b, t_b, _rate_b) in combo:
+                    c[g_b, t_b] = 1 - int(c[g_b, t_b])
+                    tag_parts.append(f"g{g_b}t{t_b}")
+                c_rep = _repair_min_up_down_heuristic(
+                    np.asarray(c, dtype=int), T_delta, ppc=ppc, unit_ids=None,
+                )
+                cand_name = f"combo_k{combo_size}_{'_'.join(tag_parts)}"
+                candidates.append((cand_name, c_rep))
+                combo_added += 1
+                ok_c, reason_c = check_uc_feasibility(c_rep, ppc, pd_matrix, T_delta)
+                cost_c: Optional[float] = None
+                if ok_c:
+                    cost_c = _evaluate_commitment_dispatch_cost(
+                        c_rep, ppc, pd_matrix, T_delta,
+                    )
+                    if cost_c is not None and float(cost_c) < best_cost:
+                        best_name = cand_name
+                        best_x = np.asarray(c_rep, dtype=int)
+                        best_cost = float(cost_c)
+                eval_log.append({
+                    "name": cand_name,
+                    "feasible": bool(ok_c),
+                    "reason": reason_c,
+                    "uc_cost": None if cost_c is None else float(cost_c),
+                })
+
+    pool_items: List[np.ndarray] = []
+    seen_pool = set()
+    for _name, cand in candidates:
+        arr = np.asarray(cand, dtype=int)
+        key = bytes(arr.astype(np.int8).tobytes())
+        if key in seen_pool:
+            continue
+        seen_pool.add(key)
+        pool_items.append(arr)
+    x_pool_arr = np.stack(pool_items, axis=0) if pool_items else x_round_theta[None, :, :]
+
+    fp_trusted_mask = np.asarray(trusted_mask, dtype=bool) & (~suspicious_mask)
+    selected_name = str(best_name or "theta_lp_round")
+    selected_x = np.asarray(best_x if best_x is not None else x_round_theta, dtype=int)
+    selected_ok = best_x is not None
+    selected_cost = None if best_x is None else float(best_cost)
+    fp_details: dict = {}
+
+    if run_fp_iterations:
+        if verbose:
+            print(
+                f"Case3lite theta_flip: Step 6/6 FP iterations "
+                f"(pool={x_pool_arr.shape[0]}, suspicious_bits={int(np.sum(suspicious_mask))})",
+                flush=True,
+            )
+
+        full_lp_injected = {"done": False}
+
+        def _deferred_full_lp_refresh(
+            iteration_idx: int,
+            stall_counter_val: int,
+            reason: str,
+        ) -> Optional[np.ndarray]:
+            if deferred_full_lp_candidate is None or full_lp_injected["done"]:
+                return None
+            if int(iteration_idx) < int(full_lp_inject_iter):
+                return None
+            full_lp_injected["done"] = True
+            if verbose:
+                print(
+                    f"Case3lite theta_flip: inject full_lp_round at iter {iteration_idx}",
+                    flush=True,
+                )
+            return deferred_full_lp_candidate[None, :, :]
+
+        x_fp, ok_fp, fp_details = run_feasibility_pump(
+            np.asarray(x_round_theta, dtype=int),
+            fp_trusted_mask,
+            ppc,
+            pd_matrix,
+            T_delta,
+            x_pool=x_pool_arr,
+            max_iter=max(1, int(fp_max_iter)),
+            min_iter_before_feasible_accept=max(0, int(fp_min_iter)),
+            stall_perturbation_mode="pool_then_flip",
+            stall_flip_fraction=0.10,
+            rng=rng,
+            verbose=verbose,
+            return_history=True,
+            rounding_strategy="chi_argmax",
+            enable_pool_tabu_prune=True,
+            pool_tabu_drop_threshold=3,
+            pool_activation_iter=0,
+            noh_milp_refresh_callback=(
+                _deferred_full_lp_refresh
+                if deferred_full_lp_candidate is not None else None
+            ),
+            noh_milp_refresh_interval=max(1, int(full_lp_inject_iter))
+            if deferred_full_lp_candidate is not None else 0,
+            noh_milp_refresh_stall=999999,
+            noh_milp_refresh_max=1,
+        )
+        fp_cost = None
+        if ok_fp:
+            fp_cost = _evaluate_commitment_dispatch_cost(
+                x_fp, ppc, pd_matrix, T_delta,
+            )
+        if selected_ok and (
+            fp_cost is None or float(best_cost) <= float(fp_cost)
+        ):
+            pass
+        elif ok_fp:
+            selected_name = "theta_flip_case3lite_fp_iter"
+            selected_x = np.asarray(x_fp, dtype=int)
+            selected_ok = True
+            selected_cost = fp_cost
+
+    details = {
+        "selected": selected_name,
+        "selected_hot_start": selected_name,
+        "selected_uc_cost": selected_cost,
+        "candidates": eval_log,
+        "n_candidates": len(candidates),
+        "n_flipped": n_flipped,
+        "n_suspicious_bits": int(np.sum(suspicious_mask)),
+        "suspicious_mask": suspicious_mask,
+        "flip_top_k": int(flip_top_k),
+        "error_map_metadata": map_data.get("metadata", {}),
+        "initial_bcd_proxy_scope": "theta",
+        "initial_lp_stats": initial_lp_stats,
+        "run_fp_iterations": bool(run_fp_iterations),
+        "trusted_mask": trusted_mask,
+        "fp_trusted_mask": fp_trusted_mask,
+        "unit_options": unit_options,
+        "global_combinations": global_combinations,
+        "theta_flip_pool_size": int(x_pool_arr.shape[0]),
+        "theta_flip_combo_added": int(combo_added),
+        "full_lp_deferred_to_fp": bool(deferred_full_lp_candidate is not None),
+        "full_lp_inject_iter": int(full_lp_inject_iter),
+        "fp_histories": [{
+            "name": "theta_flip_case3lite_pool",
+            "history": fp_details.get("history", []),
+            "iterations": fp_details.get("iterations", 0),
+            "termination": fp_details.get("termination"),
+            "final_reason": fp_details.get("final_reason"),
+        }] if run_fp_iterations else [],
+        "incumbent_preserved": bool(
+            best_x is not None and selected_name != "theta_flip_case3lite_fp_iter"
+        ),
+    }
+    if return_details:
+        return selected_x, selected_ok, details
+    return selected_x, selected_ok

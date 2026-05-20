@@ -33,6 +33,24 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--max-samples", type=int, default=None)
     p.add_argument("--sub-iter", type=int, default=None)
     p.add_argument("--unit-ids", type=str, default=None)
+    p.add_argument(
+        "--rho-binary-init",
+        type=float,
+        default=None,
+        help=(
+            "Override subproblem rho_binary initial value. "
+            "Case118 default is run_training_case118.CASE118_SUBPROBLEM_RHO_BINARY_INIT."
+        ),
+    )
+    p.add_argument(
+        "--rho-binary-max",
+        type=float,
+        default=None,
+        help=(
+            "Override subproblem rho_binary cap. "
+            "Case118 default is run_training_case118.CASE118_SUBPROBLEM_RHO_BINARY_MAX."
+        ),
+    )
     p.add_argument("--theta-dual-floor", type=float, default=strong.THETA_DUAL_FLOOR)
     p.add_argument("--zeta-dual-floor", type=float, default=strong.ZETA_DUAL_FLOOR)
     p.add_argument("--sign4-dual-floor", type=float, default=strong.SIGN4_DUAL_FLOOR)
@@ -120,6 +138,14 @@ def main() -> None:
     args.bcd_iter = int(getattr(rt, "BCD_MAX_ITER", getattr(rt, "MAX_ITER", 1)) or 1)
     args.sub_iter = int(getattr(rt, "SUBPROBLEM_MAX_ITER", getattr(rt, "MAX_ITER", 1)) or 1)
     strong._configure_strong_complex_dual_floors(args)
+    if args.rho_binary_init is not None:
+        rt.SUBPROBLEM_RHO_BINARY_INIT = float(args.rho_binary_init)
+    if args.rho_binary_max is not None:
+        rt.SUBPROBLEM_RHO_BINARY_MAX = float(args.rho_binary_max)
+    rt.SUBPROBLEM_RHO_BINARY_MAX = max(
+        float(rt.SUBPROBLEM_RHO_BINARY_MAX),
+        float(rt.SUBPROBLEM_RHO_BINARY_INIT),
+    )
     rt.NN_EPOCHS = strong.NN_EPOCHS
     rt.BCD_PG_BLOCK_PROX_WEIGHT = 0.0
     rt.BCD_DUAL_BLOCK_PROX_WEIGHT = 0.0
@@ -194,6 +220,7 @@ def main() -> None:
             f"subproblem_preset={base.SUBPROBLEM_SOLVE_PRESET} | "
             f"backend={rt.SUBPROBLEM_LP_BACKEND} | "
             f"max_samples={rt.MAX_SAMPLES} | max_iter={rt.SUBPROBLEM_MAX_ITER} | "
+            f"rho_binary={rt.SUBPROBLEM_RHO_BINARY_INIT}->{rt.SUBPROBLEM_RHO_BINARY_MAX} | "
             f"unit_ids={rt.UNIT_IDS!r} | light_overrides={light_overrides}",
             flush=True,
         )

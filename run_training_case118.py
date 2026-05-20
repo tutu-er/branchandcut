@@ -154,6 +154,11 @@ CASE118_SUBPROBLEM_PG_COST_SAMPLE_WEIGHT_CLIP: float = 10.0
 CASE118_SUBPROBLEM_RHO_DUAL_PG_INIT = 0.22
 CASE118_SUBPROBLEM_LOSS_RATIO_DUAL_PG = 1.6
 CASE118_SUBPROBLEM_ITER_DELTA_REG_WEIGHT = 2.5e-5
+# Stronger binary regularization for case118 subproblem training. The previous
+# 0.1/1.0 setting made LP relaxations too comfortable staying fractional; use a
+# 100x larger default and keep the cap one decade above the initial value.
+CASE118_SUBPROBLEM_RHO_BINARY_INIT = 1e1
+CASE118_SUBPROBLEM_RHO_BINARY_MAX = 1e2
 
 # BCD 每轮内的 direct-NN-main / direct-c_pg（``run_training.SUBPROBLEM_*_DIRECT_*``）
 # 若不在此写入，则仍用 ``run_training.py`` 顶层默认（如 mini-batch/16），与 Case118 的
@@ -542,8 +547,11 @@ def _configure_subproblem_bcd() -> None:
     rt.SUBPROBLEM_RHO_DUAL_PG_INIT = CASE118_SUBPROBLEM_RHO_DUAL_PG_INIT
     rt.SUBPROBLEM_RHO_DUAL_X_INIT = 3e-2
     rt.SUBPROBLEM_RHO_DUAL_COC_INIT = 1e1
-    rt.SUBPROBLEM_RHO_BINARY_INIT = 1e-1
-    rt.SUBPROBLEM_RHO_BINARY_MAX = 1e0
+    rt.SUBPROBLEM_RHO_BINARY_INIT = CASE118_SUBPROBLEM_RHO_BINARY_INIT
+    rt.SUBPROBLEM_RHO_BINARY_MAX = max(
+        CASE118_SUBPROBLEM_RHO_BINARY_MAX,
+        CASE118_SUBPROBLEM_RHO_BINARY_INIT,
+    )
     rt.SUBPROBLEM_RHO_OPT_INIT = 1e-1
 
     rt.SUBPROBLEM_MU_DUAL_FLOOR_INIT = 0.25

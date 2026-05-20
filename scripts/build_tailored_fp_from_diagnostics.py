@@ -253,6 +253,9 @@ def _choose_profile(summary: dict, args: argparse.Namespace) -> Tuple[str, dict]
     baseline = min(v for v in [plain_h, proxy_h, sub_h, sub_milp_h] if np.isfinite(v)) \
         if any(np.isfinite(v) for v in [plain_h, proxy_h, sub_h, sub_milp_h]) else float("nan")
 
+    subproblem_available = int(summary["subproblem_lp_to_true"].get("available_count", 0) or 0) > 0
+    proxy_available = int(summary["proxy_lp_to_true"].get("available_count", 0) or 0) > 0
+
     surrogate_best = np.isfinite(sub_h) and (
         (not np.isfinite(plain_h) or sub_h <= 0.90 * plain_h)
         and (not np.isfinite(proxy_h) or sub_h <= 1.05 * proxy_h)
@@ -269,13 +272,75 @@ def _choose_profile(summary: dict, args: argparse.Namespace) -> Tuple[str, dict]
         (not np.isfinite(sub_h) or sub_milp_h <= 0.95 * sub_h)
     )
 
-    false_off = int(summary["subproblem_lp_to_true"]["false_off"])
-    false_on = int(summary["subproblem_lp_to_true"]["false_on"])
+    # Direction signal: prefer the subproblem-LP errors (because the surrogate
+    # FP knobs steer the subproblem repair), but fall back to proxy / plain LP
+    # when the diagnostics were collected without the subproblem surrogate.
+    if subproblem_available and (
+        int(summary["subproblem_lp_to_true"]["false_off"])
+        + int(summary["subproblem_lp_to_true"]["false_on"])
+        > 0
+    ):
+        direction_source = "subproblem_lp"
+        ref_false_off = int(summary["subproblem_lp_to_true"]["false_off"])
+        ref_false_on = int(summary["subproblem_lp_to_true"]["false_on"])
+    elif proxy_available and (
+        int(summary["proxy_lp_to_true"]["false_off"])
+        + int(summary["proxy_lp_to_true"]["false_on"])
+        > 0
+    ):
+        direction_source = "proxy_lp"
+        ref_false_off = int(summary["proxy_lp_to_true"]["false_off"])
+        ref_false_on = int(summary["proxy_lp_to_true"]["false_on"])
+    else:
+        direction_source = "plain_lp"
+        ref_false_off = int(summary["plain_lp_to_true"]["false_off"])
+        ref_false_on = int(summary["plain_lp_to_true"]["false_on"])
+
+    false_off = ref_false_off
+    false_on = ref_false_on
     total_dir = max(false_off + false_on, 1)
     false_off_ratio = false_off / total_dir
     false_on_ratio = false_on / total_dir
 
-    if surrogate_best:
+    proxy_near_perfect_threshold = float(
+        args.proxy_near_perfect_threshold
+        if args.proxy_near_perfect_threshold is not None
+        else 3.0
+    )
+    proxy_only_clean = (
+        proxy_available
+        and not subproblem_available
+        and np.isfinite(proxy_h)
+        and proxy_h <= proxy_near_perfect_threshold
+        and (not np.isfinite(plain_h) or proxy_h <= 0.5 * plain_h)
+    )
+
+    if proxy_only_clean:
+        profile = "proxy_lp_only_clean"
+        # When the proxy LP already lands within a couple of Hamming bits and
+        # the subproblem surrogate was not validated against the diagnostics,
+        # do NOT engage the surrogate screen or the subproblem MILP candidate.
+        # Those layers would only re-introduce the over-tight subproblem
+        # constraints that made the global LP infeasible in the case14 run.
+        kwargs = {
+            "conf_threshold": 0.12,
+            "max_perturbation_hot_starts": 4,
+            "max_unit_options_per_generator": 3,
+            "max_unit_combination_candidates": 8,
+            "max_nearby_commitment_hot_starts": 3,
+            "nearby_commitment_pool_size": 10,
+            "parallel_fp_starts": 1,
+            "surrogate_screen_mode": "none",
+            "surrogate_screen_max_constraints_per_unit": 0,
+            "surrogate_screen_min_support_ratio": 1.0,
+            "surrogate_screen_max_normalized_violation": 0.0,
+            "surrogate_screen_min_mean_margin": 0.0,
+            "surrogate_screen_candidate_violation_tol": 0.0,
+            "surrogate_screen_soft_penalty": 0.0,
+            "projection_objective_tau": "adaptive",
+            "use_subproblem_milp_candidate": bool(args.prefer_milp_candidates),
+        }
+    elif surrogate_best:
         profile = "surrogate_guided"
         kwargs = {
             "conf_threshold": 0.12,
@@ -358,13 +423,13 @@ def _choose_profile(summary: dict, args: argparse.Namespace) -> Tuple[str, dict]
 
     if false_off_ratio >= 0.65:
         kwargs["stall_flip_fraction"] = 0.16
-        direction_hint = "surrogate_false_off_dominant_open_more"
+        direction_hint = f"{direction_source}_false_off_dominant_open_more"
     elif false_on_ratio >= 0.65:
         kwargs["stall_flip_fraction"] = 0.08
-        direction_hint = "surrogate_false_on_dominant_close_more"
+        direction_hint = f"{direction_source}_false_on_dominant_close_more"
     else:
         kwargs["stall_flip_fraction"] = 0.10
-        direction_hint = "mixed_error_direction"
+        direction_hint = f"{direction_source}_mixed_error_direction"
     kwargs["stall_perturbation_mode"] = "pool_then_flip"
 
     if args.parallel_fp_starts is not None:
@@ -378,10 +443,17 @@ def _choose_profile(summary: dict, args: argparse.Namespace) -> Tuple[str, dict]
             "proxy_lp_mean_hamming": proxy_h,
             "subproblem_lp_mean_hamming": sub_h,
             "subproblem_milp_mean_hamming": sub_milp_h,
+            "subproblem_available": bool(subproblem_available),
+            "proxy_available": bool(proxy_available),
             "surrogate_best": bool(surrogate_best),
             "proxy_best": bool(proxy_best),
             "lp_best": bool(lp_best),
             "milp_helpful": bool(milp_helpful),
+            "proxy_only_clean": bool(proxy_only_clean),
+            "proxy_near_perfect_threshold": proxy_near_perfect_threshold,
+            "direction_source": direction_source,
+            "direction_false_off": int(false_off),
+            "direction_false_on": int(false_on),
             "false_off_ratio": float(false_off_ratio),
             "false_on_ratio": float(false_on_ratio),
             "direction_hint": direction_hint,
@@ -476,6 +548,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--emit-runner", default=None, help="Optional helper .py file that loads the config.")
     p.add_argument("--prefer-milp-candidates", action="store_true")
     p.add_argument("--parallel-fp-starts", type=int, default=None)
+    p.add_argument(
+        "--proxy-near-perfect-threshold",
+        type=float,
+        default=None,
+        help=(
+            "If proxy_lp_to_true mean Hamming is below this threshold and the"
+            " subproblem signal is unavailable, pick the proxy_lp_only_clean"
+            " profile (default 3.0)."
+        ),
+    )
     return p
 
 

@@ -7,8 +7,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[1]
-CONFIG_PATH = ROOT / "result/fp_diagnostics/tailored_fp_config_case14_20260519_174044.json"
+CONFIG_PATH = Path(r"D:\0-github_workspace\branchandcut\result\fp_diagnostics\tailored_fp_config_case14_20260519_192638.json")
 
 
 def load_config() -> dict:
