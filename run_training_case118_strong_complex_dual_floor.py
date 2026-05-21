@@ -34,6 +34,36 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--sub-iter", type=int, default=None)
     p.add_argument("--unit-ids", type=str, default=None)
     p.add_argument(
+        "--subproblem-nn-size",
+        choices=("small", "medium", "large"),
+        default=None,
+        help="Override subproblem main surrogate network size.",
+    )
+    p.add_argument(
+        "--c-pg-nn-size",
+        choices=("small", "medium", "large"),
+        default=None,
+        help="Override subproblem c_pg surrogate network size.",
+    )
+    p.add_argument(
+        "--subproblem-nn-lr",
+        type=float,
+        default=None,
+        help="Override subproblem main/direct NN learning rate.",
+    )
+    p.add_argument(
+        "--c-pg-lr",
+        type=float,
+        default=None,
+        help="Override c_pg predictor learning rate and direct c_pg learning rate.",
+    )
+    p.add_argument(
+        "--c-pg-surr-lr",
+        type=float,
+        default=None,
+        help="Override c_pg surrogate-parameter learning rate.",
+    )
+    p.add_argument(
         "--rho-binary-init",
         type=float,
         default=None,
@@ -146,6 +176,18 @@ def main() -> None:
         float(rt.SUBPROBLEM_RHO_BINARY_MAX),
         float(rt.SUBPROBLEM_RHO_BINARY_INIT),
     )
+    if args.subproblem_nn_size is not None:
+        rt.SUBPROBLEM_NN_SIZE = args.subproblem_nn_size
+    if args.c_pg_nn_size is not None:
+        rt.SUBPROBLEM_C_PG_NN_SIZE = args.c_pg_nn_size
+    if args.subproblem_nn_lr is not None:
+        rt.SUBPROBLEM_NN_LR = float(args.subproblem_nn_lr)
+        rt.SUBPROBLEM_MAIN_DIRECT_LR = float(args.subproblem_nn_lr)
+    if args.c_pg_lr is not None:
+        rt.SUBPROBLEM_PG_COST_LR = float(args.c_pg_lr)
+        rt.SUBPROBLEM_C_PG_DIRECT_LR = float(args.c_pg_lr)
+    if args.c_pg_surr_lr is not None:
+        rt.SUBPROBLEM_PG_COST_SURR_LR = float(args.c_pg_surr_lr)
     rt.NN_EPOCHS = strong.NN_EPOCHS
     rt.BCD_PG_BLOCK_PROX_WEIGHT = 0.0
     rt.BCD_DUAL_BLOCK_PROX_WEIGHT = 0.0
@@ -204,7 +246,9 @@ def main() -> None:
     print(f"subproblem NN-main: epochs={rt.NN_EPOCHS}", flush=True)
     print(
         f"subproblem direct-NN-main: batch_strategy={rt.SUBPROBLEM_MAIN_DIRECT_BATCH_STRATEGY}, "
-        f"epochs={rt.SUBPROBLEM_MAIN_DIRECT_EPOCHS}",
+        f"epochs={rt.SUBPROBLEM_MAIN_DIRECT_EPOCHS}, "
+        f"size={rt.SUBPROBLEM_NN_SIZE}, lr={rt.SUBPROBLEM_NN_LR}, "
+        f"direct_lr={rt.SUBPROBLEM_MAIN_DIRECT_LR}",
         flush=True,
     )
     print(
@@ -212,7 +256,11 @@ def main() -> None:
         f"nn_epochs={rt.SUBPROBLEM_PG_COST_NN_EPOCHS}, "
         f"direct_epochs={rt.SUBPROBLEM_C_PG_DIRECT_EPOCHS}, "
         f"direct_batch={rt.SUBPROBLEM_C_PG_DIRECT_BATCH_STRATEGY}/"
-        f"{rt.SUBPROBLEM_C_PG_DIRECT_BATCH_SIZE}",
+        f"{rt.SUBPROBLEM_C_PG_DIRECT_BATCH_SIZE}, "
+        f"size={rt.SUBPROBLEM_C_PG_NN_SIZE}, "
+        f"lr={rt.SUBPROBLEM_PG_COST_LR}, "
+        f"surr_lr={rt.SUBPROBLEM_PG_COST_SURR_LR}, "
+        f"direct_lr={rt.SUBPROBLEM_C_PG_DIRECT_LR}",
         flush=True,
     )
     if args.target == "subproblem_bcd":
