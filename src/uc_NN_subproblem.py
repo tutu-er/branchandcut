@@ -2823,6 +2823,13 @@ class SubproblemSurrogateTrainer:
             float(self.T_delta),
             int(unit_id),
         )
+        # Min-up/down rows are indexed by t1 in range(T - tau); tau >= T has
+        # no valid row.  Case118 has a few units whose physical min-time value
+        # exceeds the 24-period horizon, so cap the subproblem tau horizon here
+        # to keep all LP backends and loss/logging paths shape-consistent.
+        max_tau = max(int(self.T) - 1, 0)
+        self.subproblem_Ton = min(max(int(self.subproblem_Ton), 0), max_tau)
+        self.subproblem_Toff = min(max(int(self.subproblem_Toff), 0), max_tau)
 
         self.ng = self.gen.shape[0]
         self.nb = self.bus.shape[0]

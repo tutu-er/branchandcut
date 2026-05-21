@@ -216,7 +216,7 @@ ZETA_HOT_START_STRATEGY = 'zero'             # 'zero' / 'gaussian'
 THETA_GAUSSIAN_STD = 0.01
 ZETA_GAUSSIAN_STD = 0.01
 BCD_ENABLE_DROPOUT_DURING_NN_TRAINING = True
-BCD_NN_SIZE = 'medium'   # 'small' / 'medium' / 'large'
+BCD_NN_SIZE = 'medium'   # 'tiny' / 'small' / 'medium' / 'large'
 BCD_NN_BATCH_STRATEGY = 'full-batch'   # 'full-batch' / 'mini-batch'
 BCD_NN_BATCH_SIZE = 4
 BCD_NN_SHUFFLE = True
@@ -314,8 +314,8 @@ SUBPROBLEM_MU_SIGN_HYSTERESIS_ROUNDS = 3
 SUBPROBLEM_MU_SIGN_FLIP_MIN_SHARE = 0.72
 SUBPROBLEM_X_BOUND_DUAL_ZERO_ROUNDS = 0
 SUBPROBLEM_NN_BATCH_STRATEGY = 'full-batch'   # 'full-batch' / 'mini-batch'
-SUBPROBLEM_NN_SIZE = 'medium'   # 'small' / 'medium' / 'large'
-SUBPROBLEM_C_PG_NN_SIZE = 'medium'   # 'small' / 'medium' / 'large'
+SUBPROBLEM_NN_SIZE = 'medium'   # 'tiny' / 'small' / 'medium' / 'large'
+SUBPROBLEM_C_PG_NN_SIZE = 'medium'   # 'tiny' / 'small' / 'medium' / 'large'
 SUBPROBLEM_NN_BATCH_SIZE = 4
 SUBPROBLEM_NN_SHUFFLE = True
 SUBPROBLEM_NN_LR = 5e-4
@@ -499,13 +499,15 @@ def log(msg):
     print(f"[{ts}] {msg}", flush=True)
 
 
-SUPPORTED_NN_SIZE_OPTIONS = ('small', 'medium', 'large')
+SUPPORTED_NN_SIZE_OPTIONS = ('tiny', 'small', 'medium', 'large')
 BCD_NN_HIDDEN_DIM_OPTIONS = {
+    'tiny': [8, 16],
     'small': [16, 32],
     'medium': [24, 48],
     'large': [32, 64],
 }
 SUBPROBLEM_NN_HIDDEN_DIM_OPTIONS = {
+    'tiny': [32, 32],
     'small': [64, 64],
     'medium': [96, 96],
     'large': [128, 128],

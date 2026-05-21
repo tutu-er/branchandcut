@@ -30,9 +30,11 @@ _CVXPY_HIGHS_STATUS_CACHE = None
 
 def _trainer_subproblem_ton_toff(trainer) -> tuple[int, int]:
     """τ 上界：与 ``SubproblemSurrogateTrainer.subproblem_Ton/Toff`` 一致；缺省时退回 ``min(4,T)``。"""
-    fb = min(4, int(trainer.T))
-    ton = int(getattr(trainer, "subproblem_Ton", fb))
-    toff = int(getattr(trainer, "subproblem_Toff", fb))
+    t_horizon = max(int(trainer.T), 0)
+    max_tau = max(t_horizon - 1, 0)
+    fb = min(4, max_tau)
+    ton = min(max(int(getattr(trainer, "subproblem_Ton", fb)), 0), max_tau)
+    toff = min(max(int(getattr(trainer, "subproblem_Toff", fb)), 0), max_tau)
     return ton, toff
 
 
@@ -1189,14 +1191,22 @@ def solve_primal_block(
         obj_opt_terms.append(_weighted_abs_sum(ramp_down_expr, lam_ramp_down))
 
     for tau in range(1, Ton + 1):
-        min_on_expr = x[1:trainer.T - tau + 1] - x[:trainer.T - tau] - x[tau:]
+        n_terms = int(trainer.T) - int(tau)
+        if n_terms <= 0:
+            continue
+        min_on_expr = x[1:n_terms + 1] - x[:n_terms] - x[tau:tau + n_terms]
         lam_min_on = np.abs(np.asarray(lam_inh["lambda_min_on"][tau - 1], dtype=float))
+        lam_min_on = lam_min_on[:n_terms]
         obj_primal_terms.append(_sum_pos(min_on_expr))
         obj_opt_terms.append(_weighted_abs_sum(min_on_expr, lam_min_on))
 
     for tau in range(1, Toff + 1):
-        min_off_expr = -x[1:trainer.T - tau + 1] + x[:trainer.T - tau] - (1 - x[tau:])
+        n_terms = int(trainer.T) - int(tau)
+        if n_terms <= 0:
+            continue
+        min_off_expr = -x[1:n_terms + 1] + x[:n_terms] - (1 - x[tau:tau + n_terms])
         lam_min_off = np.abs(np.asarray(lam_inh["lambda_min_off"][tau - 1], dtype=float))
+        lam_min_off = lam_min_off[:n_terms]
         obj_primal_terms.append(_sum_pos(min_off_expr))
         obj_opt_terms.append(_weighted_abs_sum(min_off_expr, lam_min_off))
 

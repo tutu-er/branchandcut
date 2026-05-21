@@ -35,13 +35,13 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--unit-ids", type=str, default=None)
     p.add_argument(
         "--subproblem-nn-size",
-        choices=("small", "medium", "large"),
+        choices=("tiny", "small", "medium", "large"),
         default=None,
         help="Override subproblem main surrogate network size.",
     )
     p.add_argument(
         "--c-pg-nn-size",
-        choices=("small", "medium", "large"),
+        choices=("tiny", "small", "medium", "large"),
         default=None,
         help="Override subproblem c_pg surrogate network size.",
     )
